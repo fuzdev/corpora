@@ -1,0 +1,278 @@
+/**
+ * Tests for create_style_rule_index function.
+ *
+ * Tests parsing custom CSS into a StyleRuleIndex for tree-shaking.
+ *
+ * @module
+ */
+
+import { test, assert, describe } from 'vitest';
+
+import {
+	create_style_rule_index,
+	get_matching_rules,
+	generate_base_css_by_layer
+} from '$lib/style_rule_parser.ts';
+
+describe('create_style_rule_index', () => {
+	describe('basic parsing', () => {
+		test('parses simple rules', () => {
+			const css = `
+				button { color: blue; }
+				input { border: 1px solid; }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.strictEqual(index.rules.length, 2);
+			assert.isTrue(index.by_element.has('button'));
+			assert.isTrue(index.by_element.has('input'));
+		});
+
+		test('indexes by element name', () => {
+			const css = `
+				button { color: red; }
+				button:hover { color: blue; }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			const button_rules = index.by_element.get('button');
+			assert.strictEqual(button_rules?.length, 2);
+		});
+
+		test('indexes by class name', () => {
+			const css = `
+				.active { color: green; }
+				button.primary { color: blue; }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.by_class.has('active'));
+			assert.isTrue(index.by_class.has('primary'));
+		});
+	});
+
+	describe('core rules', () => {
+		test('marks * rules as core', () => {
+			const css = `* { box-sizing: border-box; }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.is_core);
+			assert.strictEqual(index.rules[0]!.core_reason, 'universal');
+		});
+
+		test('marks :root rules as core', () => {
+			const css = `:root { font-size: 16px; }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.is_core);
+			assert.strictEqual(index.rules[0]!.core_reason, 'root');
+		});
+
+		test('marks body rules as core', () => {
+			const css = `body { margin: 0; }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.is_core);
+			assert.strictEqual(index.rules[0]!.core_reason, 'body');
+		});
+	});
+
+	describe('variable extraction', () => {
+		test('extracts CSS variables from rules', () => {
+			const css = `button { color: var(--btn_color); background: var(--btn_bg); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('btn_color'));
+			assert.isTrue(index.rules[0]!.variables_used.has('btn_bg'));
+		});
+
+		test('extracts multiple variables from single property', () => {
+			const css = `div { box-shadow: var(--shadow_x) var(--shadow_y) var(--shadow_blur) var(--shadow_color); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.strictEqual(index.rules[0]!.variables_used.size, 4);
+			assert.isTrue(index.rules[0]!.variables_used.has('shadow_x'));
+			assert.isTrue(index.rules[0]!.variables_used.has('shadow_y'));
+			assert.isTrue(index.rules[0]!.variables_used.has('shadow_blur'));
+			assert.isTrue(index.rules[0]!.variables_used.has('shadow_color'));
+		});
+
+		test('extracts variables from pseudo-class rules', () => {
+			const css = `
+				button:hover { background: var(--hover_bg); }
+				button:focus { outline-color: var(--focus_color); }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('hover_bg'));
+			assert.isTrue(index.rules[1]!.variables_used.has('focus_color'));
+		});
+
+		test('extracts variables from @media rules', () => {
+			const css = `
+				@media (min-width: 768px) {
+					button { padding: var(--p_lg); margin: var(--m_lg); }
+				}
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('p_lg'));
+			assert.isTrue(index.rules[0]!.variables_used.has('m_lg'));
+		});
+
+		test('extracts variables with fallbacks', () => {
+			const css = `button { color: var(--primary, blue); background: var(--bg, white); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('primary'));
+			assert.isTrue(index.rules[0]!.variables_used.has('bg'));
+		});
+
+		test('extracts nested variable fallbacks', () => {
+			const css = `div { color: var(--a, var(--b, var(--c))); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('a'));
+			assert.isTrue(index.rules[0]!.variables_used.has('b'));
+			assert.isTrue(index.rules[0]!.variables_used.has('c'));
+		});
+
+		test('extracts variables in calc()', () => {
+			const css = `div { width: calc(100% - var(--sidebar_width) - var(--gap)); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('sidebar_width'));
+			assert.isTrue(index.rules[0]!.variables_used.has('gap'));
+		});
+
+		test('deduplicates repeated variables', () => {
+			const css = `
+				div {
+					border: var(--border_width) solid var(--border_color);
+					outline: var(--border_width) solid var(--border_color);
+				}
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.strictEqual(index.rules[0]!.variables_used.size, 2);
+			assert.isTrue(index.rules[0]!.variables_used.has('border_width'));
+			assert.isTrue(index.rules[0]!.variables_used.has('border_color'));
+		});
+
+		test('returns empty set for rule without variables', () => {
+			const css = `button { color: red; background: blue; }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.strictEqual(index.rules[0]!.variables_used.size, 0);
+		});
+
+		test('extracts variables from multiple rules', () => {
+			const css = `
+				button { color: var(--btn_text); }
+				input { border-color: var(--input_border); }
+				a { color: var(--link_color); }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('btn_text'));
+			assert.isTrue(index.rules[1]!.variables_used.has('input_border'));
+			assert.isTrue(index.rules[2]!.variables_used.has('link_color'));
+		});
+
+		test('handles hyphens and underscores in variable names', () => {
+			const css = `div { color: var(--my-color); background: var(--my_bg_color); }`;
+
+			const index = create_style_rule_index(css);
+
+			assert.isTrue(index.rules[0]!.variables_used.has('my-color'));
+			assert.isTrue(index.rules[0]!.variables_used.has('my_bg_color'));
+		});
+	});
+
+	describe('tree-shaking integration', () => {
+		test('get_matching_rules filters by elements', () => {
+			const css = `
+				button { color: blue; }
+				input { border: 1px solid; }
+				a { text-decoration: none; }
+			`;
+
+			const index = create_style_rule_index(css);
+			const matched = get_matching_rules(index, new Set(['button']), new Set());
+
+			assert.strictEqual(matched.size, 1);
+		});
+
+		test('generate_base_css_by_layer outputs only matched rules', () => {
+			const css = `
+				button { color: blue; }
+				input { border: 1px solid; }
+			`;
+
+			const index = create_style_rule_index(css);
+			const matched = get_matching_rules(index, new Set(['button']), new Set());
+			const output = generate_base_css_by_layer(index, matched)['fuz.base'];
+
+			assert.include(output, 'button { color: blue; }');
+			assert.notInclude(output, 'input');
+		});
+	});
+
+	describe('metadata', () => {
+		test('generates content hash', () => {
+			const css1 = 'button { color: red; }';
+			const css2 = 'button { color: blue; }';
+
+			const index1 = create_style_rule_index(css1);
+			const index2 = create_style_rule_index(css2);
+
+			// Different content parses to different rule sets
+			assert.notStrictEqual(index1.rules[0]!.css, index2.rules[0]!.css);
+		});
+	});
+
+	describe('edge cases', () => {
+		test('handles empty CSS', () => {
+			const index = create_style_rule_index('');
+			assert.strictEqual(index.rules.length, 0);
+		});
+
+		test('handles CSS with comments', () => {
+			const css = `
+				/* This is a comment */
+				button { color: blue; }
+			`;
+
+			const index = create_style_rule_index(css);
+			assert.strictEqual(index.rules.length, 1);
+		});
+
+		test('handles @media rules', () => {
+			const css = `
+				button { font-size: 14px; }
+				@media (min-width: 768px) { button { font-size: 16px; } }
+			`;
+
+			const index = create_style_rule_index(css);
+
+			// Both rules should be indexed under button
+			assert.strictEqual(index.by_element.get('button')?.length, 2);
+		});
+	});
+});

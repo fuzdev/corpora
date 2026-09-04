@@ -1,0 +1,181 @@
+<script lang="ts">
+	import { ensure_end } from '@fuzdev/fuz_util/string.ts';
+	import { resolve } from '$app/paths';
+	import type { Snippet } from 'svelte';
+
+	import ModulesNav from './ModulesNav.svelte';
+	import type { Repo } from './repo.svelte.ts';
+
+	const {
+		repos,
+		nav_footer
+	}: {
+		repos: Array<Repo>; // TODO normalized version with cached primitives?
+		nav_footer?: Snippet;
+	} = $props();
+
+	// TODO add sorting options
+
+	// TODO show other data (bytes and lines of code per module?)
+
+	// Get modules from each repo's source_json
+	const repos_modules = $derived(
+		repos
+			.filter((repo): repo is Repo & { source_json: { modules: Array<unknown> } } =>
+				Boolean(repo.source_json.modules?.length)
+			)
+			.map((repo) => ({
+				repo,
+				modules: repo.source_json.modules
+			}))
+	);
+
+	// TODO add favicon (from library? gro?)
+</script>
+
+<div class="modules-detail">
+	<div class="nav-wrapper">
+		<section>
+			<ModulesNav {repos_modules} />
+		</section>
+		{@render nav_footer?.()}
+	</div>
+	<ul class="width_atmost_md box unstyled">
+		{#each repos_modules as repo_modules (repo_modules)}
+			{@const { repo, modules } = repo_modules}
+			<li class="repo-module">
+				<header class="width:100% position:relative">
+					<a href="#{repo.name}" id={repo.name} class="subtitle">🔗</a>
+					<a href={resolve(`/tree/${repo.repo_name}`)}>{repo.name}</a>
+				</header>
+				<ul class="modules panel unstyled">
+					{#each modules as repo_module (repo_module)}
+						{@const { path, declarations } = repo_module}
+						<li
+							class="module"
+							class:ts={path.endsWith('.ts')}
+							class:svelte={path.endsWith('.svelte')}
+							class:css={path.endsWith('.css')}
+							class:json={path.endsWith('.json')}
+						>
+							<div class="module-file">
+								{#if repo.repo_url}
+									<div class="chip row">
+										<!-- TODO this is a hack that could be fixed by adding an optional `base: './'` that defaults to './src/lib/'  -->
+										<!-- eslint-disable-next-line svelte/no-navigation-without-resolve --><a
+											href="{ensure_end(repo.repo_url, '/')}blob/main/{path === 'package.json'
+												? ''
+												: 'src/lib/'}{path}">{path}</a
+										>
+									</div>
+								{:else}
+									<span class="chip">{path}</span>
+								{/if}
+							</div>
+							{#if declarations?.length}
+								<ul class="declarations unstyled">
+									{#each declarations as { name, kind } (name)}
+										{#if name !== 'default'}
+											<li class="declaration chip {kind}-declaration">
+												{name}
+											</li>
+										{/if}
+									{/each}
+								</ul>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+			</li>
+		{/each}
+	</ul>
+</div>
+
+<!-- TODO better rendering, also show author, etc -->
+
+<style>
+	.modules-detail {
+		position: relative;
+		padding: var(--space_lg);
+		display: flex;
+		flex-direction: row;
+		align-items: flex-start;
+		width: 100%;
+		gap: var(--space_xl);
+	}
+	.subtitle {
+		position: absolute;
+		right: 0;
+		top: 0;
+		text-align: right;
+	}
+	.repo-module {
+		width: 100%;
+		display: flex;
+		flex-direction: column;
+		margin-bottom: var(--space_xl5);
+	}
+	.repo-module > header {
+		display: flex;
+		padding: var(--space_xs) var(--space_md);
+		font-size: var(--font_size_lg);
+		position: sticky;
+		top: 0;
+		background-color: var(--shade_00);
+	}
+	.modules {
+		padding: var(--space_sm);
+	}
+	.module {
+		margin-bottom: var(--space_lg);
+		--link_color: var(--text_70);
+	}
+	.module-file {
+		margin-bottom: var(--space_xs);
+	}
+	.ts {
+		--link_color: var(--color_a_50);
+	}
+	.svelte {
+		--link_color: var(--color_e_50);
+	}
+	.css {
+		--link_color: var(--color_b_50);
+	}
+	.json {
+		--link_color: var(--color_f_50);
+	}
+	/* TODO extract */
+	.declarations {
+		display: flex;
+		flex: 1;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: flex-start;
+		gap: var(--space_xs);
+		padding-left: var(--space_xs);
+	}
+	.declaration {
+		font-family: var(--font_family_mono);
+		font-size: var(--font_size_sm);
+	}
+	.variable-declaration {
+		color: var(--color_d_50);
+	}
+	.function-declaration {
+		color: var(--color_c_50);
+	}
+	.type-declaration {
+		color: var(--color_g_50);
+	}
+	.class-declaration {
+		color: var(--color_f_50);
+	}
+	/* TODO extract  */
+	.nav-wrapper {
+		position: sticky;
+		top: var(--space_xl);
+		display: flex;
+		flex-direction: column;
+	}
+</style>

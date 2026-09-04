@@ -1,0 +1,152 @@
+<script lang="ts">
+	/**
+	 * Account signup form — username + password (+ optional email).
+	 *
+	 * Calls `AuthState.signup` (`POST /api/account/signup`) via
+	 * `auth_state_context`. Validates the `Username` schema and
+	 * `PASSWORD_LENGTH_MIN` client-side; surfaces 403 (no invite),
+	 * 409 (duplicate), and 429 (rate limited) inline. Submit focuses the
+	 * first invalid field. Companion to `LoginForm` and `BootstrapForm`.
+	 *
+	 * @module
+	 */
+
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import PendingButton from '@fuzdev/fuz_ui/PendingButton.svelte';
+	import { autofocus } from '@fuzdev/fuz_ui/autofocus.svelte.ts';
+
+	import { Username } from '../primitive_schemas.ts';
+	import { PASSWORD_LENGTH_MIN } from '../auth/password.ts';
+	import { auth_state_context } from './auth_state.svelte.ts';
+	import { FormState } from './form_state.svelte.ts';
+
+	const {
+		redirect_on_signup = resolve('/')
+	}: {
+		/**
+		 * Path to navigate to after a successful signup.
+		 * @default '/'
+		 */
+		redirect_on_signup?: string;
+	} = $props();
+
+	const auth_state = auth_state_context.get();
+	const form_state = new FormState();
+
+	let username = $state.raw('');
+	let email = $state.raw('');
+	let password = $state.raw('');
+	let password_confirm = $state.raw('');
+
+	const username_valid = $derived(Username.safeParse(username).success);
+	const passwords_match = $derived(password === password_confirm);
+	const can_submit = $derived(
+		username.trim() &&
+			username_valid &&
+			password.length >= PASSWORD_LENGTH_MIN &&
+			passwords_match &&
+			!auth_state.verifying
+	);
+
+	const handle_signup = async (): Promise<void> => {
+		form_state.attempt();
+		if (!can_submit) {
+			if (!username.trim() || !username_valid) form_state.focus('username');
+			else if (password.length < PASSWORD_LENGTH_MIN) form_state.focus('password');
+			else if (!passwords_match) form_state.focus('password_confirm');
+			return;
+		}
+		const success = await auth_state.signup(username.trim(), password, email.trim() || undefined);
+		if (success) {
+			form_state.reset();
+			await goto(redirect_on_signup);
+		}
+	};
+</script>
+
+<form
+	class="width_atmost_md"
+	oninput={() => {
+		auth_state.verify_error = null;
+	}}
+	onsubmit={(e) => {
+		e.preventDefault();
+		void handle_signup();
+	}}
+	{@attach form_state.form()}
+>
+	<label>
+		<div class="title">username</div>
+		<input
+			name="username"
+			type="text"
+			bind:value={username}
+			placeholder="username"
+			autocomplete="username"
+			disabled={auth_state.verifying}
+			{@attach autofocus()}
+		/>
+	</label>
+	{#if form_state.show('username') && username && !username_valid}
+		<p class="color_c_50 font_size_sm mt_0 mb_xs">
+			3-39 chars, starts with a letter, ends with letter/number, middle allows dash/underscore
+		</p>
+	{/if}
+	<label>
+		<div class="title">email (optional)</div>
+		<input
+			name="email"
+			type="email"
+			bind:value={email}
+			placeholder="email"
+			autocomplete="email"
+			disabled={auth_state.verifying}
+		/>
+	</label>
+	<fieldset>
+		<label>
+			<div class="title">password (min {PASSWORD_LENGTH_MIN} characters)</div>
+			<input
+				name="password"
+				type="password"
+				bind:value={password}
+				placeholder="password"
+				autocomplete="new-password"
+				disabled={auth_state.verifying}
+			/>
+		</label>
+		{#if form_state.show('password') && password && password.length < PASSWORD_LENGTH_MIN}
+			<p class="color_c_50 font_size_sm mt_0 mb_xs">
+				password must be at least {PASSWORD_LENGTH_MIN} characters
+			</p>
+		{/if}
+		<label>
+			<div class="title">confirm password</div>
+			<input
+				name="password_confirm"
+				type="password"
+				bind:value={password_confirm}
+				placeholder="confirm password"
+				autocomplete="new-password"
+				disabled={auth_state.verifying}
+			/>
+		</label>
+		{#if form_state.show('password_confirm') && password && password_confirm && !passwords_match}
+			<p class="color_c_50 font_size_sm mt_0 mb_xs">passwords do not match</p>
+		{/if}
+	</fieldset>
+	<div class="row gap_sm">
+		<PendingButton
+			pending={auth_state.verifying}
+			disabled={auth_state.verifying}
+			onclick={handle_signup}
+			class={auth_state.verify_error ? 'color_c' : ''}
+		>
+			sign up
+		</PendingButton>
+	</div>
+	{#if auth_state.verify_error}
+		<p class="color_c_50 font_size_sm mt_xs mb_0">{auth_state.verify_error}</p>
+	{/if}
+</form>

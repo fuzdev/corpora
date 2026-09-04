@@ -1,0 +1,26 @@
+import type { Flavored } from '@fuzdev/fuz_util/types.ts';
+import type { Url } from '@fuzdev/fuz_util/url.ts';
+
+import type { VideoJson } from './video.ts';
+
+// TODO @many probably extract, maybe to `fuz_video`
+
+export interface Channel {
+	name: ChannelName;
+	url: Url;
+	summary: ChannelSummary; // TODO maybe accept a snippet
+	videos: Array<VideoJson>;
+	playlists: Array<Playlist>;
+}
+
+export type ChannelName = Flavored<string, 'ChannelName'>;
+export type ChannelSummary = Flavored<string, 'ChannelSummary'>;
+
+export interface Playlist {
+	name: PlaylistName;
+	url: Url;
+	summary: PlaylistSummary; // TODO maybe accept a snippet
+}
+
+export type PlaylistName = Flavored<string, 'Playlist'>; // TODO maybe refactor to an object with `PlaylistName`?
+export type PlaylistSummary = Flavored<string, 'PlaylistSummary'>;

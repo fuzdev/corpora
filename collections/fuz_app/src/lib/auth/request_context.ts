@@ -1,0 +1,814 @@
+/**
+ * Request context middleware and role_grant checking helpers.
+ *
+ * Two-phase identity resolution:
+ *
+ * 1. **Authentication (middleware)** — `create_request_context_middleware`,
+ *    `bearer_auth`, and `daemon_token_middleware` validate the credential
+ *    (session cookie, bearer token, daemon token) and set `c.var.account_id`
+ *    + `c.var.credential_type` on the Hono context. They do not resolve
+ *    an acting actor or load role_grants; `REQUEST_CONTEXT_KEY` stays null at
+ *    this stage, so account-grain identity is the only thing known.
+ * 2. **Authorization (route-spec wrapper / RPC dispatcher)** — after input
+ *    validation, the per-route layer inspects the route. If the input
+ *    schema declared `acting?: ActingActor` (reference equality with the
+ *    canonical `ActingActor` schema) or the auth requires role_grants
+ *    (`role` / `keeper`), `apply_authorization_phase` resolves the actor
+ *    against `c.var.account_id` plus the validated `acting` value via
+ *    `resolve_acting_actor`, builds the `{account, actor, role_grants}`
+ *    context via `build_request_context`, and sets it on
+ *    `REQUEST_CONTEXT_KEY` before auth guards fire. Authenticated routes
+ *    that don't need an actor still get an account-only context via
+ *    `build_account_context` so handler signatures stay uniform.
+ *
+ * Account-grain operations (logout, password_change, account_verify,
+ * etc.) declare neither `acting` nor role_grant-requiring auth, so no actor
+ * is resolved and their handlers see a `RequestContext` with
+ * `actor: null` + empty `role_grants`. They never trigger `actor_required`,
+ * which is what makes multi-actor logout work without first picking a
+ * persona.
+ *
+ * `build_request_context` loads `account → actor → role_grants` and verifies
+ * the `actor.account_id === account.id` binding. `refresh_role_grants`
+ * reloads role_grants on an existing context.
+ *
+ * @module
+ */
+
+import type { Context, MiddlewareHandler } from 'hono';
+
+import {
+	type Account,
+	type Actor,
+	is_role_grant_active,
+	type RoleGrant
+} from './account_schema.ts';
+import { hash_session_token, query_session_get_valid } from './session_queries.ts';
+import {
+	query_account_by_id,
+	query_actor_by_id,
+	query_active_actors_by_account
+} from './account_queries.ts';
+import { query_role_grant_find_active_for_actor } from './role_grant_queries.ts';
+import type { QueryDeps } from '../db/query_deps.ts';
+import {
+	ACCOUNT_ID_KEY,
+	AUTH_API_TOKEN_ID_KEY,
+	CREDENTIAL_TYPE_KEY,
+	TOKEN_SCOPE_KEY,
+	TEST_CONTEXT_PRESET_KEY,
+	type CredentialType
+} from '../hono_context.ts';
+import {
+	parse_token_scope_capability,
+	token_scope_admits_capability,
+	token_scope_denied_body,
+	token_scope_full,
+	type TokenScopeCapability
+} from './token_scope.ts';
+import type { RouteSpec } from '../http/route_spec.ts';
+import { is_public_auth, needs_actor, parse_acting, type RouteAuth } from '../http/auth_shape.ts';
+import { is_null_schema } from '../http/schema_helpers.ts';
+import {
+	ERROR_AUTHENTICATION_REQUIRED,
+	ERROR_INSUFFICIENT_PERMISSIONS,
+	ERROR_CREDENTIAL_TYPE_REQUIRED,
+	ERROR_ACTOR_REQUIRED,
+	ERROR_ACTOR_NOT_ON_ACCOUNT,
+	ERROR_NO_ACTORS_ON_ACCOUNT,
+	ERROR_ACCOUNT_VANISHED
+} from '../http/error_schemas.ts';
+
+/**
+ * The resolved identity context for an authenticated request.
+ *
+ * `actor` is null on account-grain routes (no `acting` field on input,
+ * no `role` / `keeper` auth) — those handlers don't trigger actor
+ * resolution. `role_grants` is empty in that case. Role grant checks
+ * (`has_role`, `has_scoped_role`, `has_any_scoped_role`) are
+ * null-tolerant on `RequestContext | null`; they additionally treat
+ * `actor: null` as "no role_grants" so callers don't have to narrow.
+ *
+ * Multi-actor invariant: when populated, `actor.account_id === account.id`.
+ * `build_request_context` enforces this; the dispatcher's authorization
+ * phase rejects with `actor_not_on_account` before reaching the handler.
+ */
+export interface RequestContext {
+	account: Account;
+	actor: Actor | null;
+	role_grants: Array<RoleGrant>;
+}
+
+/** Hono context variable name for the request context. */
+export const REQUEST_CONTEXT_KEY = 'request_context';
+
+/**
+ * Hono context variable name for the authenticated session token hash.
+ *
+ * Set by `create_request_context_middleware` after a successful session lookup.
+ * `null` when the request is unauthenticated or authenticated via a non-session
+ * credential (bearer token, daemon token). Exposed so handlers can scope
+ * per-session resources (e.g., SSE stream identity for targeted disconnection
+ * on `session_revoke`) without re-hashing the token.
+ */
+export const AUTH_SESSION_TOKEN_HASH_KEY = 'auth_session_token_hash';
+
+/**
+ * Get the request context from a Hono context, or `null` if unauthenticated.
+ *
+ * @param c - the Hono context
+ * @returns the request context, or `null`
+ */
+export const get_request_context = (c: Context): RequestContext | null => {
+	return (c.get(REQUEST_CONTEXT_KEY) as RequestContext | undefined) ?? null;
+};
+
+/**
+ * Get the request context, throwing if unauthenticated.
+ *
+ * Use in route handlers where the dispatcher's authorization phase guarantees
+ * a context exists (i.e., routes with `auth: {type: 'authenticated'}` or
+ * stricter). Prefer this over `get_request_context(c)!` for explicit error
+ * handling.
+ *
+ * @param c - the Hono context
+ * @returns the request context (never null)
+ * @throws Error if no request context is set (dispatcher misconfiguration)
+ */
+export const require_request_context = (c: Context): RequestContext => {
+	const ctx = get_request_context(c);
+	if (!ctx) {
+		throw new Error(
+			'require_request_context: no request context — is the dispatcher authorization phase wired?'
+		);
+	}
+	return ctx;
+};
+
+/**
+ * Request context narrowed to a resolved acting actor.
+ *
+ * Used by handlers bound through `rpc_action` against an actor-implying
+ * spec (`auth.actor === 'required'`) — the binder's conditional return
+ * type tightens `ctx.auth` to this shape because the dispatcher's
+ * authorization phase always resolves an actor before the handler runs.
+ * The biconditional `actor !== 'none' ⟺ input declares acting?: ActingActor`
+ * is enforced at registry time.
+ */
+export interface RequestActorContext extends RequestContext {
+	actor: Actor;
+}
+
+/**
+ * Check if a request context has an active role_grant for a given role.
+ *
+ * Checks the role_grants already loaded in the context (no DB query).
+ * Null-tolerant — `null` ctx (unauthenticated) returns `false`. Symmetric
+ * with `has_scoped_role` / `has_any_scoped_role` so the three helpers
+ * compose freely in the same predicate (e.g.
+ * `has_role(auth, ADMIN) || has_scoped_role(auth, role, scope)`).
+ *
+ * @param ctx - the request context, or `null` for unauthenticated callers
+ * @param role - the role to check
+ * @param now - current time (defaults to `new Date()`, pass for testability and hot-path efficiency)
+ * @returns `true` if the actor has an active role_grant for the role
+ */
+export const has_role = (
+	ctx: RequestContext | null,
+	role: string,
+	now: Date = new Date()
+): boolean =>
+	ctx?.role_grants.some((p) => p.role === role && is_role_grant_active(p, now)) ?? false;
+
+/**
+ * Whether the request context holds an active role_grant for `role` at `scope_id`.
+ *
+ * Walks the in-memory `ctx.role_grants` snapshot loaded once per request by
+ * the route-spec / RPC dispatcher's authorization phase (when the route
+ * declares `acting?: ActingActor` or has role_grant-requiring auth); zero DB
+ * roundtrip per check. The "freshness" framing of a SQL re-query is
+ * illusory because the race window is between predicate and the actual
+ * mutation, not predicate and authorization load. Closing that race needs
+ * a transactional re-check inside the UPDATE/INSERT, which neither style
+ * provides.
+ *
+ * Null-tolerant — `null` ctx (unauthenticated) and account-grain
+ * contexts (`actor: null`, empty `role_grants`) both return `false`. Same
+ * convention as `has_role`; lets the helper drop into public
+ * (`{account: 'none', actor: 'none'}`) and account-grain
+ * (`{account: 'required', actor: 'none'}`) handlers without a manual
+ * narrow. See `cell_authorize` for the resource-side analog.
+ *
+ * `scope_id` semantics: in-memory `role_grant.scope_id` is `string | null`, so
+ * JS `===` matches the SQL `IS NOT DISTINCT FROM` semantics exactly:
+ *
+ * - `scope_id === null` matches global role_grants (`scope_id IS NULL`).
+ * - `scope_id === '<uuid>'` matches role_grants bound to that exact scope.
+ *
+ * @param ctx - the request context, or `null` for unauthenticated callers
+ * @param role - the role to check
+ * @param scope_id - the scope to check (`null` for global)
+ * @param now - current time (defaults to `new Date()`, pass for testability and hot-path efficiency)
+ * @returns `true` iff the actor holds an active role_grant for the role at the requested scope
+ */
+export const has_scoped_role = (
+	ctx: RequestContext | null,
+	role: string,
+	scope_id: string | null,
+	now: Date = new Date()
+): boolean => {
+	if (!ctx) return false;
+	return ctx.role_grants.some(
+		(p) => p.role === role && p.scope_id === scope_id && is_role_grant_active(p, now)
+	);
+};
+
+/**
+ * Whether the request context holds an active role_grant for any role in `roles`
+ * at `scope_id`. Empty `roles` short-circuits to `false` — documents intent
+ * at the call site ("zero roles trivially admit no-one"). Same scope and
+ * null-tolerance semantics as `has_scoped_role`.
+ *
+ * @param ctx - the request context, or `null` for unauthenticated callers
+ * @param roles - the roles that would admit the caller (any-of)
+ * @param scope_id - the scope to check (`null` for global)
+ * @param now - current time (defaults to `new Date()`, pass for testability)
+ * @returns `true` iff the actor holds an active role_grant for any role in `roles` at the requested scope
+ */
+export const has_any_scoped_role = (
+	ctx: RequestContext | null,
+	roles: ReadonlyArray<string>,
+	scope_id: string | null,
+	now: Date = new Date()
+): boolean => {
+	if (!ctx) return false;
+	if (roles.length === 0) return false;
+	return ctx.role_grants.some(
+		(p) => roles.includes(p.role) && p.scope_id === scope_id && is_role_grant_active(p, now)
+	);
+};
+
+/**
+ * Result of `resolve_acting_actor` — either an actor id or a structured
+ * error the caller maps to an HTTP response.
+ */
+export type ResolveActingActorResult =
+	| { ok: true; actor_id: string }
+	| { ok: false; reason: 'no_actors' }
+	| { ok: false; reason: 'actor_required'; available: Array<{ id: string; name: string }> }
+	| { ok: false; reason: 'actor_not_on_account' };
+
+/**
+ * Resolve the acting actor for an authenticated request.
+ *
+ * Called from the route-spec / RPC dispatcher's authorization phase
+ * with the authenticated account id and the validated `acting` value
+ * (from the request payload). Applies the uniform resolution rules:
+ *
+ * - `acting_actor_id` omitted + 1 actor → use it.
+ * - `acting_actor_id` omitted + 0 actors → `no_actors` (defensive —
+ *   signup / bootstrap always create an actor in the same tx, so this
+ *   is a server error).
+ * - `acting_actor_id` omitted + multiple actors → `actor_required` with
+ *   the available list so the client can prompt; never pick silently.
+ * - `acting_actor_id` present + matches an actor on the account → use it.
+ * - `acting_actor_id` present + does not match → `actor_not_on_account`.
+ *   The available list is intentionally not echoed in this branch (treat
+ *   as opaque rejection).
+ *
+ * @param deps - query dependencies
+ * @param account_id - the authenticated account
+ * @param acting_actor_id - the requested acting actor id, or `undefined`
+ */
+export const resolve_acting_actor = async (
+	deps: QueryDeps,
+	account_id: string,
+	acting_actor_id: string | undefined
+): Promise<ResolveActingActorResult> => {
+	const actors = await query_active_actors_by_account(deps, account_id);
+	if (actors.length === 0) return { ok: false, reason: 'no_actors' };
+	if (acting_actor_id == null) {
+		if (actors.length === 1) return { ok: true, actor_id: actors[0]!.id };
+		return {
+			ok: false,
+			reason: 'actor_required',
+			available: actors.map((a) => ({ id: a.id, name: a.name }))
+		};
+	}
+	const match = actors.find((a) => a.id === acting_actor_id);
+	if (!match) return { ok: false, reason: 'actor_not_on_account' };
+	return { ok: true, actor_id: match.id };
+};
+
+/**
+ * Create middleware that authenticates the account from a session cookie.
+ *
+ * Reads the session identity (set by session middleware), looks up the
+ * `auth_session`, and on a valid session sets `c.var.auth_account_id`,
+ * `CREDENTIAL_TYPE_KEY = 'session'`, and `AUTH_SESSION_TOKEN_HASH_KEY`.
+ * Touches the session (fire-and-forget). Does not load actor or role_grants;
+ * `REQUEST_CONTEXT_KEY` is left null — the route-spec / RPC dispatcher
+ * authorization phase resolves the acting actor and builds the full
+ * `RequestContext` when the route needs one.
+ *
+ * Invalid / missing session leaves all keys null and calls `next()` —
+ * `require_auth` / `require_role` enforce.
+ *
+ * @param deps - query dependencies (pool-level db for middleware)
+ * @param session_context_key - the Hono context key where session middleware stored the session token
+ * @mutates Hono context - sets `ACCOUNT_ID_KEY`, `CREDENTIAL_TYPE_KEY`, `AUTH_SESSION_TOKEN_HASH_KEY`, and `AUTH_API_TOKEN_ID_KEY`
+ */
+export const create_request_context_middleware = (
+	deps: QueryDeps,
+	session_context_key = 'auth_session_id'
+): MiddlewareHandler => {
+	return async (c, next): Promise<Response | void> => {
+		c.set(REQUEST_CONTEXT_KEY, null);
+		c.set(ACCOUNT_ID_KEY, null);
+		c.set(CREDENTIAL_TYPE_KEY, null);
+		c.set(AUTH_SESSION_TOKEN_HASH_KEY, null);
+		c.set(AUTH_API_TOKEN_ID_KEY, null);
+
+		const session_token: string | null = c.get(session_context_key) ?? null;
+		if (!session_token) {
+			await next();
+			return;
+		}
+
+		const token_hash = hash_session_token(session_token);
+		const session = await query_session_get_valid(deps, token_hash);
+		if (!session) {
+			await next();
+			return;
+		}
+
+		c.set(ACCOUNT_ID_KEY, session.account_id);
+		c.set(CREDENTIAL_TYPE_KEY, 'session');
+		// A session is full account authority by construction.
+		c.set(TOKEN_SCOPE_KEY, token_scope_full());
+		c.set(AUTH_SESSION_TOKEN_HASH_KEY, token_hash);
+
+		await next();
+	};
+};
+
+/**
+ * Refuse a capability the calling credential's scope does not admit.
+ *
+ * The decision every token-scope gate outside the action dispatcher shares.
+ * Private because the two exported forms below are the whole surface: a route
+ * spec declares `auth.required_scope` and gets `require_token_scope`; anything
+ * that is not a route spec calls `token_scope_surface_denial`.
+ *
+ * An unset `TOKEN_SCOPE_KEY` is the anonymous caller, who holds no credential to
+ * narrow, so it passes. Sharing that branch is the point — hand-rolled per
+ * surface it is one `&&` from either refusing every anonymous read or admitting
+ * an authenticated caller whose middleware forgot to set the key.
+ */
+const token_scope_denial = (c: Context, capability: TokenScopeCapability): Response | null => {
+	const scope = c.get(TOKEN_SCOPE_KEY);
+	if (scope && !token_scope_admits_capability(scope, capability)) {
+		return c.json(token_scope_denied_body(capability.capability), 403);
+	}
+	return null;
+};
+
+/**
+ * Refuse a non-RPC surface to a narrowed token — rule 3, for callers that are
+ * not route specs. Under the Rust twin's name
+ * (`token_scope_surface_denied_response`).
+ *
+ * The WS upgrade is the spine's one such caller: `upgradeWebSocket`'s callback
+ * must return `WSEvents` and so cannot produce a denial, which is why the gate
+ * runs as pre-upgrade middleware calling this rather than as a route-spec
+ * declaration. A consumer hand-rolling its own upgrade is in the same position
+ * and reaches for the same function.
+ *
+ * Takes the whole capability string, not a bare surface name — one spelling
+ * across route-spec declarations and direct calls alike, and the twin of the
+ * Rust signature. It needs no parse: the surface arm's identifier is pure label,
+ * since rule 3 never asks *which* surface. And it is deliberately not narrowed
+ * to the spine's four — the name decides nothing, so there is nothing for a
+ * closed set to protect, while a consumer surface would have nothing to pass.
+ * fuz_app's own uses are pinned two ways by the surface census: the exact call
+ * site, and the scan asserting every `'surface:<name>'` literal in `src/lib`
+ * names a surface the spine actually mounts.
+ *
+ * @param c - the request context, after the auth middleware chain
+ * @param capability - the `surface:<name>` this route demands; names itself in the denial
+ * @returns the 403 to return, or `null` when the caller may proceed
+ */
+export const token_scope_surface_denial = (c: Context, capability: string): Response | null =>
+	token_scope_denial(c, { kind: 'surface', capability });
+
+/**
+ * Create middleware refusing a route to a credential whose scope does not admit
+ * `capability`.
+ *
+ * The route-spec form, mounted by `fuz_auth_guard_resolver` from
+ * `auth.required_scope`. Lands in the `pre_authorization` phase, so a narrowed
+ * token is told about its scope rather than about the role it also lacks — and
+ * learns nothing about the route's input shape on the way.
+ *
+ * Parses at construction, so a malformed capability is a registration-time
+ * throw rather than a guard that mounts and reports nonsense.
+ *
+ * @param capability - the capability string this route demands, e.g. `surface:audit_stream`
+ * @returns middleware that 403s a credential whose scope lacks it
+ * @throws Error if `capability` is not a well-formed `rpc:<method>` / `surface:<name>` string
+ */
+export const require_token_scope = (capability: string): MiddlewareHandler => {
+	const parsed = parse_token_scope_capability(capability);
+	if (parsed === null) {
+		throw new Error(
+			`auth.required_scope "${capability}" is not a valid token-scope capability \u2014 expected 'rpc:<method>' or 'surface:<name>', where a surface name is lowercase letters and underscores`
+		);
+	}
+	return async (c, next): Promise<Response | void> => {
+		const denied = token_scope_denial(c, parsed);
+		if (denied) return denied;
+		await next();
+	};
+};
+
+/**
+ * Middleware that requires authentication.
+ *
+ * Returns 401 if the auth middleware did not set `c.var.auth_account_id`.
+ */
+export const require_auth: MiddlewareHandler = async (c, next): Promise<Response | void> => {
+	if (c.get(ACCOUNT_ID_KEY) == null) {
+		return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
+	}
+	await next();
+};
+
+/**
+ * Create middleware that requires the actor to hold any of the given
+ * roles globally (`scope_id IS NULL`).
+ *
+ * Returns 401 if unauthenticated, 403 if none of the roles are present.
+ * Reads `REQUEST_CONTEXT_KEY` because role-gated routes always run the
+ * dispatcher's authorization phase before this guard (the phase sets
+ * the actor-bound `RequestContext`).
+ *
+ * Uses `has_any_scoped_role(ctx, roles, null)` so the gate matches
+ * **global / unscoped role_grants only**. A scoped role_grant
+ * (`{role: 'admin', scope_id: <some uuid>}`) does not unlock route-spec
+ * gates that are inherently global. The same scope-aware check is
+ * mirrored in `actions/action_rpc.ts` (HTTP RPC dispatcher) and
+ * `actions/register_action_ws.ts` (WS dispatcher) so all three
+ * transports agree.
+ *
+ * Multi-role disjunction (any-of) lets `auth.roles: ['admin', 'steward']`
+ * specs translate to one middleware that admits either role. Single-role
+ * routes pass `[role_name]`; the array shape is uniform.
+ *
+ * @param roles - the roles to admit (any-of)
+ */
+export const require_role = (roles: ReadonlyArray<string>): MiddlewareHandler => {
+	return async (c, next): Promise<Response | void> => {
+		if (c.get(ACCOUNT_ID_KEY) == null) {
+			return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
+		}
+		const ctx = get_request_context(c);
+		if (!ctx || !has_any_scoped_role(ctx, roles, null)) {
+			return c.json({ error: ERROR_INSUFFICIENT_PERMISSIONS, required_roles: roles }, 403);
+		}
+		await next();
+	};
+};
+
+/**
+ * Create middleware that requires the request's `credential_type` to be
+ * one of the given values.
+ *
+ * Returns 401 if unauthenticated, 403 with
+ * `ERROR_CREDENTIAL_TYPE_REQUIRED` + `required_credential_types` echoing
+ * the spec's allowlist when the wire-side credential isn't in it.
+ *
+ * Reads only `ACCOUNT_ID_KEY` + `CREDENTIAL_TYPE_KEY`, both set by the auth
+ * middleware — never the resolved `RequestContext`. That is why
+ * `fuz_auth_guard_resolver` mounts it in the `pre_authorization` phase: a
+ * wrong channel is refused before the route resolves an actor for it, so the
+ * denial costs no DB work and discloses no account state.
+ * Body shape is symmetric with the role gate (`ERROR_INSUFFICIENT_PERMISSIONS` +
+ * `required_roles`) and matches what the RPC dispatcher's post-auth
+ * gate emits for the same condition. Today's only credential gate is
+ * keeper (`['daemon_token']`); future gates (`agent_token`,
+ * `group_actor_token`) reuse this literal and label themselves through
+ * the array.
+ *
+ * @param credential_types - allowed credential types (any-of)
+ */
+export const require_credential_types = (
+	credential_types: ReadonlyArray<string>
+): MiddlewareHandler => {
+	return async (c, next): Promise<Response | void> => {
+		if (c.get(ACCOUNT_ID_KEY) == null) {
+			return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
+		}
+		const credential_type: CredentialType | null = c.get(CREDENTIAL_TYPE_KEY) ?? null;
+		if (!credential_type || !credential_types.includes(credential_type)) {
+			return c.json(
+				{
+					error: ERROR_CREDENTIAL_TYPE_REQUIRED,
+					required_credential_types: credential_types
+				},
+				403
+			);
+		}
+		await next();
+	};
+};
+
+/**
+ * Reload active role_grants from the database, returning a new request context.
+ *
+ * Useful for long-lived WebSocket connections where role_grants may change
+ * (grant or revoke) during the connection lifetime. Call periodically
+ * or after receiving a revocation signal.
+ *
+ * Returns a new `RequestContext` with updated role_grants — the original
+ * context is not mutated, making concurrent calls safe. Throws when
+ * `ctx.actor` is null; account-grain contexts have no role_grants to refresh.
+ *
+ * @param ctx - the request context to refresh
+ * @param deps - query dependencies
+ * @returns a new `RequestContext` with fresh role_grants
+ * @throws Error when called on an account-grain context (`actor: null`)
+ */
+export const refresh_role_grants = async (
+	ctx: RequestContext,
+	deps: QueryDeps
+): Promise<RequestContext> => {
+	if (!ctx.actor) {
+		throw new Error(
+			'refresh_role_grants: account-grain context has no actor / role_grants to refresh'
+		);
+	}
+	const role_grants = await query_role_grant_find_active_for_actor(deps, ctx.actor.id);
+	return { ...ctx, role_grants };
+};
+
+/**
+ * Build a full `RequestContext` from an account id and an explicit
+ * actor id (already resolved via `resolve_acting_actor`).
+ *
+ * Loads `account` + the named `actor` + the actor's active role_grants.
+ * Verifies the `actor.account_id === account.id` binding so downstream
+ * handlers can trust `ctx.actor.account_id === ctx.account.id`. Returns
+ * `null` when the account is missing, the actor is missing, or the
+ * actor doesn't belong to the supplied account.
+ *
+ * Called by the route-spec / RPC dispatcher's authorization phase for
+ * routes that need an acting actor; account-grain routes use
+ * `build_account_context` instead.
+ *
+ * @param deps - query dependencies
+ * @param account_id - the account to build context for
+ * @param actor_id - the actor this request acts as
+ * @returns a request context, or `null` if account/actor not found or mismatched
+ */
+export const build_request_context = async (
+	deps: QueryDeps,
+	account_id: string,
+	actor_id: string
+): Promise<RequestActorContext | null> => {
+	const account = await query_account_by_id(deps, account_id);
+	if (!account) return null;
+
+	const actor = await query_actor_by_id(deps, actor_id);
+	if (!actor) return null;
+	if (actor.account_id !== account.id) return null;
+
+	const role_grants = await query_role_grant_find_active_for_actor(deps, actor.id);
+	return { account, actor, role_grants };
+};
+
+/**
+ * Build an account-only `RequestContext` (no actor, no role_grants) from
+ * an account id.
+ *
+ * Used by the dispatcher's authorization phase for authenticated routes
+ * that don't need an acting actor — account-grain operations (logout,
+ * password change, account self-service). Lets handlers read
+ * `auth.account.id` / `auth.account.username` uniformly with role_grant-bound
+ * routes; the cost is one extra `query_account_by_id` per request.
+ *
+ * Returns `null` when the account row is missing (e.g. deleted between
+ * the auth middleware's session lookup and the dispatcher) — caller
+ * surfaces that as a 500 since it represents a torn read.
+ *
+ * @param deps - query dependencies
+ * @param account_id - the account to build context for
+ * @returns an account-only request context, or `null` if the account is missing
+ */
+export const build_account_context = async (
+	deps: QueryDeps,
+	account_id: string
+): Promise<RequestContext | null> => {
+	const account = await query_account_by_id(deps, account_id);
+	if (!account) return null;
+	return { account, actor: null, role_grants: [] };
+};
+
+/**
+ * Resolution-failure shape returned by `apply_authorization_phase`. Each
+ * transport binds this to the appropriate wire shape — REST emits the body
+ * directly via `c.json(body, status)`; the RPC dispatcher folds it into a
+ * JSON-RPC error envelope `{jsonrpc, id, error: {code, message, data}}`.
+ *
+ * The auth phase deliberately stops short of constructing a `Response` so
+ * the same failure flows through every transport without the auth-domain
+ * code knowing about JSON-RPC. See `../../../CLAUDE.md` §Cleanest
+ * architecture takes priority for the rationale.
+ */
+export type AuthorizationFailureBody =
+	| { error: typeof ERROR_ACTOR_REQUIRED; available: Array<{ id: string; name: string }> }
+	| { error: typeof ERROR_ACTOR_NOT_ON_ACCOUNT }
+	| { error: typeof ERROR_NO_ACTORS_ON_ACCOUNT }
+	| { error: typeof ERROR_ACCOUNT_VANISHED };
+
+/**
+ * Result of the authorization phase. Pure data — the auth domain stops
+ * short of touching the Hono context or producing a `Response` so HTTP
+ * RPC, WS, and REST each bind the same shape to their wire surface.
+ *
+ * - **`{ok: true, request_context}`** — `request_context` is non-null on
+ *   resolved (actor-bound or account-only) outcomes; `null` for public
+ *   actions (`{account: 'none', actor: 'none'}`) and for genuine anonymous
+ *   access on an `'optional'` axis. Public and unauthenticated collapse
+ *   to the same null `request_context`; every transport already treated
+ *   them identically.
+ * - **`{ok: false, status, body}`** — 400/500 failure. `status` is
+ *   narrowed to the two values the auth phase emits, so Hono's `c.json`
+ *   status overload accepts the literals directly. The 500 reasons stay
+ *   distinct in `body`: `no_actors_on_account` (signup invariant
+ *   violation); `account_vanished` (torn read after resolve).
+ */
+export type AuthorizationResult =
+	| { ok: true; request_context: RequestContext | null }
+	| { ok: false; status: 400 | 500; body: AuthorizationFailureBody };
+
+/**
+ * Apply the dispatcher's authorization phase against the flat-record
+ * `RouteAuth` shape. Shared by the route-spec wrapper, the HTTP RPC
+ * dispatcher, and the per-message WS dispatcher. Phase order:
+ * pre-authorization 401 → authorization phase → post-authorization 403 →
+ * input validation 400.
+ *
+ * Pure data — the function does not touch a Hono context. Each transport
+ * passes `account_id` (extracted from its own credential surface) and
+ * binds the returned `AuthorizationResult` to its wire shape. The REST
+ * pipeline additionally writes `REQUEST_CONTEXT_KEY` on `c` for downstream
+ * `require_role` / `require_credential_types` middleware that still reads
+ * the resolved context off the Hono context.
+ *
+ * Branching by `auth.account` × `auth.actor`:
+ *
+ * - Both `'none'` → `{ok: true, request_context: null}`. Public actions
+ *   never see a `RequestContext`.
+ * - `account_id == null` on any non-public route → same null
+ *   `request_context`. The `'required'` callers were already rejected at
+ *   the pre-authorization gate in the dispatcher; only genuine anonymous
+ *   access on an `'optional'` axis lands here.
+ * - `actor === 'none'` → builds account-only context via
+ *   `build_account_context`. Null lookup → `account_vanished` 500 failure.
+ * - `actor === 'required'` → resolves the actor from `acting_value` (or
+ *   single-actor account); failures map to 400 / 500.
+ * - `actor === 'optional'` → same as `'required'` except multi-actor
+ *   accounts without an `acting` value fall back to account-only context
+ *   (no `actor_required` 400). Bad `acting` ids still 400.
+ *
+ * 500 branches stay distinct: `ERROR_NO_ACTORS_ON_ACCOUNT` (signup
+ * invariant violation), `ERROR_ACCOUNT_VANISHED` (torn read after
+ * resolve).
+ */
+export const apply_authorization_phase = async (
+	deps: QueryDeps,
+	account_id: string | null,
+	auth: RouteAuth,
+	acting_value: string | undefined
+): Promise<AuthorizationResult> => {
+	if (is_public_auth(auth)) return { ok: true, request_context: null };
+
+	if (account_id == null) {
+		// Optional-auth route hit without a credential — leave `RequestContext`
+		// null so the handler can branch on it. `'required'` callers already
+		// got rejected at the pre-authorization gate.
+		return { ok: true, request_context: null };
+	}
+
+	if (!needs_actor(auth)) {
+		const ctx = await build_account_context(deps, account_id);
+		if (!ctx) return { ok: false, status: 500, body: { error: ERROR_ACCOUNT_VANISHED } };
+		return { ok: true, request_context: ctx };
+	}
+
+	// actor 'required' or 'optional' — resolve.
+	const acting = await resolve_acting_actor(deps, account_id, acting_value);
+	if (!acting.ok) {
+		if (acting.reason === 'actor_required') {
+			if (auth.actor === 'optional') {
+				// Multi-actor account, no pick — fall back to account-only context.
+				const ctx = await build_account_context(deps, account_id);
+				if (!ctx) return { ok: false, status: 500, body: { error: ERROR_ACCOUNT_VANISHED } };
+				return { ok: true, request_context: ctx };
+			}
+			return {
+				ok: false,
+				status: 400,
+				body: { error: ERROR_ACTOR_REQUIRED, available: acting.available }
+			};
+		}
+		if (acting.reason === 'actor_not_on_account') {
+			return { ok: false, status: 400, body: { error: ERROR_ACTOR_NOT_ON_ACCOUNT } };
+		}
+		return { ok: false, status: 500, body: { error: ERROR_NO_ACTORS_ON_ACCOUNT } };
+	}
+	const ctx = await build_request_context(deps, account_id, acting.actor_id);
+	if (!ctx) return { ok: false, status: 500, body: { error: ERROR_ACCOUNT_VANISHED } };
+	return { ok: true, request_context: ctx };
+};
+
+/**
+ * Create the route-spec authorization handler used by `apply_route_specs`.
+ *
+ * Reads the `acting` selector via `read_route_acting` — `c.var.validated_query`
+ * on GETs, the raw body on mutations, since input validation now runs after
+ * the authority gates. Public routes (`auth.account === 'none' &&
+ * auth.actor === 'none'`) skip the phase entirely.
+ *
+ * Per registry-time invariant 2, `auth.actor !== 'none'` ⟺ the input
+ * (or query) schema declares `acting?: ActingActor` — so the selector is
+ * present on exactly the specs that read it, and input validation is what
+ * rejects a malformed one.
+ *
+ * Resolved contexts land on `REQUEST_CONTEXT_KEY` so the post-authorization
+ * REST middleware (`require_role`, `require_credential_types`) reads the
+ * actor-bound context off `c.var`. The HTTP RPC and WS dispatchers consume
+ * the `apply_authorization_phase` outcome directly without round-tripping
+ * through `c.var`.
+ */
+export const create_fuz_authorization_handler = (
+	deps: QueryDeps
+): ((c: Context, spec: RouteSpec) => Promise<Response | void>) => {
+	return async (c, spec) => {
+		// Test escape hatch: harnesses that pre-populate `REQUEST_CONTEXT_KEY`
+		// flag `TEST_CONTEXT_PRESET_KEY = true` so the authorization phase
+		// trusts the supplied context instead of running DB-backed resolution.
+		// Production middleware never sets this flag.
+		if (c.get(TEST_CONTEXT_PRESET_KEY)) return;
+		if (is_public_auth(spec.auth)) return;
+		const acting_value = needs_actor(spec.auth) ? await read_route_acting(c, spec) : undefined;
+		const account_id: string | null = c.get(ACCOUNT_ID_KEY) ?? null;
+		const result = await apply_authorization_phase(deps, account_id, spec.auth, acting_value);
+		if (!result.ok) return c.json(result.body, result.status);
+		if (result.request_context !== null) {
+			c.set(REQUEST_CONTEXT_KEY, result.request_context);
+		}
+		// `request_context: null` — public action or unauthenticated optional axis.
+		// Leave `REQUEST_CONTEXT_KEY` null; downstream `require_role` /
+		// `require_credential_types` enforce.
+		return;
+	};
+};
+
+/**
+ * Read the `acting` actor selector for the authorization phase.
+ *
+ * REST is bi-located: GETs declare `acting` on `query`, mutations on `input`.
+ * Query validation still runs ahead of the authorization phase, so the GET
+ * half reads a typed Zod field. Input validation now runs *after* the
+ * authority gates (nothing about a route's body shape reaches a caller those
+ * gates refuse), so the mutation half reads the raw body instead.
+ *
+ * The raw read mirrors `create_input_validation`'s own skip conditions exactly
+ * — GETs and null-input specs — so this never parses a body the route itself
+ * would have left alone. That matters for the routes carrying raw bytes rather
+ * than JSON (git smart-HTTP, binary uploads): they declare `input: z.null()`,
+ * so their stream reaches the handler untouched, and they carry `acting` on
+ * `query` regardless.
+ *
+ * `parse_acting` owns what counts as a selector and why a malformed one reads
+ * as omitted.
+ *
+ * @param c - the request context, after query validation
+ * @param spec - the route being dispatched; decides where `acting` can live
+ * @returns the actor id, or `undefined` when absent, malformed, or unreadable
+ */
+const read_route_acting = async (c: Context, spec: RouteSpec): Promise<string | undefined> => {
+	const validated_query = c.get('validated_query') as { acting?: unknown } | undefined;
+	if (validated_query && typeof validated_query.acting === 'string') return validated_query.acting;
+	if (spec.method === 'GET' || is_null_schema(spec.input)) return undefined;
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		// Malformed body — input validation answers with the 400.
+		return undefined;
+	}
+	if (typeof body !== 'object' || body === null) return undefined;
+	return parse_acting((body as { acting?: unknown }).acting);
+};

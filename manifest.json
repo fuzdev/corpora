@@ -1,0 +1,209 @@
+{
+	"version": 1,
+	"include": ["ts", "mts", "cts", "js", "mjs", "cjs", "svelte", "css", "html", "md", "mdz"],
+	"collections": [
+		{
+			"name": "zzz",
+			"url": "https://github.com/fuzdev/zzz",
+			"commit": "43a3e50e5c18be49a3fb2417713cb426dfcd2bc8",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_app",
+			"url": "https://github.com/fuzdev/fuz_app",
+			"commit": "2f7681073cedd2755183af1498bab3e82420c3e2",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_blog",
+			"url": "https://github.com/fuzdev/fuz_blog",
+			"commit": "f8a11c76eaf020a00ae33e6dfaa21ad45b8a58e1",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_code",
+			"url": "https://github.com/fuzdev/fuz_code",
+			"commit": "55de4332b37c84a9eb9f764a25ec1754227a0596",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_css",
+			"url": "https://github.com/fuzdev/fuz_css",
+			"commit": "cf9f4bfd4e4abafb500dc80956b00846e75eba16",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_docs",
+			"url": "https://github.com/fuzdev/fuz_docs",
+			"commit": "3ad0d025b4d1a17c2acc6f211dc0cc4aed2468ec",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_gitops",
+			"url": "https://github.com/fuzdev/fuz_gitops",
+			"commit": "d043dee346e2760041d27996456bc5c6936bc167",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_mastodon",
+			"url": "https://github.com/fuzdev/fuz_mastodon",
+			"commit": "d44985aaa8d95712c7c0f44ec2a94186e4581eec",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_template",
+			"url": "https://github.com/fuzdev/fuz_template",
+			"commit": "3f2464e2ef23d1a9906c515e61059b0b982bf6ef",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_ui",
+			"url": "https://github.com/fuzdev/fuz_ui",
+			"commit": "87809cbef82ce41c39ceafa527022d07d9cb54ae",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "fuz_util",
+			"url": "https://github.com/fuzdev/fuz_util",
+			"commit": "144fcfc6654ceb75858575b2e09225d4f183c005",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "mdz",
+			"url": "https://github.com/fuzdev/mdz",
+			"commit": "9edec8e24c375ae4b4e97d75831cc70088d61461",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "gro",
+			"url": "https://github.com/fuzdev/gro",
+			"commit": "777467f1329f3c38a2376235d7162d4206c0e697",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "svelte-docinfo",
+			"url": "https://github.com/fuzdev/svelte-docinfo",
+			"commit": "48d7b623600d13fbd541ab2046c483ac9d184918",
+			"subpaths": ["src"],
+			"exclude": ["src/test/fixtures"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "tsv.fuz.dev",
+			"url": "https://github.com/fuzdev/tsv.fuz.dev",
+			"commit": "d91025aa381a84b1a6191428624389e64ec97daf",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "ryanatkn.com",
+			"url": "https://github.com/ryanatkn/ryanatkn.com",
+			"commit": "f299ca0b47a0fc25af35646e5fc128dfdf827025",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "webdevladder.net",
+			"url": "https://github.com/ryanatkn/webdevladder.net",
+			"commit": "7f1873a382f84fb0b0e9376b76e750bd056c1bb7",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "earbetter",
+			"url": "https://github.com/ryanatkn/earbetter",
+			"commit": "a53684256bd02ec383397f2b0e75853d5e040b64",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "Unlicense", "file": "license"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "cosmicplayground",
+			"url": "https://github.com/ryanatkn/cosmicplayground",
+			"commit": "fa3efaeab621a827363916b62addbef232f7967a",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "Unlicense", "file": "license"},
+			"shaped_by": "tsv"
+		},
+		{
+			"name": "kit",
+			"url": "https://github.com/sveltejs/kit",
+			"commit": "c0c9361240f87983880a7fe4ec25bdc4d2b111ca",
+			"subpaths": ["packages/kit/src"],
+			"exclude": [
+				"packages/kit/src/core/adapt/fixtures",
+				"packages/kit/src/core/config/fixtures",
+				"packages/kit/src/core/postbuild/fixtures",
+				"packages/kit/src/core/sync/create_manifest_data/test/samples"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "svelte",
+			"url": "https://github.com/sveltejs/svelte",
+			"commit": "5ccdfe355739229573b20a2fa2ee49e38e3868fe",
+			"subpaths": ["packages/svelte/src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE.md"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "svelte.dev",
+			"url": "https://github.com/sveltejs/svelte.dev",
+			"commit": "996bd63e478e199e50d841149965290c358fd735",
+			"subpaths": ["apps/svelte.dev/src", "packages/repl/src", "packages/site-kit/src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "declared_in": "package.json"},
+			"shaped_by": "prettier"
+		}
+	]
+}

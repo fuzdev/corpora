@@ -1,0 +1,43 @@
+<script lang="ts">
+	import { asset } from '$app/paths';
+
+	import { LOGO_ALT, LOGO_SRC } from '$lib/project.ts';
+
+	const {
+		src = LOGO_SRC,
+		alt = LOGO_ALT
+	}: {
+		src?: string;
+		alt?: string;
+	} = $props();
+
+	const path = $derived(asset(`/${src}`));
+
+	// these extra images hide the asymmetries of pixelated circles
+</script>
+
+<img class="img-2 pixelated" src={path} alt="" />
+<img class="img-3 pixelated" src={path} alt="" />
+<img class="pixelated" src={path} {alt} />
+
+<style>
+	img {
+		position: relative;
+		top: 15px;
+		width: 1600px;
+		height: 1600px;
+		min-width: 1600px;
+		transform-origin: center;
+		animation: rotating 1667s linear infinite;
+	}
+	.img-2 {
+		position: absolute;
+		opacity: 0.62;
+		rotate: 55deg;
+	}
+	.img-3 {
+		position: absolute;
+		opacity: 0.62;
+		rotate: -55deg;
+	}
+</style>

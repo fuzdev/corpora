@@ -1,0 +1,850 @@
+/**
+ * Tests for backend_db_routes — allowlist-gated PostgreSQL table browser route specs.
+ *
+ * Uses pglite (in-memory) with auth tables for real schema/FK testing.
+ *
+ * @module
+ */
+
+import { describe, assert, test, beforeAll, afterAll, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { Logger } from '@fuzdev/fuz_util/log.ts';
+
+import {
+	create_db_route_specs,
+	type ColumnInfo,
+	type DbRouteOptions
+} from '$lib/http/db_routes.ts';
+import { create_recording_audit_emitter } from '$lib/testing/audit_drift_guard.ts';
+import { apply_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
+import { flush_post_commit_effects } from '$lib/http/pending_effects.ts';
+import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
+import { REQUEST_CONTEXT_KEY, type RequestContext } from '$lib/auth/request_context.ts';
+import { audit_metadata_schemas } from '$lib/auth/audit_log_schema.ts';
+import { create_test_context } from '$lib/testing/entities.ts';
+import { ACCOUNT_ID_KEY, CREDENTIAL_TYPE_KEY, TEST_CONTEXT_PRESET_KEY } from '$lib/hono_context.ts';
+import type { Db } from '$lib/db/db.ts';
+import { run_migrations } from '$lib/db/migrate.ts';
+import { auth_migration_ns } from '$lib/auth/migrations.ts';
+import { create_pglite_factory } from '$lib/testing/db.ts';
+
+const log = new Logger('test', { level: 'off' });
+
+// Shared PGlite WASM instance via factory cache — avoids cold start overhead.
+const factory = create_pglite_factory(async (db) => {
+	await run_migrations(db, [auth_migration_ns]);
+});
+
+let db: Db;
+
+/** Create a request context with keeper role. */
+const keeper_ctx: RequestContext = create_test_context([{ role: 'keeper' }]);
+
+/** Recording audit emitter — `audit.calls` resets per test in `beforeEach`. */
+const audit = create_recording_audit_emitter();
+/** Deps for `create_db_route_specs` — the recording emitter as `audit`. */
+const deps = { audit: audit.emitter };
+
+/**
+ * Default allowlist for the suite. Deliberately includes `account` — the
+ * credential floor must subtract it even when a consumer names it. `invite`
+ * exists in the auth schema but is deliberately absent, as the
+ * unlisted-but-existing masking target.
+ */
+const TEST_BROWSABLE: ReadonlyArray<string> = [
+	'account',
+	'actor',
+	'role_grant',
+	'audit_log',
+	'app_settings',
+	'schema_version',
+	'browse_test',
+	'bytea_test',
+	'composite_pk_test',
+	'consumer_ledger',
+	'fk_test_parent',
+	'fk_test_child',
+	'int_pk_test'
+];
+
+/** Create db route specs with the suite defaults, overridable per test. */
+const create_specs = (overrides?: Partial<DbRouteOptions>): Array<RouteSpec> =>
+	create_db_route_specs(deps, {
+		db_type: 'pglite-memory',
+		db_name: 'test',
+		browsable_tables: TEST_BROWSABLE,
+		...overrides
+	});
+
+/** Create a test Hono app with keeper auth (daemon_token credential) and db route specs. */
+const create_test_app = (specs: Array<RouteSpec>) => {
+	const app = new Hono();
+	app.use('/*', async (c, next) => {
+		c.set(ACCOUNT_ID_KEY, keeper_ctx.account.id);
+		c.set(REQUEST_CONTEXT_KEY, keeper_ctx);
+		c.set(TEST_CONTEXT_PRESET_KEY, true);
+		c.set(CREDENTIAL_TYPE_KEY, 'daemon_token');
+		// the queues + post-commit flush the app server provides — the DELETE
+		// route defers its audit emission via `emit_after_commit`, so the
+		// recording emitter observes it only when the flush runs (i.e. only
+		// for a committed transaction)
+		c.set('pending_effects', []);
+		c.set('post_commit_effects', []);
+		await next();
+		await flush_post_commit_effects(c.var.post_commit_effects, log);
+	});
+	apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
+	return app;
+};
+
+beforeAll(async () => {
+	db = await factory.create();
+});
+
+afterAll(async () => {
+	await factory.close(db);
+});
+
+beforeEach(async () => {
+	// clean up scratch tables from prior runs (isolate: false shares state)
+	await db.query('DROP TABLE IF EXISTS fk_test_child, fk_test_parent CASCADE');
+	await db.query(
+		'DROP TABLE IF EXISTS composite_pk_test, consumer_ledger, bytea_test, int_pk_test CASCADE'
+	);
+	await db.query('DROP TABLE IF EXISTS browse_test CASCADE');
+	await db.query('TRUNCATE audit_log, api_token, auth_session, role_grant, actor, account CASCADE');
+	// the ordinary browse/delete target — a stand-in for a consumer content table
+	await db.query(`CREATE TABLE browse_test (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		label TEXT NOT NULL
+	)`);
+	audit.calls.length = 0;
+});
+
+describe('route spec metadata', () => {
+	test('creates 4 route specs', () => {
+		const specs = create_specs();
+		assert.strictEqual(specs.length, 4);
+	});
+
+	test('all specs require keeper auth', () => {
+		const specs = create_specs();
+		for (const spec of specs) {
+			assert.deepStrictEqual(spec.auth, {
+				account: 'required',
+				actor: 'required',
+				roles: ['keeper'],
+				credential_types: ['daemon_token']
+			});
+		}
+	});
+
+	test('spec paths and methods are correct', () => {
+		const specs = create_specs();
+		assert.strictEqual(specs[0]!.method, 'GET');
+		assert.strictEqual(specs[0]!.path, '/health');
+		assert.strictEqual(specs[1]!.method, 'GET');
+		assert.strictEqual(specs[1]!.path, '/tables');
+		assert.strictEqual(specs[2]!.method, 'GET');
+		assert.strictEqual(specs[2]!.path, '/tables/:name');
+		assert.strictEqual(specs[3]!.method, 'DELETE');
+		assert.strictEqual(specs[3]!.path, '/tables/:name/rows/:id');
+	});
+
+	test('all specs have descriptions', () => {
+		const specs = create_specs();
+		for (const spec of specs) {
+			assert.ok(spec.description);
+		}
+	});
+
+	test('apply_route_specs accepts every db route (invariant 2: actor ⟺ acting)', () => {
+		// Registration-time tripwire. Every keeper route declares
+		// `auth.actor: 'required'`, which per registry-time invariant 2
+		// biconditionally requires `acting?: ActingActor` on `input` or
+		// `query`. `apply_route_specs` calls
+		// `assert_route_auth_acting_biconditional` on every spec — a
+		// drop or mistype here throws at registration and this test
+		// fails loudly inside fuz_app CI instead of surfacing as a
+		// confusing throw the first time a consumer
+		// (mageguild / zap) registers these routes.
+		const specs = create_specs();
+		assert.doesNotThrow(() => create_test_app(specs));
+	});
+});
+
+describe('GET /health handler', () => {
+	test('returns connected true with table count', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/health');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.connected, true);
+		assert.strictEqual(body.type, 'pglite-memory');
+		assert.strictEqual(body.name, 'test');
+		assert.ok(typeof body.table_count === 'number');
+		// schema-wide by design (did-migrations-run diagnostic), not allowlist-filtered
+		assert.ok(body.table_count >= 5); // auth tables
+	});
+
+	test('includes extra_stats when provided', async () => {
+		const specs = create_specs({ extra_stats: async () => ({ custom_count: 42 }) });
+		const app = create_test_app(specs);
+		const res = await app.request('/health');
+		const body = await res.json();
+		assert.strictEqual(body.custom_count, 42);
+	});
+});
+
+describe('GET /tables handler', () => {
+	test('lists only browsable tables with row counts', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.ok(Array.isArray(body.tables));
+		const names = body.tables.map((t: { name: string }) => t.name);
+		assert.ok(names.includes('actor'));
+		assert.ok(names.includes('role_grant'));
+		assert.ok(names.includes('browse_test'));
+		// unlisted-but-existing table is absent
+		assert.ok(!names.includes('invite'));
+		for (const table of body.tables) {
+			assert.ok(typeof table.row_count === 'number');
+		}
+	});
+
+	test('the credential floor is subtracted even when the consumer names it', async () => {
+		// TEST_BROWSABLE deliberately includes 'account'.
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables');
+		const body = await res.json();
+		const names = body.tables.map((t: { name: string }) => t.name);
+		assert.ok(!names.includes('account'));
+		assert.ok(!names.includes('auth_session'));
+		assert.ok(!names.includes('api_token'));
+		assert.ok(!names.includes('bootstrap_lock'));
+	});
+
+	test('a listed table that does not exist is silently absent', async () => {
+		const specs = create_specs({ browsable_tables: ['browse_test', 'not_migrated_yet'] });
+		const app = create_test_app(specs);
+		const res = await app.request('/tables');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		const names = body.tables.map((t: { name: string }) => t.name);
+		assert.deepStrictEqual(names, ['browse_test']);
+	});
+});
+
+describe('GET /tables/:name handler', () => {
+	test('returns columns and empty rows for empty table', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.ok(Array.isArray(body.columns));
+		assert.ok(body.columns.length > 0);
+		const col = body.columns[0] as ColumnInfo;
+		assert.ok('column_name' in col);
+		assert.ok('data_type' in col);
+		assert.ok('is_nullable' in col);
+		assert.deepStrictEqual(body.rows, []);
+		assert.strictEqual(body.total, 0);
+		assert.strictEqual(body.offset, 0);
+		assert.strictEqual(body.limit, 100);
+	});
+
+	test('returns rows with pagination', async () => {
+		await db.query(`INSERT INTO browse_test (label) VALUES ('u1')`);
+		await db.query(`INSERT INTO browse_test (label) VALUES ('u2')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test?offset=0&limit=1');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.rows.length, 1);
+		assert.strictEqual(body.total, 2);
+		assert.strictEqual(body.offset, 0);
+		assert.strictEqual(body.limit, 1);
+	});
+
+	test('detects primary key', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test');
+		const body = await res.json();
+		assert.strictEqual(body.primary_key, 'id');
+	});
+
+	test('bytea and bytea[] values are placeholdered, other columns pass through', async () => {
+		await db.query(`DROP DOMAIN IF EXISTS blob_dom CASCADE`);
+		await db.query(`CREATE DOMAIN blob_dom AS BYTEA`);
+		await db.query(`CREATE TABLE bytea_test (
+			id TEXT PRIMARY KEY,
+			data BYTEA,
+			datas BYTEA[],
+			data_dom BLOB_DOM,
+			note TEXT NOT NULL
+		)`);
+		await db.query(
+			`INSERT INTO bytea_test (id, data, datas, data_dom, note)
+			 VALUES
+			   ('a', decode('deadbeef', 'hex'), ARRAY[decode('dead', 'hex'), decode('beef', 'hex')], decode('cafebabe99', 'hex'), 'x'),
+			   ('b', NULL, NULL, NULL, 'y')`
+		);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/bytea_test');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		// column metadata stays truthful, and the internal udt_name is stripped
+		const data_col = body.columns.find((c: ColumnInfo) => c.column_name === 'data');
+		assert.strictEqual(data_col.data_type, 'bytea');
+		assert.ok(!('udt_name' in data_col), 'udt_name is internal, not wire');
+		const datas_col = body.columns.find((c: ColumnInfo) => c.column_name === 'datas');
+		assert.strictEqual(datas_col.data_type, 'ARRAY');
+		// values are size placeholders; NULL stays NULL; neighbors untouched
+		const by_id = new Map(body.rows.map((r: Record<string, unknown>) => [r.id, r] as const));
+		const a = by_id.get('a') as Record<string, unknown>;
+		assert.strictEqual(a.data, '<4 bytes>');
+		// bytea[] reports pg_column_size (storage size), not octet_length —
+		// the exact number is representation-dependent, the shape is the pin
+		assert.match(a.datas as string, /^<\d+ bytes>$/);
+		// a DOMAIN over bytea resolves to `udt_name: 'bytea'` in
+		// information_schema, so the placeholder holds — pinned so a
+		// consumer's domain-typed blob column can't silently reopen the
+		// bytea egress amplification
+		assert.strictEqual(a.data_dom, '<5 bytes>');
+		assert.strictEqual(a.note, 'x');
+		const b = by_id.get('b') as Record<string, unknown>;
+		assert.strictEqual(b.data, null);
+		assert.strictEqual(b.datas, null);
+		assert.strictEqual(b.data_dom, null);
+		assert.strictEqual(b.note, 'y');
+	});
+
+	test('out-of-range and malformed paging params are 400s on both twins', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// each of these is refused by the Rust twin's strict i64 parse +
+		// bounds; `z.coerce` alone silently admitted several
+		for (const query of [
+			'limit=0',
+			'limit=1001',
+			'limit=1e2',
+			'limit=5.0',
+			'limit=',
+			'offset=-1',
+			'offset=%205'
+		]) {
+			const res = await app.request(`/tables/browse_test?${query}`);
+			assert.strictEqual(res.status, 400, query);
+		}
+		// spellings both twins accept (`%2B` — a literal `+` in a query
+		// string URL-decodes to a space, which both twins refuse)
+		const ok = await app.request('/tables/browse_test?offset=%2B0&limit=1000');
+		assert.strictEqual(ok.status, 200);
+	});
+
+	test('duplicate query keys take the first occurrence, not a 400', async () => {
+		await db.query(`INSERT INTO browse_test (label) VALUES ('a'), ('b')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// Hono's `c.req.query()` keeps the first value of a duplicated key —
+		// later occurrences are invisible to validation. Pinned because the
+		// Rust twin's derived-serde extractor used to answer this with axum's
+		// plain-text "duplicate field" 400; both backends now read `limit=1`.
+		const res = await app.request('/tables/browse_test?limit=1&limit=1001');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.limit, 1);
+		assert.strictEqual(body.rows.length, 1);
+	});
+
+	test('unknown query keys are refused — the query schema is strict', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test?foo=1');
+		assert.strictEqual(res.status, 400);
+		assert.strictEqual((await res.json()).error, 'invalid_query_params');
+	});
+
+	test('excluded table reports deletable false while primary_key stays truthful', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/audit_log');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		// The key shape is reported honestly — the exclusion is policy, not schema.
+		assert.strictEqual(body.primary_key, 'id');
+		assert.strictEqual(body.deletable, false);
+	});
+
+	test('ordinary table reports deletable true', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.primary_key, 'id');
+		assert.strictEqual(body.deletable, true);
+	});
+
+	test('composite primary key reports deletable false', async () => {
+		await db.query(`CREATE TABLE composite_pk_test (
+			source_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (source_id, name)
+		)`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/composite_pk_test');
+		const body = await res.json();
+		assert.strictEqual(body.deletable, false);
+	});
+
+	test('composite primary key reports primary_key null (no single deletable column)', async () => {
+		await db.query(`CREATE TABLE composite_pk_test (
+			source_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			value TEXT,
+			PRIMARY KEY (source_id, name)
+		)`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/composite_pk_test');
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.primary_key, null);
+	});
+
+	test('invalid table name returns 400', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/Robert%27;DROP%20TABLE');
+		assert.strictEqual(res.status, 400);
+	});
+
+	test('nonexistent table returns 404', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/nonexistent_table');
+		assert.strictEqual(res.status, 404);
+	});
+
+	test('unlisted and floor tables answer exactly like nonexistent ones', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// truly nonexistent — the masking reference
+		const missing = await app.request('/tables/nonexistent_table');
+		assert.strictEqual(missing.status, 404);
+		const missing_body = await missing.json();
+		// exists in the schema, absent from the allowlist
+		const unlisted = await app.request('/tables/invite');
+		assert.strictEqual(unlisted.status, 404);
+		assert.deepStrictEqual(await unlisted.json(), missing_body);
+		// exists, named in the allowlist, but on the credential floor
+		const floored = await app.request('/tables/account');
+		assert.strictEqual(floored.status, 404);
+		assert.deepStrictEqual(await floored.json(), missing_body);
+	});
+});
+
+describe('SQL injection resistance', () => {
+	const sql_injection_payloads = [
+		{ name: 'UNION SELECT', value: 'account UNION SELECT' },
+		{ name: 'null byte', value: 'account%00' },
+		{ name: 'comment injection', value: 'account/**/' },
+		{ name: 'semicolon', value: 'account;DROP TABLE account' },
+		{ name: 'double dash comment', value: 'account--' },
+		{ name: 'single quote', value: "account'" },
+		{ name: 'schema qualified', value: 'pg_catalog.pg_user' },
+		{ name: 'backtick escape', value: 'account`' },
+		{ name: 'backslash', value: 'account\\' },
+		{ name: 'newline', value: 'account\n' }
+	];
+
+	for (const { name, value } of sql_injection_payloads) {
+		test(`rejects ${name} in table name`, async () => {
+			const specs = create_specs();
+			const app = create_test_app(specs);
+			const res = await app.request(`/tables/${encodeURIComponent(value)}`);
+			assert.strictEqual(res.status, 400, `${name} should be rejected`);
+		});
+	}
+
+	test('rejects SQL injection in DELETE row id param', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// The id param is passed via parameterized query ($1), so injection
+		// attempts cannot execute arbitrary SQL — and the typed compare means
+		// a non-UUID string against the uuid PK fails coercion (22P02),
+		// mapped to a clean 404.
+		const res = await app.request(
+			`/tables/browse_test/rows/${encodeURIComponent("'; DROP TABLE browse_test; --")}`,
+			{ method: 'DELETE' }
+		);
+		assert.strictEqual(res.status, 404);
+	});
+});
+
+describe('DELETE /tables/:name/rows/:id handler', () => {
+	test('deletes a row successfully', async () => {
+		const result = await db.query<{ id: string }>(
+			`INSERT INTO browse_test (label) VALUES ('to_delete') RETURNING id`
+		);
+		const id = result[0]!.id;
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request(`/tables/browse_test/rows/${id}`, { method: 'DELETE' });
+		assert.strictEqual(res.status, 200);
+		const body = await res.json();
+		assert.strictEqual(body.success, true);
+	});
+
+	test('row not found returns 404', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/browse_test/rows/00000000-0000-0000-0000-000000000000', {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 404);
+	});
+
+	test('mistyped id against a uuid primary key is a 404, not a type error', async () => {
+		await db.query(`INSERT INTO browse_test (label) VALUES ('kept')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// typed compare (twinning the Rust spine): the non-UUID id fails
+		// coercion at bind (22P02), which the route maps to the same masked
+		// 404 as a typed miss rather than surfacing a PG cast error.
+		const res = await app.request('/tables/browse_test/rows/not-a-uuid', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		const body = await res.json();
+		assert.strictEqual(body.error, 'row_not_found');
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM browse_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 1);
+	});
+
+	test('any valid uuid spelling deletes the row — typed compare follows the column type', async () => {
+		const result = await db.query<{ id: string }>(
+			`INSERT INTO browse_test (label) VALUES ('cased') RETURNING id`
+		);
+		const canonical = result[0]!.id;
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// The `::text` compare this replaced would 404 here (uuid renders
+		// lowercase, so the uppercase spelling never text-matched); the typed
+		// compare coerces the spelling to the same uuid value.
+		const res = await app.request(`/tables/browse_test/rows/${canonical.toUpperCase()}`, {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 200);
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM browse_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 0);
+		// The trail records the canonical lowercase rendering, not the
+		// uppercase URL spelling (uuid twin of the bigint '007' case below).
+		assert.strictEqual(audit.calls.length, 1);
+		assert.deepStrictEqual(audit.calls[0]!.metadata, {
+			table: 'browse_test',
+			pk_column: 'id',
+			id: canonical
+		});
+	});
+
+	test('uncoercible ids against a bigint primary key are 404s, not type errors', async () => {
+		await db.query(`CREATE TABLE int_pk_test (id BIGINT PRIMARY KEY, label TEXT)`);
+		await db.query(`INSERT INTO int_pk_test (id, label) VALUES (7, 'kept')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// 22P02 invalid_text_representation — not digits at all
+		let res = await app.request('/tables/int_pk_test/rows/not-a-number', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		assert.strictEqual((await res.json()).error, 'row_not_found');
+		// 22003 numeric_value_out_of_range — digits beyond int8
+		res = await app.request('/tables/int_pk_test/rows/99999999999999999999', {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 404);
+		assert.strictEqual((await res.json()).error, 'row_not_found');
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM int_pk_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 1);
+	});
+
+	test('a NUL byte in the id is a 404, not a 500 — whatever the PK type', async () => {
+		await db.query(`INSERT INTO browse_test (label) VALUES ('kept')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// 22021 character_not_in_repertoire — the server encoding rejects the
+		// NUL before any type coercion, so this fires even against a text PK;
+		// no stored id can contain one, so the masked 404 is the honest answer.
+		const res = await app.request('/tables/browse_test/rows/%00abc', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		assert.strictEqual((await res.json()).error, 'row_not_found');
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM browse_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 1);
+	});
+
+	test('a zero-padded integer id matches the canonical row — the decided typed-compare semantics', async () => {
+		await db.query(`CREATE TABLE int_pk_test (id BIGINT PRIMARY KEY, label TEXT)`);
+		await db.query(`INSERT INTO int_pk_test (id, label) VALUES (7, 'target')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// '007' coerces to 7 and matches — the accepted cost of the typed
+		// compare (under `::text` it matched nothing). The audit trail records
+		// the canonical rendering, not the padded spelling (asserted in the
+		// audit emission suite).
+		const res = await app.request('/tables/int_pk_test/rows/007', { method: 'DELETE' });
+		assert.strictEqual(res.status, 200);
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM int_pk_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 0);
+	});
+
+	test('unlisted and floor tables answer exactly like nonexistent ones', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const missing = await app.request('/tables/nonexistent_table/rows/x', { method: 'DELETE' });
+		assert.strictEqual(missing.status, 404);
+		const missing_body = await missing.json();
+		// exists (auth schema), absent from the allowlist
+		const unlisted = await app.request('/tables/invite/rows/x', { method: 'DELETE' });
+		assert.strictEqual(unlisted.status, 404);
+		assert.deepStrictEqual(await unlisted.json(), missing_body);
+		// exists, named in TEST_BROWSABLE, but on the credential floor
+		await db.query(`INSERT INTO account (username, password_hash) VALUES ('u', 'h')`);
+		const target = await db.query<{ id: string }>(`SELECT id FROM account LIMIT 1`);
+		const floored = await app.request(`/tables/account/rows/${target[0]!.id}`, {
+			method: 'DELETE'
+		});
+		assert.strictEqual(floored.status, 404);
+		assert.deepStrictEqual(await floored.json(), missing_body);
+		// on BOTH floors — `bootstrap_lock` is non-browsable AND
+		// non-deletable; the browsable mask must answer first (a 400
+		// `table_not_deletable` would confirm the credential table exists
+		// and is specially protected)
+		const double_floor = await app.request('/tables/bootstrap_lock/rows/x', { method: 'DELETE' });
+		assert.strictEqual(double_floor.status, 404);
+		assert.deepStrictEqual(await double_floor.json(), missing_body);
+		const remaining = await db.query<{ count: string }>(`SELECT COUNT(*) as count FROM account`);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 1, 'the floor row must survive');
+	});
+
+	test('FK constraint returns 409 when child rows prevent deletion', async () => {
+		// Auth tables use CASCADE, so create a custom table with RESTRICT FK
+		// to exercise the 409 handler path. PGlite (PG 17) raises 23503 here;
+		// PG 18+ raises 23001 restrict_violation for the same refusal — that
+		// arm is pinned against real PG by the Rust twin's
+		// `restricted_fk_delete_is_a_409_and_deletes_nothing`.
+		await db.query(`CREATE TABLE IF NOT EXISTS fk_test_parent (
+			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			name TEXT NOT NULL
+		)`);
+		await db.query(`CREATE TABLE IF NOT EXISTS fk_test_child (
+			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			parent_id TEXT NOT NULL REFERENCES fk_test_parent(id) ON DELETE RESTRICT
+		)`);
+		const parent = await db.query<{ id: string }>(
+			`INSERT INTO fk_test_parent (name) VALUES ('parent') RETURNING id`
+		);
+		const parent_id = parent[0]!.id;
+		await db.query(`INSERT INTO fk_test_child (parent_id) VALUES ($1)`, [parent_id]);
+
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request(`/tables/fk_test_parent/rows/${parent_id}`, {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 409);
+		const body = await res.json();
+		assert.strictEqual(body.error, 'foreign_key_violation');
+		// Regression guard: PG detail/constraint must not leak to client (scrubbed 2026-03-19)
+		assert.strictEqual(body.detail, undefined, 'PG detail must not leak to client');
+		assert.strictEqual(body.constraint, undefined, 'PG constraint must not leak to client');
+	});
+
+	test('excluded table delete is refused and deletes nothing', async () => {
+		await db.query(
+			`INSERT INTO audit_log (event_type, outcome) VALUES ('login', 'success'), ('logout', 'success')`
+		);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const target = await db.query<{ id: string }>(`SELECT id FROM audit_log LIMIT 1`);
+		const res = await app.request(`/tables/audit_log/rows/${target[0]!.id}`, { method: 'DELETE' });
+		assert.strictEqual(res.status, 400);
+		const body = await res.json();
+		assert.strictEqual(body.error, 'table_not_deletable');
+		const remaining = await db.query<{ count: string }>(`SELECT COUNT(*) as count FROM audit_log`);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 2, 'the trail must survive the refusal');
+	});
+
+	test('the exclusion is checked before the primary-key shape', async () => {
+		// `schema_version` is composite, so both refusals apply; the policy one
+		// must win, or removing a table from the exclusion set would silently
+		// change which error a caller sees.
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/schema_version/rows/fuz_auth', { method: 'DELETE' });
+		assert.strictEqual(res.status, 400);
+		const body = await res.json();
+		assert.strictEqual(body.error, 'table_not_deletable');
+	});
+
+	test('consumer non_deletable_tables extends the builtin set rather than replacing it', async () => {
+		await db.query(`CREATE TABLE consumer_ledger (id TEXT PRIMARY KEY)`);
+		await db.query(`INSERT INTO consumer_ledger (id) VALUES ('a')`);
+		const specs = create_specs({ non_deletable_tables: ['consumer_ledger'] });
+		const app = create_test_app(specs);
+
+		const consumer_res = await app.request('/tables/consumer_ledger/rows/a', { method: 'DELETE' });
+		assert.strictEqual(consumer_res.status, 400);
+		assert.strictEqual((await consumer_res.json()).error, 'table_not_deletable');
+
+		// The builtin floor still holds alongside the consumer's addition.
+		await db.query(`INSERT INTO audit_log (event_type, outcome) VALUES ('login', 'success')`);
+		const builtin = await db.query<{ id: string }>(`SELECT id FROM audit_log LIMIT 1`);
+		const builtin_res = await app.request(`/tables/audit_log/rows/${builtin[0]!.id}`, {
+			method: 'DELETE'
+		});
+		assert.strictEqual(builtin_res.status, 400);
+		assert.strictEqual((await builtin_res.json()).error, 'table_not_deletable');
+	});
+
+	test('composite primary key delete is refused and deletes nothing', async () => {
+		await db.query(`CREATE TABLE composite_pk_test (
+			source_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			value TEXT,
+			PRIMARY KEY (source_id, name)
+		)`);
+		// Three rows sharing the same `name` across different `source_id`s — the
+		// over-delete trap a single-column WHERE "name" = $1 would spring.
+		await db.query(
+			`INSERT INTO composite_pk_test (source_id, name, value)
+			 VALUES ('s1', 'title', 'a'), ('s2', 'title', 'b'), ('s3', 'title', 'c')`
+		);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/composite_pk_test/rows/title', { method: 'DELETE' });
+		assert.strictEqual(res.status, 400);
+		const body = await res.json();
+		assert.strictEqual(body.error, 'table_no_primary_key');
+		// The refusal must not delete anything.
+		const remaining = await db.query<{ count: string }>(
+			`SELECT COUNT(*) as count FROM composite_pk_test`
+		);
+		assert.strictEqual(parseInt(remaining[0]!.count, 10), 3);
+	});
+
+	test('invalid table name returns 400', async () => {
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request('/tables/bad--name/rows/1', { method: 'DELETE' });
+		assert.strictEqual(res.status, 400);
+	});
+});
+
+describe('DELETE audit emission', () => {
+	test('successful delete emits db_admin_row_delete with table, pk column, and id', async () => {
+		const result = await db.query<{ id: string }>(
+			`INSERT INTO browse_test (label) VALUES ('audited') RETURNING id`
+		);
+		const id = result[0]!.id;
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		const res = await app.request(`/tables/browse_test/rows/${id}`, { method: 'DELETE' });
+		assert.strictEqual(res.status, 200);
+
+		assert.strictEqual(audit.calls.length, 1, 'exactly one audit emission');
+		const call = audit.calls[0]!;
+		assert.strictEqual(call.event_type, 'db_admin_row_delete');
+		// Account-grain attribution — the browser's gate is account-grain, so
+		// the emission claims no actor.
+		assert.strictEqual(call.account_id, keeper_ctx.account.id);
+		assert.isUndefined(call.actor_id);
+		assert.deepStrictEqual(call.metadata, { table: 'browse_test', pk_column: 'id', id });
+		// The recording emitter bypasses `query_audit_log`'s fail-open metadata
+		// validation, so bind the emitted shape to the builtin schema here — a
+		// schema key rename fails this parse instead of bumping a prod counter.
+		audit_metadata_schemas.db_admin_row_delete.parse(call.metadata);
+	});
+
+	test('the audited id is the canonical PK rendering, not the URL spelling', async () => {
+		await db.query(`CREATE TABLE int_pk_test (id BIGINT PRIMARY KEY, label TEXT)`);
+		await db.query(`INSERT INTO int_pk_test (id, label) VALUES (7, 'target')`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+		// The typed compare admits non-canonical spellings ('007' → 7), so the
+		// trail records what was actually deleted via `RETURNING "<pk>"::text`
+		// — the row's rendering, not the caller's.
+		const res = await app.request('/tables/int_pk_test/rows/007', { method: 'DELETE' });
+		assert.strictEqual(res.status, 200);
+		assert.strictEqual(audit.calls.length, 1);
+		assert.deepStrictEqual(audit.calls[0]!.metadata, {
+			table: 'int_pk_test',
+			pk_column: 'id',
+			id: '7'
+		});
+	});
+
+	test('refused and missed deletes emit nothing', async () => {
+		await db.query(`INSERT INTO audit_log (event_type, outcome) VALUES ('login', 'success')`);
+		const excluded = await db.query<{ id: string }>(`SELECT id FROM audit_log LIMIT 1`);
+		const specs = create_specs();
+		const app = create_test_app(specs);
+
+		// policy exclusion
+		let res = await app.request(`/tables/audit_log/rows/${excluded[0]!.id}`, {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 400);
+		// composite-PK refusal
+		await db.query(`CREATE TABLE composite_pk_test (a TEXT, b TEXT, PRIMARY KEY (a, b))`);
+		res = await app.request('/tables/composite_pk_test/rows/anything', { method: 'DELETE' });
+		assert.strictEqual(res.status, 400);
+		// row not found
+		res = await app.request('/tables/browse_test/rows/00000000-0000-0000-0000-000000000000', {
+			method: 'DELETE'
+		});
+		assert.strictEqual(res.status, 404);
+		// table not found
+		res = await app.request('/tables/nonexistent_table/rows/x', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		// unlisted (masked) and floor (masked) tables
+		res = await app.request('/tables/invite/rows/x', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		res = await app.request('/tables/account/rows/x', { method: 'DELETE' });
+		assert.strictEqual(res.status, 404);
+		// FK violation — the DELETE query throws before the emit is reached
+		await db.query(`CREATE TABLE fk_test_parent (
+			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			name TEXT NOT NULL
+		)`);
+		await db.query(`CREATE TABLE fk_test_child (
+			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+			parent_id TEXT NOT NULL REFERENCES fk_test_parent(id) ON DELETE RESTRICT
+		)`);
+		const parent = await db.query<{ id: string }>(
+			`INSERT INTO fk_test_parent (name) VALUES ('p') RETURNING id`
+		);
+		await db.query(`INSERT INTO fk_test_child (parent_id) VALUES ($1)`, [parent[0]!.id]);
+		res = await app.request(`/tables/fk_test_parent/rows/${parent[0]!.id}`, { method: 'DELETE' });
+		assert.strictEqual(res.status, 409);
+
+		assert.strictEqual(audit.calls.length, 0, 'only a successful delete is audited');
+	});
+});

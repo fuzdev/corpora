@@ -1,0 +1,4 @@
+MIT (declared, not shipped as a file)
+
+svelte.dev declares "license": "MIT" in package.json at commit 996bd63e478e199e50d841149965290c358fd735 and ships no license file at the repository root. The MIT terms apply as declared by the upstream:
+https://github.com/sveltejs/svelte.dev/blob/996bd63e478e199e50d841149965290c358fd735/package.json

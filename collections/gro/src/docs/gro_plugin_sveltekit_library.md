@@ -1,0 +1,81 @@
+# SvelteKit library plugin
+
+Gro's [SvelteKit library plugin](/src/lib/gro_plugin_sveltekit_library.ts)
+uses [`svelte-package`](https://svelte.dev/docs/kit/packaging)
+to build libraries from `src/lib/` for publishing to npm.
+
+## detection
+
+The [default config](/src/lib/gro.config.default.ts) enables this plugin
+when all three conditions are met:
+
+1. `@sveltejs/kit` is a dependency in `package.json`
+2. `@sveltejs/package` is listed in `package.json` dependencies
+3. `src/lib/` directory exists (or the path configured by `kit.files.lib`)
+
+They're checked in that order, so a project that isn't a library never reads the
+Svelte config, which is the only one of the three that costs anything.
+
+Only `dependencies` and `devDependencies` count for the first two - a peer dep
+declares what a package works alongside, not what the package itself is.
+
+Install to enable:
+
+```bash
+npm i -D @sveltejs/package
+```
+
+## behavior
+
+In production (`gro build`), runs `svelte-package` during `setup`
+to compile `src/lib/` into `dist/`, then rewrites relative `.ts` import
+specifiers to `.js` (and `.svelte.ts` to `.svelte.js`) in the emitted `.d.ts`
+declarations and `.svelte` `<script>` blocks
+(the two outputs `svelte-package` leaves on `.ts`)
+so the published `dist` resolves for consumers without
+`allowImportingTsExtensions`. Bare `@fuzdev/*.ts` specifiers (resolved by the
+package `exports` `.js`/`.ts` mirror), `.svelte` component imports, and
+already-`.js` specifiers are left untouched.
+
+In development (`gro dev`), does nothing — `svelte-package` is a build-time tool.
+
+During `adapt`, if `package.json` has a `bin` field,
+the plugin makes the binaries executable and runs `npm link -f`
+so CLI commands are available locally after building.
+
+## configuration
+
+```ts
+// gro.config.ts
+import type {CreateGroConfig} from '@fuzdev/gro';
+import {gro_plugin_sveltekit_library} from '@fuzdev/gro/gro_plugin_sveltekit_library.ts';
+
+const config: CreateGroConfig = async (cfg) => {
+	cfg.plugins = async () => [
+		// included in the default config when detection passes
+		gro_plugin_sveltekit_library({
+			// svelte_package_options: {output: 'custom_dist'},
+			// svelte_package_cli: 'svelte-package',
+		}),
+	];
+	return cfg;
+};
+
+export default config;
+```
+
+Options are forwarded to `svelte-package`.
+See [`SveltePackageOptions`](/src/lib/sveltekit_helpers.ts)
+and the [SvelteKit packaging docs](https://svelte.dev/docs/kit/packaging#options).
+
+## exports
+
+When this plugin is active, `gro sync` auto-generates `package.json` `"exports"`
+using wildcard subpath patterns for `.js`, `.ts`, `.svelte`, `.json`, and `.css` files in `src/lib/`.
+Every `internal/` directory is blocked from consumer imports at any depth by a null
+exports entry (`"./internal/*": null`, one per outermost internal directory)
+while its files still ship in `dist/`,
+and internal files don't count toward which wildcard patterns are emitted.
+Customize via [`map_package_json` in the config](config.md#map_package_json).
+
+For the full publishing workflow, see [publish.md](publish.md).

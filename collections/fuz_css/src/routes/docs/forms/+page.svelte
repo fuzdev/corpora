@@ -1,0 +1,251 @@
+<script lang="ts">
+	import Code from '@fuzdev/fuz_code/Code.svelte';
+	import { fly } from 'svelte/transition';
+	import Alert from '@fuzdev/fuz_ui/Alert.svelte';
+	import TomeContent from '@fuzdev/fuz_ui/TomeContent.svelte';
+	import MdnLink from '@fuzdev/fuz_ui/MdnLink.svelte';
+	import { tome_get_by_slug } from '@fuzdev/fuz_ui/tome.ts';
+	import TomeSectionHeader from '@fuzdev/fuz_ui/TomeSectionHeader.svelte';
+	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
+	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
+
+	import UnfinishedImplementationWarning from '$routes/docs/UnfinishedImplementationWarning.svelte';
+
+	const LIBRARY_ITEM_NAME = 'forms';
+
+	const tome = tome_get_by_slug(LIBRARY_ITEM_NAME);
+
+	// TODO extract this to where? (where is it used in the css? check all @keyframe)
+	const ANIMATION_DURATION_FAST = 91; // ms
+
+	let created_account = $state.raw(false);
+
+	const faces = ['😊', '😑', '🤔', '😉'];
+
+	// @fuz-classes xs sm md lg xl
+
+	let username = $state.raw('');
+	let password = $state.raw('');
+	let lifestory = $state.raw('');
+
+	const radio_items = ['a radio input', 'another radio input'];
+	let selected_radio_item = $state.raw(radio_items[0]);
+
+	let checked1 = $state.raw(false);
+	let checked2 = $state.raw(true);
+</script>
+
+<!-- eslint-disable svelte/no-useless-mustaches -->
+
+<TomeContent {tome}>
+	<UnfinishedImplementationWarning>Forms need more work.</UnfinishedImplementationWarning>
+	<section>
+		<p>
+			Form elements have basic default styles that can be omitted with <code>.unstyled</code>.
+		</p>
+	</section>
+
+	<TomeSection>
+		<TomeSectionHeader text="form with a fieldset">
+			<MdnLink path="Web/HTML/Element/form" /> with a <MdnLink path="Web/HTML/Element/fieldset" />
+		</TomeSectionHeader>
+		<Code
+			content={`<form>
+	<fieldset>
+		<legend>
+			a <MdnLink path="Web/HTML/Element/legend" />
+		</legend>
+		<label>
+			<div class="title">
+				username
+			</div>
+			<input
+				bind:value={username}
+				placeholder=">"
+			/>
+		</label>
+		...
+	</fieldset>
+	...
+</form>`}
+		/>
+		<div class="width_atmost_sm">
+			<form>
+				<fieldset>
+					<legend>This is a <MdnLink path="Web/HTML/Element/legend" /></legend>
+					<label class:disabled={created_account}>
+						<div class="title">username</div>
+						<input bind:value={username} disabled={created_account} placeholder=">" />
+					</label>
+					<label class:disabled={created_account}>
+						<div class="title">password</div>
+						<input
+							type="password"
+							bind:value={password}
+							disabled={created_account}
+							placeholder=">"
+						/>
+					</label>
+					<p>
+						More info can be included in <code>{'<'}p></code> tags like this one. Here we could
+						include info about passwords.
+					</p>
+					<label class:disabled={created_account}>
+						<div class="title">lifestory</div>
+						<textarea bind:value={lifestory} disabled={created_account} placeholder="👀"></textarea>
+					</label>
+					<label class:disabled={created_account}>
+						<div class="title">select</div>
+						<select class="text-align:center font_size_xl5" disabled={created_account}>
+							{#each faces as face (face)}
+								<option value={face}>{face}</option>
+							{/each}
+						</select>
+					</label>
+					<button type="button" disabled={created_account} onclick={() => (created_account = true)}>
+						create account
+					</button>
+				</fieldset>
+			</form>
+			{#if created_account}
+				<form
+					in:fly={{ y: -100, duration: ANIMATION_DURATION_FAST }}
+					out:fly={{ y: 100, duration: ANIMATION_DURATION_FAST }}
+				>
+					<Alert status="error">cannot create account because the docs are fake</Alert>
+					<button type="button" class="width:100%" onclick={() => (created_account = false)}>
+						undo undo!
+					</button>
+				</form>
+			{/if}
+		</div>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="form with range input">
+			<code>form</code> with range input
+		</TomeSectionHeader>
+		<form>
+			<fieldset>
+				<Code content={`<input type="range" />`} />
+				<input type="range" step={1} min={0} max={100} />
+			</fieldset>
+			<fieldset>
+				<Code content={`<input type="range" disabled />`} />
+				<input type="range" step={1} min={0} max={100} disabled />
+			</fieldset>
+		</form>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="form with checkboxes">
+			<code>form</code> with checkboxes
+		</TomeSectionHeader>
+		<UnfinishedImplementationWarning>
+			This will change, probably to toggles.
+		</UnfinishedImplementationWarning>
+		<!-- TODO make this a form, but figure out the checkbox problem - maybe a last-child exception? -->
+		<form>
+			<fieldset>
+				<label class="row">
+					<input type="checkbox" bind:checked={checked1} style:margin-right="var(--space_lg)" />
+					<Code content={`<input type="checkbox" ${checked1 ? 'checked ' : ''}/>`} />
+				</label>
+				<label class="row">
+					<input type="checkbox" bind:checked={checked2} style:margin-right="var(--space_lg)" />
+					<Code content={`<input type="checkbox" ${checked2 ? 'checked ' : ''}/>`} />
+				</label>
+				<label class="row disabled">
+					<input type="checkbox" disabled style:margin-right="var(--space_lg)" />
+					<Code content={`<input type="checkbox" disabled />`} />
+					(disabled)
+				</label>
+				<label class="row disabled">
+					<input type="checkbox" checked disabled />
+					<Code content={`<input type="checkbox" checked disabled />`} />
+					(disabled)
+				</label>
+			</fieldset>
+		</form>
+		<aside>
+			The above are wrapped with: <Code content={`<label class="row">`} inline />
+			with <code>.disabled</code> as needed:
+			<Code content={`<label class="row disabled">`} inline />
+		</aside>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="form with radio inputs">
+			<code>form</code> with radio inputs
+		</TomeSectionHeader>
+		<form>
+			<fieldset>
+				{#each radio_items as radio_item (radio_item)}
+					{@const selected = radio_item === selected_radio_item}
+					<label class="row" class:selected>
+						<input type="radio" bind:group={selected_radio_item} value={radio_item} />
+						<Code
+							content={`<label class="row${selected ? ' selected' : ''}">\n\t<input type="radio" ${
+								selected ? 'checked' : ''
+							}/>\n</label>`}
+						/>
+					</label>
+				{/each}
+				<label class="row disabled">
+					<input type="radio" disabled />
+					<Code content={`<label class="row">\n\t<input type="radio" disabled />\n</label>`} />
+				</label>
+				<label class="row disabled selected">
+					<input type="radio" checked disabled />
+					<Code
+						content={`<label class="row">\n\t<input type="radio" checked disabled />\n</label>`}
+					/>
+				</label>
+			</fieldset>
+		</form>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="Size composites" />
+		<p>
+			The <TomeLink slug="classes" hash="#Composite-classes">size composite classes</TomeLink>
+			<code>.xs</code>, <code>.sm</code>, <code>.md</code>, <code>.lg</code>, and <code>.xl</code>
+			scale inputs and buttons, adjusting height and padding. Apply directly or on a container to
+			cascade to children.
+		</p>
+		<Code
+			content={`<input class="xs" />\n<input class="sm" />\n<input />\n<input class="lg" />\n<input class="xl" />`}
+		/>
+		<div class="column gap_sm mb_lg width_atmost_sm">
+			{#each ['xs', 'sm', 'md', 'lg', 'xl'] as size (size)}
+				<div class="row align-items:center gap_sm">
+					<input class={size} placeholder={size} />
+					<button type="button" class={size}>{size}</button>
+				</div>
+			{/each}
+		</div>
+		<p>Set on a container and children inherit the sizing:</p>
+		<Code content={`<form class="xs">...</form>`} />
+		<div class="width_atmost_sm">
+			<form class="xs">
+				<fieldset>
+					<label>
+						<div class="title">inherits .xs</div>
+						<select>
+							{#each faces as face (face)}
+								<option value={face}>{face}</option>
+							{/each}
+						</select>
+					</label>
+					<div class="row">
+						<button type="button">submit</button>
+					</div>
+				</fieldset>
+			</form>
+		</div>
+		<UnfinishedImplementationWarning class="mt_lg">
+			Table cell padding doesn't yet respond to size composites. A size-composite region containing
+			a table will scale inputs and buttons but leave cells at their default padding.
+		</UnfinishedImplementationWarning>
+	</TomeSection>
+</TomeContent>

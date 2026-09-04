@@ -1,0 +1,146 @@
+/**
+ * Tests for middleware/auth - auth middleware stack factory.
+ *
+ * @module
+ */
+
+import { describe, assert, test } from 'vitest';
+
+import { create_auth_middleware_specs, type AuthMiddlewareOptions } from '$lib/auth/middleware.ts';
+import { create_stub_app_deps } from '$lib/testing/stubs.ts';
+
+const create_options = (overrides?: Partial<AuthMiddlewareOptions>): AuthMiddlewareOptions => ({
+	allowed_origins: [],
+	session_options: {
+		cookie_name: 'test_session',
+		context_key: 'session_identity',
+		encode_identity: (id: string) => id,
+		decode_identity: (payload: string) => payload
+	},
+	...overrides
+});
+
+describe('create_auth_middleware_specs', () => {
+	test('returns 4 middleware specs by default', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		assert.strictEqual(specs.length, 4);
+	});
+
+	test('middleware names are origin, session, request_context, bearer_auth', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		const names = specs.map((s) => s.name);
+		assert.deepStrictEqual(names, ['origin', 'session', 'request_context', 'bearer_auth']);
+	});
+
+	test('all middleware use default /api/* path', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		for (const spec of specs) {
+			assert.strictEqual(spec.path, '/api/*');
+		}
+	});
+
+	test('custom path is applied to all middleware', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options({ path: '/custom/*' }));
+		for (const spec of specs) {
+			assert.strictEqual(spec.path, '/custom/*');
+		}
+	});
+
+	test('appends daemon_token middleware when daemon_token_state is provided', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(
+			deps,
+			create_options({
+				daemon_token_state: {
+					current_token: 'tok123',
+					previous_token: null,
+					rotated_at: new Date(),
+					keeper_account_id: null
+				}
+			})
+		);
+		assert.strictEqual(specs.length, 5);
+		assert.strictEqual(specs[4]!.name, 'daemon_token');
+	});
+
+	test('daemon_token middleware uses the configured custom path', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(
+			deps,
+			create_options({
+				path: '/custom/*',
+				daemon_token_state: {
+					current_token: 'tok',
+					previous_token: null,
+					rotated_at: new Date(),
+					keeper_account_id: null
+				}
+			})
+		);
+		const daemon = specs.find((s) => s.name === 'daemon_token');
+		assert.ok(daemon);
+		assert.strictEqual(daemon.path, '/custom/*');
+	});
+
+	test('origin middleware has 403 error schema', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		const origin = specs.find((s) => s.name === 'origin')!;
+		assert.ok(origin.errors);
+		assert.ok(origin.errors[403]);
+	});
+
+	test('bearer_auth middleware declares no errors (soft-fails on every path)', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		const bearer = specs.find((s) => s.name === 'bearer_auth')!;
+		assert.ok(bearer.errors);
+		// The layer returns no status of its own: invalid tokens soft-fail to "no
+		// credential" and it carries no rate limiter, so not even a 429. Auth
+		// enforcement happens downstream (check_action_auth / require_auth).
+		assert.strictEqual(Object.keys(bearer.errors).length, 0);
+	});
+
+	test('session and request_context have no error schemas', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		const session = specs.find((s) => s.name === 'session')!;
+		const rc = specs.find((s) => s.name === 'request_context')!;
+		assert.strictEqual(session.errors, undefined);
+		assert.strictEqual(rc.errors, undefined);
+	});
+
+	test('daemon_token middleware declares no error schemas (soft-fails through)', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(
+			deps,
+			create_options({
+				daemon_token_state: {
+					current_token: 'tok',
+					previous_token: null,
+					rotated_at: new Date(),
+					keeper_account_id: null
+				}
+			})
+		);
+		const dt = specs.find((s) => s.name === 'daemon_token')!;
+		// The middleware soft-fails (discards) on every non-success path — browser
+		// context, malformed/invalid token, and no-keeper all `next()` through to
+		// the dispatcher's credential gate — so it returns no error response of its
+		// own and declares none.
+		assert.ok(dt.errors);
+		assert.strictEqual(Object.keys(dt.errors).length, 0);
+	});
+
+	test('all specs have handler functions', async () => {
+		const deps = create_stub_app_deps();
+		const specs = await create_auth_middleware_specs(deps, create_options());
+		for (const spec of specs) {
+			assert.strictEqual(typeof spec.handler, 'function');
+		}
+	});
+});

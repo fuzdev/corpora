@@ -1,0 +1,84 @@
+<script lang="ts">
+	import ConfirmButton from '@fuzdev/fuz_app/ui/ConfirmButton.svelte';
+
+	import type { Chat } from './chat.svelte.ts';
+	import type { Thread } from './thread.svelte.ts';
+	import { icon_remove } from '@fuzdev/fuz_ui/icons.ts';
+	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import ThreadContextmenu from './ThreadContextmenu.svelte';
+	import ProviderLogo from './ProviderLogo.svelte';
+	import ThreadToggleButton from './ThreadToggleButton.svelte';
+
+	const {
+		thread,
+		chat
+	}: {
+		thread: Thread;
+		chat: Chat;
+	} = $props();
+
+	const turn_count = $derived(thread.turns.size);
+
+	// TODO hacky but is the desired UX for now
+	const selectable = $derived(chat.view_mode === 'simple');
+	const selected = $derived(selectable && chat.selected_thread_id === thread.id);
+</script>
+
+<ThreadContextmenu {thread}>
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div
+		class="thread-listitem p_xs2"
+		class:dormant={!thread.enabled}
+		class:selected
+		onclick={selectable ? () => chat.select_thread(thread.id) : undefined}
+		onkeydown={selectable ? (e) => e.key === 'Enter' && chat.select_thread(thread.id) : undefined}
+		role={selectable ? 'button' : undefined}
+		tabindex={selectable ? 0 : undefined}
+	>
+		<div class="row justify-content:space-between gap_xs">
+			<div class="flex:1">
+				<div class="font-weight:400">
+					{#if thread.model}
+						<ProviderLogo name={thread.model.provider_name} size="var(--font_size_md)" />
+					{/if}
+					{thread.model_name}
+				</div>
+				<div class="display:flex gap_xs">
+					{#if turn_count > 0}
+						<small>
+							{turn_count} message{turn_count !== 1
+								? 's'
+								: ''}, {thread.token_count} token{thread.token_count !== 1 ? 's' : ''}
+						</small>
+					{:else}
+						&nbsp;
+					{/if}
+				</div>
+			</div>
+			<div class="display:flex gap_xs">
+				<ThreadToggleButton {thread} />
+				<ConfirmButton
+					onconfirm={() => chat.remove_thread(thread.id)}
+					class="icon-button plain"
+					title="delete thread"
+				>
+					<Svg data={icon_remove} />
+				</ConfirmButton>
+			</div>
+		</div>
+	</div>
+</ThreadContextmenu>
+
+<style>
+	/* TODO hacky styles, see usage, extract reusable parts (classes/components and border variables) */
+	.thread-listitem {
+		border-radius: var(--border_radius_xs);
+		border: var(--border_width_2) var(--border_style) transparent;
+	}
+	.thread-listitem.selected {
+		border-color: var(--palette_a_50);
+	}
+	.thread-listitem:hover {
+		background-color: var(--shade_10);
+	}
+</style>

@@ -1,0 +1,463 @@
+/**
+ * Tests for error_schemas.ts — standard error schemas and auto-derivation.
+ *
+ * @module
+ */
+
+import { describe, assert, test } from 'vitest';
+
+import {
+	ApiError,
+	ValidationError,
+	PermissionError,
+	CredentialTypeRequiredError,
+	RateLimitError,
+	PayloadTooLargeError,
+	ForeignKeyError,
+	derive_error_schemas,
+	ERROR_INVALID_REQUEST_BODY,
+	ERROR_INVALID_JSON_BODY,
+	ERROR_INVALID_ROUTE_PARAMS,
+	ERROR_AUTHENTICATION_REQUIRED,
+	ERROR_INSUFFICIENT_PERMISSIONS,
+	ERROR_CREDENTIAL_TYPE_REQUIRED,
+	ERROR_TOKEN_SCOPE_REQUIRED,
+	ERROR_INVALID_TOKEN,
+	ERROR_ACCOUNT_NOT_FOUND,
+	ERROR_FORBIDDEN_ORIGIN,
+	ERROR_RATE_LIMIT_EXCEEDED,
+	ERROR_INVALID_CREDENTIALS,
+	ERROR_KEEPER_ACCOUNT_NOT_FOUND,
+	ERROR_ALREADY_BOOTSTRAPPED,
+	ERROR_TOKEN_FILE_MISSING,
+	ERROR_ROLE_NOT_WEB_GRANTABLE,
+	ERROR_ROLE_GRANT_NOT_FOUND,
+	ERROR_INVALID_EVENT_TYPE,
+	ERROR_PAYLOAD_TOO_LARGE,
+	ERROR_FOREIGN_KEY_VIOLATION,
+	ERROR_TABLE_NOT_FOUND,
+	ERROR_TABLE_NO_PRIMARY_KEY,
+	ERROR_TABLE_NOT_DELETABLE,
+	ERROR_ROW_NOT_FOUND,
+	ERROR_INVALID_QUERY_PARAMS,
+	ERROR_NO_MATCHING_INVITE,
+	ERROR_SIGNUP_CONFLICT,
+	ERROR_INVITE_NOT_FOUND,
+	ERROR_INVITE_DUPLICATE,
+	ERROR_INVITE_ACCOUNT_EXISTS_USERNAME,
+	ERROR_INVITE_ACCOUNT_EXISTS_EMAIL,
+	ERROR_ACTOR_REQUIRED,
+	ERROR_ACTOR_NOT_ON_ACCOUNT,
+	ERROR_NO_ACTORS_ON_ACCOUNT,
+	ERROR_ACCOUNT_VANISHED,
+	ActorRequiredError,
+	ActorNotOnAccountError,
+	NoActorsOnAccountError,
+	AccountVanishedError
+} from '$lib/http/error_schemas.ts';
+
+describe('standard error schemas', () => {
+	test('ApiError accepts basic error response', () => {
+		const result = ApiError.safeParse({ error: ERROR_AUTHENTICATION_REQUIRED });
+		assert.isTrue(result.success);
+	});
+
+	test('ApiError allows extra fields (looseObject)', () => {
+		const result = ApiError.safeParse({ error: 'test', extra: 'field' });
+		assert.isTrue(result.success);
+	});
+
+	test('ApiError rejects missing error field', () => {
+		const result = ApiError.safeParse({ message: 'wrong' });
+		assert.isFalse(result.success);
+	});
+
+	test('ValidationError accepts error with issues', () => {
+		const result = ValidationError.safeParse({
+			error: 'invalid_request_body',
+			issues: [{ code: 'invalid_type', message: 'Expected string', path: ['name'] }]
+		});
+		assert.isTrue(result.success);
+	});
+
+	test('PermissionError requires insufficient_permissions literal', () => {
+		const valid = PermissionError.safeParse({
+			error: ERROR_INSUFFICIENT_PERMISSIONS,
+			required_roles: ['admin']
+		});
+		assert.isTrue(valid.success);
+
+		const invalid = PermissionError.safeParse({
+			error: 'wrong_error',
+			required_roles: ['admin']
+		});
+		assert.isFalse(invalid.success);
+	});
+
+	test('CredentialTypeRequiredError requires credential_type_required literal', () => {
+		const valid = CredentialTypeRequiredError.safeParse({
+			error: ERROR_CREDENTIAL_TYPE_REQUIRED,
+			required_credential_types: ['daemon_token']
+		});
+		assert.isTrue(valid.success);
+
+		const invalid = CredentialTypeRequiredError.safeParse({
+			error: 'wrong_error',
+			required_credential_types: ['daemon_token']
+		});
+		assert.isFalse(invalid.success);
+	});
+
+	test('RateLimitError requires rate_limit_exceeded and retry_after', () => {
+		const valid = RateLimitError.safeParse({
+			error: ERROR_RATE_LIMIT_EXCEEDED,
+			retry_after: 60
+		});
+		assert.isTrue(valid.success);
+
+		const missing_retry = RateLimitError.safeParse({
+			error: ERROR_RATE_LIMIT_EXCEEDED
+		});
+		assert.isFalse(missing_retry.success);
+	});
+
+	test('PayloadTooLargeError requires payload_too_large literal', () => {
+		const valid = PayloadTooLargeError.safeParse({ error: ERROR_PAYLOAD_TOO_LARGE });
+		assert.isTrue(valid.success);
+
+		const invalid = PayloadTooLargeError.safeParse({ error: 'wrong_error' });
+		assert.isFalse(invalid.success);
+	});
+
+	test('ForeignKeyError accepts error without detail or constraint', () => {
+		const result = ForeignKeyError.safeParse({
+			error: ERROR_FOREIGN_KEY_VIOLATION
+		});
+		assert.isTrue(result.success);
+	});
+});
+
+describe('derive_error_schemas', () => {
+	test('auth none + no input derives no errors', () => {
+		const errors = derive_error_schemas({ auth: { account: 'none', actor: 'none' } });
+		assert.deepStrictEqual(errors, {});
+	});
+
+	test('auth none + has input derives 400', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			has_input: true
+		});
+		assert.ok(errors[400]);
+		assert.strictEqual(errors[401], undefined);
+	});
+
+	test('auth authenticated derives 401', () => {
+		const errors = derive_error_schemas({ auth: { account: 'required', actor: 'none' } });
+		assert.ok(errors[401]);
+		assert.strictEqual(errors[403], undefined);
+	});
+
+	test('auth authenticated + has input derives 400 and 401', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'none' },
+			has_input: true
+		});
+		assert.ok(errors[400]);
+		assert.ok(errors[401]);
+	});
+
+	test('auth role derives 401 and 403 with PermissionError', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'required', roles: ['admin'] }
+		});
+		assert.ok(errors[401]);
+		assert.ok(errors[403]);
+		// Verify the 403 schema is PermissionError (accepts required_role)
+		const result = (errors[403] as any).safeParse({
+			error: ERROR_INSUFFICIENT_PERMISSIONS,
+			required_roles: ['admin']
+		});
+		assert.isTrue(result.success);
+	});
+
+	test('auth keeper derives 401 and 403 with CredentialTypeRequiredError', () => {
+		const errors = derive_error_schemas({
+			auth: {
+				account: 'required',
+				actor: 'required',
+				roles: ['keeper'],
+				credential_types: ['daemon_token']
+			}
+		});
+		assert.ok(errors[401]);
+		assert.ok(errors[403]);
+		// 403 is a union(PermissionError, CredentialTypeRequiredError) when both
+		// gates are set; verify the credential-type shape parses.
+		const result = (errors[403] as any).safeParse({
+			error: ERROR_CREDENTIAL_TYPE_REQUIRED,
+			required_credential_types: ['daemon_token']
+		});
+		assert.isTrue(result.success);
+	});
+
+	/**
+	 * `auth.required_scope` mounts `require_token_scope`, a framework-emitted
+	 * 403 at a fixed middleware site — exactly the class this derivation
+	 * covers. Without it the audit stream and the bare-hash fact read (both
+	 * role-gated *and* surface-gated) would derive `PermissionError` alone, so
+	 * a narrowed token's real denial would fail DEV-mode error-schema
+	 * validation and go undocumented in the generated attack surface.
+	 */
+	test('auth required_scope derives 403 with TokenScopeRequiredError', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'required', required_scope: 'surface:audit_stream' }
+		});
+		assert.ok(errors[403]);
+		const result = (errors[403] as any).safeParse({
+			error: ERROR_TOKEN_SCOPE_REQUIRED,
+			required_scope: 'surface:audit_stream'
+		});
+		assert.isTrue(result.success);
+	});
+
+	test('required_scope alongside a role gate derives a 403 union admitting both', () => {
+		const errors = derive_error_schemas({
+			auth: {
+				account: 'required',
+				actor: 'required',
+				roles: ['admin'],
+				required_scope: 'surface:fact_bare'
+			}
+		});
+		assert.ok(errors[403]);
+		const scope_denial = (errors[403] as any).safeParse({
+			error: ERROR_TOKEN_SCOPE_REQUIRED,
+			required_scope: 'surface:fact_bare'
+		});
+		assert.isTrue(scope_denial.success, 'the pre-authorization scope refusal must parse');
+		const role_denial = (errors[403] as any).safeParse({
+			error: ERROR_INSUFFICIENT_PERMISSIONS,
+			required_roles: ['admin']
+		});
+		assert.isTrue(role_denial.success, 'the post-authorization role denial must still parse');
+	});
+
+	test('does not auto-derive 429 without rate_limit', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			has_input: true
+		});
+		assert.strictEqual(errors[429], undefined);
+	});
+
+	test('rate_limit ip derives 429', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			rate_limit: 'ip'
+		});
+		assert.ok(errors[429]);
+	});
+
+	test('rate_limit account derives 429', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			rate_limit: 'account'
+		});
+		assert.ok(errors[429]);
+	});
+
+	test('rate_limit both derives 429', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			has_input: true,
+			rate_limit: 'both'
+		});
+		assert.ok(errors[400]);
+		assert.ok(errors[429]);
+	});
+
+	test('has_params derives 400', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			has_params: true
+		});
+		assert.ok(errors[400]);
+	});
+
+	test('has_query derives 400', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'none', actor: 'none' },
+			has_query: true
+		});
+		assert.ok(errors[400]);
+	});
+});
+
+describe('error code constants', () => {
+	test('constants match expected string values', () => {
+		assert.strictEqual(ERROR_INVALID_REQUEST_BODY, 'invalid_request_body');
+		assert.strictEqual(ERROR_INVALID_JSON_BODY, 'invalid_json_body');
+		assert.strictEqual(ERROR_INVALID_ROUTE_PARAMS, 'invalid_route_params');
+		assert.strictEqual(ERROR_INVALID_QUERY_PARAMS, 'invalid_query_params');
+		assert.strictEqual(ERROR_AUTHENTICATION_REQUIRED, 'authentication_required');
+		assert.strictEqual(ERROR_INSUFFICIENT_PERMISSIONS, 'insufficient_permissions');
+		assert.strictEqual(ERROR_CREDENTIAL_TYPE_REQUIRED, 'credential_type_required');
+		assert.strictEqual(ERROR_INVALID_TOKEN, 'invalid_token');
+		assert.strictEqual(ERROR_ACCOUNT_NOT_FOUND, 'account_not_found');
+		assert.strictEqual(ERROR_FORBIDDEN_ORIGIN, 'forbidden_origin');
+		assert.strictEqual(ERROR_RATE_LIMIT_EXCEEDED, 'rate_limit_exceeded');
+		assert.strictEqual(ERROR_INVALID_CREDENTIALS, 'invalid_credentials');
+		assert.strictEqual(ERROR_KEEPER_ACCOUNT_NOT_FOUND, 'keeper_account_not_found');
+		assert.strictEqual(ERROR_ALREADY_BOOTSTRAPPED, 'already_bootstrapped');
+		assert.strictEqual(ERROR_TOKEN_FILE_MISSING, 'token_file_missing');
+		assert.strictEqual(ERROR_ROLE_NOT_WEB_GRANTABLE, 'role_not_web_grantable');
+		assert.strictEqual(ERROR_ROLE_GRANT_NOT_FOUND, 'role_grant_not_found');
+		assert.strictEqual(ERROR_INVALID_EVENT_TYPE, 'invalid_event_type');
+		assert.strictEqual(ERROR_PAYLOAD_TOO_LARGE, 'payload_too_large');
+		assert.strictEqual(ERROR_FOREIGN_KEY_VIOLATION, 'foreign_key_violation');
+		assert.strictEqual(ERROR_TABLE_NOT_FOUND, 'table_not_found');
+		assert.strictEqual(ERROR_TABLE_NO_PRIMARY_KEY, 'table_no_primary_key');
+		assert.strictEqual(ERROR_TABLE_NOT_DELETABLE, 'table_not_deletable');
+		assert.strictEqual(ERROR_ROW_NOT_FOUND, 'row_not_found');
+		assert.strictEqual(ERROR_NO_MATCHING_INVITE, 'no_matching_invite');
+		assert.strictEqual(ERROR_SIGNUP_CONFLICT, 'signup_conflict');
+		assert.strictEqual(ERROR_INVITE_NOT_FOUND, 'invite_not_found');
+		assert.strictEqual(ERROR_INVITE_DUPLICATE, 'invite_duplicate');
+		assert.strictEqual(ERROR_INVITE_ACCOUNT_EXISTS_USERNAME, 'invite_account_exists_username');
+		assert.strictEqual(ERROR_INVITE_ACCOUNT_EXISTS_EMAIL, 'invite_account_exists_email');
+	});
+
+	test('constants are used by standard error schemas', () => {
+		assert.isTrue(ApiError.safeParse({ error: ERROR_AUTHENTICATION_REQUIRED }).success);
+		assert.isTrue(
+			PermissionError.safeParse({
+				error: ERROR_INSUFFICIENT_PERMISSIONS,
+				required_roles: ['admin']
+			}).success
+		);
+		assert.isTrue(
+			CredentialTypeRequiredError.safeParse({
+				error: ERROR_CREDENTIAL_TYPE_REQUIRED,
+				required_credential_types: ['daemon_token']
+			}).success
+		);
+		assert.isTrue(
+			ValidationError.safeParse({
+				error: ERROR_INVALID_REQUEST_BODY,
+				issues: [{ code: 'invalid_type', message: 'Expected string', path: ['name'] }]
+			}).success
+		);
+		assert.isTrue(
+			RateLimitError.safeParse({
+				error: ERROR_RATE_LIMIT_EXCEEDED,
+				retry_after: 60
+			}).success
+		);
+		assert.isTrue(
+			PayloadTooLargeError.safeParse({
+				error: ERROR_PAYLOAD_TOO_LARGE
+			}).success
+		);
+		assert.isTrue(
+			ForeignKeyError.safeParse({
+				error: ERROR_FOREIGN_KEY_VIOLATION
+			}).success
+		);
+	});
+});
+
+describe('authorization-phase actor error schemas', () => {
+	test('ActorRequiredError accepts available[] with id+name entries', () => {
+		const result = ActorRequiredError.safeParse({
+			error: ERROR_ACTOR_REQUIRED,
+			available: [{ id: '00000000-0000-4000-8000-000000000001', name: 'alice' }]
+		});
+		assert.isTrue(result.success);
+	});
+
+	test('ActorRequiredError rejects missing available', () => {
+		const result = ActorRequiredError.safeParse({ error: ERROR_ACTOR_REQUIRED });
+		assert.isFalse(result.success);
+	});
+
+	test('ActorNotOnAccountError accepts the literal-only shape', () => {
+		const result = ActorNotOnAccountError.safeParse({ error: ERROR_ACTOR_NOT_ON_ACCOUNT });
+		assert.isTrue(result.success);
+	});
+
+	test('NoActorsOnAccountError accepts the literal-only shape', () => {
+		const result = NoActorsOnAccountError.safeParse({ error: ERROR_NO_ACTORS_ON_ACCOUNT });
+		assert.isTrue(result.success);
+	});
+
+	test('AccountVanishedError accepts the literal-only shape', () => {
+		const result = AccountVanishedError.safeParse({ error: ERROR_ACCOUNT_VANISHED });
+		assert.isTrue(result.success);
+	});
+
+	test('derive_error_schemas with actor !== none folds actor errors into 400 + 500', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'optional' },
+			has_input: true
+		});
+		// 400 union accepts ValidationError + actor 400 shapes.
+		assert.ok(errors[400]);
+		const validation_match = errors[400].safeParse({
+			error: ERROR_INVALID_REQUEST_BODY,
+			issues: []
+		});
+		assert.isTrue(validation_match.success);
+		const actor_required_match = errors[400].safeParse({
+			error: ERROR_ACTOR_REQUIRED,
+			available: []
+		});
+		assert.isTrue(actor_required_match.success);
+		const actor_not_on_account_match = errors[400].safeParse({
+			error: ERROR_ACTOR_NOT_ON_ACCOUNT
+		});
+		assert.isTrue(actor_not_on_account_match.success);
+		// 500 union accepts both invariant + torn-read shapes.
+		assert.ok(errors[500]);
+		const no_actors_match = errors[500].safeParse({ error: ERROR_NO_ACTORS_ON_ACCOUNT });
+		assert.isTrue(no_actors_match.success);
+		const account_vanished_match = errors[500].safeParse({ error: ERROR_ACCOUNT_VANISHED });
+		assert.isTrue(account_vanished_match.success);
+	});
+
+	test('derive_error_schemas with actor === none leaves 400 narrow and omits 500', () => {
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'none' },
+			has_input: true
+		});
+		assert.ok(errors[400]);
+		const validation_match = errors[400].safeParse({
+			error: ERROR_INVALID_REQUEST_BODY,
+			issues: []
+		});
+		assert.isTrue(validation_match.success);
+		const actor_required_match = errors[400].safeParse({
+			error: ERROR_ACTOR_REQUIRED,
+			available: []
+		});
+		// `error` is an enum of validation codes — `ERROR_ACTOR_REQUIRED`
+		// isn't a member, so the parse fails even though `issues` is now optional.
+		assert.isFalse(actor_required_match.success);
+		assert.strictEqual(errors[500], undefined);
+	});
+
+	test('derive_error_schemas with actor !== none and no validation still emits 400 + 500', () => {
+		// Parameterless acting-aware route (no input/params/query) — auth phase
+		// can still emit actor errors before the (empty) input validation step.
+		const errors = derive_error_schemas({
+			auth: { account: 'required', actor: 'required', roles: ['admin'] }
+		});
+		assert.ok(errors[400]);
+		const actor_required_match = errors[400].safeParse({
+			error: ERROR_ACTOR_REQUIRED,
+			available: []
+		});
+		assert.isTrue(actor_required_match.success);
+		assert.ok(errors[500]);
+	});
+});

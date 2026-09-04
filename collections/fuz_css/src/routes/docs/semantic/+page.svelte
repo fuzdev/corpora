@@ -1,0 +1,139 @@
+<script lang="ts">
+	import Code from '@fuzdev/fuz_code/Code.svelte';
+	import { resolve } from '$app/paths';
+	import TomeContent from '@fuzdev/fuz_ui/TomeContent.svelte';
+	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
+	import { tome_get_by_slug } from '@fuzdev/fuz_ui/tome.ts';
+	import TomeSectionHeader from '@fuzdev/fuz_ui/TomeSectionHeader.svelte';
+	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
+
+	import SourceFileLink from '$routes/SourceFileLink.svelte';
+
+	const LIBRARY_ITEM_NAME = 'semantic';
+
+	const tome = tome_get_by_slug(LIBRARY_ITEM_NAME);
+</script>
+
+<TomeContent {tome}>
+	<section>
+		<p>
+			fuz_css styles HTML elements in its <SourceFileLink path="style.css">
+				reset stylesheet
+			</SourceFileLink>, so semantic markup gets themed and color-scheme-aware styling automatically
+			- utility classes optional. The goal is to be accessible and attractive out of the box,
+			minimal yet extensible.
+		</p>
+	</section>
+
+	<TomeSection>
+		<TomeSectionHeader text="Layers and specificity" />
+		<p>
+			All opinionated styles live in the <code>fuz.base</code> cascade layer, so your unlayered
+			styles and the generated utility classes override them by layer order alone. The selectors are
+			additionally wrapped in <code>:where()</code>, giving them zero specificity, so overriding
+			stays effortless even from inside the fuz layers.
+		</p>
+		<Code
+			lang="css"
+			content={`/* any styles you apply will override these */
+:where(a:not(.unstyled)) {
+  color: var(--link_color);
+  font-weight: 700;
+}
+
+:where(button:not(.unstyled)) {
+  background-color: var(--button_fill);
+  border-radius: var(--border_radius_sm);
+}`}
+		/>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text=".unstyled escape hatch" />
+		<p>
+			Add the <code>.unstyled</code>
+			<TomeLink slug="classes" hash="Builtin-classes">builtin class</TomeLink>
+			to opt out of decorative styling while keeping reset normalizations. Works for both decorative
+			containers and interactive elements like links, buttons, inputs, and summary.
+		</p>
+		<Code
+			lang="svelte"
+			content={`<a href="/home">styled link</a>
+<a href="/home" class="unstyled">unstyled link</a>`}
+		/>
+		<p>
+			<a href={resolve('/')}>styled link</a> vs
+			<a href={resolve('/')} class="unstyled">unstyled link</a>
+		</p>
+		<Code
+			lang="svelte"
+			content={`<button>styled button</button>
+<button class="unstyled">unstyled button</button>`}
+		/>
+		<p>
+			<button type="button">styled button</button>
+			<button type="button" class="unstyled">unstyled button</button>
+		</p>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="Document flow by default" />
+		<p>
+			Block elements get <code>margin-bottom</code> via <code>:not(:last-child)</code>, creating
+			natural vertical rhythm without trailing margins.
+		</p>
+		<Code
+			lang="css"
+			content={`:where(
+  :is(p, ul, ...[many others])
+    :not(:last-child):not(.unstyled)
+) {
+  margin-bottom: var(--flow_margin, var(--space_lg));
+}`}
+		/>
+		<p>
+			The <code>--flow_margin</code> variable is unset by default, falling back to
+			<code>var(--space_lg)</code>. Size composite classes like <code>.sm</code> and
+			<code>.lg</code> set <code>--flow_margin</code> to adjust vertical rhythm for all flow
+			elements and headings.
+		</p>
+		<p>
+			For elements not in the flow list, use the <code>.mb_flow</code> and <code>.mt_flow</code>
+			composite classes to get the same size-responsive spacing. Use <code>.mb_lg</code> when you
+			want a fixed value that ignores size composites.
+		</p>
+		<aside>
+			⚠️ The <code>:not(:last-child)</code> creates unfortunate edge cases by coupling structure to
+			style, including usage with Svelte's component-level CSS variables, because it adds a wrapper
+			div. Perhaps the better global optimum is to omit the last child exception? This would add
+			unwanted margin in many cases, but perhaps that's better overall; <code>mb_0</code> removes
+			it.
+		</aside>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="Flex containers reset flow margins" />
+		<p>
+			The <code>.row</code> layout composite resets margins on its direct children. Flow margins
+			make less sense in horizontal flex layout - for spacing prefer gap utilities like
+			<code>.gap_md</code> and <code>var(--gap_sm)</code> instead.
+		</p>
+		<Code
+			lang="css"
+			content={`:where(.row > *) {
+  margin: 0;
+}`}
+		/>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="Element-specific docs" />
+		<p>See the related docs for specifics:</p>
+		<ul>
+			<li><TomeLink slug="buttons" /> - button states, colors, variants</li>
+			<li><TomeLink slug="elements" /> - links, lists, tables, code, details</li>
+			<li><TomeLink slug="forms" /> - inputs, labels, checkboxes, selects</li>
+			<li><TomeLink slug="typography" /> - headings, fonts, text styles</li>
+		</ul>
+	</TomeSection>
+</TomeContent>

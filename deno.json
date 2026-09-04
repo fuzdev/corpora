@@ -1,0 +1,8 @@
+{
+	"tasks": {
+		"materialize": "deno run --allow-read --allow-write --allow-run=git scripts/materialize.ts",
+		"check": "deno run --allow-read --allow-write --allow-run=git scripts/materialize.ts --check",
+		"typecheck": "deno check scripts/materialize.ts scripts/lib/manifest.test.ts",
+		"test": "deno test --allow-read scripts/"
+	}
+}

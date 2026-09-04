@@ -1,0 +1,137 @@
+/**
+ * Bearer auth middleware for API token authentication.
+ *
+ * Bearer tokens are rejected when `Origin` or `Referer` headers are present —
+ * browsers must use cookie auth. This reduces attack surface: a stolen token
+ * cannot be replayed from a browser context (the browser adds `Origin`
+ * automatically). The discard is silent on the wire (anti-enumeration); in
+ * `DEV` only, the middleware adds an `X-Fuz-Auth-Debug:
+ * bearer_discarded_browser_context` response header so tests/tooling can tell
+ * "token discarded for browser context" apart from "no credential supplied"
+ * without weakening production.
+ *
+ * Token generation and hashing utilities live in `auth/api_token.ts`.
+ *
+ * @module
+ */
+
+import { DEV } from 'esm-env';
+import type { MiddlewareHandler } from 'hono';
+import type { Logger } from '@fuzdev/fuz_util/log.ts';
+
+import {
+	AUTH_API_TOKEN_ID_KEY,
+	ACCOUNT_ID_KEY,
+	CREDENTIAL_TYPE_KEY,
+	TOKEN_SCOPE_KEY
+} from '../hono_context.ts';
+import { parse_stored_token_scope, token_scope_full } from './token_scope.ts';
+import { query_validate_api_token } from './api_token_queries.ts';
+import type { QueryDeps } from '../db/query_deps.ts';
+import { get_client_ip } from '../http/client_ip.ts';
+import { is_browser_context } from '../http/origin.ts';
+
+/**
+ * Create middleware that authenticates via bearer token.
+ *
+ * Soft-fails for invalid, expired, or empty tokens — calls `next()` without
+ * setting account identity, letting downstream auth enforcement (the RPC
+ * dispatcher's pre-authorization / post-authorization auth gates or
+ * `require_auth`) return a consistent JSON-RPC or route-level error. This
+ * avoids leaking token-specific diagnostics
+ * (`invalid_token`, `account_not_found`) that could aid enumeration attacks,
+ * and ensures public actions are not blocked by bad credentials.
+ *
+ * Rejects bearer tokens when an `Origin` or `Referer` header is present —
+ * browsers must use cookie auth to reduce attack surface.
+ * Auth scheme matching is case-insensitive per RFC 7235.
+ * On success, sets `c.var.auth_account_id`, `CREDENTIAL_TYPE_KEY = 'api_token'`,
+ * and `AUTH_API_TOKEN_ID_KEY`. Skips when an account is already authenticated
+ * (e.g. by session middleware). Acting-actor resolution + `RequestContext`
+ * construction are deferred to the dispatcher's authorization phase.
+ *
+ * There is deliberately **no rate limit on this path**, and no 429 — every
+ * failure soft-fails to "no credential". An API token is 32 bytes of CSPRNG
+ * output resolved by a blake3 hash lookup, so guessing is bounded by entropy,
+ * not by throttling; a limiter here would buy nothing measurable while costing
+ * availability (the check/record has to precede the async lookup to close its
+ * own TOCTOU window, so concurrent requests bearing a *valid* token race each
+ * other into a 429). The Rust spine never had one here; this is the converged
+ * shape. See `docs/security.md` §Why bearer auth is not rate limited.
+ *
+ * @param deps - query dependencies (pool-level db for middleware)
+ * @param log - the logger instance
+ * @mutates Hono context - sets `ACCOUNT_ID_KEY`, `CREDENTIAL_TYPE_KEY`, and `AUTH_API_TOKEN_ID_KEY` on success
+ */
+export const create_bearer_auth_middleware = (deps: QueryDeps, log: Logger): MiddlewareHandler => {
+	return async (c, next): Promise<Response | void> => {
+		// Skip if an account is already authenticated (e.g. by session middleware)
+		if (c.get(ACCOUNT_ID_KEY) != null) {
+			await next();
+			return;
+		}
+
+		const auth_header = c.req.header('Authorization');
+		// Case-insensitive scheme matching per RFC 7235 §2.1 — defense-in-depth:
+		// without this, a `bearer` (lowercase) header silently bypasses token
+		// validation and browser-context rejection instead of being processed.
+
+		if (!auth_header || auth_header.slice(0, 7).toLowerCase() !== 'bearer ') {
+			await next();
+			return;
+		}
+
+		// Silently discard bearer tokens in browser context (`is_browser_context`
+		// — Origin or Referer present). Discards rather than returning 403 so that
+		// the RPC dispatcher can still handle public actions or fall through to
+		// cookie auth.
+		if (is_browser_context(c)) {
+			log.debug('bearer auth rejected: browser context (Origin/Referer present)');
+			// The discard is silent on the wire by design (a stolen-token probe
+			// gets an indistinguishable 401, not a "your token was dropped"
+			// signal — anti-enumeration). That same silence makes the contract
+			// easy to trip over in tests/tooling, so surface the reason in DEV
+			// only: production never emits it, so it leaks nothing to an attacker.
+			if (DEV) c.header('X-Fuz-Auth-Debug', 'bearer_discarded_browser_context');
+			await next();
+			return;
+		}
+
+		const raw_token = auth_header.slice(7);
+
+		// Empty token body — soft-fail (treat as "no credential").
+		// (The Fetch API trims 'Bearer ' to 'Bearer' which skips this middleware entirely,
+		// but raw HTTP clients may send 'Bearer ' with an empty token.)
+		if (!raw_token) {
+			await next();
+			return;
+		}
+
+		// `ip` feeds the token's `last_used_ip` bookkeeping, not a limiter.
+		const ip = get_client_ip(c);
+
+		const api_token = await query_validate_api_token(
+			{ ...deps, log },
+			raw_token,
+			ip,
+			c.var.pending_effects
+		);
+		if (!api_token) {
+			// Invalid or expired token — soft-fail, indistinguishable from
+			// sending no credential at all.
+			log.debug('bearer auth soft-fail: token not found or expired');
+			await next();
+			return;
+		}
+
+		c.set(ACCOUNT_ID_KEY, api_token.account_id);
+		c.set(CREDENTIAL_TYPE_KEY, 'api_token');
+		c.set(AUTH_API_TOKEN_ID_KEY, api_token.id);
+		// `query_validate_api_token` is fail-closed on an unreadable scope, so a
+		// token that got this far has a readable one. The `?? token_scope_full()`
+		// is unreachable defensive cover, not a fallback with meaning.
+		c.set(TOKEN_SCOPE_KEY, parse_stored_token_scope(api_token.scope) ?? token_scope_full());
+
+		await next();
+	};
+};

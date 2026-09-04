@@ -1,0 +1,14 @@
+<script lang="ts">
+	import TreePage from '@fuzdev/fuz_gitops/TreePage.svelte';
+	import { repos_context } from '@fuzdev/fuz_gitops/repo.svelte.ts';
+
+	// TODO ideally there would be one `PackagesTree` mounted by the layout
+
+	const { repo, repos } = repos_context.get();
+</script>
+
+<svelte:head>
+	<title>tree {repo.library.pkg_json.glyph} {repo.library.repo_name}</title>
+</svelte:head>
+
+<TreePage {repo} {repos} />

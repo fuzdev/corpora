@@ -1,0 +1,156 @@
+/**
+ * Shared initialization logic for all gitops tasks.
+ *
+ * Provides `get_gitops_ready()` which orchestrates:
+ * - Config loading and normalization
+ * - Repo resolution (local path discovery)
+ * - Branch switching and syncing
+ * - Dependency installation
+ *
+ * Used by: `gitops_sync.task.ts`, `gitops_analyze.task.ts`, `gitops_plan.task.ts`,
+ * `gitops_publish.task.ts`, and `gitops_validate.task.ts`.
+ *
+ * Accepts `git_ops` and `npm_ops` parameters to support testing via operations pattern
+ * (see `operations.ts` for dependency injection details).
+ *
+ * @module
+ */
+
+import { TaskError } from '@fuzdev/gro';
+import { styleText as st } from 'node:util';
+import { resolve, dirname } from 'node:path';
+import { print_path } from '@fuzdev/gro/paths.ts';
+import type { Logger } from '@fuzdev/fuz_util/log.ts';
+
+import { load_gitops_config, type GitopsConfig } from './gitops_config.ts';
+import { local_repos_load, local_repos_ensure, type LocalRepo } from './local_repo.ts';
+import { resolve_gitops_config } from './resolved_gitops_config.ts';
+import { DEFAULT_REPOS_DIR } from './paths.ts';
+import type { GitOperations, NpmOperations } from './operations.ts';
+
+export interface GetGitopsReadyOptions {
+	config: string;
+	dir?: string;
+	download: boolean;
+	log?: Logger;
+	git_ops?: GitOperations;
+	npm_ops?: NpmOperations;
+	parallel?: boolean;
+	concurrency?: number;
+	/**
+	 * Sync each repo's working tree to its configured branch before loading
+	 * (switch branch, pull, install). When `false`, repos load exactly as they
+	 * sit on disk — the safe default for read-only diagnostics. Defaults to `true`.
+	 */
+	sync?: boolean;
+	/** When syncing, tolerate uncommitted changes instead of throwing. Defaults to `false`. */
+	allow_dirty?: boolean;
+}
+
+/**
+ * Central initialization function for all gitops tasks.
+ *
+ * Initialization sequence:
+ * 1. Loads and normalizes config from `gitops.config.ts`
+ * 2. Resolves local repo paths (creates missing with `--download`)
+ * 3. If `sync`, switches branches and pulls latest changes (in parallel by default)
+ * 4. If `sync`, auto-installs deps if `package.json` changed during pull
+ *
+ * With `sync: false` (the default for read-only diagnostics), steps 3-4 are
+ * skipped and repos are loaded exactly as checked out — no branch switch, pull,
+ * install, or clean-workspace check.
+ *
+ * Priority for path resolution:
+ * - `dir` argument (explicit override)
+ * - Config `repos_dir` setting
+ * - `DEFAULT_REPOS_DIR` constant
+ *
+ * @param options.git_ops - for testing (defaults to real git operations)
+ * @param options.npm_ops - for testing (defaults to real npm operations)
+ * @param options.parallel - whether to load repos in parallel (default: true)
+ * @param options.concurrency - max concurrent repo loads (default: 5)
+ * @param options.sync - sync working trees before loading (default: true)
+ * @param options.allow_dirty - when syncing, tolerate uncommitted changes (default: false)
+ * @returns initialized config and fully loaded repos ready for operations
+ * @throws {TaskError} if config loading or repo resolution fails
+ */
+export const get_gitops_ready = async (
+	options: GetGitopsReadyOptions
+): Promise<{
+	config_path: string;
+	repos_dir: string;
+	gitops_config: GitopsConfig;
+	local_repos: Array<LocalRepo>;
+}> => {
+	const { config, dir, download, log, git_ops, npm_ops, parallel, concurrency, sync, allow_dirty } =
+		options;
+	const config_path = resolve(config);
+	const gitops_config = await import_gitops_config(config_path);
+
+	// Priority: explicit dir arg → config repos_dir → default (two dirs up from config)
+	const repos_dir = resolve_gitops_paths({
+		config,
+		dir,
+		config_repos_dir: gitops_config.repos_dir
+	}).repos_dir;
+
+	log?.info(
+		`resolving gitops configs on the filesystem in ${repos_dir}`,
+		gitops_config.repos.map((r) => r.repo_url)
+	);
+	const resolved_config = resolve_gitops_config(gitops_config, repos_dir);
+
+	const local_repo_paths = await local_repos_ensure({
+		resolved_config,
+		repos_dir,
+		gitops_config,
+		download,
+		log,
+		npm_ops
+	});
+
+	const local_repos = await local_repos_load({
+		local_repo_paths,
+		log,
+		git_ops,
+		npm_ops,
+		parallel,
+		concurrency,
+		sync,
+		allow_dirty
+	});
+
+	return { config_path, repos_dir, gitops_config, local_repos };
+};
+
+export interface ResolveGitopsPathsOptions {
+	config: string;
+	dir?: string;
+	config_repos_dir?: string;
+}
+
+export const resolve_gitops_paths = (
+	options: ResolveGitopsPathsOptions
+): { config_path: string; repos_dir: string } => {
+	const { config, dir, config_repos_dir } = options;
+	const config_path = resolve(config);
+	const config_dir = dirname(config_path);
+
+	// Priority: explicit dir arg → config repos_dir → default (parent of config dir)
+	const repos_dir =
+		dir !== undefined
+			? resolve(dir)
+			: config_repos_dir !== undefined
+				? resolve(config_dir, config_repos_dir)
+				: resolve(config_dir, DEFAULT_REPOS_DIR);
+
+	return { config_path, repos_dir };
+};
+
+export const import_gitops_config = async (config_path: string): Promise<GitopsConfig> => {
+	const gitops_config = await load_gitops_config(config_path);
+	if (!gitops_config) {
+		throw new TaskError(st('red', `No gitops config found at ${print_path(config_path)}`));
+	}
+	return gitops_config;
+};

@@ -1,0 +1,164 @@
+/* TODO a lot of this can be deleted or cleaned up, especially using the new Moss colors */
+:root:root:root.dark {
+	/* TODO force dark mode and remove these when Moss supports it */
+	--bg: hsl(var(--primary_hue), 63%, 11%);
+	--text_color: hsl(var(--primary_hue), 8%, 85%);
+	--text_color_dark: hsl(var(--primary_hue), 8%, 91%);
+	--link_color: var(--primary_text_color);
+	--button_color: var(--lighten_2);
+	--button_color_dark: var(--lighten_1);
+	--input_fill: var(--button_color);
+
+	/* Moss overrides */
+
+	/* TODO a lot of these are hacky, needs cleanup and better patterns for overrides in Moss */
+	--tint_hue: var(--hue_d);
+	--fill: hsl(var(--hue_d) 15% 50%);
+
+	--accent_hue: 210;
+	--primary_hue: 260;
+	--border_color: hsl(var(--primary_hue) 100% 98% / 0.2);
+	--primary_text_color: hsl(var(--primary_hue), 90%, 70%);
+	--accent_text_color: hsl(var(--accent_hue), 50%, 55%);
+	--light_text_color: hsl(var(--accent_hue), 80%, 60%);
+	/* TODO upstream `accent` stuff */
+	--accent_border_color: hsl(var(--accent_hue) 100% 58% / 0.5);
+	--accent_border_color_dark: hsl(var(--accent_hue) 100% 43% / 0.5);
+	--accent_border_color_darker: hsl(var(--accent_hue) 100% 28% / 0.5);
+
+	--primary_color: hsl(var(--primary_hue), 80%, 52%);
+	--primary_color_dark: hsl(var(--primary_hue), 80%, 36%);
+	--accent_color: hsl(var(--accent_hue), 80%, 48%);
+
+	--text_shadow: 1px 1px 15px #000, 1px 1px 7px #000, 1px 1px #000;
+}
+
+a:hover {
+	--text_color: var(--light_text_color);
+}
+a:active {
+	--text_color: var(--primary_text_color);
+}
+
+/* TODO probably upstream to Moss as `.pressable` */
+.clickable {
+	cursor: pointer;
+	transition: transform var(--duration_1) ease;
+}
+.clickable:focus {
+	transform: scale3d(var(--scale, 1.015), var(--scale, 1.015), var(--scale, 1.015)) skew(0.6deg);
+}
+.clickable:hover {
+	transform: scale3d(var(--scale, 1.03), var(--scale, 1.03), var(--scale, 1.03)) skew(0.6deg);
+}
+.clickable:active,
+.clickable.active {
+	transform: scale3d(var(--scale, 0.94), var(--scale, 0.94), var(--scale, 0.94));
+}
+
+button.big {
+	font-size: var(--font_size_xl);
+	padding: var(--space_md) var(--space_xl3);
+}
+
+code {
+	background-color: var(--lighten_2);
+}
+
+/* TODO this hack shouldn't be needed */
+.row label {
+	margin-bottom: 0 !important;
+}
+
+th,
+td {
+	padding: 0 var(--space_sm);
+}
+
+@keyframes highlighting {
+	from {
+		filter: drop-shadow(1px 1px 15px var(--lighten_5));
+	}
+	to {
+		filter: drop-shadow(1px 1px 25px var(--lighten_7));
+	}
+}
+
+header {
+	font-size: var(--font_size_xl);
+	text-align: center;
+	margin-bottom: var(--space_md);
+}
+
+/* TODO use Moss instead, "danger"? */
+.error {
+	--border_color: var(--red);
+	--border_color_dark: hsl(var(--red_hue), 60%, 61%);
+}
+
+/* TODO upstream this somehow, maybe as a variable */
+/* button {
+	background: linear-gradient(var(--button_color), var(--button_color_dark));
+} */
+
+/* cards include padding for layout so they can be seamlessly animated in/out (is janky with margin) */
+.card {
+	padding: var(--space_xl3) 0;
+	margin: 0;
+}
+
+/* TODO hacky but idk */
+.card .panel {
+	width: 100%;
+}
+
+:where(.section_title) {
+	padding: var(--space_lg);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--lighten_1);
+	width: 100%;
+	margin-bottom: var(--space_md);
+}
+
+.pane {
+	--shadow_color: var(--shadow_color_h);
+	box-shadow: var(--shadow_bottom_xl)
+		color-mix(in hsl, var(--shadow_color) var(--shadow_alpha_2), transparent);
+	border-radius: 0;
+}
+
+.section_body {
+	padding: var(--space_md);
+	width: 100%;
+}
+
+/* TODO replace with Moss */
+.accent {
+	--text_color: var(--accent_text_color);
+	--border_color: var(--accent_border_color);
+}
+.accent:focus {
+	--outline_color: var(--accent_border_color);
+}
+.accent:hover:not(:disabled) {
+	--border_color: var(--accent_border_color_dark);
+}
+.accent:active {
+	--border_color: var(--accent_border_color_darker);
+}
+
+.progress_bar {
+	position: var(--progress_bar_position, absolute);
+	left: var(--progress_bar_left, 0);
+	top: var(--progress_bar_top, calc(50% - var(--progress_bar_height, var(--space_md)) / 2));
+	width: calc(var(--progress_bar_percent, 0) * 100%);
+	height: var(--progress_bar_height, var(--space_md));
+	background-color: var(--progress_bar_bg, var(--lighten_4));
+	border-radius: var(--border_radius);
+	transition: var(
+		--progress_bar_transition,
+		width var(--progress_bar_duration, var(--duration_4)) ease
+	);
+}

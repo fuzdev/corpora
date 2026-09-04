@@ -1,0 +1,435 @@
+import { test, assert, describe } from 'vitest';
+
+import { modify_single_selector, modify_selector_group } from '$lib/css_ruleset_parser.ts';
+
+/**
+ * Tests for selector modification: modify_single_selector and modify_selector_group.
+ */
+describe('modify_single_selector', () => {
+	// Table-driven test cases: [selector, className, newClassName, state, pseudo, expected, description]
+	const cases: Array<[string, string, string, string, string, string, string]> = [
+		// Basic state modifications
+		[
+			'.menuitem',
+			'menuitem',
+			'hover\\:menuitem',
+			':hover',
+			'',
+			'.hover\\:menuitem:hover',
+			'simple selector'
+		],
+		[
+			'.menuitem .content',
+			'menuitem',
+			'hover\\:menuitem',
+			':hover',
+			'',
+			'.hover\\:menuitem:hover .content',
+			'descendant'
+		],
+		[
+			'.menuitem.selected',
+			'menuitem',
+			'hover\\:menuitem',
+			':hover',
+			'',
+			'.hover\\:menuitem.selected:hover',
+			'compound'
+		],
+		[
+			'.selectable:active',
+			'selectable',
+			'hover\\:selectable',
+			':hover',
+			'',
+			'.hover\\:selectable:active:hover',
+			'existing pseudo-class'
+		],
+		[
+			'.chevron::before',
+			'chevron',
+			'hover\\:chevron',
+			':hover',
+			'',
+			'.hover\\:chevron:hover::before',
+			'before pseudo-element'
+		],
+
+		// Pseudo-element only
+		['.box', 'box', 'before\\:box', '', '::before', '.before\\:box::before', 'add pseudo-element'],
+
+		// Element.class
+		['a.chip', 'chip', 'hover\\:chip', ':hover', '', 'a.hover\\:chip:hover', 'element.class'],
+
+		// Combinators
+		[
+			'.parent > .child',
+			'parent',
+			'hover\\:parent',
+			':hover',
+			'',
+			'.hover\\:parent:hover > .child',
+			'child combinator'
+		],
+		[
+			'.foo + .bar',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:hover + .bar',
+			'adjacent sibling'
+		],
+		[
+			'.foo ~ .bar',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:hover ~ .bar',
+			'general sibling'
+		],
+
+		// No match cases
+		['.other', 'menuitem', 'hover\\:menuitem', ':hover', '', '.other', 'no match'],
+		['.boxed', 'box', 'hover\\:box', ':hover', '', '.boxed', 'prefix no match'],
+		['.checkbox', 'box', 'hover\\:box', ':hover', '', '.checkbox', 'suffix no match'],
+
+		// Complex functional pseudo-classes
+		[
+			'.foo:not(:is(.a, .b))',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:not(:is(.a, .b)):hover',
+			'nested functional'
+		],
+		[
+			'.foo:where(.a, .b)',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:where(.a, .b):hover',
+			':where()'
+		],
+		[
+			'.parent:has(.child)',
+			'parent',
+			'hover\\:parent',
+			':hover',
+			'',
+			'.hover\\:parent:has(.child):hover',
+			':has()'
+		],
+
+		// With ID selectors
+		['.foo#bar', 'foo', 'hover\\:foo', ':hover', '', '.hover\\:foo#bar:hover', 'ID after class'],
+		[
+			'.foo#bar:focus',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo#bar:focus:hover',
+			'ID + pseudo'
+		],
+
+		// Attribute selectors
+		[
+			'.btn[disabled]',
+			'btn',
+			'hover\\:btn',
+			':hover',
+			'',
+			'.hover\\:btn[disabled]:hover',
+			'attribute'
+		],
+
+		// Class in descendant
+		[
+			'.container .box',
+			'box',
+			'hover\\:box',
+			':hover',
+			'',
+			'.container .hover\\:box:hover',
+			'class in descendant'
+		],
+
+		// Both state and pseudo-element
+		[
+			'.box',
+			'box',
+			'hover\\:before\\:box',
+			':hover',
+			'::before',
+			'.hover\\:before\\:box:hover::before',
+			'state + pseudo'
+		],
+
+		// Empty state/pseudo (just rename)
+		['.box', 'box', 'md\\:box', '', '', '.md\\:box', 'rename only'],
+
+		// Class with numbers/underscores
+		['.p_md', 'p_md', 'hover\\:p_md', ':hover', '', '.hover\\:p_md:hover', 'numbers'],
+		[
+			'.color_a_50',
+			'color_a_50',
+			'hover\\:color_a_50',
+			':hover',
+			'',
+			'.hover\\:color_a_50:hover',
+			'underscores and numbers'
+		],
+
+		// Multiple occurrences - only first instance is modified
+		['.foo.foo', 'foo', 'hover\\:foo', ':hover', '', '.hover\\:foo.foo:hover', 'duplicate class'],
+		[
+			'.foo .content .foo',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:hover .content .foo',
+			'class twice - descendant'
+		],
+		[
+			'.foo.bar.foo',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo.bar.foo:hover',
+			'class twice - compound'
+		],
+
+		// ::part() and ::slotted() pseudo-elements
+		[
+			'.component::part(button)',
+			'component',
+			'hover\\:component',
+			':hover',
+			'',
+			'.hover\\:component:hover::part(button)',
+			'::part()'
+		],
+		[
+			'.host::slotted(.item)',
+			'host',
+			'focus\\:host',
+			':focus',
+			'',
+			'.focus\\:host:focus::slotted(.item)',
+			'::slotted()'
+		],
+
+		// CSS2 single-colon pseudo-elements
+		[
+			'.foo:before',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:hover:before',
+			'CSS2 :before'
+		],
+		['.foo:after', 'foo', 'hover\\:foo', ':hover', '', '.hover\\:foo:hover:after', 'CSS2 :after'],
+		[
+			'.foo:first-letter',
+			'foo',
+			'hover\\:foo',
+			':hover',
+			'',
+			'.hover\\:foo:hover:first-letter',
+			'CSS2 :first-letter'
+		]
+	];
+
+	test.each(cases)(
+		'modifies "%s" (%s)',
+		(selector, className, newClassName, state, pseudo, expected, _desc) => {
+			assert.strictEqual(
+				modify_single_selector(selector, className, newClassName, state, pseudo),
+				expected
+			);
+		}
+	);
+});
+
+describe('modify_selector_group', () => {
+	test('handles grouped selectors', () => {
+		const result = modify_selector_group(
+			'.selectable.selected, .selectable:active',
+			'selectable',
+			'hover\\:selectable',
+			[':hover'],
+			''
+		);
+
+		assert.strictEqual(
+			result.selector,
+			'.hover\\:selectable.selected:hover,\n.hover\\:selectable:active:hover'
+		);
+		assert.isNull(result.skipped_modifiers);
+	});
+
+	test('handles functional pseudo-classes in group', () => {
+		const result = modify_selector_group(
+			'.plain:not(:hover), .plain:active',
+			'plain',
+			'focus\\:plain',
+			[':focus'],
+			''
+		);
+
+		assert.strictEqual(
+			result.selector,
+			'.focus\\:plain:not(:hover):focus,\n.focus\\:plain:active:focus'
+		);
+		assert.isNull(result.skipped_modifiers);
+	});
+
+	describe('per-selector conflict detection', () => {
+		test('applies state only to selectors without conflict', () => {
+			const result = modify_selector_group(
+				'.plain:hover, .plain:active',
+				'plain',
+				'hover\\:plain',
+				[':hover'],
+				''
+			);
+
+			assert.strictEqual(result.selector, '.hover\\:plain:hover,\n.hover\\:plain:active:hover');
+			assert.isNotNull(result.skipped_modifiers);
+			assert.lengthOf(result.skipped_modifiers, 1);
+			assert.strictEqual(result.skipped_modifiers[0]!.selector, '.plain:hover');
+			assert.strictEqual(result.skipped_modifiers[0]!.reason, 'state_conflict');
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':hover');
+		});
+
+		// Tests for state matching precision (avoid false positives with related states)
+		test('focus modifier applies to selector with :focus-within (no conflict)', () => {
+			const result = modify_selector_group(
+				'.btn:focus-within',
+				'btn',
+				'focus\\:btn',
+				[':focus'],
+				''
+			);
+			assert.strictEqual(result.selector, '.focus\\:btn:focus-within:focus');
+			assert.isNull(result.skipped_modifiers); // No conflict - different states!
+		});
+
+		test('focus modifier applies to selector with :focus-visible (no conflict)', () => {
+			const result = modify_selector_group(
+				'.btn:focus-visible',
+				'btn',
+				'focus\\:btn',
+				[':focus'],
+				''
+			);
+			assert.strictEqual(result.selector, '.focus\\:btn:focus-visible:focus');
+			assert.isNull(result.skipped_modifiers);
+		});
+
+		test('hover modifier not confused by attribute selector containing hover', () => {
+			const result = modify_selector_group(
+				'.btn[data-hover="true"]',
+				'btn',
+				'hover\\:btn',
+				[':hover'],
+				''
+			);
+			assert.strictEqual(result.selector, '.hover\\:btn[data-hover="true"]:hover');
+			assert.isNull(result.skipped_modifiers);
+		});
+
+		test('focus modifier skipped for selector with exact :focus match', () => {
+			const result = modify_selector_group('.btn:focus', 'btn', 'focus\\:btn', [':focus'], '');
+			assert.isNotNull(result.skipped_modifiers);
+			assert.lengthOf(result.skipped_modifiers, 1);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':focus');
+		});
+
+		test('focus modifier skipped for :focus in functional pseudo-class', () => {
+			const result = modify_selector_group(
+				'.btn:not(:focus)',
+				'btn',
+				'focus\\:btn',
+				[':focus'],
+				''
+			);
+			assert.isNotNull(result.skipped_modifiers);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':focus');
+		});
+
+		test('active modifier skipped for :active in :not(:active)', () => {
+			const result = modify_selector_group(
+				'.btn:not(:active)',
+				'btn',
+				'active\\:btn',
+				[':active'],
+				''
+			);
+			assert.isNotNull(result.skipped_modifiers);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':active');
+		});
+
+		test('hover modifier skipped for deeply nested :not(:is(:focus, :hover))', () => {
+			const result = modify_selector_group(
+				'.btn:not(:is(:focus, :hover))',
+				'btn',
+				'hover\\:btn',
+				[':hover'],
+				''
+			);
+			assert.isNotNull(result.skipped_modifiers);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':hover');
+		});
+
+		test('focus modifier skipped for :where(:focus, :active)', () => {
+			const result = modify_selector_group(
+				'.btn:where(:focus, :active)',
+				'btn',
+				'focus\\:btn',
+				[':focus'],
+				''
+			);
+			assert.isNotNull(result.skipped_modifiers);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':focus');
+		});
+
+		test('applies non-conflicting states when some conflict', () => {
+			const result = modify_selector_group(
+				'.selectable:hover',
+				'selectable',
+				'hover\\:focus\\:selectable',
+				[':hover', ':focus'],
+				''
+			);
+
+			assert.strictEqual(result.selector, '.hover\\:focus\\:selectable:hover:focus');
+			assert.isNotNull(result.skipped_modifiers);
+			assert.lengthOf(result.skipped_modifiers, 1);
+			assert.strictEqual(result.skipped_modifiers[0]!.conflicting_modifier, ':hover');
+		});
+
+		test('handles pseudo-element conflict per-selector', () => {
+			const result = modify_selector_group(
+				'.chevron, .chevron::before',
+				'chevron',
+				'before\\:chevron',
+				[],
+				'::before'
+			);
+
+			assert.strictEqual(result.selector, '.before\\:chevron::before,\n.before\\:chevron::before');
+			assert.isNotNull(result.skipped_modifiers);
+			assert.lengthOf(result.skipped_modifiers, 1);
+			assert.strictEqual(result.skipped_modifiers[0]!.selector, '.chevron::before');
+			assert.strictEqual(result.skipped_modifiers[0]!.reason, 'pseudo_element_conflict');
+		});
+	});
+});

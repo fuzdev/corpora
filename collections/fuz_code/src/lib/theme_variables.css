@@ -1,0 +1,20 @@
+/*
+
+CSS variables for syntax highlighting when not using fuz_css.
+Import this alongside theme.css if you're not using fuz_css.
+
+*/
+
+:root {
+	--text_color_5: light-dark(#8e7e71, #8e7e71);
+	--color_a_5: light-dark(#397fc6, #88b2dd);
+	--color_b_5: light-dark(#298e29, #66c266);
+	--color_c_5: light-dark(#d22d2d, #dd4040);
+	--color_d_5: light-dark(#6a40bf, #a68cd9);
+	--color_e_5: light-dark(#ad9625, #e2cb5a);
+	--color_f_5: light-dark(#6a3e1b, #b08b6d);
+	--color_g_5: light-dark(#e03e81, #ea7ba9);
+	--color_h_5: light-dark(#f24e0d, #f67c4c);
+	--color_i_5: light-dark(#19b3b3, #79ecec);
+	--color_j_5: light-dark(#2e9e82, #61d1b5);
+}

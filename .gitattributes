@@ -1,0 +1,7 @@
+# Corpus bytes are verbatim upstream. Never convert line endings anywhere in this
+# repo: a CRLF-converting checkout (e.g. core.autocrlf=true on Windows) would
+# silently rewrite the corpus and every consumer's numbers with it.
+* -text
+
+# Vendored upstream source: collapse in GitHub diffs, exclude from language stats.
+collections/** linguist-vendored

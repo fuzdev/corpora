@@ -1,0 +1,6 @@
+# The clone cache the materializer fetches pinned commits into (see scripts/lib/source.ts).
+.cache/
+
+# Local (per-machine, never shared)
+*.local
+*.local.*

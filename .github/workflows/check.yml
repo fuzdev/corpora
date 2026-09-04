@@ -1,0 +1,42 @@
+# One job on every push to main and every PR: the snapshot must reproduce from the
+# manifest. `deno task check` re-materializes every collection at its pinned commit —
+# fetched shallowly from each upstream, since this runner has no sibling checkouts —
+# and compares the result byte for byte with the committed `collections/`, plus the
+# recomputed lock entries with `lock.json`. That check is also the license gate: a
+# collection whose license file or declaration does not read as its manifest SPDX id
+# fails inside it. Typecheck + the unit tests run first.
+#
+# No scheduled run: a refresh re-pins every consumer's counts, so it is always a
+# deliberate PR, never a cron.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.9.5
+
+      - run: deno task typecheck
+      - run: deno task test
+      - run: deno task check

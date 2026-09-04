@@ -1,0 +1,61 @@
+<script lang="ts">
+	import type { Prompt } from './prompt.svelte.ts';
+	import type { PartUnion } from './part.svelte.ts';
+	import PartToggleButton from './PartToggleButton.svelte';
+	import PartRemoveButton from './PartRemoveButton.svelte';
+	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import PartContextmenu from './PartContextmenu.svelte';
+	import { get_part_type_icon } from './part_helpers.ts';
+
+	const {
+		part,
+		prompt
+	}: {
+		part: PartUnion;
+		prompt?: Prompt | undefined;
+	} = $props();
+
+	const total_chars = $derived(part.enabled ? part.length : 0);
+	// TODO bug here where the xml tag is not taken into account, so they add up to less than 100% as calculated
+	const percent = $derived(total_chars && prompt?.length ? (total_chars / prompt.length) * 100 : 0);
+
+	// TODO visuals are very basic
+</script>
+
+<PartContextmenu {part}>
+	<div
+		class="part-summary display:flex justify-content:space-between gap_xs2 font_size_sm position:relative panel"
+		class:dormant={!part.enabled}
+	>
+		<div class="progress-bar" style:width="{percent}%"></div>
+		<div class="flex:1 pl_sm py_xs3 ellipsis">
+			<Svg data={get_part_type_icon(part)} />&nbsp;
+			{part.name}
+			{part.content_preview}
+		</div>
+		<div class="controls display:flex gap_xs2">
+			<PartToggleButton {part} />
+			<PartRemoveButton {part} {prompt} />
+		</div>
+	</div>
+</PartContextmenu>
+
+<style>
+	.progress-bar {
+		position: absolute;
+		left: 0;
+		top: 0;
+		height: 100%;
+		background: var(--shade_50);
+		opacity: 10%;
+		transition: width var(--duration_3) ease-in-out;
+		border-radius: var(--border_radius_xs);
+	}
+
+	.controls {
+		visibility: hidden;
+	}
+	.part-summary:hover .controls {
+		visibility: visible;
+	}
+</style>

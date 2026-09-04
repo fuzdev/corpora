@@ -1,0 +1,111 @@
+<script lang="ts">
+	import PendingButton from '@fuzdev/fuz_ui/PendingButton.svelte';
+	import { slide } from 'svelte/transition';
+	import ConfirmButton from '@fuzdev/fuz_app/ui/ConfirmButton.svelte';
+
+	import { Chat } from './chat.svelte.ts';
+	import ChatThread from './ChatThread.svelte';
+	import { icon_add, icon_remove, icon_send } from '@fuzdev/fuz_ui/icons.ts';
+	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import { format_placeholder } from './helpers.ts';
+	import ContentEditor from './ContentEditor.svelte';
+	import ModelPickerDialog from './ModelPickerDialog.svelte';
+
+	const {
+		chat
+	}: {
+		chat: Chat;
+	} = $props();
+
+	let content_input: { focus: () => void } | undefined;
+	let pending = $state.raw(false); // TODO refactor request state
+
+	const send_to_all = async () => {
+		if (!count) return;
+		const parsed = chat.main_input.trim();
+		if (!parsed) {
+			content_input?.focus();
+			return;
+		}
+		chat.main_input = '';
+		pending = true;
+		await chat.send_to_all(parsed);
+		pending = false;
+	};
+
+	const count = $derived(chat.enabled_threads.length);
+
+	let show_model_picker = $state.raw(false);
+</script>
+
+<div class="column-fluid">
+	<div class="column-bg-1 p_sm">
+		<ContentEditor
+			bind:this={content_input}
+			bind:content={chat.main_input}
+			token_count={chat.main_input_token_count}
+			placeholder={format_placeholder(`to ${count}`)}
+			show_actions
+			show_stats
+			focus_key={chat.id}
+			bind:pending_element_to_focus_key={
+				() => chat.app.ui.pending_element_to_focus_key,
+				(v) => {
+					chat.app.ui.pending_element_to_focus_key = v;
+				}
+			}
+		>
+			<PendingButton
+				{pending}
+				onclick={send_to_all}
+				disabled={!count ? true : undefined}
+				class="plain"
+			>
+				<Svg data={icon_send} /> to {count}
+			</PendingButton>
+		</ContentEditor>
+
+		<div class="display:flex mt_lg">
+			<button type="button" class="plain" onclick={() => (show_model_picker = true)}>
+				<Svg data={icon_add} />&nbsp; add thread
+			</button>
+			<ConfirmButton
+				onconfirm={() => chat.remove_all_threads()}
+				position="right"
+				disabled={!count}
+				class="plain"
+			>
+				<Svg data={icon_remove} />&nbsp; remove all
+			</ConfirmButton>
+		</div>
+		<ul class="threads unstyled mt_lg">
+			{#each chat.threads as thread (thread.id)}
+				<li in:slide>
+					<ChatThread
+						{thread}
+						onsend={(input) => chat.send_to_thread(thread.id, input)}
+						turns_attrs={{ class: 'max-height-sm' }}
+						attrs={{ class: 'p_md' }}
+					/>
+				</li>
+			{/each}
+		</ul>
+	</div>
+</div>
+
+<ModelPickerDialog
+	bind:show={show_model_picker}
+	onpick={(model) => {
+		if (model) {
+			chat.add_thread(model); // TODO @many insert at an index via a range input
+		}
+	}}
+/>
+
+<style>
+	.threads {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+		gap: var(--space_md);
+	}
+</style>

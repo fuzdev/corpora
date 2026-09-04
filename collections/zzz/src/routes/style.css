@@ -1,0 +1,401 @@
+/* global stylesheet imported by `src/routes/+layout.svelte */
+
+/* TODO probably upstream serif headings to fuz_css */
+.heading,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+	font-family: 'DM Serif Display', Georgia, serif; /* copying svelte's homework and taste */
+}
+
+textarea {
+	scrollbar-width: thin; /* TODO maybe upstream? */
+	border-radius: var(--border_radius_xs2); /* TODO upstream? */
+}
+input[type='text'] {
+	border-radius: var(--border_radius_xs2); /* TODO upstream? */
+}
+
+/* TODO upstream */
+/* This is needed in places where glyphs may appear with non-sans fonts like headings. */
+.glyph {
+	font-family: var(--font_family_sans);
+	font-weight: 400;
+}
+
+.click-effect-scale:hover {
+	transform: scale(1.08);
+}
+.click-effect-scale:active {
+	transform: scale(1.14);
+}
+
+/* TODO refactor with `Glyph`*/
+.icon-xs {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 2ch;
+	margin-right: var(--space_xs);
+	text-align: center;
+}
+
+/* TODO upstream these? */
+input[type='checkbox'].sm {
+	height: var(--input_height);
+	min-height: var(--input_height);
+}
+input[type='checkbox'].sm:not(:hover)::before {
+	color: var(--text_70);
+}
+
+/* TODO upstream */
+input[type='checkbox'].plain {
+	height: var(--input_height);
+	min-height: var(--input_height);
+}
+input[type='checkbox'].plain:not(:hover) {
+	--input_fill: transparent;
+}
+
+/* TOOD upstream */
+input.input-xs {
+	--input_width_min: 80px;
+	max-width: 80px;
+}
+
+/* TODO upstream? something like it? */
+.dormant {
+	opacity: 0.6;
+}
+
+/* TODO upstream probably */
+.scrolled {
+	box-shadow: var(
+		--box_shadow,
+		var(--shadow_sm)
+			color-mix(
+				in hsl,
+				var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha_40),
+				transparent
+			)
+			inset
+	);
+}
+
+/* TODO @many upstream to Fuz? (not fuz_css right?) */
+.reorderable-item {
+	--reorderable_outline_style: dashed;
+	outline: var(--outline_width) var(--reorderable_outline_style) var(--outline_color);
+}
+.reorderable-item:hover {
+	outline-width: var(--border_width_1);
+	outline-color: var(--border_color_30);
+}
+.reorderable-item:active {
+	outline-width: var(--border_width_1);
+	outline-color: var(--outline_color);
+}
+.reorderable-item.dragging {
+	opacity: 40%;
+	outline-width: var(--border_width_2);
+}
+
+/* TODO @many upstream to Fuz? (not fuz_css right?) */
+[draggable='true'] {
+	cursor: grab;
+}
+[draggable='true']:active {
+	cursor: grabbing;
+}
+/* Drag indicator base style */
+.drag-over {
+	--drag_indicator_size: 4px;
+	--drag_indicator_color: var(--palette_a_50);
+	--drag_indicator_z_index: 100;
+	position: relative;
+}
+/* Common styles for all indicators */
+.drag-over-top::before,
+.drag-over-bottom::after,
+.drag-over-left::before,
+.drag-over-right::after {
+	content: '';
+	position: absolute;
+	background-color: var(--drag_indicator_color);
+	z-index: var(--drag_indicator_z_index);
+	pointer-events: none;
+}
+/* Top drag indicator */
+.drag-over-top::before {
+	top: calc(-1 * var(--drag_indicator_size) / 2);
+	left: 0;
+	right: 0;
+	height: var(--drag_indicator_size);
+}
+/* Bottom drag indicator */
+.drag-over-bottom::after {
+	bottom: calc(-1 * var(--drag_indicator_size) / 2);
+	left: 0;
+	right: 0;
+	height: var(--drag_indicator_size);
+}
+/* Left drag indicator */
+.drag-over-left::before {
+	left: calc(-1 * var(--drag_indicator_size) / 2);
+	top: 0;
+	bottom: 0;
+	width: var(--drag_indicator_size);
+}
+/* Right drag indicator */
+.drag-over-right::after {
+	right: calc(-1 * var(--drag_indicator_size) / 2);
+	top: 0;
+	bottom: 0;
+	width: var(--drag_indicator_size);
+}
+
+/* TODO ? */
+/* .drag-over-invalid::before {
+	background-color: var(--palette_c_50);
+} */
+
+/* TODO upstream */
+.column-fixed {
+	width: var(--column_width, var(--distance_sm));
+	min-width: var(--column_width, var(--distance_sm));
+	height: 100%;
+	overflow: auto;
+	scrollbar-width: thin;
+}
+.column-fluid {
+	flex: 1;
+	height: 100%;
+	min-width: var(--column_width, var(--distance_sm));
+	overflow: auto;
+	scrollbar-width: thin;
+}
+
+.column-bg-1 {
+	background-color: var(--shade_10);
+	min-height: 100%;
+}
+
+/* TODO upstream */
+.max-height-sm {
+	max-height: var(--distance_sm);
+	overflow: auto;
+	scrollbar-width: thin;
+}
+
+/* TODO upstream */
+/* Chip styles */
+.chip {
+	padding: var(--space_xs5) var(--space_sm);
+	background-color: var(--shade_10);
+	border-radius: var(--border_radius_xs);
+	display: inline-flex;
+	align-items: center;
+}
+.chip:not(.plain) {
+	border: var(--border_width_1) solid transparent;
+}
+a.chip {
+	font-weight: 700;
+}
+/* Chip color variants */
+.chip.palette_a {
+	color: var(--palette_a_50);
+	background-color: color-mix(in hsl, var(--palette_a_40) 12%, transparent);
+}
+.chip.palette_b {
+	color: var(--palette_b_50);
+	background-color: color-mix(in hsl, var(--palette_b_40) 12%, transparent);
+}
+.chip.palette_c {
+	color: var(--palette_c_50);
+	background-color: color-mix(in hsl, var(--palette_c_40) 12%, transparent);
+}
+.chip.palette_d {
+	color: var(--palette_d_50);
+	background-color: color-mix(in hsl, var(--palette_d_40) 12%, transparent);
+}
+.chip.palette_e {
+	color: var(--palette_e_50);
+	background-color: color-mix(in hsl, var(--palette_e_40) 12%, transparent);
+}
+.chip.palette_f {
+	color: var(--palette_f_50);
+	background-color: color-mix(in hsl, var(--palette_f_40) 12%, transparent);
+}
+.chip.palette_g {
+	color: var(--palette_g_50);
+	background-color: color-mix(in hsl, var(--palette_g_40) 12%, transparent);
+}
+.chip.palette_h {
+	color: var(--palette_h_50);
+	background-color: color-mix(in hsl, var(--palette_h_40) 12%, transparent);
+}
+.chip.palette_i {
+	color: var(--palette_i_50);
+	background-color: color-mix(in hsl, var(--palette_i_40) 12%, transparent);
+}
+.chip.palette_a:not(.plain) {
+	border-color: var(--palette_a_50);
+}
+.chip.palette_b:not(.plain) {
+	border-color: var(--palette_b_50);
+}
+.chip.palette_c:not(.plain) {
+	border-color: var(--palette_c_50);
+}
+.chip.palette_d:not(.plain) {
+	border-color: var(--palette_d_50);
+}
+.chip.palette_e:not(.plain) {
+	border-color: var(--palette_e_50);
+}
+.chip.palette_f:not(.plain) {
+	border-color: var(--palette_f_50);
+}
+.chip.palette_g:not(.plain) {
+	border-color: var(--palette_g_50);
+}
+.chip.palette_h:not(.plain) {
+	border-color: var(--palette_h_50);
+}
+.chip.palette_i:not(.plain) {
+	border-color: var(--palette_i_50);
+}
+
+/* TODO maybe upstream? is weird but has a consistency  */
+.height-input-height {
+	height: var(--input_height);
+}
+
+/* TODO remove after switching to svg icons */
+.icon-button {
+	font-weight: 400;
+}
+
+.listitem {
+	width: 100%;
+	border-radius: 0;
+	word-break: break-all;
+	justify-content: space-between;
+	padding: 0 var(--space_xs);
+	box-shadow: none;
+	border: var(--border_width_1) solid transparent;
+	font-weight: 400;
+	font-size: var(--font_size_sm);
+	text-align: left;
+}
+.listitem:hover {
+	--button_text_color: var(--text_80);
+}
+.listitem.selected {
+	--button_text_color: var(--text_90);
+	--button_fill: var(--shade_20);
+	--button_fill_hover: var(--shade_10);
+	--button_fill_active: var(--shade_20);
+	--button_border_color: var(--palette_a_50);
+}
+
+/* Column sections use padding instead of margin so they can transition in/out without layout jank. */
+.column-section {
+	padding: var(--space_sm) var(--space_sm) var(--space_xl7);
+	margin-bottom: 0;
+}
+
+/* TODO this is a hack because .plain doesn't compose with .selectable and .deselectable in fuz_css */
+.plain.selectable.deselectable:not(.menuitem) {
+	border: none;
+	color: var(--text_color);
+}
+.plain.selectable.deselectable:not(.menuitem).selected {
+	background-color: transparent;
+	box-shadow: var(--shadow_inset_top_xs)
+		color-mix(
+			in hsl,
+			var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha, var(--shadow_alpha_30)),
+			transparent
+		);
+}
+.plain.selectable.deselectable:not(.menuitem).selected:hover {
+	box-shadow: var(--shadow_inset_top_sm)
+		color-mix(
+			in hsl,
+			var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha, var(--shadow_alpha_30)),
+			transparent
+		);
+}
+.plain.selectable.deselectable:not(.menuitem).selected:active {
+	box-shadow: var(--shadow_inset_bottom_xs)
+		color-mix(
+			in hsl,
+			var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha, var(--shadow_alpha_30)),
+			transparent
+		);
+}
+
+/* TODO upstream but maybe not exactly like this, fixes the contextmenu active state */
+.plain.selectable.deselectable.menuitem.selected:active {
+	background-color: var(--shade_30);
+}
+
+/* TODO hacky for buttons as menuitems, fix upstream, need to think about composability of the classes if it even makes sense */
+button.menuitem.plain {
+	box-shadow: none !important;
+}
+/* TODO also hacky */
+button.menuitem.selected.plain {
+	--button_text_color: var(--text_80);
+}
+button.menuitem.plain:hover:not(.selected) {
+	background-color: var(--shade_60);
+}
+/* TODO hacky */
+button.menuitem[disabled] {
+	cursor: default;
+}
+
+/* TODO hacky, is like `.pane` but softer and without the semantics for dialogs, maybe these styles should replace .pane upstream? */
+.floating {
+	--shadow_alpha: 14%;
+	width: 100%;
+	box-shadow:
+		var(--shadow_bottom_xl)
+			color-mix(
+				in hsl,
+				var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha, var(--shadow_alpha_30)),
+				transparent
+			),
+		var(--shadow_bottom_xs)
+			color-mix(
+				in hsl,
+				var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha, var(--shadow_alpha_30)),
+				transparent
+			);
+}
+
+/* TODO upstream? */
+pre code {
+	padding: var(--space_xs) var(--space_md);
+}
+
+/* TODO upstream */
+[role='button'] {
+	outline-color: var(--outline_color);
+}
+
+/* shared link style: bold normally, plain when selected */
+.selected-plain {
+	font-weight: 600;
+}
+.selected-plain.selected {
+	font-weight: 400;
+	text-decoration: none;
+}

@@ -1,0 +1,779 @@
+# auth/
+
+> Auth domain: identity, crypto, schema + DDL, queries, middleware, routes,
+> RPC actions, cleanup.
+
+For design rationale and threat model: ../../../docs/identity.md and
+../../../docs/security.md. For server assembly and middleware ordering:
+../../../docs/architecture.md and the root ../../../CLAUDE.md. For migration
+runner contract + operator recipes: ../../../docs/migrations.md. For
+workspace-wide DI vocabulary: Skill(fuz-stack) §Dependency Injection.
+
+**CLAUDE.md is a map; TSDoc is the detail.** Per-symbol semantics
+(parameters, error shapes, invariants, fire-and-forget contracts) live on
+TSDoc next to the code. This file orients you across the ~60 modules and
+documents the cross-cutting invariants that don't fit on any single symbol.
+
+## AppDeps split
+
+- **Capabilities** — `AppDeps` — stateless, injectable per env: `read_secure_file` (hardened bootstrap-token read), `delete_file`, `keyring`, `password`, `db`, `log`, `audit`.
+- **Route caps** — `RouteFactoryDeps` — `Omit<AppDeps, 'db'>`; handlers get `db` via `RouteContext`.
+- **Action caps** — `ActionFactoryDeps` (`auth/deps.ts`) — the `{log, audit}` shape action factories take; `RouteFactoryDeps`/`AppDeps` satisfy it structurally (role-grant-offer adds `notification_sender?`). The two pure-read actor factories (`actor_lookup`/`actor_search`) take only `{log: Logger}`.
+- **Parameters** — `*Options` — static startup values, per-factory.
+- **Runtime state** — inline ref — mutable values: `bootstrap_status`, `DaemonTokenState`. NOT in deps or options.
+
+`audit: AuditEmitter` is the bound emitter built once at backend assembly by
+the consumer's `audit_factory` callback over `create_audit_emitter`; closes
+over the pool so rows persist when request transactions roll back. See root
+../../../CLAUDE.md §AppDeps Vocabulary for the workspace-wide split.
+
+## Module map
+
+### Crypto primitives (pure, I/O-free)
+
+- `auth/keyring.ts` — `Keyring`, `create_keyring`, `validate_keyring`, `create_validated_keyring`.
+- `auth/session_cookie.ts` — `SessionOptions<T>`, `parse_session`, `process_session_cookie` (`'none' | 'clear'` — no refresh action; the 30-day lifetime is an absolute cap signed once at mint), `create_session_config`, `fuz_session_config`, `SESSION_AGE_MAX`.
+- `auth/password.ts` — `Password`, `PasswordProvided`, `PasswordHashDeps`, `PASSWORD_LENGTH_MIN` (12, OWASP), `PASSWORD_LENGTH_MAX` (300).
+- `auth/password_argon2.ts` — `hash_password`, `verify_password`, `verify_dummy`, `argon2_password_deps`.
+- `auth/api_token.ts` — `API_TOKEN_PREFIX` (`secret_fuz_token_`), `hash_api_token`, `generate_api_token`.
+- `auth/daemon_token.ts` — `DaemonToken`, `DAEMON_TOKEN_HEADER` (`X-Daemon-Token`), `generate_daemon_token`, `validate_daemon_token`, `DaemonTokenState`.
+- `auth/bootstrap_account.ts` — `bootstrap_account` (one-shot, `bootstrap_lock`-protected).
+
+Cross-cutting notes that don't live on any single symbol:
+
+- **Password schemas are split deliberately.** `Password` (length min 12)
+  gates creation + change; `PasswordProvided` (length min 1) gates
+  login/verify so tightening creation rules doesn't lock out existing
+  accounts. Both carry `sensitivity: 'secret'` meta.
+- **Argon2id parameters** track OWASP guidance (`memoryCost: 19456`,
+  `timeCost: 2`, `parallelism: 1`); `verify_dummy` equalizes timing on
+  account-lookup miss.
+- **API token format** `secret_fuz_token_<base64url>` — prefix enables
+  secret scanning (GitHub, TruffleHog); public `id` is `tok_<12 chars>`;
+  storage key is the blake3 hash. Raw token returned once.
+
+### Schemas, types, DDL
+
+Convention — `*_schema.ts` is Zod-only; `*_ddl.ts` holds DDL strings.
+
+- `auth/account_schema.ts` — `Account`, `Actor`, `RoleGrant`, `AuthSession`, `ApiToken` + client-safe JSON shapes.
+- `auth/role_schema.ts` — `RoleName`, `RoleSpec`, `ROLE_KEEPER`, `ROLE_ADMIN`, `create_role_schema`, `builtin_role_specs_by_name`, `role_has_grant_path`, `list_roles_with_grant_path`.
+- `auth/scope_kind_schema.ts` — `ScopeKindName`, `create_scope_kind_schema` (open registry, no builtins).
+- `auth/credential_type_schema.ts` — `CredentialTypeName`, `CREDENTIAL_TYPE_SESSION` / `_API_TOKEN` / `_DAEMON_TOKEN`, `create_credential_type_schema`.
+- `auth/grant_path_schema.ts` — `GrantPathName`, `GRANT_PATH_ADMIN` / `_SELF_SERVICE` / `_SYSTEM` / `_BOOTSTRAP`, `create_grant_path_schema`.
+- `auth/token_lifetime.ts` — the temporal axis of a minted token: `TokenLifetimeInput` (required union on `account_token_create` — `{kind:'eternal'}` or `{kind:'ttl', days}`), `token_lifetime_to_expires_at`, `TOKEN_TTL_DAYS_MAX`. No default — `expires_at IS NULL` always means "deliberately eternal".
+- `auth/token_scope.ts` — per-credential authority narrowing stored on `api_token.scope`: `TokenScope` / `TokenScopeInput` + constructors, `parse_stored_token_scope` (fail-closed), `token_scope_admits_method` / `_non_rpc`, and the `<section>:<id>` capability vocabulary `RouteAuth.required_scope` is written in (`parse_token_scope_capability`, `token_scope_admits_capability`, `token_scope_denied_body`, `TOKEN_SURFACES`). Not an open registry — see ../../../docs/security.md §Token scoping for why the identifier half is deliberately unregistered.
+- `auth/auth_ddl.ts` — `CREATE TABLE` / index / seed strings for the core identity tables.
+- `auth/audit_log_schema.ts` — `AUDIT_EVENT_TYPES` (27 builtins), `AuditEventType` / `AuditEventTypeName`, `audit_metadata_schemas`, `AuditLogEvent`, `AuditLogInput`, `AuditLogConfig`, `create_audit_log_config`.
+- `auth/audit_log_ddl.ts` — `audit_log` table DDL with `seq BIGSERIAL` for cursor-based gap fill (BIGSERIAL converges with the Rust spine; `create_db` registers a `pg.types` int8 parser so `seq` still reads as a JS number).
+- `auth/invite_schema.ts` — `Invite`, `CreateInviteInput`.
+- `auth/app_settings_schema.ts` — `AppSettings`, `UpdateAppSettingsInput` (single-row via `CHECK (id = 1)`).
+- `auth/role_grant_offer_schema.ts` — `RoleGrantOffer`, `RoleGrantOfferJson`, `to_role_grant_offer_json`, scope-sentinel constants.
+- `auth/role_grant_offer_ddl.ts` — `role_grant_offer` table + indexes + `ROLE_GRANT_OFFER_SCOPE_SENTINEL_UUID` / `_GLOBAL_TOKEN` + `ROLE_GRANT_OFFER_COLUMNS` and the shared `ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT` CTE tail (homed here per the placement rule in `db/sql_columns.ts`).
+- `auth/role_grant_offer_notifications.ts` — six WS notification specs for the consentful-grant lifecycle.
+
+### Queries
+
+All take `deps: QueryDeps = {db}` first; `query_validate_api_token` adds `log`.
+
+- `auth/account_queries.ts` — account CRUD, actor resolution, password update with verify-write race guard, paged `query_admin_account_list`.
+- `auth/actor_lookup_queries.ts` — batched `actor` ⨝ `account` for the labels arc.
+- `auth/actor_search_queries.ts` — case-insensitive prefix search on `actor.name`, scope-filtered when not admin.
+- `auth/role_grant_queries.ts` — idempotent create, IDOR-guarded revoke (with in-tx supersede), scope-aware lookup, role/account predicates, `query_role_grant_revoke_for_scope` parent-scope cascade.
+- `auth/role_grant_offer_queries.ts` — offer create/decline/retract/list/history/sweep, atomic `query_accept_offer` with sibling supersede; error classes `RoleGrantOfferSelfTargetError` / `_AlreadyTerminalError` / `_ExpiredError` / `_NotFoundError` / `_ActorAccountMismatchError` / `_ActorMismatchError`.
+- `auth/session_queries.ts` — server-side sessions (blake3-hashed), `query_session_revoke_by_hash_unscoped` (logout only), `query_session_enforce_limit` (transaction-required). No touch/renewal query — `expires_at` is an absolute cap set at mint (`AUTH_SESSION_LIFETIME_MS`).
+- `auth/api_token_queries.ts` — token validation with fire-and-forget usage tracking, IDOR-guarded revoke, `query_api_token_enforce_limit` (transaction-required).
+- `auth/invite_queries.ts` — invite create/find/claim/list/delete; `query_invite_claim_unscoped` (scoping enforced upstream by `_find_unclaimed_match_for_update`, which runs inside the signup tx with `FOR UPDATE` so find + claim are atomic).
+- `auth/app_settings_queries.ts` — load/update for the single-row settings table.
+- `auth/audit_log_queries.ts` — `query_audit_log` (in-tx insert), `_list` / `_list_with_usernames` / `_list_role_grant_history` / `_cleanup_before`, drift counters (`get_audit_metadata_validation_failures` / `get_audit_unknown_event_type_failures`).
+
+**Named projections** (rationale + helpers: ../../../docs/architecture.md
+§Query Modules). The consts on this side: `ACCOUNT_COLUMNS` + `ACTOR_COLUMNS`
+(`account_queries.ts` owns both tables; its admin listing derives an
+active-grant subset from `ROLE_GRANT_COLUMNS`), `AUTH_SESSION_COLUMNS`,
+`INVITE_COLUMNS`, `AUDIT_LOG_COLUMNS` (shared with `db/cell_audit_queries.ts`),
+`API_TOKEN_COLUMNS` (the client listing derives `minus token_hash`),
+`ROLE_GRANT_COLUMNS`, `ROLE_GRANT_OFFER_COLUMNS` (in `role_grant_offer_ddl.ts`),
+`APP_SETTINGS_COLUMNS` (reads omit the constant singleton `id`; the one const
+without a `satisfies keyof Row` clause, since `AppSettings` deliberately
+doesn't carry `id`). Module direction: `role_grant_offer_queries.ts` imports
+`role_grant_queries.ts` (the accept path writes through
+`query_create_role_grant` / `query_role_grant_by_id`) and not the reverse —
+the revoke cascades in `role_grant_queries.ts` still _write_ offer rows, which
+is exactly why the offer const and the shared CTE tail live in the DDL module.
+Every const is pinned to the live schema by
+`src/test/db/column_projections.db.test.ts`. The Rust `fuz_auth` twin carries
+the same nine consts (names and order), projected through
+`fuz_db::qualify_columns` / `omit_columns`, decoded with compile-time
+name→index (`fuz_db::col!`), and pinned by its own
+`tests/columns.rs` registry; its narrow purpose rows (`AccountRow` is an
+`id, username` pair) keep private per-shape lists checked as subsets of the
+table const.
+
+`_unscoped` suffix on `query_session_revoke_by_hash_unscoped` and
+`query_invite_claim_unscoped` is the safety signal: SQL only checks row state,
+caller is responsible for scoping. Production scoping for invites is enforced
+upstream in `auth/signup_routes.ts` via `query_invite_find_unclaimed_match_for_update`
+(SELECT … FOR UPDATE inside the signup tx — find + claim atomic on the row lock).
+
+### Audit emitter
+
+`auth/audit_emitter.ts` defines the `AuditEmitter` capability that lives on
+`AppDeps.audit`. Built once at backend assembly via the consumer's
+`audit_factory` callback over `create_audit_emitter`; closes over the pool +
+its registered listeners + optional `AuditLogConfig`. Six methods:
+
+- `emit(ctx, input)` — fire-and-forget pool write, pushes to `ctx.pending_effects`
+- `emit_role_grant_target(ctx, auth, input)` — lifts `actor_id` / `account_id` / `ip` boilerplate for role-grant-shape events
+- `emit_pool(input)` — awaitable pool write for code paths without `pending_effects` (cleanup sweeps)
+- `notify(event)` — fan out an already-written row to listeners (used by in-tx audit batches like `query_accept_offer.audit_events`)
+- `add_listener(listener)` — append-only listener registration (twin of Rust `fuz_auth` `AuditEmitter::add_listener`)
+- `listener_count()` — registered-listener count, for tests / diagnostics
+
+Listeners are closure-private and append-only. `create_app_server` registers
+the audit-log SSE listener and per-endpoint WS auth guards / logout closers via
+`add_listener` so SSE + WS fan-out compose on top of the consumer's
+`on_audit_event` callback without shallow-copying `AppDeps`. `notify` iterates a
+snapshot so a listener registered mid-fan-out fires only on the next event
+(converges with the Rust twin's cloned vec).
+
+**Drift counters** (`auth/audit_log_queries.ts`) — `audit_metadata_validation_failures`
+and `audit_unknown_event_type_failures` are process-wide, fail-open
+(write the row anyway). Independent in implementation; under the factory
+they track the same config. Sample via `get_*`; `reset_*` are test-only.
+
+### Routes
+
+- `auth/account_routes.ts` — `POST /login` / `/logout` / `/password`, `GET /verify` (nginx `auth_request` shim), `GET /api/account/status`. Constants: `DEFAULT_MAX_SESSIONS = 5`, `DEFAULT_MAX_TOKENS = 10`, `DEFAULT_LOGIN_FAIL_FLOOR_MS = 250`, `DEFAULT_LOGIN_FAIL_JITTER_MS = 25`.
+- `auth/bootstrap_routes.ts` — `POST /bootstrap` + `check_bootstrap_status`; `BootstrapStatus` runtime ref.
+- `auth/signup_routes.ts` — `POST /signup` (open or invite-gated).
+- `auth/audit_log_routes.ts` — optional `GET /audit/stream` (SSE); list/history are on the RPC surface.
+- `auth/auth_guard_resolver.ts` — `fuz_auth_guard_resolver` injected into `apply_route_specs` so the framework stays auth-agnostic. Maps each `RouteAuth` axis to a guard and is the single site every route spec traverses, so it also carries the two invariants the schema can't (a `required_scope` that isn't a well-formed capability, and one on an unrestricted route).
+
+**Hono-free route shapes.** Each cookie/SSE-coupled route module has a sibling
+`*_route_schema.ts` (`account_route_schema.ts`, `signup_route_schema.ts`,
+`audit_log_route_schema.ts`, `bootstrap_route_schema.ts`) holding the I/O
+schemas **and** the route _shapes_ (`Omit<RouteSpec, 'handler'>` —
+method/path/auth/io/errors, via `create_*_route_shapes(options)` or a static
+`*_route_shape` const). The `create_*_route_specs` factories spread a shape and
+attach the live (hono-coupled) handler; a cross-process surface builder spreads
+the same shape with a stub handler (surface generation never runs handlers).
+Single source of truth — the shape can't drift between the live route and the
+attack surface — and a backend-spawning consumer assembling its surface imports
+the shapes without dragging `hono/cookie` / `hono/streaming` (and the optional
+`hono` peer) onto a Rust-only cross-process suite. Shared route-limit constants
+(`DEFAULT_MAX_SESSIONS` / `_TOKENS`) live in `account_route_schema.ts` for the
+same reason (the RPC `account_actions` reads `DEFAULT_MAX_TOKENS`).
+
+**`POST /login` timing floor.** Login 401s are floored to
+`DEFAULT_LOGIN_FAIL_FLOOR_MS` (250ms) + uniform jitter (±25ms) via
+`Promise.all(work, setTimeout)` so observed time is `max(work, delay)` and
+found-wrong-password and not-found paths converge. 429 stays fast by design;
+`verify_dummy` equalizes Argon2id timing on not-found.
+
+**`POST /password` revokes everything.** Revokes all sessions + all API
+tokens (force re-auth everywhere), then clears the session cookie. Declares
+`credential_types: ['session']` (see ../../../docs/security.md
+§Credential-channel gating).
+
+REST-only post RPC migration: `/login`, `/logout`, `/password`, `/signup`,
+`/bootstrap`, `/verify` (empty-body shim), optional `/audit/stream`.
+Everything else listed under §RPC action surfaces.
+
+### Middleware
+
+- `auth/middleware.ts` — `create_auth_middleware_specs(deps, options)` assembles `[origin, session, request_context, bearer_auth]` + optional `daemon_token`.
+- `auth/request_context.ts` — `RequestContext`, `resolve_acting_actor`, `build_request_context`, predicates (`has_role`, `has_scoped_role`, `has_any_scoped_role`), guards (`require_auth`, `require_role`, `require_credential_types`, `require_token_scope`), `token_scope_surface_denial` (the direct-call form, for surfaces that aren't route specs), `refresh_role_grants`.
+- `auth/session_middleware.ts` — `process_session_cookie` integration, `create_session_and_set_cookie` (shared by login / signup / bootstrap).
+- `auth/bearer_auth.ts` — soft-fail bearer middleware; rejects when `Origin` or `Referer` present (browser context).
+- `auth/daemon_token_middleware.ts` — `create_daemon_token_middleware(state, deps, log)` — the credential **consumer** only (soft-fail validation, keeper account resolution). The producer (`write_daemon_token` / `start_daemon_token_rotation`) lives in `testing/daemon_token_rotation.ts` behind the dev-env guard — no production assembly mints daemon tokens, mirroring the Rust spine's `fuz_testing`-confined producer. Soft-fails — discards the credential (pass-through, no own 401/503) on **every** non-success path: browser context (`Origin`/`Referer` present), malformed/invalid token, and valid-token-but-no-keeper all `next()` through to the dispatcher's `credential_type_required` (403) gate, mirroring the bearer guard and the Rust spine's `resolve.rs`. Daemon tokens are loopback-only, so browser context never arises in practice — the discard is defense-in-depth.
+
+See root ../../../CLAUDE.md §Middleware Ordering for canonical assembly
+order. The auth-specific invariants are described below in §Cross-cutting
+invariants.
+
+### Cell layer
+
+The cell content primitive's wire schemas, RPC handlers, and authz live
+here; the schema + queries live in `db/` (see `db/CLAUDE.md` §Cell layer).
+Generic-only — no app vocabulary on the wire; per-kind shape is the
+consumer's `validate_data` pass-through callback on `CellActionDeps`.
+
+- `auth/cell_data_schema.ts` — `CellData` base (`z.looseObject` with
+  optional `label` / `summary`); per-kind sub-API extends it. **`kind` is
+  not in `data`** — it is a top-level `cell.kind` column (peer to
+  `visibility` / `path`), the write-once capability/identity axis; a stray
+  `kind` inside `data` is rejected fail-loud (`ERROR_CELL_KIND_IN_DATA`).
+- `auth/cell_action_specs.ts` — `CellVisibility` enum, `CellPath` brand,
+  `CellJson`, the generic verb specs (`cell_create / get / update /
+delete / list / clone / moderate`), error reasons, and `all_cell_action_specs`
+  (spreads in the grant / field / item / audit registries so codegen + UI
+  see one cell namespace). `CellJson` has no hub axis; `path` is global. The
+  directory-tree columns `parent_id` / `root_id` (containment, immutable in v1)
+  - the `moderation` lifecycle marker (`pending` / `approved` / `rejected`) are
+    top-level `CellJson` keys, peer to `visibility` (set by the create authorizer's
+    verdict + the `cell_moderate` verb, never in `data`).
+- `auth/cell_grant_action_specs.ts` / `cell_field_action_specs.ts` /
+  `cell_item_action_specs.ts` / `cell_audit_action_specs.ts` — the
+  `cell_grant_*` (3) / `cell_field_*` (3) / `cell_item_*` (4) /
+  `cell_audit_list` (1) specs + their wire JSON shapes.
+- `auth/cell_authorize.ts` — pure predicates over
+  `(RequestContext | null, CellRow, grants)`: `can_view_cell`,
+  `can_edit_cell`, and `can_manage_cell` (= admin ‖ owner, where owner is
+  the `cell.created_by` actor field). The manage tier gates visibility
+  writes, all grant management (`cell_grant_create` / `_list` /
+  `_revoke`), and the per-cell audit timeline (`cell_audit_list`, D14 —
+  it surfaces who-touched-the-cell); it is not a grant level and not
+  delegable. Editor-grant holders edit content + relations but cannot
+  manage grants or read the audit timeline. NULL
+  `created_by` (system origin) is admin-only for edit/manage (explicit
+  defense-in-depth).
+- `auth/cell_relation_visibility.ts` — `filter_visible_target_ids(deps,
+auth, ids)`: batched strict relation-read filter. Every relation read —
+  the `cell_get` bundle, **forward and reverse** `cell_field_list` /
+  `cell_item_list`, and the deep-clone walk (children bulk-loaded via
+  `query_cell_load_many`) — drops edges whose far endpoint the caller can't
+  view, so a viewer of a parent can't enumerate private linked cells by id.
+  Two queries for the whole id-set (avoids the N+1 of a per-row check). The
+  reverse list verbs additionally cap the fetch by the wire `limit` so a
+  heavily inbound-linked target can't force an unbounded scan.
+- `auth/cell_actions.ts` — `create_cell_actions(deps)`, the generic
+  handlers. `cell_create` stamps `created_by` + writes the top-level `kind`
+  column; `path` writes are admin-only. It also resolves the directory tree:
+  `parent_id` (wire) → the governing `root_id` (`parent.root_id ?? parent.id`),
+  **404**-masking a hidden parent. `cell_update` gates `visibility`
+  writes on `can_manage_cell` (`ERROR_CELL_VISIBILITY_MANAGE_ONLY`) and
+  **never touches `kind`** / `parent_id` / `root_id` / `moderation` (all
+  write-once-at-birth or control-gated, never on the update patch).
+  `cell_get` bundles visibility-filtered `fields` + `items` (one over the cap
+  for truncation detection). `cell_clone` deep-walks viewable children only
+  (each clone inherits its source's `kind`; clones are unparented). The optional
+  parent-aware `authorize_create` dep (`CellCreateAuthorize` — wider input
+  `{kind, data, parent_id, root_id, root_data, scope_id}` than `validate_data`,
+  returning a `CellCreateVerdict` `{allow:false} | {allow:true, moderation_required}`)
+  gates create by capability; it runs after the validator + the parent-resolve.
+  A **viewable**-parent / root-creation deny is **403** `cell_create_forbidden`
+  (the create-path **404** mask is reserved for a hidden parent); `Allow` folds
+  the moderation outcome (born `pending`+private vs `approved`+author-visibility).
+  The authorizer is **pure** — the handler reads the governing root's `data`
+  in-tx and hands it over as `root_data`, so a directory policy resolves
+  `root.data.policy[kind]` without its own DB read (which also dodges the
+  single-connection PGlite deadlock). `None`/omitted = open create (the default;
+  mirrors `validate_data`). `cell_moderate` is the `pending → approved | rejected`
+  transition, gated on `can_manage_cell` of the **governing root** (admin / root
+  owner — the author lands a 403, the anti-self-approval guard); approve flips
+  `moderation → approved` + `visibility → public`, reject sets `rejected`.
+- `auth/cell_grant_actions.ts` / `cell_field_actions.ts` /
+  `cell_item_actions.ts` / `cell_audit_actions.ts` — the relation + ACL +
+  audit handlers, exporting `to_grant_json` / `to_field_json` /
+  `to_item_json` reused by the `cell_get` bundle.
+- `auth/all_cell_actions.ts` — `create_all_cell_actions(deps, {roles})`, the
+  handler-side twin of `all_cell_action_specs` and sibling of
+  `create_standard_rpc_actions`: bundles all five cell factories (CRUD + grant
+  - field + item + audit) into one list. Reach for this whenever a backend
+    mounts the full cell layer — a single source so an HTTP-RPC mount and a WS
+    mount (or two backends) can't diverge on which cell verbs they expose.
+    Distinct from `create_cell_actions` (the CRUD-only factory it bundles).
+- `auth/cell_audit_metadata.ts` + `cell_grant_audit_metadata.ts` +
+  `cell_field_audit_metadata.ts` + `cell_item_audit_metadata.ts` — audit
+  metadata envelopes (IDs only), registered via `extra_events:` on the
+  consumer's `create_audit_log_config`.
+- `auth/cell_audit_events.ts` — `cell_audit_events`, the canonical
+  `event_type → metadata` map bundling every cell-domain audit event.
+  Consumers spread it into `extra_events` to register the whole layer in
+  one call (aggregator by design, not a compat shim).
+
+The cell event types (`cell_create` / `_update` / `_delete` / `_clone`,
+`cell_grant_create` / `_revoke`, `cell_field_set` / `_delete`,
+`cell_item_insert` / `_move` / `_delete`) are consumer-registered extras,
+not built-ins — see §Audit event extensibility.
+
+## Cross-cutting invariants
+
+The things that span multiple files and don't fit on any one symbol's TSDoc.
+
+### Two-phase identity
+
+**Authentication runs in middleware** (session / bearer / daemon token).
+Sets `c.var.account_id` + `CREDENTIAL_TYPE_KEY` on a valid credential.
+Account-only — never loads actor or role_grants, never populates
+`REQUEST_CONTEXT_KEY`.
+
+**Authorization runs before input validation**, matching the dispatcher's
+401 → authz → 403 → 400 phase order (see `http/CLAUDE.md` §Validation
+pipeline). When the route's input declares `acting?: ActingActor` or its auth
+requires role_grants, the authorization phase calls `resolve_acting_actor` over
+the `acting` selector — the validated query value on GETs, read off the raw
+body on mutations — and builds an actor-bound `RequestContext`. A malformed
+selector reads as omitted (it only ever picks among actors the account already
+owns, and input validation rejects it a step later). Account-grain routes run
+with `RequestContext.actor: null`.
+
+`apply_authorization_phase` is pure data — returns `AuthorizationResult`
+(`{ok: true, request_context: RequestContext | null} | {ok: false, status, body}`)
+without touching the Hono context. Each transport binds the same failure to
+its wire shape: REST `c.json(body, status)`; HTTP RPC + WS fold into a
+JSON-RPC envelope where `error.message` is the reason string and
+`error.data: {reason, ...rest}` flattens diagnostic fields. The 500 reasons
+stay distinct: `no_actors_on_account` (signup invariant violation),
+`account_vanished` (torn read after resolve).
+
+**Production-middleware invariant.** No production middleware on the auth
+path populates `REQUEST_CONTEXT_KEY`; it sets only `ACCOUNT_ID_KEY`,
+`CREDENTIAL_TYPE_KEY`, and (for sessions / bearer) `AUTH_SESSION_TOKEN_HASH_KEY` /
+`AUTH_API_TOKEN_ID_KEY`. Test harnesses pre-populate `REQUEST_CONTEXT_KEY` +
+`TEST_CONTEXT_PRESET_KEY` to bypass DB-backed actor resolution; production
+code that reads `REQUEST_CONTEXT_KEY` is reading test escape-hatch state.
+
+### Open-registry composition
+
+Four open string registries — `RoleName`, `ScopeKindName`,
+`CredentialTypeName`, `GrantPathName` — share the same factory shape:
+construction-time guards (name regex, duplicate detection, builtin-collision
+rejection), `ReadonlyMap` output, pass into `create_role_schema` for
+cross-axis validation.
+
+Dependency flow:
+
+```
+create_credential_type_schema()
+create_scope_kind_schema()        → create_role_schema({roles, options}) → role_specs
+create_grant_path_schema()
+```
+
+`role_specs` drives downstream defaults:
+
+- `admin_actions.grantable_roles` ⊇ `{role : 'admin' ∈ grant_paths}`
+- `self_service_role_actions` default eligibility ⊇ `{role : 'self_service' ∈ grant_paths}`
+
+`AuditEventTypeName` is the fifth open registry but composes differently —
+via `create_audit_log_config({extra_events})` into the bound emitter.
+
+### Audit `target_*_id` rules
+
+The two target columns on `AuditLogEvent` populate by a single rule:
+**`target_actor_id` is set when the event subject is bound to a specific
+actor**; `target_account_id` is always populated when there's an account
+subject. SSE/WS socket-close keys on `target_account_id ?? account_id`
+(sessions stay account-grain at the routing layer even after multi-actor).
+
+The full per-event-type table lives in `AuditLogEvent.target_actor_id`
+TSDoc. The pattern that spans emit sites:
+
+- **Role-grant-shape events** populate both targets (the grantee actor is
+  the subject regardless of initiator). Use `audit.emit_role_grant_target`
+  to lift the `actor_id` / `account_id` / `ip` boilerplate.
+- **Offer-shape events** (`role_grant_offer_create` / `_expire` / `_retract` /
+  `_supersede`) populate `target_actor_id` only when the offer was
+  actor-targeted at create time (`role_grant_offer.to_actor_id` set).
+- **Account-shape events** (login, logout, signup, bootstrap, password
+  change, session/token revoke, app_settings update, invite events) stay
+  account-grain on **both** `target_actor_id` and `actor_id` — the
+  operation is performed by the account, and a multi-actor user must be
+  able to log out without first picking an acting actor.
+
+### Audit event extensibility
+
+Consumers extend the closed `AUDIT_EVENT_TYPES` enum via
+`create_audit_log_config({extra_events})` — Zod schema or `null` per type;
+collisions with builtins or name-format failures throw at construction. The
+DB column is `TEXT NOT NULL` (no enum), so consumer types round-trip through
+list queries, the `audit_log_list` RPC, and SSE identically to builtins.
+
+`AuditLogEvent.event_type` / `AuditLogEventJson.event_type` / the
+`audit_log_list` filter input are all `AuditEventTypeName` (regex-validated
+string) — widened from the closed enum so consumer rows round-trip. The
+write side (`AuditLogInput<T>`, `AuditMetadataMap`) stays closed-enum so
+metadata-narrowing helpers like `get_audit_metadata` keep their type guard.
+
+### `AUDIT_EVENT_TYPES` builtins
+
+For quick reference; the source-of-truth list is the `Object.freeze`d
+constant in `auth/audit_log_schema.ts`.
+
+```
+login                       role_grant_create
+logout                      role_grant_revoke
+bootstrap                   role_grant_offer_create
+signup                      role_grant_offer_accept
+password_change             role_grant_offer_decline
+session_revoke              role_grant_offer_retract
+session_revoke_all          role_grant_offer_expire
+token_create                role_grant_offer_supersede
+token_revoke                invite_create
+token_revoke_all            invite_delete
+account_delete              app_settings_update
+account_purge               db_admin_row_delete
+account_undelete
+actor_delete
+actor_purge
+actor_undelete
+```
+
+`account_delete` / `account_purge` / `account_undelete` snapshot
+`{username, email}` into metadata; `actor_delete` / `actor_purge` /
+`actor_undelete` snapshot `{name}`. The account-level handlers emit the
+account event plus one per-actor event (`delete` = soft, `purge` = hard,
+`undelete` = reactivation — see ../../../docs/security.md §Authorization,
+"Account-removal target guards").
+
+`role_grant_offer_supersede` carries
+`reason: 'sibling_accepted' | 'role_grant_revoked' | 'scope_destroyed'`
+plus `cause_id` pointing to the row that triggered the supersede.
+
+### Keeper auth shape
+
+Keeper is not a dedicated guard — it's a composable `RouteAuth` shape:
+`{account: 'required', actor: 'required', roles: ['keeper'], credential_types: ['daemon_token']}`.
+The two-part check is `require_credential_types(['daemon_token'])` (403
+`ERROR_CREDENTIAL_TYPE_REQUIRED`) followed by `require_role(['keeper'])`
+(403 `ERROR_INSUFFICIENT_PERMISSIONS`) — the channel gate lands
+pre-authorization and the role gate post-authorization, so a non-daemon
+credential is refused before the route resolves an actor for it. Same
+scope-aware semantics mirrored
+in the HTTP RPC dispatcher (`actions/action_rpc.ts`), the WS dispatcher
+(`actions/register_action_ws.ts`), and the admin bypasses inside
+`auth/role_grant_offer_actions.ts`.
+
+### Migrations
+
+Schema migrations live in `auth/migrations.ts` — a frozen, append-only chain
+(`full_auth_schema` first, every later change its own appended entry) under
+the single reserved namespace `AUTH_MIGRATION_NAMESPACE = 'fuz_auth'`, each
+entry twinned byte-for-byte by name on the Rust spine. Consumer namespaces must avoid
+`reserved_migration_namespaces`. Runner contract, error vocabulary, and
+operator recipes (rename, mark applied, reset, baseline) are in
+../../../docs/migrations.md.
+
+## RPC action surfaces
+
+Each registry splits across `*_action_specs.ts` (schemas + specs + registry,
+codegen-importable) and `*_actions.ts` (`create_*_actions(deps, options)`
+factory with handlers). Client codegen imports the specs and skips the
+handler module's transitive query-layer deps.
+
+- `create_admin_actions` — registry `all_admin_action_specs` — bundled in `create_standard_rpc_actions`.
+- `create_role_grant_offer_actions` — registry `all_role_grant_offer_action_specs` — bundled.
+- `create_account_actions` — registry `all_account_action_specs` — bundled.
+- `create_self_service_role_actions` — registry `all_self_service_role_action_specs` — not bundled (`eligible_roles` is app-specific).
+- `create_actor_lookup_actions` — registry `all_actor_lookup_action_specs` — not bundled (opt-in batched id → label resolver).
+- `create_actor_search_actions` — registry `all_actor_search_action_specs` — not bundled (opt-in prefix-search picker).
+
+`auth/all_action_spec_registries.ts` exposes `all_fuz_auth_action_spec_registries`
+for registry-wide invariant tests. Not a mounting surface; protocol specs
+are excluded.
+
+### Authorization patterns
+
+- **Spec-level enforcement.** Every admin spec declares
+  `auth: {account: 'required', actor: 'required', roles: ['admin']}`; the
+  dispatcher checks per-spec, so mixed-auth bundles compose cleanly
+  (`role_grant_revoke` uses the admin gate alongside non-admin offer
+  siblings in the same factory).
+- **Input-dependent elevation.** `role_grant_offer_list` and `_history` use
+  `side_effects: false` so they're GET-addressable. Spec-level auth is
+  `{account: 'required', actor: 'required'}` so any caller reaches their
+  own inbox; the handler additionally requires admin when `{account_id}`
+  refers to another account. The spec can't express this because auth runs
+  before input parsing.
+- **Account-grain self-service.** `account_*` specs declare
+  `auth: {account: 'required', actor: 'none'}` — no `acting` on input, so
+  the actor axis stays `'none'` per registry-time invariant 2. IDOR via
+  `query_session_revoke_for_account` / `query_revoke_api_token_for_account`.
+- **Credential-channel gating.** `account_token_create` / `_revoke`,
+  `account_session_revoke` / `_revoke_all`, and REST `POST /password` all
+  declare `credential_types: ['session']`. `account_session_revoke` is
+  gated alongside `_revoke_all` because a leaked bearer can otherwise
+  compose `account_session_list` + N×revoke to reach the same lockout.
+  REST `POST /logout` also declares `credential_types: ['session']`, but
+  for forensic fidelity rather than a threat — a bearer / daemon token
+  holds no session to end, so the gate refuses it instead of returning a
+  misleading 200 + a phantom `logout` audit row.
+  Admin token/session revoke specs deliberately stay unrestricted (admin
+  scripting from CLI/bearer is legitimate operator workflow). See
+  ../../../docs/security.md §Credential-channel gating.
+- **Rate-limit posture.** Admin specs and authed-spam-prone surfaces
+  (`role_grant_offer_create`, `role_grant_revoke`, `account_token_create`,
+  `self_service_role_set`, `actor_lookup`, `actor_search`) declare
+  `rate_limit: 'account'`. Throttle-requests semantics — every invocation
+  records, regardless of outcome. Default
+  `default_action_account_rate_limit` is 1200/15min per actor.
+
+### Admin actions
+
+`create_admin_actions(deps, options?)` in `auth/admin_actions.ts`.
+
+Three of these — `account_delete` / `account_purge` / `account_undelete` —
+carry `account_*` method names (not `admin_`): privilege lives in the auth
+spec, not the name, so soft-delete stays self-service-capable. They sit in
+the admin factory because their `actor: 'required'` shape + account-management
+queries match the rest of this registry (mixed-auth in one factory is
+fine — same as `role_grant_revoke`). `account_undelete` is admin-only —
+reactivation has no self path because a soft-deleted account can't
+authenticate.
+
+- `admin_account_list_action_spec` — read; input `{limit?, offset?, include_deleted?}`; output `{accounts, grantable_roles}`. `include_deleted` (default false) surfaces soft-deleted rows (with `account.deleted_at` set) for the admin UI's reactivation view.
+- `account_delete_action_spec` — mutation (soft delete); self-or-admin (`{account, actor}`, handler elevates to admin when `account_id` ≠ self); input `{account_id?}`; output `{ok, deleted}`. Tombstones account + actor(s), revokes sessions/tokens, emits `account_delete` + per-actor `actor_delete`. Refuses a keeper-role target (`ERROR_CANNOT_DELETE_KEEPER`) or the sole active admin (`ERROR_CANNOT_DELETE_LAST_ADMIN`) — both fail-loud with a failure-audit row.
+- `account_purge_action_spec` — mutation (hard purge); keeper-only (`credential_types: ['daemon_token']` + `roles: ['keeper']`) + `confirm: true` + WARN; input `{account_id, confirm?}`; output `{ok, purged}`. Cascading delete; emits `account_purge` + per-actor `actor_purge` (identity snapshot survives in metadata since `audit_log` ids carry no FK). Refuses a keeper-role target (`ERROR_CANNOT_DELETE_KEEPER`) or the sole active admin (`ERROR_CANNOT_DELETE_LAST_ADMIN`).
+- `account_undelete_action_spec` — mutation (reactivation, inverse of soft delete); admin-only (`roles: ['admin']` — no self path, a tombstoned account can't authenticate); input `{account_id}`; output `{ok, undeleted}`. Clears the `deleted_at` tombstone on the account + its actor(s), emits `account_undelete` + per-actor `actor_undelete`. Does not restore revoked sessions/tokens.
+- `admin_session_list_action_spec` — read; input `z.void()`; output `{sessions}`.
+- `admin_session_revoke_all_action_spec` — mutation; input `{account_id}`; output `{ok, count}`.
+- `admin_token_revoke_all_action_spec` — mutation; input `{account_id}`; output `{ok, count}`.
+- `audit_log_list_action_spec` — read; input `{event_type?, account_id?, limit?, offset?, since_seq?}`; output `{events}`.
+- `audit_log_role_grant_history_action_spec` — read; input `{limit?, offset?}`; output `{events}`.
+- `invite_create_action_spec` — mutation; input `{email?, username?}`; output `{ok, invite}`.
+- `invite_list_action_spec` — read; input `z.void()`; output `{invites}`.
+- `invite_delete_action_spec` — mutation; input `{invite_id}`; output `{ok}`.
+- `app_settings_get_action_spec` — read; input `z.void()`; output `{settings}`.
+- `app_settings_update_action_spec` — mutation; input `{open_signup}`; output `{ok, settings}`.
+
+Constants: `AUDIT_LOG_LIST_LIMIT_MAX = 200`, `ADMIN_ACCOUNT_LIST_DEFAULT_LIMIT = 50`,
+`ADMIN_ACCOUNT_LIST_LIMIT_MAX = 200`.
+
+Error reasons via `error.data.reason`: `ERROR_ACCOUNT_NOT_FOUND` (404 via
+`jsonrpc_errors.not_found`) on admin revoke-all + account delete/purge,
+`ERROR_INSUFFICIENT_PERMISSIONS` (403) when `account_delete` targets another
+account without admin, `ERROR_PURGE_NOT_CONFIRMED` (400) when `account_purge`
+omits `confirm: true`, `ERROR_CANNOT_DELETE_KEEPER` (403) when `account_delete` /
+`account_purge` targets a keeper-role account (the keeper account is never
+API-removable — auth + daemon-token both pivot on it),
+`ERROR_CANNOT_DELETE_LAST_ADMIN` (403) when `account_delete` / `account_purge`
+targets the sole remaining active admin (keeper-recoverable, but not in one
+click; soft-deleted admins don't count), `ERROR_INVITE_ACCOUNT_EXISTS_USERNAME` /
+`_EMAIL` / `ERROR_INVITE_DUPLICATE` on invite create, `ERROR_INVITE_NOT_FOUND`
+on invite delete. `invite_create` empty input is rejected at the schema via
+`.refine()` and surfaces as `invalid_params` with `error.data.issues`.
+
+Closure state:
+
+- `grantable_roles` derived once from `options.roles?.role_specs ?? builtin_role_specs_by_name`
+  via `list_roles_with_grant_path(_, GRANT_PATH_ADMIN)`.
+- `app_settings_get`/`_update` handlers are always wired and read/write the DB
+  directly (`query_app_settings_load`/`query_app_settings_update`);
+  `auth/signup_routes.ts` reads the current value fresh per request. There is no
+  `options.app_settings` ref.
+- `options.connection_closer?` — handler-side eager WS close on
+  `admin_session_revoke_all` / `admin_token_revoke_all` BEFORE the audit
+  emit so revocation lands even on audit INSERT failure. Listener-based
+  close (`transports_ws_auth_guard`) stays as a fail-safe. Failure outcomes
+  skip the eager close.
+
+Failure-outcome audit rows: `admin_session_revoke_all` and `_token_revoke_all`
+emit an `outcome: 'failure'` row on `ERROR_ACCOUNT_NOT_FOUND` for forensic
+visibility — `target_account_id` is null (FK rejects missing ids), and the
+probed id is preserved under `metadata.attempted_account_id`. Every gated
+event additionally records `credential_type` in metadata (defense in depth).
+
+### Role-grant-offer actions
+
+`create_role_grant_offer_actions(deps, options?)` in
+`auth/role_grant_offer_actions.ts`.
+
+> **Hazard — admin `role_grant_offer_create` does not auto-accept.** The
+> action returns `{offer}` only. Acceptance is a separate
+> `role_grant_offer_accept` call; admin-side tests that materialize a
+> role_grant drive the full offer + accept RPCs (see
+> `testing/admin_integration.ts` §`offer_and_accept`), or skip the consent
+> path entirely via `create_test_role_grant_direct` from
+> `testing/db_entities.ts` when the test focuses on revoke / isolation
+> rather than the grant path itself. The v0.31 CHANGELOG entry was the
+> first signal of this two-step flow; consumers reading the standard admin
+> suite assume auto-accept and have to redesign their tests when they
+> discover otherwise.
+
+- `role_grant_offer_create_action_spec` — input `{to_account_id, to_actor_id?, role, scope_id?, message?}`; output `{offer}`.
+- `role_grant_offer_accept_action_spec` — input `{offer_id}`; output `{role_grant_id, offer, superseded_offer_ids}`.
+- `role_grant_offer_decline_action_spec` — input `{offer_id, reason?}`; output `{ok}`.
+- `role_grant_offer_retract_action_spec` — input `{offer_id}`; output `{ok}`.
+- `role_grant_offer_list_action_spec` — input `{account_id?}`; output `{offers}`.
+- `role_grant_offer_history_action_spec` — input `{account_id?, limit?, offset?}`; output `{offers}`.
+- `role_grant_revoke_action_spec` — input `{actor_id, role_grant_id, reason?}`; output `{ok, revoked}`.
+- `role_grant_assign_action_spec` — admin-only immediate conferral (no consent step); input `{to_account_id, to_actor_id?, role, scope_id?}`; output `{ok, role_grant_id}`. Runs the same admin-grant-path gate as offer-create, resolves the target actor (named `to_actor_id` ∈ the account's active actors, else its sole active actor — multi-actor → `invalid_params`, actorless → 404), writes via the idempotent `query_create_role_grant` (`scope_kind` stays null), and emits a `role_grant_create` audit row. No WS notification in v1. Reasons: `ERROR_ROLE_NOT_WEB_GRANTABLE`, `ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH`.
+
+Every input carries `acting?: ActingActor` (registry-time invariant 2).
+`role_grant_revoke` keys on **`actor_id`**, not `account_id` — role_grants
+are actor-scoped and deriving actor from account collapses under multi-actor
+accounts.
+
+`role_grant_offer_create` runs the **admin-grantability gate first** (offered
+role's `RoleSpec.grant_paths` must include `'admin'`), then the
+`RoleGrantOfferCreateAuthorize` callback. **Default `default_authorize`: the
+caller must hold a _global_ `admin` grant** — conferral is admin-only, with no
+holder-propagation (holding the offered role confers no power to offer it). The
+global check (`has_scoped_role(_, ROLE_ADMIN, null)`) stops a scoped `admin`
+escalating into global authority over the offer surface. A consumer needing
+scope-aware delegation (e.g. a classroom teacher offering within their own
+scope) supplies a custom `authorize` callback.
+
+Error reasons (`as const` literals):
+
+- `ERROR_ROLE_GRANT_OFFER_SELF_TARGET`
+- `ERROR_ROLE_GRANT_OFFER_TERMINAL`
+- `ERROR_ROLE_GRANT_OFFER_EXPIRED`
+- `ERROR_ROLE_GRANT_OFFER_NOT_FOUND` (404-over-403 IDOR mask)
+- `ERROR_ROLE_GRANT_OFFER_ROLE_NOT_GRANTABLE`
+- `ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED`
+- `ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH` (supplied `to_actor_id` doesn't belong to `to_account_id`)
+- `ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH` (actor-targeted offer accepted by wrong actor)
+
+Plus re-uses from `http/error_schemas.ts`: `ERROR_ROLE_GRANT_NOT_FOUND`,
+`ERROR_ROLE_NOT_WEB_GRANTABLE`, `ERROR_INSUFFICIENT_PERMISSIONS`,
+`ERROR_ACCOUNT_NOT_FOUND`. Each spec declares the reason codes its handler
+may surface via `spec.error_reasons`; drift is caught per-module by
+../../test/auth/role_grant_offer_actions.error_reasons.test.ts.
+
+Failure-outcome audits use `emit_create_failure_audit` /
+`emit_revoke_failure_audit` so all denial paths land uniform rows; the
+admin-role-denied path (pre-IDOR) on `role_grant_revoke` emits no audit,
+matching the middleware auth-guard precedent.
+
+#### WS notifications
+
+Post-commit via `emit_after_commit` (see `http/CLAUDE.md` §Pending Effects):
+
+- Create — `role_grant_offer_received` → recipient.
+- Retract — `role_grant_offer_retracted` → recipient.
+- Accept — `role_grant_offer_accepted` → grantor + `_supersede` per sibling.
+- Decline — `role_grant_offer_declined` → grantor.
+- Revoke — `role_grant_revoke` → revokee + `_supersede` per superseded sibling.
+
+Spec module is `auth/role_grant_offer_notifications.ts` — six
+`RemoteNotificationActionSpec`s with Zod params schemas and notification
+builders, plus `role_grant_offer_notification_specs: Array<EventSpec>` for
+`create_app_server`'s `event_specs` (drives surface generation and
+DEV-mode `create_validated_broadcaster` payload validation).
+
+Deps: `ActionFactoryDeps & {notification_sender?: NotificationSender | null}`.
+`NotificationSender` is the narrow structural capability
+(`send_to_account(account_id, message): number`); `BackendWebsocketTransport`
+satisfies it structurally. Target account travels via the send argument, not
+the payload — `revoked_by` is deliberately not in the `role_grant_revoke`
+payload (the revokee doesn't need to learn the admin's identity). When
+`notification_sender` is absent, WS fan-out is silently skipped.
+
+Options: `roles?: RoleSchemaResult` (drives admin-grant-path lookup),
+`default_ttl_ms?` (defaults to `ROLE_GRANT_OFFER_DEFAULT_TTL_MS` = 30 days),
+`authorize?: RoleGrantOfferCreateAuthorize`.
+
+### Account actions — self-service
+
+`create_account_actions(deps, options?)` in `auth/account_actions.ts`.
+
+- `account_verify_action_spec` — read; input `z.void()`; output `SessionAccountJson`.
+- `account_session_list_action_spec` — read; input `z.void()`; output `{sessions}`.
+- `account_session_revoke_action_spec` — mutation; input `{session_id}`; output `{ok, revoked}`.
+- `account_session_revoke_all_action_spec` — mutation; input `z.void()`; output `{ok, count}`.
+- `account_token_create_action_spec` — mutation; input `{name?, scope, lifetime}` (both `scope` and `lifetime` required — default-deny at mint on both axes); output `{ok, token, id, name, expires_at}`.
+- `account_token_list_action_spec` — read; input `z.void()`; output `{tokens}`.
+- `account_token_revoke_action_spec` — mutation; input `{token_id}`; output `{ok, revoked}`.
+
+`account_verify` is intentionally on both surfaces: the REST `GET /verify`
+shim is a status-only nginx probe; the RPC action returns
+`SessionAccountJson` for programmatic callers.
+
+`session_id` validates as `Blake3Hash`; `token_id` as `ApiTokenId`
+(`tok_[A-Za-z0-9_-]{12}`).
+
+Audit events via `deps.audit.emit` with `ip: ctx.client_ip`:
+`session_revoke`, `session_revoke_all`, `token_create`, `token_revoke`. Every
+gated event also records `credential_type` in metadata (mirrors REST
+`password_change`).
+
+Options: `max_tokens?: number | null` (defaults to `DEFAULT_MAX_TOKENS`;
+`null` disables), `connection_closer?: ConnectionCloser | null`. Each handler
+fires `close_sockets_for_*` synchronously BEFORE the audit emit. Failure
+outcomes (`revoked: false`) skip the eager close — mirrors the listener's
+`outcome === 'failure'` guard so attacker-guessable ids can't target
+arbitrary sockets.
+
+### Standard RPC bundle
+
+`create_standard_rpc_actions(deps, options)` in `auth/standard_rpc_actions.ts`
+spreads `create_admin_actions`, `create_role_grant_offer_actions`, and
+`create_account_actions` into a single `Array<RpcAction>` — the canonical
+fuz_app "standard" surface (admin + role-grant-offer + account; the two
+app-settings methods are always wired). Frontend mirror is
+`all_standard_action_specs` in `auth/standard_action_specs.ts`.
+
+Option routing — `roles` is shared between admin + role-grant-offer;
+`default_ttl_ms` + `authorize` → role-grant-offer
+only; `max_tokens` → account only; `connection_closer` → admin + account;
+`notification_sender` → role-grant-offer only.
+
+Pair with `create_app_server`'s `rpc_endpoints` factory form
+`(ctx) => Array<RpcEndpointSpec>` so the combined action list gets
+`ctx.deps`. `create_app_server` auto-mounts the
+endpoint via `create_rpc_endpoint`. To expose the standard surface over
+WebSocket as well, spread `protocol_actions` and the same factory into
+`ws_endpoints` — per-message authorization and rate limiting fire
+identically across HTTP RPC and WS.
+
+Bundling account actions into the "standard" surface is deliberate: the
+admin integration suite exercises `account_token_create` / `_revoke` for
+cross-account isolation, so a consumer wiring the admin surface without
+account actions hits `method_not_found` on first admin-suite run.
+
+### Self-service role toggle
+
+`create_self_service_role_actions(deps, {eligible_roles?, roles?})` in
+`auth/self_service_role_actions.ts`. One static action
+`self_service_role_set({role, enabled})` toggles a global role_grant on the
+caller. Idempotent in both directions (`changed: false` when the post-call
+state already matched).
+
+Audit metadata carries `self_service: true` so admin reviewers can
+distinguish self-toggled role_grants. Eligibility derives from
+`roles.role_specs` by selecting roles with `'self_service' ∈ grant_paths`;
+override via `eligible_roles`. Roles outside the eligible set are rejected
+with `ERROR_ROLE_NOT_SELF_SERVICE_ELIGIBLE`.
+
+Method name is static (`role` lives in input, not method) — per-role
+parameterized methods would break the `satisfies RequestResponseActionSpec`
+codegen invariant.
+
+Bundle **not** included in `create_standard_rpc_actions` — `eligible_roles`
+is app-specific.
+
+### Actor lookup / actor search
+
+Two opt-in helpers for surfaces that stamp actor ids (bylines, owner
+columns, grantor labels, picker UIs):
+
+- `create_actor_lookup_actions(deps)` — `actor_lookup({ids}) → {actors}`,
+  batched id → label resolver. `ACTOR_LOOKUP_IDS_MAX = 50`.
+- `create_actor_search_actions(deps)` — `actor_search({query, scope_ids?, limit?}) → {actors}`,
+  prefix search. Default limit `ACTOR_SEARCH_LIMIT_DEFAULT = 20`, cap
+  `_MAX = 50`. Non-admin callers must pass `scope_ids` (filtered to actors
+  holding active role_grants on those scopes); admin-only when `scope_ids`
+  is empty. `ERROR_ACTOR_SEARCH_SCOPE_REQUIRED` on non-admin + empty
+  `scope_ids`.
+
+Both: `auth: {account: 'required', actor: 'none'}` + `rate_limit: 'account'`,
+pure reads (no audit, no side effects). `ActorLookupEntryJson` deliberately
+omits `account_id`, `email`, credentials, timestamps, and role state —
+control-plane details, timing-oracle avoidance, separation of concern. LIKE
+wildcards in the user-supplied query are escaped at the JS layer so
+`%xyz`-style inputs can't widen the per-call cap.
+
+Bundle **not** included in `create_standard_rpc_actions`.
+
+### `admin_rpc_adapters.ts` (in `ui/`)
+
+`create_admin_rpc_adapters(api)` + `provide_admin_rpc_contexts(adapters)` —
+single-call wiring for the four admin RPC contexts (`admin_accounts`,
+`admin_invites`, `audit_log`, `app_settings`). One line at the admin shell
+drops the hand-maintained method-name mappings:
+`provide_admin_rpc_contexts(create_admin_rpc_adapters(api))`.
+
+## Cleanup
+
+`auth/cleanup.ts` — `run_auth_cleanup(deps)` runs every sweep (expired
+sessions + expired offers) and returns counts. Re-throws sweep errors so the
+caller's scheduler can log/alert. Idempotency: audit log has no tombstone on
+`role_grant_offer_expire`, so concurrent runs double-audit — deploy a single
+scheduled invocation per instance. Expired offer rows are preserved (audit
+value for the history view).
+
+`AuthCleanupDeps` requires `audit: AuditEmitter` — production wiring always
+has a bound emitter; tests pass `create_test_audit_emitter()` from
+`testing/stubs.ts`.
