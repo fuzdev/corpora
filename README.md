@@ -65,8 +65,10 @@ Never format a collection in place. Copy it, or `git checkout -- collections` af
 1. Edit the commits (and any new collections) in `manifest.json`.
 2. `deno task materialize`, then review the diffstat.
 3. Commit with the per-collection commit ranges in the message. The new commit is the
-   roll-up hash consumers pin; each one re-pins its counts against it, so refreshes are
-   deliberate and unscheduled.
+   roll-up hash a reader clones; what consumers pin is the `collections/` tree id
+   (`git rev-parse HEAD:collections`), which a refresh moves and a scripts or docs commit
+   here does not — each re-pins its counts against it, so refreshes are deliberate and
+   unscheduled.
 
 ## License
 

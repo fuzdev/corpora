@@ -13,7 +13,9 @@ can reproduce their numbers with one clone. First consumer: [tsv](https://github
 stopping points with short 1-liner messages using `feat:` / `fix:` / `docs:` /
 `chore:` prefixes; no body, no trailers. A corpus refresh is always its own commit:
 its message carries the per-collection commit ranges and the diffstat, because every
-consumer re-pins its counts against the new roll-up SHA.
+consumer re-pins its counts against the new `collections/` tree (consumers pin
+`git rev-parse HEAD:collections`, not the commit, so a scripts or docs commit here moves
+nothing downstream).
 
 ## Layout
 
