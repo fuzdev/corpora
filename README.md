@@ -1,9 +1,10 @@
 # corpora
 
-> Pinned snapshot of real-code corpora for the fuz ecosystem's language tools.
+> pinned snapshot of real-code corpora for the fuz ecosystem's language tools.
 
-A data repo, not a package. It vendors the source of real-world projects, one
-collection per upstream repo, every collection pinned at one roll-up commit, so that a
+This is a data repo, not a package, and it's AI-generated and may be low quality.
+It vendors the source of real-world projects, one collection per upstream repo,
+every collection pinned at one roll-up commit, so that a
 tool's benchmarks, conformance gates and PGO training all name one SHA and anyone can
 reproduce their numbers with one clone.
 
