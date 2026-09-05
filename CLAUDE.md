@@ -58,7 +58,8 @@ manifest SPDX id fails inside it.
   Symlinks are skipped (a snapshot holds bytes, not links); a collection that matches no
   file fails.
 - **Code as people write it.** Upstream test fixtures are excluded by the upstream's
-  own meaning; conformance suites (test262, the TypeScript compiler's cases, wpt,
+  own meaning, and so is a third-party bundle an upstream vendors into its tree (both
+  spelled per collection in the manifest's `exclude`); conformance suites (test262, the TypeScript compiler's cases, wpt,
   Svelte's and prettier's test suites) do not belong here — consumers read those
   checkouts directly.
 - **Redistributable only.** Every collection carries its upstream LICENSE (or names

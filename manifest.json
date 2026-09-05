@@ -204,6 +204,70 @@
 			"exclude": [],
 			"license": {"spdx": "MIT", "declared_in": "package.json"},
 			"shaped_by": "prettier"
+		},
+		{
+			"name": "language-tools",
+			"url": "https://github.com/sveltejs/language-tools",
+			"commit": "dafb5f1b781f6bd2039aace886e07428cd0e02d2",
+			"subpaths": [
+				"packages/language-server/src",
+				"packages/svelte2tsx/src",
+				"packages/typescript-plugin/src",
+				"packages/svelte-vscode/src",
+				"packages/svelte-check/src",
+				"packages/load-config/src"
+			],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "layerchart",
+			"url": "https://github.com/techniq/layerchart",
+			"commit": "ec05fb1b845344e041f1f40c7e4d643330f5d86b",
+			"subpaths": ["packages/layerchart/src"],
+			"exclude": [
+				"packages/layerchart/src/lib/components/charts/__fixtures__",
+				"packages/layerchart/src/lib/states/__fixtures__"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "svelte-ux",
+			"url": "https://github.com/techniq/svelte-ux",
+			"commit": "11c79b8c6e851ade9edec2e99108f8a859ccec55",
+			"subpaths": ["packages/svelte-ux/src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "flowbite-svelte",
+			"url": "https://github.com/themesberg/flowbite-svelte",
+			"commit": "85f20a048ec51598e2be099bd57b5f555fe7a5b4",
+			"subpaths": ["src"],
+			"exclude": ["src/routes/admin-dashboard/utils/highlight"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "svelte-maplibre",
+			"url": "https://github.com/dimfeld/svelte-maplibre",
+			"commit": "05dd0b2a7647eb7f34cd32d99be349df40bb4fcf",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "layercake",
+			"url": "https://github.com/mhkeller/layercake",
+			"commit": "e7b421e30e31fd5189b65a6bca0f6d4cc8edb129",
+			"subpaths": ["src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
 		}
 	]
 }

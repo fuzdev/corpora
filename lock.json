@@ -132,6 +132,42 @@
 			"files": 276,
 			"bytes": 711518,
 			"digest": "sha256:c2ae4bcac5a0987602ec6ced8c23b1b7a37e02236e6427b6de448efc08ed7ed3"
+		},
+		"language-tools": {
+			"commit": "dafb5f1b781f6bd2039aace886e07428cd0e02d2",
+			"files": 216,
+			"bytes": 1636314,
+			"digest": "sha256:36c0d73c6a589fe0c4607c88a2bc5e3c27fe2d117b6433aea479bfc3a7f1a5ac"
+		},
+		"layerchart": {
+			"commit": "ec05fb1b845344e041f1f40c7e4d643330f5d86b",
+			"files": 534,
+			"bytes": 1712749,
+			"digest": "sha256:ed4591db20da3869c0c6ab86d74080e5693c334c849715e1125a7e3640c09879"
+		},
+		"svelte-ux": {
+			"commit": "11c79b8c6e851ade9edec2e99108f8a859ccec55",
+			"files": 307,
+			"bytes": 770469,
+			"digest": "sha256:6cd03c9d8c95b3a244192b0123ef3d460061dbab20bc2c050e202ceb1b1d42d7"
+		},
+		"flowbite-svelte": {
+			"commit": "85f20a048ec51598e2be099bd57b5f555fe7a5b4",
+			"files": 1898,
+			"bytes": 4222346,
+			"digest": "sha256:7679fbd92b56653ae8134879009034d3326e03bbc8f7eee98a1e23fb25ad9156"
+		},
+		"svelte-maplibre": {
+			"commit": "05dd0b2a7647eb7f34cd32d99be349df40bb4fcf",
+			"files": 151,
+			"bytes": 254542,
+			"digest": "sha256:b434a02b39b4eabaae3cff332b744a90fc9945069944a719c6e2983247c770ac"
+		},
+		"layercake": {
+			"commit": "e7b421e30e31fd5189b65a6bca0f6d4cc8edb129",
+			"files": 286,
+			"bytes": 609297,
+			"digest": "sha256:97f2c6fde633bc2923e2af8189da3ca09194f8534a72c59895d1d45508bf74c2"
 		}
 	}
 }

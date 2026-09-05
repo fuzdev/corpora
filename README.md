@@ -26,7 +26,10 @@ collection holds only corpus files, so every tool's discovery sees the same set.
 ## What belongs
 
 **Code as people write it.** Application, library and framework source, under a
-permissive license, with the upstream's own test fixtures left out. Not:
+permissive license, with the upstream's own test fixtures left out — and, with them,
+any third-party bundle an upstream vendors into its tree (a copied highlighter's
+language and theme files): real files in that repo, but not code its authors wrote.
+Both are named per collection in the manifest's `exclude`. Not:
 
 - **Conformance suites** — test262, the TypeScript compiler's `tests/cases`, wpt,
   Svelte's and prettier's test suites. Each is consumed whole with its own harness
