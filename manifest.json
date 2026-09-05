@@ -158,11 +158,11 @@
 		{
 			"name": "earbetter",
 			"url": "https://github.com/ryanatkn/earbetter",
-			"commit": "a53684256bd02ec383397f2b0e75853d5e040b64",
+			"commit": "5d2ecd94004ac5a10e1ee6c33aa387337f0febb2",
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "Unlicense", "file": "license"},
-			"shaped_by": "tsv"
+			"shaped_by": "prettier"
 		},
 		{
 			"name": "cosmicplayground",
@@ -171,7 +171,7 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "Unlicense", "file": "license"},
-			"shaped_by": "tsv"
+			"shaped_by": "prettier"
 		},
 		{
 			"name": "kit",
