@@ -177,6 +177,14 @@ const main = async (): Promise<void> => {
 		for (const c of manifest.collections) {
 			if (lock.collections[c.name]) ordered[c.name] = lock.collections[c.name];
 		}
+		// An `--only` run leaves leftovers alone, the lock's included: a removed
+		// collection's entry stays beside its directory until a full run drops both, so
+		// the two never disagree about whether the collection is gone.
+		if (args.only.length > 0) {
+			for (const [name, entry] of Object.entries(lock.collections)) {
+				if (!(name in ordered)) ordered[name] = entry;
+			}
+		}
 		await Deno.writeTextFile(
 			lock_path,
 			JSON.stringify({ version: MANIFEST_VERSION, collections: ordered }, null, '\t') + '\n'
