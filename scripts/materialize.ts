@@ -10,8 +10,14 @@
  * committed `collections/`, and the recomputed lock entries with `lock.json`. Any
  * difference exits 1 — the snapshot is a fixed point of the manifest, or it is wrong.
  *
+ * A full run (no `--only`) also owns what the manifest no longer names: a
+ * `collections/<name>` directory or a lock entry with no manifest collection is a removed
+ * collection's leftover — a difference in `--check`, deleted (the directory) or dropped
+ * (the lock entry) in write mode — so removing a collection is a one-line manifest edit,
+ * and a stale tree cannot sit under a green check.
+ *
  * `--only <name>` (repeatable) limits either mode to some collections; in write mode the
- * other collections' lock entries are kept as they are.
+ * other collections' lock entries are kept as they are, and leftovers are not touched.
  *
  * @module
  */
@@ -71,6 +77,19 @@ const read_lock = async (path: string): Promise<Lock> => {
 };
 
 const format_bytes = (n: number): string => `${(n / 1e6).toFixed(1)} MB`;
+
+/** Directories under `collections/` that no manifest collection names, sorted. */
+const leftover_dirs = async (collections_dir: string, names: Set<string>): Promise<string[]> => {
+	const leftovers: string[] = [];
+	try {
+		for await (const entry of Deno.readDir(collections_dir)) {
+			if (!names.has(entry.name)) leftovers.push(entry.name);
+		}
+	} catch (error) {
+		if (!(error instanceof Deno.errors.NotFound)) throw error;
+	}
+	return leftovers.sort();
+};
 
 const main = async (): Promise<void> => {
 	const args = parse_args(Deno.args);
@@ -134,6 +153,23 @@ const main = async (): Promise<void> => {
 		}
 	} finally {
 		if (args.check) await Deno.remove(out_root, { recursive: true }).catch(() => {});
+	}
+
+	if (args.only.length === 0) {
+		const names = new Set(manifest.collections.map((c) => c.name));
+		for (const leftover of await leftover_dirs(collections_dir, names)) {
+			if (args.check) {
+				problems.push(`collections/${leftover}: not in manifest.json (a removed collection?)`);
+			} else {
+				await Deno.remove(join(collections_dir, leftover), { recursive: true });
+				log(`  removed collections/${leftover} (not in manifest.json)`);
+			}
+		}
+		if (args.check) {
+			for (const name of Object.keys(lock.collections)) {
+				if (!names.has(name)) problems.push(`lock.json: entry "${name}" is not in manifest.json`);
+			}
+		}
 	}
 
 	if (!args.check) {

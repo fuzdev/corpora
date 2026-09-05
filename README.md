@@ -49,7 +49,7 @@ consumers can select a fair subset.
 ```bash
 deno task materialize                 # rewrite collections/ + lock.json from manifest.json
 deno task materialize --only kit      # one collection (others keep their lock entries)
-deno task check                       # re-materialize to a temp dir; fail on any byte of drift
+deno task check                       # re-materialize to a temp dir; fail on any byte of drift or a leftover collection
 deno task test && deno task typecheck
 ```
 

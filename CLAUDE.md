@@ -22,7 +22,7 @@ corpora/
 ├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, license, shaped_by
 ├── lock.json         # per collection: commit, file count, bytes, content digest (generated)
 ├── scripts/          # the Deno materializer + check (zero external deps; git via subprocess)
-│   ├── materialize.ts      # CLI: write mode, `--check`, `--only <name>`
+│   ├── materialize.ts      # CLI: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped
 │   └── lib/                # manifest (types + validation), git, source (sibling or .cache clone), snapshot
 ├── .cache/           # gitignored: bare clones fetched at the pinned commits when no sibling has them
 └── collections/
