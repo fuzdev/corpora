@@ -5,7 +5,7 @@
 		{
 			"name": "zzz",
 			"url": "https://github.com/fuzdev/zzz",
-			"commit": "43a3e50e5c18be49a3fb2417713cb426dfcd2bc8",
+			"commit": "c7f4d15e0bdc98c6d77b5c25c45aacfcd71401e4",
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},

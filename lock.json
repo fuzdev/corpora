@@ -2,10 +2,10 @@
 	"version": 1,
 	"collections": {
 		"zzz": {
-			"commit": "43a3e50e5c18be49a3fb2417713cb426dfcd2bc8",
+			"commit": "c7f4d15e0bdc98c6d77b5c25c45aacfcd71401e4",
 			"files": 328,
-			"bytes": 1263839,
-			"digest": "sha256:bb1c5e7d327b8a9ffd7d5b2292d570586a01611bf4bd22438706832ad87668a1"
+			"bytes": 1263812,
+			"digest": "sha256:0732e33634120fdac7f8a0a526ea88cb6f167431ff11528e56a2c94eedec92f9"
 		},
 		"fuz_app": {
 			"commit": "2f7681073cedd2755183af1498bab3e82420c3e2",
