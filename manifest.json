@@ -57,8 +57,8 @@
 			"shaped_by": "tsv"
 		},
 		{
-			"name": "fuz_gitops",
-			"url": "https://github.com/fuzdev/fuz_gitops",
+			"name": "fuz_repos",
+			"url": "https://github.com/fuzdev/fuz_repos",
 			"commit": "d043dee346e2760041d27996456bc5c6936bc167",
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],

@@ -37,7 +37,7 @@
 			"bytes": 566948,
 			"digest": "sha256:1352c6efc1717783a78649f2e41dae39176c2e62e9a4a02fc18fd0ff44fed9cb"
 		},
-		"fuz_gitops": {
+		"fuz_repos": {
 			"commit": "d043dee346e2760041d27996456bc5c6936bc167",
 			"files": 101,
 			"bytes": 534793,
