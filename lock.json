@@ -116,10 +116,10 @@
 			"digest": "sha256:b7d129da1a3410b2c40891ee65b9e7d7cc4b999bad03cc66364032bb6970a547"
 		},
 		"kit": {
-			"commit": "c0c9361240f87983880a7fe4ec25bdc4d2b111ca",
-			"files": 305,
-			"bytes": 1350755,
-			"digest": "sha256:07ca0d9fefb2dd725e5a3ad55efe57805d4da22d695ae4587de9a676dc1d8a4b"
+			"commit": "b27c82f9c6896d7127a4023a8b1868c68e4a27b9",
+			"files": 234,
+			"bytes": 1336264,
+			"digest": "sha256:1f07883d5a0d51708e39cd42fda64be37577313d58970b28bf779cd267d4b792"
 		},
 		"svelte": {
 			"commit": "5ccdfe355739229573b20a2fa2ee49e38e3868fe",

@@ -176,13 +176,14 @@
 		{
 			"name": "kit",
 			"url": "https://github.com/sveltejs/kit",
-			"commit": "c0c9361240f87983880a7fe4ec25bdc4d2b111ca",
+			"commit": "b27c82f9c6896d7127a4023a8b1868c68e4a27b9",
 			"subpaths": ["packages/kit/src"],
 			"exclude": [
 				"packages/kit/src/core/adapt/fixtures",
 				"packages/kit/src/core/config/fixtures",
 				"packages/kit/src/core/postbuild/fixtures",
-				"packages/kit/src/core/sync/create_manifest_data/test/samples"
+				"packages/kit/src/core/sync/create_manifest_data/test",
+				"packages/kit/src/core/sync/write_types/test"
 			],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
 			"shaped_by": "prettier"

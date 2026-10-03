@@ -132,7 +132,9 @@ declare module '$app/types' {
 	 * `Pathname`, but possibly suffixed with a search string and/or hash.
 	 */
 	export type PathnameWithSearchOrHash =
-		Pathname | `${Pathname}?${string}` | `${Pathname}#${string}`;
+		| Pathname
+		| `${Pathname}?${string}`
+		| `${Pathname}#${string}`;
 
 	/**
 	 * `Pathname`, but possibly prefixed with a base path. Used for `page.url.pathname`.
