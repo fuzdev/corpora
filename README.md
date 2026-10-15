@@ -73,6 +73,6 @@ Never format a collection in place. Copy it, or `git checkout -- collections` af
 
 ## License
 
-The materializer and this repo's own files are MIT (see [LICENSE](./LICENSE)). Each
+The materializer and this repo's own files are 0BSD (see [LICENSE](./LICENSE)). Each
 collection is the upstream's work under the upstream's license, kept beside it in
 `collections/<name>/LICENSE`.
