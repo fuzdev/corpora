@@ -269,6 +269,53 @@
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
 			"shaped_by": "prettier"
+		},
+		{
+			"name": "typescript-parser",
+			"url": "https://github.com/microsoft/TypeScript",
+			"commit": "5be33469d551655d878876faa9e30aa3b49f8ee9",
+			"subpaths": ["src/compiler/parser.ts"],
+			"exclude": [],
+			"license": {"spdx": "Apache-2.0", "file": "LICENSE.txt"},
+			"shaped_by": "none"
+		},
+		{
+			"name": "storybook",
+			"url": "https://github.com/storybookjs/storybook",
+			"commit": "5073688f5836ec16575855550ffbeb3e81ab1cf1",
+			"subpaths": [
+				"code/core/src",
+				"code/lib/cli-storybook/src",
+				"code/lib/codemod/src",
+				"code/lib/core-webpack/src",
+				"code/lib/create-storybook/src",
+				"code/lib/csf-plugin/src",
+				"code/lib/eslint-plugin/src",
+				"code/lib/react-dom-shim/src"
+			],
+			"exclude": [
+				"code/core/src/docs-tools/argTypes/convert/__testfixtures__",
+				"code/lib/codemod/src/transforms/__testfixtures__",
+				"code/core/src/manager/components/sidebar/mockdata.large.ts"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier"
+		},
+		{
+			"name": "continue",
+			"url": "https://github.com/continuedev/continue",
+			"commit": "d0a3c0b626b5bebc3bef4742eec05a0242be0bab",
+			"subpaths": ["core", "extensions/cli"],
+			"exclude": [
+				"core/autocomplete/context/root-path-context/test/files",
+				"core/llm/llamaTokenizer.js",
+				"core/llm/llamaTokenizer.mjs",
+				"core/vendor",
+				"extensions/cli/src/util/apiKeyValidation.test.ts",
+				"extensions/cli/src/util/yamlConfigUpdater.test.ts"
+			],
+			"license": {"spdx": "Apache-2.0", "file": "LICENSE"},
+			"shaped_by": "prettier"
 		}
 	]
 }

@@ -168,6 +168,24 @@
 			"files": 286,
 			"bytes": 609297,
 			"digest": "sha256:97f2c6fde633bc2923e2af8189da3ca09194f8534a72c59895d1d45508bf74c2"
+		},
+		"typescript-parser": {
+			"commit": "5be33469d551655d878876faa9e30aa3b49f8ee9",
+			"files": 2,
+			"bytes": 548785,
+			"digest": "sha256:224f79e2c3f499cdda7ca21d3226010e0bec8cb25e54cadf040cf00e2973173c"
+		},
+		"storybook": {
+			"commit": "5073688f5836ec16575855550ffbeb3e81ab1cf1",
+			"files": 1382,
+			"bytes": 6968064,
+			"digest": "sha256:e1d2880cf3c4bb69f55de7f8829e1abe9411ea1d421d9f88a5fc5e35f4949b23"
+		},
+		"continue": {
+			"commit": "d0a3c0b626b5bebc3bef4742eec05a0242be0bab",
+			"files": 982,
+			"bytes": 5187013,
+			"digest": "sha256:a501637cb9b5fbe442578b7f1b0029fc78fa3fc32196d379215aaf38a5cb7b27"
 		}
 	}
 }
