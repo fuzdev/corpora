@@ -11,7 +11,7 @@ can reproduce their numbers with one clone. First consumer: [tsv](https://github
 
 ```
 corpora/
-├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, files, license, shaped_by
+├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, files, license, shaped_by, origin
 ├── lock.json         # per collection: commit, file count, bytes, content digest (generated)
 ├── scripts/          # the Deno materializer + check (zero external deps; git via subprocess)
 │   ├── materialize.ts      # CLI: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped

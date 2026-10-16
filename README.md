@@ -50,6 +50,11 @@ Each collection is tagged `shaped_by` (`tsv`, `prettier`, `none`): who last form
 it. A formatter benchmarked on code it already shaped measures its idempotent path, so
 consumers can select a fair subset.
 
+Each is also tagged `origin` (`own`, `third_party`): whether the fuz ecosystem's own
+authors (the `fuzdev` and `ryanatkn` repos, checked against each URL's owner) wrote it.
+A tool is developed against its authors' code, so consumers can report the rest apart
+from it.
+
 ## Usage
 
 ```bash

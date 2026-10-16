@@ -1,5 +1,5 @@
 {
-	"version": 1,
+	"version": 2,
 	"include": ["ts", "mts", "cts", "js", "mjs", "cjs", "svelte", "css", "html", "md", "mdz"],
 	"collections": [
 		{
@@ -9,7 +9,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_app",
@@ -18,7 +19,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_blog",
@@ -27,7 +29,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_code",
@@ -36,7 +39,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_css",
@@ -45,7 +49,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_docs",
@@ -54,7 +59,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_repos",
@@ -63,7 +69,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_mastodon",
@@ -72,7 +79,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_template",
@@ -81,7 +89,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_ui",
@@ -90,7 +99,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "fuz_util",
@@ -100,7 +110,8 @@
 			"exclude": [],
 			"files": ["package.json"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "mdz",
@@ -109,7 +120,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "gro",
@@ -118,7 +130,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "svelte-docinfo",
@@ -127,7 +140,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/test/fixtures"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "tsv.fuz.dev",
@@ -136,7 +150,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "ryanatkn.com",
@@ -145,7 +160,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "webdevladder.net",
@@ -154,7 +170,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv"
+			"shaped_by": "tsv",
+			"origin": "own"
 		},
 		{
 			"name": "earbetter",
@@ -163,7 +180,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "Unlicense", "file": "license"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "own"
 		},
 		{
 			"name": "cosmicplayground",
@@ -172,7 +190,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "Unlicense", "file": "license"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "own"
 		},
 		{
 			"name": "kit",
@@ -187,7 +206,8 @@
 				"packages/kit/src/core/sync/write_types/test"
 			],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "svelte",
@@ -196,7 +216,8 @@
 			"subpaths": ["packages/svelte/src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE.md"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "svelte.dev",
@@ -205,7 +226,8 @@
 			"subpaths": ["apps/svelte.dev/src", "packages/repl/src", "packages/site-kit/src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "declared_in": "package.json"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "language-tools",
@@ -221,7 +243,8 @@
 			],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "layerchart",
@@ -233,7 +256,8 @@
 				"packages/layerchart/src/lib/states/__fixtures__"
 			],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "svelte-ux",
@@ -242,7 +266,8 @@
 			"subpaths": ["packages/svelte-ux/src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "flowbite-svelte",
@@ -251,7 +276,8 @@
 			"subpaths": ["src"],
 			"exclude": ["src/routes/admin-dashboard/utils/highlight"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "svelte-maplibre",
@@ -260,7 +286,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "layercake",
@@ -269,7 +296,8 @@
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "typescript-parser",
@@ -278,7 +306,8 @@
 			"subpaths": ["src/compiler/parser.ts"],
 			"exclude": [],
 			"license": {"spdx": "Apache-2.0", "file": "LICENSE.txt"},
-			"shaped_by": "none"
+			"shaped_by": "none",
+			"origin": "third_party"
 		},
 		{
 			"name": "storybook",
@@ -300,7 +329,8 @@
 				"code/core/src/manager/components/sidebar/mockdata.large.ts"
 			],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		},
 		{
 			"name": "continue",
@@ -316,7 +346,8 @@
 				"extensions/cli/src/util/yamlConfigUpdater.test.ts"
 			],
 			"license": {"spdx": "Apache-2.0", "file": "LICENSE"},
-			"shaped_by": "prettier"
+			"shaped_by": "prettier",
+			"origin": "third_party"
 		}
 	]
 }

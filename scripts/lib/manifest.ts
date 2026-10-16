@@ -10,6 +10,13 @@
 export type ShapedBy = 'tsv' | 'prettier' | 'none';
 
 /**
+ * Who wrote a collection's code: `own` for the fuz ecosystem's own authors (the `fuzdev`
+ * and `ryanatkn` repos), `third_party` for everyone else's. Lets a consumer report the
+ * code its tools were not developed against apart from the code they were.
+ */
+export type Origin = 'own' | 'third_party';
+
+/**
  * Where a collection's license comes from: a file at the pinned commit (copied verbatim
  * to `collections/<name>/LICENSE`), or a `package.json` declaration when the upstream
  * ships no license file at its root (a generated `LICENSE` names the declaration).
@@ -39,10 +46,12 @@ export interface Collection {
 	license: LicenseSource;
 	/** Who last formatted the code. */
 	shaped_by: ShapedBy;
+	/** Who wrote the code. */
+	origin: Origin;
 }
 
 /** The manifest format consumers read; bump on a shape change they must notice. */
-export const MANIFEST_VERSION = 1;
+export const MANIFEST_VERSION = 2;
 
 /** The whole manifest. */
 export interface Manifest {
@@ -69,6 +78,10 @@ export const PERMISSIVE_LICENSES: Record<string, RegExp> = {
 };
 
 const SHAPED_BY: ReadonlySet<string> = new Set(['tsv', 'prettier', 'none']);
+const ORIGINS: ReadonlySet<string> = new Set(['own', 'third_party']);
+
+/** The GitHub owners whose repos are `own` — `origin` must agree with the URL's owner. */
+const OWN_OWNERS: ReadonlySet<string> = new Set(['fuzdev', 'ryanatkn']);
 
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
@@ -178,6 +191,17 @@ export const validate_manifest = (raw: unknown): string[] => {
 		}
 		if (typeof col.shaped_by !== 'string' || !SHAPED_BY.has(col.shaped_by)) {
 			problems.push(`${where}.shaped_by must be one of ${[...SHAPED_BY].join(', ')}`);
+		}
+		if (typeof col.origin !== 'string' || !ORIGINS.has(col.origin)) {
+			problems.push(`${where}.origin must be one of ${[...ORIGINS].join(', ')}`);
+		} else if (typeof col.url === 'string') {
+			const owner = /^https:\/\/github\.com\/([^/]+)\//.exec(col.url)?.[1];
+			if (owner !== undefined && OWN_OWNERS.has(owner) !== (col.origin === 'own')) {
+				problems.push(
+					`${where}.origin "${col.origin}" disagrees with the URL's owner "${owner}" ` +
+						`(\`own\` is exactly ${[...OWN_OWNERS].join(', ')})`
+				);
+			}
 		}
 	});
 	return problems;

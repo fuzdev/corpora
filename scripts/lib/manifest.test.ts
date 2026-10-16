@@ -34,17 +34,18 @@ Deno.test('is_clean_path rejects traversal and decoration', () => {
 });
 
 const valid = {
-	version: 1,
+	version: 2,
 	include: ['ts'],
 	collections: [
 		{
 			name: 'x',
-			url: 'https://github.com/o/x',
+			url: 'https://github.com/fuzdev/x',
 			commit: 'a'.repeat(40),
 			subpaths: ['src'],
 			exclude: ['src/test/fixtures'],
 			license: { spdx: 'MIT', file: 'LICENSE' },
-			shaped_by: 'tsv'
+			shaped_by: 'tsv',
+			origin: 'own'
 		}
 	]
 };
@@ -60,6 +61,7 @@ Deno.test('validate_manifest names every problem', () => {
 	c.exclude = ['elsewhere/fixtures'];
 	c.license = { spdx: 'BUSL-1.1', file: 'LICENSE' };
 	c.shaped_by = 'biome';
+	c.origin = 'upstream';
 	(broken.collections as unknown[]).push({ ...valid.collections[0] });
 	const problems = validate_manifest(broken);
 	assert.ok(
@@ -79,13 +81,29 @@ Deno.test('validate_manifest names every problem', () => {
 		'shaped_by'
 	);
 	assert.ok(
+		problems.some((p) => p.includes('origin')),
+		'origin'
+	);
+	assert.ok(
 		problems.some((p) => p.includes('duplicated')),
 		'duplicate name'
 	);
 });
 
+Deno.test('validate_manifest requires origin to agree with the URL owner', () => {
+	const mismatch = (url: string, origin: string): boolean => {
+		const m = structuredClone(valid);
+		Object.assign(m.collections[0], { url, origin });
+		return validate_manifest(m).some((p) => p.includes('disagrees'));
+	};
+	assert.ok(mismatch('https://github.com/sveltejs/kit', 'own'));
+	assert.ok(mismatch('https://github.com/ryanatkn/x', 'third_party'));
+	assert.ok(!mismatch('https://github.com/ryanatkn/x', 'own'));
+	assert.ok(!mismatch('https://github.com/sveltejs/kit', 'third_party'));
+});
+
 Deno.test('validate_manifest requires the current version', () => {
-	assert.ok(validate_manifest({ ...valid, version: 2 }).some((p) => p.includes('version')));
+	assert.ok(validate_manifest({ ...valid, version: 3 }).some((p) => p.includes('version')));
 });
 
 Deno.test('validate_manifest requires exactly one license source', () => {

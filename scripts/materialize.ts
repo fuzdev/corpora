@@ -131,7 +131,7 @@ const main = async (): Promise<void> => {
 			for (const s of materialized.symlinks) log(`  ${collection.name}: skipped symlink ${s}`);
 			for (const l of materialized.large) log(`  ${collection.name}: large file ${l}`);
 			rows.push(
-				`${collection.name.padEnd(18)} ${collection.commit.slice(0, 9)}  ${String(entry.files).padStart(5)} files  ${format_bytes(entry.bytes).padStart(8)}  ${collection.shaped_by.padEnd(8)} ${collection.license.spdx}`
+				`${collection.name.padEnd(18)} ${collection.commit.slice(0, 9)}  ${String(entry.files).padStart(5)} files  ${format_bytes(entry.bytes).padStart(8)}  ${collection.shaped_by.padEnd(8)} ${collection.origin.padEnd(11)} ${collection.license.spdx}`
 			);
 
 			if (args.check) {
@@ -166,6 +166,9 @@ const main = async (): Promise<void> => {
 			}
 		}
 		if (args.check) {
+			if (lock.version !== MANIFEST_VERSION) {
+				problems.push(`lock.json: version ${lock.version} is not ${MANIFEST_VERSION}`);
+			}
 			for (const name of Object.keys(lock.collections)) {
 				if (!names.has(name)) problems.push(`lock.json: entry "${name}" is not in manifest.json`);
 			}
