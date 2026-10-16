@@ -41,6 +41,11 @@ Both are named per collection in the manifest's `exclude`. Not:
 - **Verdicts.** What a formatter or parser says about these files stays in the consumer,
   keyed on this repo's commit.
 
+A collection can also name `files` kept verbatim outside the extension allowlist: a
+module-type or config file a runtime reads to load the source as written, such as the
+`package.json` whose `"type": "module"` tells Node the `.ts` files are ESM. Each must exist
+at the pinned commit.
+
 Each collection is tagged `shaped_by` (`tsv`, `prettier`, `none`): who last formatted
 it. A formatter benchmarked on code it already shaped measures its idempotent path, so
 consumers can select a fair subset.

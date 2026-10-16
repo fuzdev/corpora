@@ -98,6 +98,7 @@
 			"commit": "144fcfc6654ceb75858575b2e09225d4f183c005",
 			"subpaths": ["src"],
 			"exclude": [],
+			"files": ["package.json"],
 			"license": {"spdx": "MIT", "file": "LICENSE"},
 			"shaped_by": "tsv"
 		},

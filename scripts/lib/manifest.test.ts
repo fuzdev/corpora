@@ -97,3 +97,26 @@ Deno.test('validate_manifest requires exactly one license source', () => {
 	};
 	assert.ok(validate_manifest(both).some((p) => p.includes('exactly one')));
 });
+
+Deno.test('validate_manifest accepts named files the extension filter would drop', () => {
+	const with_files = structuredClone(valid) as Record<string, unknown>;
+	(with_files.collections as Array<Record<string, unknown>>)[0].files = [
+		'package.json',
+		'src/tsconfig.json'
+	];
+	assert.deepEqual(validate_manifest(with_files), []);
+});
+
+Deno.test('validate_manifest rejects bad, duplicate, colliding and redundant files', () => {
+	const files_problems = (files: unknown): string[] => {
+		const m = structuredClone(valid) as Record<string, unknown>;
+		(m.collections as Array<Record<string, unknown>>)[0].files = files;
+		return validate_manifest(m);
+	};
+	assert.ok(files_problems('package.json').some((p) => p.includes('clean relative paths')));
+	assert.ok(files_problems(['./package.json']).some((p) => p.includes('clean relative paths')));
+	assert.ok(files_problems(['package.json', 'package.json']).some((p) => p.includes('duplicated')));
+	assert.ok(files_problems(['LICENSE']).some((p) => p.includes('collides')));
+	assert.ok(files_problems(['src/a.ts']).some((p) => p.includes('already kept')));
+	assert.deepEqual(files_problems(['src/test/fixtures/a.ts']), []);
+});

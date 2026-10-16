@@ -11,7 +11,7 @@ can reproduce their numbers with one clone. First consumer: [tsv](https://github
 
 ```
 corpora/
-├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, license, shaped_by
+├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, files, license, shaped_by
 ├── lock.json         # per collection: commit, file count, bytes, content digest (generated)
 ├── scripts/          # the Deno materializer + check (zero external deps; git via subprocess)
 │   ├── materialize.ts      # CLI: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped
@@ -48,7 +48,10 @@ manifest SPDX id fails inside it.
   cat-file --batch` copies — filtered by the manifest's extension allowlist and excludes.
   Never from a directory walk of a live checkout, never from a consumer's own discovery.
   Symlinks are skipped (a snapshot holds bytes, not links); a collection that matches no
-  file fails.
+  file fails. A collection's `files` names upstream files kept whatever their extension
+  — a module-type or config file a runtime reads to load the source as written, like the
+  `package.json` whose `"type": "module"` makes Node read `.ts` as ESM; each must exist
+  at the commit.
 - **Code as people write it.** Upstream test fixtures are excluded by the upstream's
   own meaning, and so is a third-party bundle an upstream vendors into its tree (both
   spelled per collection in the manifest's `exclude`); conformance suites (test262, the TypeScript compiler's cases, wpt,

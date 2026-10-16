@@ -34,7 +34,7 @@ const decoder = new TextDecoder();
 
 /**
  * Builds a collection's files from the pinned commit in `source`: the filtered tree
- * under each subpath plus the LICENSE. Nothing is written here.
+ * under each subpath, the named `files`, and the LICENSE. Nothing is written here.
  */
 export const materialize_collection = async (
 	collection: Collection,
@@ -62,6 +62,15 @@ export const materialize_collection = async (
 	}
 	if (kept.length === 0) {
 		throw new Error(`${collection.name}: no files matched — did the upstream layout change?`);
+	}
+	for (const path of collection.files ?? []) {
+		const entry = (await ls_tree(source, collection.commit, path)).find((e) => e.path === path);
+		if (!entry || entry.mode === '120000') {
+			throw new Error(
+				`${collection.name}: files "${path}" is not a regular file at ${collection.commit}`
+			);
+		}
+		kept.push({ path: entry.path, oid: entry.oid });
 	}
 	kept.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 	const blobs = await cat_blobs(source, [...new Set(kept.map((k) => k.oid))]);

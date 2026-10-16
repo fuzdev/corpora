@@ -63,9 +63,9 @@
 		},
 		"fuz_util": {
 			"commit": "144fcfc6654ceb75858575b2e09225d4f183c005",
-			"files": 149,
-			"bytes": 1099921,
-			"digest": "sha256:7d2cc86645b330379517d8b711b6b3ae48c5781bf5b130358a9258bfa2591c20"
+			"files": 150,
+			"bytes": 1103458,
+			"digest": "sha256:c8ec119865e8bdbf889a2d0d07748b867dc7bb208c968c1baf561df0022a70ab"
 		},
 		"mdz": {
 			"commit": "9edec8e24c375ae4b4e97d75831cc70088d61461",

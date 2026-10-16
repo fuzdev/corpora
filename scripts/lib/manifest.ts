@@ -28,6 +28,13 @@ export interface Collection {
 	subpaths: string[];
 	/** Repo-relative path prefixes to leave out — the upstream's own test fixtures. */
 	exclude: string[];
+	/**
+	 * Repo-relative files to vendor verbatim whatever their extension — a module-type or
+	 * config file a runtime reads to load the source as written, like the `package.json`
+	 * whose `"type": "module"` makes Node read `.ts` as ESM. Each must be a regular file
+	 * at the pinned commit, or the materializer fails.
+	 */
+	files?: string[];
 	/** License provenance; must be a permissive license the materializer can verify. */
 	license: LicenseSource;
 	/** Who last formatted the code. */
@@ -129,6 +136,28 @@ export const validate_manifest = (raw: unknown): string[] => {
 			for (const e of exclude as string[]) {
 				if (!subpaths.some((s) => typeof s === 'string' && is_under(e, s))) {
 					problems.push(`${where}.exclude "${e}" is not under any subpath`);
+				}
+			}
+		}
+		if (col.files !== undefined) {
+			const files = col.files;
+			if (!Array.isArray(files) || !files.every(is_clean_path)) {
+				problems.push(`${where}.files must be an array of clean relative paths`);
+			} else {
+				const include = new Set(Array.isArray(m.include) ? (m.include as string[]) : []);
+				const seen = new Set<string>();
+				for (const f of files as string[]) {
+					if (seen.has(f)) problems.push(`${where}.files "${f}" is duplicated`);
+					seen.add(f);
+					if (f === 'LICENSE') {
+						problems.push(`${where}.files "LICENSE" collides with the collection LICENSE`);
+					} else if (
+						Array.isArray(subpaths) &&
+						subpaths.some((s) => typeof s === 'string' && is_under(f, s)) &&
+						is_included_path(f, include, Array.isArray(exclude) ? (exclude as string[]) : [])
+					) {
+						problems.push(`${where}.files "${f}" is already kept by \`subpaths\``);
+					}
 				}
 			}
 		}
