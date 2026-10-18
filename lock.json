@@ -153,9 +153,9 @@
 		},
 		"flowbite-svelte": {
 			"commit": "85f20a048ec51598e2be099bd57b5f555fe7a5b4",
-			"files": 1898,
-			"bytes": 4222346,
-			"digest": "sha256:7679fbd92b56653ae8134879009034d3326e03bbc8f7eee98a1e23fb25ad9156"
+			"files": 360,
+			"bytes": 828707,
+			"digest": "sha256:0fd0973be5308037ae4b455d2d18ca66cfe2bfef4af3cad503ca35361203f741"
 		},
 		"svelte-maplibre": {
 			"commit": "05dd0b2a7647eb7f34cd32d99be349df40bb4fcf",
