@@ -43,12 +43,6 @@
 			"bytes": 534793,
 			"digest": "sha256:eb7f9ef27e395df4ab28e85986284efc9a7333ad11570ea1fab802ff4548f1b5"
 		},
-		"fuz_mastodon": {
-			"commit": "d44985aaa8d95712c7c0f44ec2a94186e4581eec",
-			"files": 27,
-			"bytes": 73276,
-			"digest": "sha256:e3d20cc57e3ef7dbd4003973b5721ae8bf84cb7b3101be3f4ac18f9c66aa64eb"
-		},
 		"fuz_template": {
 			"commit": "3f2464e2ef23d1a9906c515e61059b0b982bf6ef",
 			"files": 20,

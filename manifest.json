@@ -73,16 +73,6 @@
 			"origin": "own"
 		},
 		{
-			"name": "fuz_mastodon",
-			"url": "https://github.com/fuzdev/fuz_mastodon",
-			"commit": "d44985aaa8d95712c7c0f44ec2a94186e4581eec",
-			"subpaths": ["src"],
-			"exclude": [],
-			"license": {"spdx": "MIT", "file": "LICENSE"},
-			"shaped_by": "tsv",
-			"origin": "own"
-		},
-		{
 			"name": "fuz_template",
 			"url": "https://github.com/fuzdev/fuz_template",
 			"commit": "3f2464e2ef23d1a9906c515e61059b0b982bf6ef",
