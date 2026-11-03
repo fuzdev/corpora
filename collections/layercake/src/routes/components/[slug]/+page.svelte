@@ -1,23 +1,13 @@
 <script>
 	import MarkdownIt from 'markdown-it';
-	import hljs from 'highlight.js';
 
 	import CopyBtn from '../../_site-components/CopyBtn.svelte';
 	import DownloadComponentBtn from '../../_site-components/DownloadComponentBtn.svelte';
-	import hljsDefineSvelte from '../../../_modules/hljsDefineSvelte.js';
+	import hljs from '../../../_modules/hljs.js';
 
 	import components from '../../_components.js';
 
 	/**
-	 * @typedef {{
-	 *   kind: string,
-	 *   type: string,
-	 *   name: string,
-	 *   required: boolean,
-	 *   defaultValue: string | null,
-	 *   description: string
-	 * }} JsdocProp
-	 *
 	 * @typedef {{
 	 *   slug: string,
 	 *   name?: string,
@@ -31,9 +21,6 @@
 	 */
 
 	const md = new MarkdownIt({ html: true, linkify: true });
-
-	hljs.registerLanguage('svelte', hljsDefineSvelte);
-	hljsDefineSvelte(hljs);
 
 	/** @type {import('./$types').PageProps} */
 	let { data } = $props();
@@ -72,6 +59,9 @@
 			}
 		);
 
+	// Only components in the gallery have a demo we can render on its own.
+	// Helpers like ArrowheadMarker or SmallMultipleWrapper aren't in there, so
+	// this is undefined for them and the demo is skipped.
 	let component = $derived(lookup.get(data.slug));
 
 	/**
@@ -109,47 +99,46 @@
 	const jsdocTableHeader = `|Param|Default|Required|Description|
 |-----|-------|--------|-----------|`;
 
-	let jsdocTableBody = '';
-	let jsdocTable = $state('');
-
-	// svelte-ignore state_referenced_locally
-	if (data.content.hasjsDoctable === true) {
-		// svelte-ignore state_referenced_locally
-		jsdocTableBody = `${data.content.jsdocParsed
-			.map(
-				/** @param {JsdocProp} d */ d =>
-					`**${d.name}** ${printTypes(d.type)}|${printDefault(d.defaultValue)}|${printRequired(
-						d.required
-					)}|${d.description?.replace(/^(-|–|—)/g, '').trim()}`
-			)
-			.join('\n')}`;
-		// svelte-ignore state_referenced_locally
-		jsdocTable = data.content.jsdocParsed.length ? `${jsdocTableHeader}\n${jsdocTableBody}` : '';
-	}
+	// Derived from `data`, so it follows the component when the page is reused
+	// for another one on client-side navigation
+	let jsdocTable = $derived.by(() => {
+		if (data.content.jsdocParsed.length === 0) return '';
+		const rows = data.content.jsdocParsed.map(
+			d =>
+				`**${d.name}** ${printTypes(d.type)}|${printDefault(d.defaultValue)}|${printRequired(
+					d.required
+				)}|${d.description?.replace(/^(-|–|—)/g, '').trim()}`
+		);
+		return `${jsdocTableHeader}\n${rows.join('\n')}`;
+	});
 </script>
 
 <svelte:head>
-	<title>{component.slug} component</title>
+	<title>{data.slug} component</title>
 </svelte:head>
 
 <div class="main">
 	<div class="all-components">
 		<a href="/components">← View all components</a>
 	</div>
-	<h1>{component.slug} component</h1>
+	<h1>{data.slug} component</h1>
 
-	<div class="chart-hero">
-		<component.component />
-	</div>
+	{#if component}
+		<div class="chart-hero">
+			<component.component />
+		</div>
+	{/if}
 
 	<div class="download">
 		<DownloadComponentBtn data={data.content} slug={data.slug} />
 	</div>
 
-	<div class="dek">
-		<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-		{@html markdownToHtml(data.content.componentDescription)}
-	</div>
+	{#if data.content.componentDescription}
+		<div class="dek">
+			<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+			{@html markdownToHtml(data.content.componentDescription)}
+		</div>
+	{/if}
 	{#if data.content.hasjsDoctable === true}
 		<div id="params-table">
 			<!-- eslint-disable-next-line svelte/no-at-html-tags -->
@@ -179,7 +168,7 @@
 		{/if}
 	</div>
 
-	<div id="pages" class={data.content.dek ? 'has-dek' : ''}>
+	<div id="pages">
 		<ul id="page-nav">
 			{#each pages as page}
 				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -194,9 +183,6 @@
 		</ul>
 		<div id="contents-container">
 			<CopyBtn getText={() => pages[0].contents} />
-			<!-- svelte-ignore element_invalid_self_closing_tag -->
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<!-- <div class="copy" onclick={copyToClipboard} onkeypress={copyToClipboard}></div> -->
 			{#each pages as page}
 				<div class="contents" style="display: {active === page.slug ? 'block' : 'none'};">
 					<!-- eslint-disable-next-line svelte/no-at-html-tags -->
@@ -229,29 +215,12 @@
 		width: calc(100% - 80px);
 	}
 
-	.dek :global(p a) {
-		color: #ff3e00;
-		text-decoration: none;
-	}
-
-	.dek :global(p a:hover) {
-		text-decoration: underline;
-	}
-
 	.chart-hero :global(.chart-container) {
 		height: 100% !important;
 	}
 
 	#pages {
 		margin-top: 50px;
-	}
-
-	#pages.has-dek {
-		margin-top: 35px;
-	}
-
-	.dek {
-		width: calc(100% - 80px);
 	}
 
 	#used-in a,
@@ -272,7 +241,6 @@
 	}
 
 	pre {
-		margin-top: 7px 0 0 0;
 		padding-left: 14px;
 		overflow-x: auto;
 	}

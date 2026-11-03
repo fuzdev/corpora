@@ -13,12 +13,13 @@
 			<aside out:fly={{ duration: DURATION_LG, x: 10, y: -1 }}>
 				<p>
 					⚠️ This filesystem interface is an early proof of concept and lacks most features you'd
-					expect. Some basics work if you're using this with Node, and there will be more soon.
-					Chatting creates files, and you can modify and save them, and see the edit history.
+					expect. Some basics work, and there will be more soon: you can create files in the active
+					workspace, edit and save files in open workspaces, scoped directories, and the app
+					directory, and see the edit history.
 				</p>
 				<button
 					type="button"
-					class="sm"
+					class="sized_sm"
 					onclick={() => {
 						app.ui.tutorial_for_diskfiles = false;
 					}}

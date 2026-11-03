@@ -16,6 +16,18 @@ import '../assert_dev_env.ts';
  *   re-assigning the active grant is idempotent (same id).
  * - **consent flow** — `role_grant_offer_create` of `participant` (admin-only)
  *   → the recipient `role_grant_offer_accept`s → a role_grant lands.
+ * - **offer replay** — re-accepting an accepted offer whose grant still
+ *   stands answers `200` with the same `role_grant_id` and writes no audit
+ *   row; once the grant is revoked, the replay is refused `invalid_request`
+ *   with reason `role_grant_offer_terminal` (never the revoked grant's id).
+ * - **no self-offer, in either case** — an admin offering to its own
+ *   account is refused `invalid_params` with reason
+ *   `role_grant_offer_self_target`, whether the id is sent lowercase or
+ *   uppercase: both spines canonicalize the id before comparing it with the
+ *   grantor's account.
+ * - **scoped assign** — `role_grant_assign` of `participant` with a paired
+ *   `scope_kind` + `scope_id` lands a scoped grant carrying both, read back
+ *   through `admin_account_list`, distinct from the global grant.
  *
  * The single-request gate/denial matrix (grantability refusal, admin-only
  * conferral, dispatcher admin gate, auth) lives in the declarative table
@@ -25,16 +37,25 @@ import '../assert_dev_env.ts';
  * The `participant` role is registered admin-grantable on both spines
  * (`spine_roles` / the Rust stub's `RoleRegistry`), so the suite is ungated;
  * every spine mounts the standard RPC surface it drives.
- *
- * `$lib`-free by contract (relative specifiers only), like the sibling
- * cross-backend suites.
+ * The role is the `role` option, `participant` by default: a backend without
+ * it passes another admin-grantable role (`ROLE_ADMIN` for one with only the
+ * builtins, which skips the scoped case — builtins are global-only).
  *
  * @module
  */
 
 import { describe, test, assert } from 'vitest';
 
+import { is_builtin_role } from '../../auth/role_schema.ts';
+
 import { rpc_call, type RpcCallResult } from '../rpc_helpers.ts';
+import {
+	ERROR_ROLE_GRANT_OFFER_SELF_TARGET,
+	ERROR_ROLE_GRANT_OFFER_TERMINAL
+} from '../../auth/role_grant_offer_action_specs.ts';
+import { JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST } from '../../http/jsonrpc.ts';
+import { list_audit_events } from './audit_cross_helpers.ts';
+import { test_if } from './capabilities.ts';
 import { SPINE_PARTICIPANT_ROLE, SPINE_RPC_PATH } from './spine_surface_constants.ts';
 import type { SetupTest } from './setup.ts';
 
@@ -44,6 +65,19 @@ export interface RoleGrantParticipationCrossTestOptions {
 	readonly setup_test: SetupTest;
 	/** RPC endpoint path. Default `/api/rpc`. */
 	readonly rpc_path?: string;
+	/**
+	 * The role conferred — one the backend's registry holds with the `admin`
+	 * grant path. Default `SPINE_PARTICIPANT_ROLE`, the spine's own; a backend
+	 * with only the builtin roles passes `ROLE_ADMIN`.
+	 */
+	readonly role?: string;
+	/**
+	 * A scope kind `role` applies to, for the scoped-assign case; `null` skips
+	 * that case. Default `'space'` (the spine participant's), or `null` for a
+	 * builtin role, which is global-only (a scoped builtin is refused
+	 * `role_grant_builtin_scoped`).
+	 */
+	readonly scope_kind?: string | null;
 }
 
 export const describe_role_grant_participation_cross_tests = (
@@ -51,6 +85,13 @@ export const describe_role_grant_participation_cross_tests = (
 ): void => {
 	const { setup_test } = options;
 	const rpc_path = options.rpc_path ?? SPINE_RPC_PATH;
+	const role = options.role ?? SPINE_PARTICIPANT_ROLE;
+	const scope_kind =
+		options.scope_kind === undefined
+			? is_builtin_role(role)
+				? null
+				: 'space'
+			: options.scope_kind;
 
 	const rpc = (
 		transport: Parameters<typeof rpc_call>[0]['app'],
@@ -61,7 +102,7 @@ export const describe_role_grant_participation_cross_tests = (
 		rpc_call({ app: transport, path: rpc_path, method, params, headers });
 
 	describe('role-gated participation conferral (success paths)', () => {
-		test('admin assigns the participant app-role to a fresh account (idempotent)', async () => {
+		test(`admin assigns the ${role} app-role to a fresh account (idempotent)`, async () => {
 			const fixture = await setup_test();
 			const recipient = await fixture.create_account({ username: 'participation_assignee' });
 
@@ -72,7 +113,7 @@ export const describe_role_grant_participation_cross_tests = (
 			const first = await rpc(
 				fixture.transport,
 				'role_grant_assign',
-				{ to_account_id: recipient.account.id, role: SPINE_PARTICIPANT_ROLE },
+				{ to_account_id: recipient.account.id, role },
 				fixture.create_session_headers()
 			);
 			assert.ok(first.ok, `assign must succeed: ${JSON.stringify(first)}`);
@@ -87,7 +128,7 @@ export const describe_role_grant_participation_cross_tests = (
 			const second = await rpc(
 				fixture.transport,
 				'role_grant_assign',
-				{ to_account_id: recipient.account.id, role: SPINE_PARTICIPANT_ROLE },
+				{ to_account_id: recipient.account.id, role },
 				fixture.create_session_headers()
 			);
 			assert.ok(second.ok, `re-assign must succeed: ${JSON.stringify(second)}`);
@@ -98,7 +139,73 @@ export const describe_role_grant_participation_cross_tests = (
 			);
 		});
 
-		test('admin offers the participant app-role and the recipient accepts', async () => {
+		test_if(
+			scope_kind !== null,
+			`admin assigns a scoped ${role} grant that round-trips scope_kind`,
+			async () => {
+				const fixture = await setup_test();
+				const recipient = await fixture.create_account({ username: 'participation_scoped' });
+				const scope_id = '33333333-3333-4333-8333-333333333333';
+
+				const scoped = await rpc(
+					fixture.transport,
+					'role_grant_assign',
+					{
+						to_account_id: recipient.account.id,
+						role,
+						scope_kind,
+						scope_id
+					},
+					fixture.create_session_headers()
+				);
+				assert.ok(scoped.ok, `scoped assign must succeed: ${JSON.stringify(scoped)}`);
+				const scoped_id = (scoped.result as { role_grant_id: string }).role_grant_id;
+
+				const global = await rpc(
+					fixture.transport,
+					'role_grant_assign',
+					{ to_account_id: recipient.account.id, role },
+					fixture.create_session_headers()
+				);
+				assert.ok(global.ok, `global assign must succeed: ${JSON.stringify(global)}`);
+				const global_id = (global.result as { role_grant_id: string }).role_grant_id;
+				assert.notStrictEqual(global_id, scoped_id, 'the global grant is a distinct row');
+
+				const listed = await rpc(
+					fixture.transport,
+					'admin_account_list',
+					{},
+					fixture.create_session_headers()
+				);
+				assert.ok(listed.ok, `admin_account_list must succeed: ${JSON.stringify(listed)}`);
+				const entry = (
+					listed.result as {
+						accounts: Array<{
+							account: { id: string };
+							role_grants: Array<{
+								id: string;
+								role: string;
+								scope_kind: string | null;
+								scope_id: string | null;
+							}>;
+						}>;
+					}
+				).accounts.find((a) => a.account.id === recipient.account.id);
+				assert.ok(entry, 'the recipient is listed');
+				const by_id = new Map(entry.role_grants.map((g) => [g.id, g]));
+				const scoped_row = by_id.get(scoped_id);
+				assert.ok(scoped_row, 'the scoped grant is listed');
+				assert.strictEqual(scoped_row.role, role);
+				assert.strictEqual(scoped_row.scope_kind, scope_kind, 'scope_kind round-trips');
+				assert.strictEqual(scoped_row.scope_id, scope_id, 'scope_id round-trips');
+				const global_row = by_id.get(global_id);
+				assert.ok(global_row, 'the global grant is listed');
+				assert.strictEqual(global_row.scope_kind, null);
+				assert.strictEqual(global_row.scope_id, null);
+			}
+		);
+
+		test(`admin offers the ${role} app-role and the recipient accepts`, async () => {
 			const fixture = await setup_test();
 			const recipient = await fixture.create_account({ username: 'participation_offeree' });
 
@@ -108,7 +215,7 @@ export const describe_role_grant_participation_cross_tests = (
 			const created = await rpc(
 				fixture.transport,
 				'role_grant_offer_create',
-				{ to_account_id: recipient.account.id, role: SPINE_PARTICIPANT_ROLE },
+				{ to_account_id: recipient.account.id, role },
 				fixture.create_session_headers()
 			);
 			assert.ok(created.ok, `offer create must succeed: ${JSON.stringify(created)}`);
@@ -126,6 +233,122 @@ export const describe_role_grant_participation_cross_tests = (
 				typeof (accepted.result as { role_grant_id?: unknown }).role_grant_id === 'string',
 				'accept lands a role_grant for the app-role'
 			);
+		});
+
+		/** Offer `role` to `recipient` as the keeper and accept it; returns the ids. */
+		const offer_and_accept = async (
+			fixture: Awaited<ReturnType<SetupTest>>,
+			recipient: Awaited<ReturnType<Awaited<ReturnType<SetupTest>>['create_account']>>
+		): Promise<{ offer_id: string; role_grant_id: string }> => {
+			const created = await rpc(
+				fixture.transport,
+				'role_grant_offer_create',
+				{ to_account_id: recipient.account.id, role },
+				fixture.create_session_headers()
+			);
+			assert.ok(created.ok, `offer create must succeed: ${JSON.stringify(created)}`);
+			const offer_id = (created.result as { offer: { id: string } }).offer.id;
+			const accepted = await rpc(
+				fixture.fresh_transport(),
+				'role_grant_offer_accept',
+				{ offer_id },
+				recipient.create_session_headers()
+			);
+			assert.ok(accepted.ok, `accept must succeed: ${JSON.stringify(accepted)}`);
+			const { role_grant_id } = accepted.result as { role_grant_id: string };
+			return { offer_id, role_grant_id };
+		};
+
+		/**
+		 * How many `event_type` audit rows the keeper can list, behind the drain
+		 * barrier — without it a replay's late row could land after the count,
+		 * and the no-new-row assertions would pass vacuously.
+		 */
+		const count_audit_rows = async (
+			fixture: Awaited<ReturnType<SetupTest>>,
+			event_type: string
+		): Promise<number> => (await list_audit_events(fixture, { event_type }, rpc_path)).length;
+
+		test('re-accepting an accepted offer answers the same grant and writes no audit row', async () => {
+			const fixture = await setup_test();
+			const recipient = await fixture.create_account({ username: 'participation_replayer' });
+			const { offer_id, role_grant_id } = await offer_and_accept(fixture, recipient);
+			const accept_rows = await count_audit_rows(fixture, 'role_grant_offer_accept');
+			const create_rows = await count_audit_rows(fixture, 'role_grant_create');
+			assert.ok(accept_rows >= 1, 'the accept itself is audited');
+
+			const replayed = await rpc(
+				fixture.fresh_transport(),
+				'role_grant_offer_accept',
+				{ offer_id },
+				recipient.create_session_headers()
+			);
+
+			assert.ok(replayed.ok, `a replay of a held grant must succeed: ${JSON.stringify(replayed)}`);
+			assert.strictEqual(
+				(replayed.result as { role_grant_id: string }).role_grant_id,
+				role_grant_id,
+				'a replay answers the grant the accept minted'
+			);
+			assert.strictEqual(
+				await count_audit_rows(fixture, 'role_grant_offer_accept'),
+				accept_rows,
+				'a replay writes no role_grant_offer_accept row'
+			);
+			assert.strictEqual(
+				await count_audit_rows(fixture, 'role_grant_create'),
+				create_rows,
+				'a replay writes no role_grant_create row'
+			);
+		});
+
+		test('re-accepting an offer whose grant was revoked is refused as terminal', async () => {
+			const fixture = await setup_test();
+			const recipient = await fixture.create_account({ username: 'participation_revoked' });
+			const { offer_id, role_grant_id } = await offer_and_accept(fixture, recipient);
+			const revoked = await rpc(
+				fixture.transport,
+				'role_grant_revoke',
+				{ actor_id: recipient.actor.id, role_grant_id },
+				fixture.create_session_headers()
+			);
+			assert.ok(revoked.ok, `revoke must succeed: ${JSON.stringify(revoked)}`);
+
+			const replayed = await rpc(
+				fixture.fresh_transport(),
+				'role_grant_offer_accept',
+				{ offer_id },
+				recipient.create_session_headers()
+			);
+
+			assert.ok(!replayed.ok, `a replay after revoke must be refused: ${JSON.stringify(replayed)}`);
+			assert.strictEqual(replayed.status, 400);
+			assert.strictEqual(replayed.error.code, JSONRPC_INVALID_REQUEST);
+			assert.deepStrictEqual(replayed.error.data, { reason: ERROR_ROLE_GRANT_OFFER_TERMINAL });
+		});
+
+		test('an admin offering to its own account is refused, whatever the id case', async () => {
+			const fixture = await setup_test();
+			const own_id = fixture.account.id;
+			for (const to_account_id of [own_id, own_id.toUpperCase()]) {
+				const res = await rpc(
+					fixture.transport,
+					'role_grant_offer_create',
+					{ to_account_id, role },
+					fixture.create_session_headers()
+				);
+				assert.ok(
+					!res.ok,
+					`a self-offer must be refused (${to_account_id}): ${JSON.stringify(res)}`
+				);
+				assert.strictEqual(res.status, 400, to_account_id);
+				assert.strictEqual(res.error.code, JSONRPC_INVALID_PARAMS, to_account_id);
+				assert.deepStrictEqual(
+					res.error.data,
+					{ reason: ERROR_ROLE_GRANT_OFFER_SELF_TARGET },
+					to_account_id
+				);
+			}
 		});
 	});
 };

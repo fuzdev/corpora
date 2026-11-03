@@ -58,7 +58,16 @@
 			<ContextmenuEntryCopyToClipboard content={chat.id} label="copy id" />
 
 			{#if chat.threads.length}
-				<ContextmenuEntry icon={icon_remove} run={() => chat.remove_all_threads()}>
+				<ContextmenuEntry
+					icon={icon_remove}
+					run={() => {
+						// TODO @many better confirmation
+						// eslint-disable-next-line no-alert
+						if (confirm(`Remove all threads from the chat "${chat.name}"?`)) {
+							chat.remove_all_threads();
+						}
+					}}
+				>
 					<span>remove all threads</span>
 				</ContextmenuEntry>
 			{/if}
@@ -87,9 +96,7 @@
 				run={() => {
 					// TODO make this focus the `EditableText` if available, somehow
 					const new_name = prompt('Enter new name for chat:', chat.name); // eslint-disable-line no-alert
-					if (new_name && new_name !== chat.name) {
-						chat.name = new_name;
-					}
+					if (new_name) chat.rename(new_name);
 				}}
 			>
 				<span>edit chat</span>
@@ -98,15 +105,7 @@
 			<ContextmenuEntry
 				icon={icon_chat}
 				run={async () => {
-					// TODO make it have a unique name, and adding threads looks hacky,
-					// maybe add a `chats.duplicate` method
-					const new_chat = app.chats.add_chat(chat.clone());
-					// TODO hacky
-					for (const thread of chat.threads) {
-						if (thread.model) new_chat.add_thread(thread.model);
-					}
-
-					// Select the new chat
+					const new_chat = app.chats.duplicate(chat);
 					await app.chats.navigate_to(new_chat.id);
 				}}
 			>

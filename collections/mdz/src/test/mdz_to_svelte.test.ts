@@ -1,13 +1,15 @@
 import { test, assert, describe } from 'vitest';
 
 import { escape_svelte_text } from '@fuzdev/fuz_util/svelte_preprocess_helpers.ts';
+import { escape_js_string } from '@fuzdev/fuz_util/string.ts';
 
-import { mdz_parse, type MdzNode } from '$lib/mdz.ts';
+import { mdz_parse, type MdzNode } from '#lib/mdz.ts';
 import {
 	mdz_to_svelte,
 	type MdzToSvelteOptions,
-	type MdzToSvelteResult
-} from '$lib/mdz_to_svelte.ts';
+	type MdzToSvelteResult,
+	type MdzComponentImport
+} from '#lib/mdz_to_svelte.ts';
 
 /** Renderer imports matching the docs site: inline code → DocsLink, codeblocks → fuz_code's Code. */
 const DOCS_RENDERER_IMPORTS: Pick<
@@ -21,7 +23,7 @@ const DOCS_RENDERER_IMPORTS: Pick<
 /** Parses mdz content and converts to Svelte markup in one step. */
 const convert = (
 	content: string,
-	components: Record<string, string> = {},
+	components: Record<string, MdzComponentImport> = {},
 	elements: Record<string, boolean> = {},
 	renderer_imports: Pick<
 		MdzToSvelteOptions,
@@ -228,7 +230,7 @@ describe('mdz_to_svelte', () => {
 	describe('link nodes', () => {
 		test('renders internal link with resolve', () => {
 			const result = convert('[docs](/docs/foo)');
-			assert.ok(result.markup.includes("href={resolve('/docs/foo')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo')}"));
 			assert.ok(result.markup.includes('>docs</a>'));
 			assert_import(result, 'resolve', '$app/paths', 'named');
 		});
@@ -261,13 +263,41 @@ describe('mdz_to_svelte', () => {
 
 		test('renders auto-detected internal path', () => {
 			const result = convert('see /docs/api');
-			assert.ok(result.markup.includes("href={resolve('/docs/api')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/api')}"));
 			assert_import(result, 'resolve', '$app/paths', 'named');
+		});
+
+		test('emits internal paths verbatim in pathname form', () => {
+			const result = convert('see /a/(b)/c and /a//b and /docs?y=1#x//z');
+			assert.ok(result.markup.includes("href={resolve('a/(b)/c')}"));
+			assert.ok(result.markup.includes("href={resolve('a//b')}"));
+			assert.ok(result.markup.includes("href={resolve('docs?y=1#x//z')}"));
+			assert_import(result, 'resolve', '$app/paths', 'named');
+		});
+
+		test('emits `[x]` segments of hand-built trees in pathname form', () => {
+			const nodes: Array<MdzNode> = [
+				{
+					type: 'Link',
+					reference: '/a/[x]',
+					link_type: 'internal',
+					start: 0,
+					end: 6,
+					children: [{ type: 'Text', content: 'x', start: 0, end: 1 }]
+				}
+			];
+			const result = mdz_to_svelte(nodes, { components: {}, elements: {} });
+			assert.equal(result.markup, "<a href={resolve('a/[x]')}>x</a>");
+		});
+
+		test('collapses a leading `//` to stay under the base', () => {
+			const result = convert('[x](//example.com/a)');
+			assert.ok(result.markup.includes("href={resolve('example.com/a')}"));
 		});
 
 		test('escapes special chars in link reference', () => {
 			const result = convert("[docs](/docs/it's)");
-			assert.ok(result.markup.includes("resolve('/docs/it\\'s')"));
+			assert.ok(result.markup.includes("resolve('docs/it\\'s')"));
 		});
 
 		test('renders link with formatted children', () => {
@@ -429,9 +459,9 @@ describe('mdz_to_svelte', () => {
 		});
 
 		test('renders configured component with import', () => {
-			const result = convert('<Alert>warning</Alert>', { Alert: '$lib/Alert.svelte' });
+			const result = convert('<Alert>warning</Alert>', { Alert: '#lib/Alert.svelte' });
 			assert.equal(result.markup, '<Alert>warning</Alert>');
-			assert_import(result, 'Alert', '$lib/Alert.svelte', 'default');
+			assert_import(result, 'Alert', '#lib/Alert.svelte', 'default');
 			assert.equal(result.has_unconfigured_tags, false);
 		});
 
@@ -466,7 +496,7 @@ describe('mdz_to_svelte', () => {
 		});
 
 		test('renders configured component with formatted children', () => {
-			const result = convert('<Alert>**bold** note</Alert>', { Alert: '$lib/Alert.svelte' });
+			const result = convert('<Alert>**bold** note</Alert>', { Alert: '#lib/Alert.svelte' });
 			assert.ok(result.markup.includes('<strong>bold</strong>'));
 			assert.ok(result.markup.includes('<Alert>'));
 		});
@@ -515,14 +545,14 @@ describe('mdz_to_svelte', () => {
 		});
 
 		test('adds configured component imports', () => {
-			const result = convert('<Alert>warning</Alert>', { Alert: '$lib/Alert.svelte' });
-			assert_import(result, 'Alert', '$lib/Alert.svelte', 'default');
+			const result = convert('<Alert>warning</Alert>', { Alert: '#lib/Alert.svelte' });
+			assert_import(result, 'Alert', '#lib/Alert.svelte', 'default');
 		});
 
 		test('collects multiple imports', () => {
 			const result = convert(
 				'`fn` and [link](/path) and <Alert>hi</Alert>',
-				{ Alert: '$lib/Alert.svelte' },
+				{ Alert: '#lib/Alert.svelte' },
 				{},
 				DOCS_RENDERER_IMPORTS
 			);
@@ -557,7 +587,7 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/foo/bar')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo/bar')}"));
 			assert_import(result, 'resolve', '$app/paths', 'named');
 		});
 
@@ -568,14 +598,14 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/foo')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo')}"));
 			assert_import(result, 'resolve', '$app/paths', 'named');
 		});
 
 		test('base without trailing slash resolves correctly', () => {
 			const nodes = mdz_parse('see ./bar');
 			const result = mdz_to_svelte(nodes, { components: {}, elements: {}, base: '/docs/foo' });
-			assert.ok(result.markup.includes("href={resolve('/docs/foo/bar')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo/bar')}"));
 		});
 
 		test('base does not affect absolute paths', () => {
@@ -585,7 +615,7 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/api')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/api')}"));
 		});
 
 		test('base does not affect fragment links', () => {
@@ -617,7 +647,7 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/foo/bar')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo/bar')}"));
 			assert.ok(result.markup.includes('>bar</a>'));
 		});
 
@@ -634,7 +664,7 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/baz')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/baz')}"));
 		});
 
 		test('multiple relative links in same content resolve independently', () => {
@@ -644,8 +674,8 @@ describe('mdz_to_svelte', () => {
 				elements: {},
 				base: '/docs/foo/'
 			});
-			assert.ok(result.markup.includes("href={resolve('/docs/foo/bar')}"));
-			assert.ok(result.markup.includes("href={resolve('/docs/baz')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/foo/bar')}"));
+			assert.ok(result.markup.includes("href={resolve('docs/baz')}"));
 		});
 	});
 
@@ -674,7 +704,7 @@ describe('mdz_to_svelte', () => {
 
 		test('handles single component without paragraph wrapper', () => {
 			// mdz parser wraps single components directly (MDX convention)
-			const result = convert('<Alert>text</Alert>', { Alert: '$lib/Alert.svelte' });
+			const result = convert('<Alert>text</Alert>', { Alert: '#lib/Alert.svelte' });
 			// Should NOT be wrapped in <p>
 			assert.ok(!result.markup.includes('<p>'));
 			assert.equal(result.markup, '<Alert>text</Alert>');
@@ -698,6 +728,59 @@ describe('mdz_to_svelte', () => {
 			assert.ok(result.markup.includes('<p>hello</p>'));
 			// unconfigured tag produces empty output
 			assert.ok(!result.markup.includes('Unknown'));
+		});
+	});
+
+	describe('tag attributes', () => {
+		test('emits an allowed element attribute as a JS-expression', () => {
+			const result = convert('<aside class="box">hi</aside>', {}, { aside: true });
+			assert.equal(result.markup, `<aside class={'box'}>hi</aside>`);
+		});
+
+		test('drops a disallowed element attribute', () => {
+			const result = convert('<aside class="box" onclick="x()">hi</aside>', {}, { aside: true });
+			assert.equal(result.markup, `<aside class={'box'}>hi</aside>`);
+			assert.notInclude(result.markup, 'onclick');
+		});
+
+		test('emits a bare boolean element attribute as `{true}`', () => {
+			// not bare — Svelte compiles a bare attribute to `aria-hidden=""`, which
+			// ARIA reads as unset, while the runtime spread renders `"true"`
+			const result = convert('<aside aria-hidden>hi</aside>', {}, { aside: true });
+			assert.equal(result.markup, `<aside aria-hidden={true}>hi</aside>`);
+		});
+
+		test('passes registered props through (string + bare boolean)', () => {
+			const result = convert('<Alert status="error" dismissible>hi</Alert>', {
+				Alert: { path: '#lib/Alert.svelte', props: ['status', 'dismissible'] }
+			});
+			assert.equal(result.markup, `<Alert status={'error'} dismissible={true}>hi</Alert>`);
+			assert_import(result, 'Alert', '#lib/Alert.svelte', 'default');
+		});
+
+		test('a bare import path receives no attributes', () => {
+			const result = convert('<Alert status="error">hi</Alert>', { Alert: '#lib/Alert.svelte' });
+			assert.equal(result.markup, '<Alert>hi</Alert>');
+			assert_import(result, 'Alert', '#lib/Alert.svelte', 'default');
+		});
+
+		test('drops attributes outside the registered props', () => {
+			const result = convert('<Alert status="error" style="x">hi</Alert>', {
+				Alert: { path: '#lib/Alert.svelte', props: ['status'] }
+			});
+			assert.equal(result.markup, `<Alert status={'error'}>hi</Alert>`);
+		});
+
+		test('escapes a string value through escape_js_string', () => {
+			// a value with a single-quote and a backslash must be escaped for the
+			// single-quoted JS-expression attribute (not emitted verbatim)
+			const value = "a'b\\c";
+			const result = convert(`<Alert label="${value}">hi</Alert>`, {
+				Alert: { path: '#lib/Alert.svelte', props: 'all' }
+			});
+			assert.equal(result.markup, `<Alert label={'${escape_js_string(value)}'}>hi</Alert>`);
+			// the raw quote/backslash never appear unescaped in the output
+			assert.include(result.markup, escape_js_string(value));
 		});
 	});
 });

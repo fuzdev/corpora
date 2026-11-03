@@ -1,11 +1,11 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import PendingAnimation from '$lib/PendingAnimation.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import PendingAnimation from '#lib/PendingAnimation.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 
 	const TOME_SLUG = 'PendingAnimation';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -49,17 +49,14 @@
 				running
 			)} />`}
 		/>
-		<div class="mb_lg align_items_flex_start" role="none">
+		<div class="mb_lg" role="none">
 			<PendingAnimation --font_size="var(--font_size_xl5)" {running} />
 		</div>
 		<p>Set size with classes:</p>
 		<Code
-			content={`<PendingAnimation attrs={{class: 'font_size_xl3'}}${to_boolean_attr(
-				'running',
-				running
-			)} />`}
+			content={`<PendingAnimation class="font_size_xl3"${to_boolean_attr('running', running)} />`}
 		/>
-		<div class="align_items_flex_start" role="none">
+		<div role="none">
 			<PendingAnimation class="font_size_xl3" {running} />
 		</div>
 		<p>Size is inherited by default:</p>
@@ -69,7 +66,7 @@
 				running
 			)} /></div>`}
 		/>
-		<div class="font_size_xl4 align_items_flex_start" role="none">
+		<div class="font_size_xl4" role="none">
 			<PendingAnimation {running} />
 		</div>
 	</section>
@@ -145,8 +142,7 @@
 			</code>
 		</p>
 		<p>
-			and children <input bind:value={turtle_slot_2a} />
-			<input bind:value={turtle_slot_2b} />
+			and children <input bind:value={turtle_slot_2a} /> <input bind:value={turtle_slot_2b} />
 		</p>
 		<PendingAnimation {running}>
 			{#snippet children(index)}

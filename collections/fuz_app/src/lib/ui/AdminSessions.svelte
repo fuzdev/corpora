@@ -32,10 +32,10 @@
 </script>
 
 <section>
-	<h1>active sessions</h1>
+	<h1>Active Sessions</h1>
 	{#if admin_sessions.active_count > 0}
 		<p>
-			<span class="chip color_a">{admin_sessions.active_count} active</span>
+			<span class="chip palette_a">{admin_sessions.active_count} active</span>
 		</p>
 	{/if}
 
@@ -44,7 +44,7 @@
 	{:else if admin_sessions.list.error}
 		<p class="color_c_50">{admin_sessions.list.error}</p>
 	{:else}
-		<Datatable {columns} rows={admin_sessions.sessions} height="400px">
+		<Datatable {columns} rows={admin_sessions.sessions} row_key={(row) => row.id} height="400px">
 			{#snippet cell(column, row)}
 				{#if column.key === 'id'}
 					<code class="font_size_sm text_50">{truncate_uuid(row.id)}</code>
@@ -62,7 +62,7 @@
 					<ConfirmButton
 						onconfirm={() => admin_sessions.submit_revoke_sessions(row.account_id)}
 						title="revoke all sessions for {row.username}"
-						class="sm"
+						class="sized_sm"
 						label="revoke sessions"
 						pending={admin_sessions.revoke_sessions.loading(row.account_id)}
 					/>
@@ -72,7 +72,7 @@
 					<ConfirmButton
 						onconfirm={() => admin_sessions.submit_revoke_tokens(row.account_id)}
 						title="revoke all tokens for {row.username}"
-						class="sm"
+						class="sized_sm"
 						label="revoke tokens"
 						pending={admin_sessions.revoke_tokens.loading(row.account_id)}
 					/>

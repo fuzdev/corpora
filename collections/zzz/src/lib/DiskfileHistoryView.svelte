@@ -2,7 +2,7 @@
 	import { slide } from 'svelte/transition';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 	import ConfirmButton from '@fuzdev/fuz_app/ui/ConfirmButton.svelte';
-	import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+	import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 	import type { DiskfileEditorState } from './diskfile_editor_state.svelte.ts';
 	import { format_time } from './time_helpers.ts';
@@ -24,7 +24,7 @@
 		<ConfirmButton
 			onconfirm={() => editor_state.clear_history()}
 			position="right"
-			class="plain sm"
+			class="plain sized_sm"
 			disabled={!editor_state.can_clear_history}
 			title={editor_state.can_clear_history
 				? 'Clear history entries except the current disk state'
@@ -37,10 +37,10 @@
 			onconfirm={() => {
 				editor_state.clear_unsaved_edits();
 			}}
-			class="plain sm"
+			class="plain sized_sm"
 			disabled={!editor_state.can_clear_unsaved_edits}
 			title={editor_state.can_clear_unsaved_edits
-				? 'Remove all unsaved edit entries from history'
+				? 'Delete the unsaved edit from history'
 				: 'No unsaved edits to clear'}
 		>
 			clear unsaved edits
@@ -54,7 +54,7 @@
 			<button
 				transition:slide
 				type="button"
-				class="listitem sm"
+				class="listitem sized_sm"
 				class:selected
 				class:content-matches={content_matches}
 				class:plain={!selected && !content_matches}
@@ -67,6 +67,8 @@
 						<span class="ml_xl">from disk</span>
 					{:else if entry.is_unsaved_edit}
 						<span class="ml_xl">unsaved</span>
+					{:else if entry.is_discarded_edit}
+						<span class="ml_xl">discarded</span>
 					{/if}
 				</span>
 				<span>{entry.content.length} chars</span>
@@ -80,7 +82,7 @@
 		background-color: var(--shade_10);
 	}
 
-	.listitem.sm {
+	.listitem.sized_sm {
 		padding: var(--space_xs2) var(--space_xs);
 		font-size: var(--font_size_sm);
 		display: flex;

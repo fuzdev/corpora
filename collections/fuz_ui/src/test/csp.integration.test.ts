@@ -1,6 +1,6 @@
 import { describe, test, assert } from 'vitest';
 
-import { create_csp_directives, COLOR_SCHEME_SCRIPT_HASH, type CspFrameSource } from '$lib/csp.ts';
+import { create_csp_directives, COLOR_SCHEME_SCRIPT_HASH, type CspFrameSource } from '#lib/csp.ts';
 import { TEST_SOURCES, src, srcs } from './csp_test_helpers.ts';
 
 const { GOOGLE_FONTS, GOOGLE_FONTS_STATIC, CLOUDFLARE_CDN, ANALYTICS, STRIPE } = TEST_SOURCES;

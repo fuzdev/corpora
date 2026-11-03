@@ -13,12 +13,19 @@
  *
  * Three tiers:
  *
- * - `can_view_cell` — admin / public / owner / any `viewer`+ grant.
- * - `can_edit_cell` — admin / owner / `editor` grant. NULL `created_by`
+ * - `can_view_cell` — admin / owner / public / any `viewer`+ grant, the
+ *   public and grant arms only while the cell's `moderation` admits an
+ *   audience (`db/cell_moderation.ts`: unmoderated or `'approved'`).
+ * - `can_edit_cell` — admin / owner / `editor` grant, the grant arm only
+ *   while the cell's `moderation` admits an audience. NULL `created_by`
  *   is admin-only (system-origin defense-in-depth).
  * - `can_manage_cell` — admin / owner only. Not delegable, not a grant
  *   level. Gates the manage tier: `visibility` writes and all grant
  *   management (`cell_grant_create` / `_list` / `_revoke`).
+ * - `can_steward_cell` — the governing root's manager reading a pending or
+ *   rejected contribution under it. A separate read arm beside
+ *   `can_view_cell`, composed only at the surfaces a moderator works from
+ *   (`auth/cell_steward.ts` names them).
  *
  * Grant-admit branches: per-`actor_id` grants admit the matching
  * actor; `(role, scope_id?)` grants admit any holder of an active
@@ -26,17 +33,30 @@
  * role_grant). The grant's `level` (`viewer` / `editor`) gates which
  * predicate it satisfies.
  *
+ * The admin bypass on every tier is the **global** `admin` grant
+ * (`has_scoped_role(auth, ROLE_ADMIN, null)`), never a scoped one.
+ *
+ * Moderation gates the audience: a cell's effective audience is its
+ * visibility or grants **and** its admission, so a pending, rejected, or
+ * unknown-marker contribution is readable through `can_view_cell` by its owner
+ * and a global admin alone, whatever its `visibility` or grants say. The
+ * `editor` grant arm of `can_edit_cell` follows the same admission; the owner,
+ * admin, and manage arms don't consult it.
+ *
  * @module
  */
 
-import { has_role, type RequestContext } from './request_context.ts';
+import { has_scoped_role, type RequestContext } from './request_context.ts';
 import { is_role_grant_active } from './account_schema.ts';
 import { ROLE_ADMIN } from './role_schema.ts';
 
-import type { CellRow } from '../db/cell_queries.ts';
+import type { CellRow, CellViewRow } from '../db/cell_queries.ts';
+import { CELL_VIEWER_ANONYMOUS, type CellViewer } from '../db/cell_view_sql.ts';
 import type { CellGrantRow } from '../db/cell_grant_queries.ts';
-
-const cell_is_public = (cell: CellRow): boolean => cell.visibility === 'public';
+import {
+	cell_moderation_admits_audience,
+	cell_moderation_is_stewardable
+} from '../db/cell_moderation.ts';
 
 /**
  * Whether any grant admits `auth` at the given level.
@@ -94,36 +114,68 @@ const grant_admits = (
  * a load-bearing property rather than relying on JS equality returning
  * false for NULL.
  */
-const is_owner = (auth: RequestContext, cell: CellRow): boolean =>
+const is_owner = (auth: RequestContext, cell: Pick<CellRow, 'created_by'>): boolean =>
 	auth.actor !== null && cell.created_by !== null && cell.created_by === auth.actor.id;
 
 /**
  * View authorization for a cell.
  *
  * - Admin: always allowed.
- * - `cell.visibility === 'public'`: allowed for everyone, including
- *   unauthenticated callers (e.g. a public landing cell).
  * - Owner (`cell.created_by === auth.actor.id`): allowed.
+ * - `cell.visibility === 'public'`: allowed for everyone, including
+ *   unauthenticated callers (e.g. a public landing cell) — while the cell's
+ *   `moderation` admits an audience (`cell_moderation_admits_audience`).
  * - Any active grant on the cell admits the caller (actor-shaped:
  *   match on actor_id; role-shaped: match on `(role, scope_id?)`
- *   against an active role_grant).
+ *   against an active role_grant) — under the same moderation admission.
  * - Otherwise: false.
  *
+ * A pending or rejected contribution stays with its owner and admins even
+ * when public or granted.
+ *
+ * Reads only the view facts (`visibility`, `moderation`, `created_by`), so a
+ * full `CellRow` and the narrow `CellViewRow` both answer it.
+ *
  * @param auth - request context, or `null` for unauthenticated callers
- * @param cell - the cell row
+ * @param cell - the cell row, or its view facts
  * @param grants - the cell's grant list, or `null` to skip the grant branch
  * @returns whether the caller may view the cell
  */
 export const can_view_cell = (
 	auth: RequestContext | null,
-	cell: CellRow,
+	cell: Omit<CellViewRow, 'id'>,
 	grants: ReadonlyArray<CellGrantRow> | null
 ): boolean => {
-	if (auth && has_role(auth, ROLE_ADMIN)) return true;
-	if (cell_is_public(cell)) return true;
+	if (auth && has_scoped_role(auth, ROLE_ADMIN, null)) return true;
 	if (auth && is_owner(auth, cell)) return true;
+	if (!cell_moderation_admits_audience(cell.moderation)) return false;
+	if (cell.visibility === 'public') return true;
 	if (auth && grant_admits(auth, grants, 'viewer')) return true;
 	return false;
+};
+
+/**
+ * The `CellViewer` a SQL view filter (`db/cell_view_sql.ts`) binds for
+ * `auth` — the facts `can_view_cell` reads, so the two admit the same cells:
+ * the acting actor, the global `admin` grant, and the active role grants
+ * `grant_admits` matches against.
+ *
+ * @param auth - request context, or `null` for unauthenticated callers
+ * @param now - the instant role-grant expiry is judged at
+ * @returns the viewer
+ */
+export const cell_viewer_from_auth = (
+	auth: RequestContext | null,
+	now: Date = new Date()
+): CellViewer => {
+	if (!auth) return CELL_VIEWER_ANONYMOUS;
+	const active = auth.role_grants.filter((p) => is_role_grant_active(p, now));
+	return {
+		actor_id: auth.actor?.id ?? null,
+		is_admin: has_scoped_role(auth, ROLE_ADMIN, null, now),
+		role_grant_roles: active.map((p) => p.role),
+		role_grant_scope_ids: active.map((p) => p.scope_id)
+	};
 };
 
 /**
@@ -140,6 +192,12 @@ export const can_view_cell = (
  * `false` for NULL via JS equality semantics — the explicit branch
  * survives refactors and reads as a load-bearing security property.
  *
+ * The `editor` grant arm requires the cell's `moderation` to admit an
+ * audience (`cell_moderation_admits_audience`), as in `can_view_cell`: a
+ * grant made while a contribution was approved stops admitting once it is
+ * rejected, for writes as for reads (every write verb echoes or reveals the
+ * row it touched).
+ *
  * @param auth - request context, or `null` for unauthenticated callers
  * @param cell - the cell row
  * @param grants - the cell's grant list, or `null` to skip the grant branch
@@ -151,12 +209,14 @@ export const can_edit_cell = (
 	grants: ReadonlyArray<CellGrantRow> | null
 ): boolean => {
 	if (!auth) return false;
-	if (has_role(auth, ROLE_ADMIN)) return true;
+	if (has_scoped_role(auth, ROLE_ADMIN, null)) return true;
 	if (cell.created_by === null) return false; // explicit: NULL = admin-only
 	// Owner check requires a resolved acting actor — account-grain auth
 	// (`actor: null`) cannot match an actor-id `created_by`. Grant-admit
 	// fallback below handles the actor-grain editor-grant path.
 	if (is_owner(auth, cell)) return true;
+	// the grant arm follows moderation admission, as in `can_view_cell`
+	if (!cell_moderation_admits_audience(cell.moderation)) return false;
 	if (grant_admits(auth, grants, 'editor')) return true;
 	return false;
 };
@@ -178,6 +238,38 @@ export const can_edit_cell = (
  */
 export const can_manage_cell = (auth: RequestContext | null, cell: CellRow): boolean => {
 	if (!auth) return false;
-	if (has_role(auth, ROLE_ADMIN)) return true;
+	if (has_scoped_role(auth, ROLE_ADMIN, null)) return true;
 	return is_owner(auth, cell);
 };
+
+/**
+ * Steward authorization: whether `auth` manages `root` — the governing root of
+ * `cell` — and `cell` is a pending or rejected contribution under it.
+ *
+ * The moderator's read of a contribution its audience can't see: true when
+ * `cell.root_id` is `root.id`, `cell.moderation` is exactly `'pending'` or
+ * `'rejected'` (`cell_moderation_is_stewardable`), `root` is not soft-deleted,
+ * and `can_manage_cell` admits `auth` on `root` (global admin or the root's
+ * owner — no grant tier confers manage). Unauthenticated callers are never
+ * stewards. An approved contribution later narrowed to private is not
+ * stewarded — it reads like any cell its author narrowed.
+ *
+ * Not part of `can_view_cell`: the steward arm admits only where a moderator
+ * works (`auth/cell_steward.ts` names the sites), so the relation gates, clone,
+ * contribution parents, and the grant paths keep the narrower predicate.
+ *
+ * @param auth - request context, or `null` for unauthenticated callers
+ * @param cell - the contribution
+ * @param root - the cell's governing root
+ * @returns whether the caller stewards the contribution
+ */
+export const can_steward_cell = (
+	auth: RequestContext | null,
+	cell: CellRow,
+	root: CellRow
+): boolean =>
+	auth !== null &&
+	cell.root_id === root.id &&
+	cell_moderation_is_stewardable(cell.moderation) &&
+	root.deleted_at === null &&
+	can_manage_cell(auth, root);

@@ -1,10 +1,12 @@
 <script lang="ts">
-	import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+	import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 	import { icon_arrow_left, icon_arrow_right, icon_refresh } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import { frontend_context } from './frontend.svelte.ts';
 	import type { DiskfileEditorState } from './diskfile_editor_state.svelte.ts';
+	import { DISKFILE_TABS_CLOSED_MAX } from './diskfile_tabs.svelte.ts';
+	import { to_prepended_list } from './list_helpers.ts';
 
 	const {
 		editor_state
@@ -16,7 +18,10 @@
 	const { diskfiles } = app;
 	const { editor } = diskfiles;
 
-	// Track navigation history
+	// Track navigation history, each stack capped at the closed tabs `DiskfileTabs`
+	// remembers — an older closed tab couldn't be navigated back to anyway
+	const push = (stack: Array<Uuid>, id: Uuid): Array<Uuid> =>
+		to_prepended_list(stack, id, DISKFILE_TABS_CLOSED_MAX);
 	let history_stack = $state<Array<Uuid>>([]); // Forward stack (for "back" operations)
 	let future_stack = $state<Array<Uuid>>([]); // Future stack (for "forward" operations)
 	let current_id = $state<Uuid | null>(null); // Currently displayed tab id
@@ -36,7 +41,7 @@
 		if (selected_id && selected_id !== current_id) {
 			// If we have a current id, push it to history stack
 			if (current_id) {
-				history_stack = [current_id, ...history_stack];
+				history_stack = push(history_stack, current_id);
 			}
 
 			// Clear forward navigation
@@ -63,26 +68,19 @@
 
 		// Push current tab to future stack
 		if (current_id) {
-			future_stack = [current_id, ...future_stack];
+			future_stack = push(future_stack, current_id);
 		}
 
 		// Update stacks
 		history_stack = remaining_history;
 
 		// Navigate to previous tab
-		const result = editor.tabs.navigate_to_tab(previous_id);
-		if (result.resulting_tab_id) {
-			// If we got back a different tab id (preview was created),
-			// update the current_id and replace the id in the future stack
-			if (result.resulting_tab_id !== previous_id) {
-				current_id = result.resulting_tab_id;
-
-				// Replace previous_id with the new tab id in any history stacks
-				future_stack = future_stack.map((id) =>
-					id === previous_id ? result.resulting_tab_id! : id
-				);
-			} else {
-				current_id = result.resulting_tab_id;
+		const resulting_tab_id = editor.navigate_to_tab(previous_id);
+		if (resulting_tab_id) {
+			current_id = resulting_tab_id;
+			// a closed tab resolves to a different tab id — replace it in the future stack
+			if (resulting_tab_id !== previous_id) {
+				future_stack = future_stack.map((id) => (id === previous_id ? resulting_tab_id : id));
 			}
 		}
 	};
@@ -98,24 +96,19 @@
 
 		// Push current tab to history stack
 		if (current_id) {
-			history_stack = [current_id, ...history_stack];
+			history_stack = push(history_stack, current_id);
 		}
 
 		// Update stacks
 		future_stack = remaining_future;
 
 		// Navigate to next tab
-		const result = editor.tabs.navigate_to_tab(next_id);
-		if (result.resulting_tab_id) {
-			// If we got back a different tab id (preview was created),
-			// update the current_id and replace the id in the history stack
-			if (result.resulting_tab_id !== next_id) {
-				current_id = result.resulting_tab_id;
-
-				// Replace next_id with the new tab id in any history stacks
-				history_stack = history_stack.map((id) => (id === next_id ? result.resulting_tab_id! : id));
-			} else {
-				current_id = result.resulting_tab_id;
+		const resulting_tab_id = editor.navigate_to_tab(next_id);
+		if (resulting_tab_id) {
+			current_id = resulting_tab_id;
+			// a closed tab resolves to a different tab id — replace it in the history stack
+			if (resulting_tab_id !== next_id) {
+				history_stack = history_stack.map((id) => (id === next_id ? resulting_tab_id : id));
 			}
 		}
 	};
@@ -129,7 +122,7 @@
 		onclick={go_back}
 		disabled={!can_go_back}
 	>
-		<Svg data={icon_arrow_left} />
+		<Icon data={icon_arrow_left} />
 	</button>
 	<button
 		type="button"
@@ -138,7 +131,7 @@
 		onclick={go_forward}
 		disabled={!can_go_forward}
 	>
-		<Svg data={icon_arrow_right} />
+		<Icon data={icon_arrow_right} />
 	</button>
 	<button
 		type="button"
@@ -150,6 +143,6 @@
 		}}
 		disabled
 	>
-		<Svg data={icon_refresh} />
+		<Icon data={icon_refresh} />
 	</button>
 </div>

@@ -30,8 +30,9 @@
 		/**
 		 * Language identifier (e.g. 'ts', 'css', 'html', 'json', 'svelte', 'md').
 		 * Selects the registered lexer and sets the `data-lang` attribute. `null`
-		 * disables highlighting (content renders as plain text); `undefined`
-		 * falls back to the default ('svelte').
+		 * or an unregistered id disables highlighting (content renders as plain
+		 * text, and an unregistered id logs an error in DEV); `undefined` falls
+		 * back to the default ('svelte').
 		 *
 		 * @default 'svelte'
 		 */
@@ -104,13 +105,17 @@
 
 <!-- eslint-disable svelte/no-at-html-tags -->
 
-<code {...rest} class:inline class:wrap data-lang={lang} bind:this={code_element}
-	>{#if use_ranges && children}{@render children(
-			content
-		)}{:else if use_ranges || rh.highlighting_disabled}{content}{:else if children}{@render children(
-			html_content
-		)}{:else}{@html html_content}{/if}</code
->
+<code {...rest} class:inline class:wrap data-lang={lang} bind:this={code_element}>
+	{#if use_ranges && children}
+		{@render children(content)}
+	{:else if use_ranges || rh.highlighting_disabled}
+		{content}
+	{:else if children}
+		{@render children(html_content)}
+	{:else}
+		{@html html_content}
+	{/if}
+</code>
 
 <style>
 	/* inline code inherits fuz_css defaults: pre-wrap, inline-block, baseline alignment */

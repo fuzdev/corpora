@@ -11,10 +11,14 @@
 
 import { describe, test, assert, vi, afterEach } from 'vitest';
 
-import { AdminAccountsState, type AdminAccountsRpc } from '$lib/ui/admin_accounts_state.svelte.ts';
-import type { AdminAccountEntryJson } from '$lib/auth/account_schema.ts';
-import type { RoleGrantOfferJson } from '$lib/auth/role_grant_offer_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import {
+	AdminAccountsState,
+	can_offer_global_role,
+	type AdminAccountsRpc
+} from '#lib/ui/admin_accounts_state.svelte.ts';
+import type { AdminAccountEntryJson } from '#lib/auth/account_schema.ts';
+import type { RoleGrantOfferJson } from '#lib/auth/role_grant_offer_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 
 import { make_offer } from './role_grant_offer_fixtures.ts';
 
@@ -35,7 +39,7 @@ const make_rpc = (overrides: Partial<AdminAccountsRpc> = {}): AdminAccountsRpc =
 	list_sessions: vi.fn().mockResolvedValue({ sessions: [] }),
 	create_role_grant: vi.fn().mockResolvedValue({ offer: make_offer() }),
 	revoke_role_grant: vi.fn().mockResolvedValue({ ok: true, revoked: true }),
-	retract_offer: vi.fn().mockResolvedValue({ ok: true }),
+	retract_offer: vi.fn().mockResolvedValue({ offer: make_offer() }),
 	session_revoke_all: vi.fn().mockResolvedValue({ ok: true, count: 1 }),
 	token_revoke_all: vi.fn().mockResolvedValue({ ok: true, count: 1 }),
 	...overrides
@@ -276,10 +280,9 @@ describe('AdminAccountsState.submit_retract', () => {
 
 		await state.submit_retract(offer_abc);
 
-		assert.strictEqual(
-			(rpc.retract_offer as ReturnType<typeof vi.fn>).mock.calls[0]![0],
-			offer_abc
-		);
+		assert.deepStrictEqual((rpc.retract_offer as ReturnType<typeof vi.fn>).mock.calls[0]![0], {
+			offer_id: offer_abc
+		});
 		assert.strictEqual((rpc.list_accounts as ReturnType<typeof vi.fn>).mock.calls.length, 1);
 		assert.strictEqual(state.retract.error(offer_abc), null);
 	});
@@ -322,10 +325,25 @@ describe('AdminAccountsState account lifecycle', () => {
 
 		await state.submit_delete(acct_1);
 
-		assert.deepStrictEqual(delete_account.mock.calls[0], [acct_1]);
+		assert.deepStrictEqual(delete_account.mock.calls[0], [{ account_id: acct_1 }]);
 		assert.ok(state.soft_delete.succeeded(acct_1));
 		// Refetched after success.
 		assert.strictEqual(list.mock.calls.length, 1);
+	});
+
+	test('delete_account requires a Uuid account_id, since the empty input deletes the caller', () => {
+		const rpc = make_rpc();
+		// never called — the expected errors are the assertions
+		const unused = (): unknown => [
+			// @ts-expect-error the empty input deletes the caller
+			rpc.delete_account({}),
+			// @ts-expect-error so does a null `account_id`
+			rpc.delete_account({ account_id: null }),
+			// @ts-expect-error and an omitted one
+			rpc.delete_account({ account_id: undefined }),
+			rpc.delete_account({ account_id: acct_1 })
+		];
+		assert.typeOf(unused, 'function');
 	});
 
 	test('submit_undelete calls account_undelete and refetches', async () => {
@@ -336,7 +354,7 @@ describe('AdminAccountsState account lifecycle', () => {
 
 		await state.submit_undelete(acct_1);
 
-		assert.deepStrictEqual(undelete_account.mock.calls[0], [acct_1]);
+		assert.deepStrictEqual(undelete_account.mock.calls[0], [{ account_id: acct_1 }]);
 		assert.ok(state.undelete.succeeded(acct_1));
 		assert.strictEqual(list.mock.calls.length, 1);
 	});
@@ -349,9 +367,112 @@ describe('AdminAccountsState account lifecycle', () => {
 		await state.set_show_deleted(true);
 
 		assert.ok(state.show_deleted);
-		assert.deepStrictEqual(list.mock.calls[0], [true]);
+		assert.deepStrictEqual(list.mock.calls[0], [{ include_deleted: true }]);
 		// Idempotent: same value doesn't refetch.
 		await state.set_show_deleted(true);
 		assert.strictEqual(list.mock.calls.length, 1);
+	});
+});
+
+describe('can_offer_global_role', () => {
+	const NOW = new Date('2026-06-01T12:00:00Z');
+	const scope = '11111111-1111-4111-8111-111111111111' as Uuid;
+
+	const make_grant = (
+		role: string,
+		scope_id: Uuid | null,
+		expires_at: string | null = null
+	): AdminAccountEntryJson['role_grants'][number] => ({
+		id: role_grant_1,
+		role,
+		scope_kind: scope_id === null ? null : 'classroom',
+		scope_id,
+		created_at: '2026-01-01T00:00:00Z',
+		expires_at,
+		granted_by: null
+	});
+
+	const make_pending_offer = (
+		role: string,
+		scope_id: Uuid | null
+	): AdminAccountEntryJson['pending_offers'][number] => ({
+		id: offer_1,
+		role,
+		scope_kind: scope_id === null ? null : 'classroom',
+		scope_id,
+		from_actor_id: actor_42,
+		from_username: 'admin',
+		created_at: '2026-01-01T00:00:00Z',
+		expires_at: '2026-12-01T00:00:00Z'
+	});
+
+	test('offers a role the account has no grant or offer of', () => {
+		assert.strictEqual(
+			can_offer_global_role({ role_grants: [], pending_offers: [] }, 'teacher', NOW),
+			true
+		);
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [make_grant('admin', null)], pending_offers: [] },
+				'teacher',
+				NOW
+			),
+			true
+		);
+	});
+
+	test('a global grant of the role rules the offer out', () => {
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [make_grant('teacher', null)], pending_offers: [] },
+				'teacher',
+				NOW
+			),
+			false
+		);
+	});
+
+	test('a scoped grant of the role does not', () => {
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [make_grant('teacher', scope)], pending_offers: [] },
+				'teacher',
+				NOW
+			),
+			true
+		);
+	});
+
+	test('a pending global offer of the role rules the offer out', () => {
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [], pending_offers: [make_pending_offer('teacher', null)] },
+				'teacher',
+				NOW
+			),
+			false
+		);
+	});
+
+	test('a pending scoped offer of the role does not', () => {
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [], pending_offers: [make_pending_offer('teacher', scope)] },
+				'teacher',
+				NOW
+			),
+			true
+		);
+	});
+
+	test('an expired global grant does not rule the offer out', () => {
+		assert.strictEqual(
+			can_offer_global_role(
+				{ role_grants: [make_grant('teacher', null, '2026-05-01T00:00:00Z')], pending_offers: [] },
+				'teacher',
+				NOW
+			),
+			true
+		);
 	});
 });

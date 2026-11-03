@@ -12,7 +12,15 @@
 import { test, assert, describe, beforeAll } from 'vitest';
 import ts from 'typescript';
 
-import { cleanComment, parseComment } from '$lib/tsdoc.ts';
+import {
+	cleanComment,
+	jsdocParamTagDefault,
+	parseComment,
+	parseCommentText,
+	parseCsspropTagText,
+	parseModuleComment,
+	toModuleDocFields
+} from '#lib/tsdoc.ts';
 
 import {
 	loadFixtures,
@@ -134,6 +142,35 @@ describe('parseComment module-comment filtering', () => {
 		assert.isUndefined(result);
 	});
 
+	test('a mid-line `@module` mention leaves the block a declaration doc', () => {
+		const result = parseFirstStatement(
+			'/**\n * Reads an HTML `<!-- @module -->` comment.\n *\n * @since 1.0.0\n */\nexport const d = 1;\n'
+		);
+		assert.ok(result);
+		// a declaration's JSDoc follows TypeScript, whose tag starts at the
+		// mid-line `@`, so the text stops there; the block stays the declaration's
+		assert.strictEqual(result.text, 'Reads an HTML `<!--');
+		assert.strictEqual(result.since, '1.0.0');
+	});
+
+	test('a `@module` after a second `*` margin is not line-leading, as in `cleanComment`', () => {
+		for (const block of ['/**\n * Docs.\n * * @module\n */', '/**\n * Docs.\n ** @module\n */']) {
+			const result = parseFirstStatement(`${block}\nexport const d = 1;\n`);
+			// the declaration keeps its doc; the text ends where TypeScript starts the tag
+			assert.ok(result?.text.startsWith('Docs.'), block);
+		}
+	});
+
+	test('a line-leading `@module` makes a module block, indented or on the opener line', () => {
+		for (const block of [
+			'/** @module */',
+			'/**\n * Docs.\n *   @module\n */',
+			'/**\n@module\n*/'
+		]) {
+			assert.isUndefined(parseFirstStatement(`${block}\nexport const d = 1;\n`), block);
+		}
+	});
+
 	test('own JSDoc below a module comment still applies', () => {
 		const result = parseFirstStatement(
 			'/**\n * Module docs.\n *\n * @module\n * @nodocs\n */\n\n/** Own docs. */\nexport const foo = 1;\n'
@@ -141,6 +178,26 @@ describe('parseComment module-comment filtering', () => {
 		assert.ok(result);
 		assert.strictEqual(result.text, 'Own docs.');
 		assert.notOk(result.nodocs);
+	});
+});
+
+describe('parseComment inline links', () => {
+	test('keeps each `{@link}` as written, targets that are not entity names included', () => {
+		const result = parseFirstStatement(
+			'/**\n * a {@link ./b.ts} c {@link} d {@link E} f {@link https://fuz.dev g}\n *\n * @see {@link ./h.ts}\n * @since {@link ./i.ts}\n */\nexport const a = (): number => 1;\n'
+		);
+		assert.ok(result);
+		assert.strictEqual(
+			result.text,
+			'a {@link ./b.ts} c {@link} d {@link E} f {@link https://fuz.dev g}'
+		);
+		assert.deepStrictEqual(result.seeAlso, ['{@link ./h.ts}']);
+		assert.strictEqual(result.since, '{@link ./i.ts}');
+	});
+
+	test('joins a link that spans lines onto one', () => {
+		const result = parseFirstStatement('/**\n * a {@link B\n * c} d\n */\nexport const a = 1;\n');
+		assert.strictEqual(result?.text, 'a {@link B c} d');
 	});
 });
 
@@ -155,11 +212,207 @@ describe('parseComment tag spelling synonyms', () => {
 		}
 	});
 
+	test('`@cssproperty` parses like `@cssprop`, one entry per name across both', () => {
+		const result = parseFirstStatement(
+			'/**\n * Docs.\n *\n * @cssproperty --a - b\n * @cssprop --a - c\n * @cssprop --d\n */\nexport const foo = 1;\n'
+		);
+		assert.ok(result);
+		assert.strictEqual(result.text, 'Docs.');
+		assert.deepEqual(result.cssProperties, [{ name: '--a', description: 'b' }, { name: '--d' }]);
+	});
+
 	test('`@return` (JSDoc synonym) parses like `@returns`', () => {
 		const result = parseFirstStatement(
 			'/**\n * Docs.\n *\n * @return the answer\n */\nexport const foo = (): number => 42;\n'
 		);
 		assert.ok(result);
 		assert.strictEqual(result.returns, 'the answer');
+	});
+});
+
+describe('parseCsspropTagText', () => {
+	test.each([
+		['a bare name', '--a', { name: '--a' }],
+		['a dash-separated description', '--a - b c', { name: '--a', description: 'b c' }],
+		['a description without the dash', '--a b', { name: '--a', description: 'b' }],
+		['a braced syntax', '{<color>} --a - b', { name: '--a', description: 'b', syntax: '<color>' }],
+		['an empty syntax', '{} --a', { name: '--a' }],
+		['a bracketed name', '[--a] - b', { name: '--a', description: 'b' }],
+		['a default', '[--a=1px] - b', { name: '--a', description: 'b', default: '1px' }],
+		['a spaced default', '[ --a = 1px 2px ]', { name: '--a', default: '1px 2px' }],
+		['an empty default', '[--a=]', { name: '--a' }],
+		[
+			'a default with nested brackets and strings',
+			"[--a=var(--b, [c]) ']'] - d",
+			{ name: '--a', description: 'd', default: "var(--b, [c]) ']'" }
+		],
+		['a non-ASCII name', '--é', { name: '--é' }],
+		['a multi-line description', '--a - b\nc', { name: '--a', description: 'b\nc' }]
+	])('%s', (_label, text, expected) => {
+		assert.deepEqual(parseCsspropTagText(text), expected);
+	});
+
+	test.each([
+		['an empty text', ''],
+		['a name without `--`', 'a - b'],
+		['a bare `--`', '-- - b'],
+		['an unclosed brace', '{<color> --a'],
+		['an unclosed bracket', '[--a=1px - b'],
+		['a description only', '- b']
+	])('names nothing: %s', (_label, text) => {
+		assert.strictEqual(parseCsspropTagText(text), undefined);
+	});
+});
+
+describe('jsdocParamTagDefault', () => {
+	/** The bracket default of `tagText`, the one `@param` tag on a JS function's JSDoc. */
+	const defaultOf = (tagText: string): string | undefined => {
+		const sourceFile = ts.createSourceFile(
+			'mod.js',
+			`/**\n * ${tagText}\n */\nexport function fn(a) {}\n`,
+			ts.ScriptTarget.Latest,
+			true,
+			ts.ScriptKind.JS
+		);
+		const tag = ts.getJSDocTags(sourceFile.statements[0]!).find(ts.isJSDocParameterTag);
+		assert.ok(tag, `expected a @param tag in ${tagText}`);
+		return jsdocParamTagDefault(tag, sourceFile);
+	};
+
+	test('slices the written default verbatim', () => {
+		assert.strictEqual(defaultOf('@param {number} [a=0] - d'), '0');
+		assert.strictEqual(defaultOf('@param {string} [a = "b c"] - d'), '"b c"');
+		assert.strictEqual(defaultOf('@param [a=0] {number} d'), '0');
+	});
+
+	test('skips brackets and quoted brackets inside the default', () => {
+		assert.strictEqual(defaultOf('@param [a=[1, [2]]] - d'), '[1, [2]]');
+		assert.strictEqual(defaultOf("@param [a='b]'] - d"), "'b]'");
+		assert.strictEqual(defaultOf("@param [a='b\\'] ]'] - d"), "'b\\'] ]'");
+		assert.strictEqual(defaultOf('@param [a={ b: () => 1 }] - d'), '{ b: () => 1 }');
+	});
+
+	test('drops the JSDoc margin from a multi-line default', () => {
+		assert.strictEqual(defaultOf('@param [a={\n *   x: 1\n * }] - d'), '{\n  x: 1\n}');
+	});
+
+	test('reads a regex literal containing `]` short (a named limit)', () => {
+		assert.strictEqual(defaultOf('@param [a=/]/] - d'), '/');
+	});
+
+	test('returns undefined without a written default', () => {
+		assert.strictEqual(defaultOf('@param {number} [a] - d'), undefined);
+		assert.strictEqual(defaultOf('@param {number} a - d'), undefined);
+		assert.strictEqual(defaultOf('@param {number} [a=] - d'), undefined);
+	});
+});
+
+describe('parseComment nested @param tags', () => {
+	test('property tags under a braced `{object}` parent key by their full name', () => {
+		const result = parseFirstStatement(
+			[
+				'/**',
+				' * @param {object} a - d1',
+				' * @param {object} a.b - d2',
+				' * @param {string} a.b.c - d3',
+				' * @param {object[]} d - d4',
+				' * @param {string} d[].e - d5',
+				' */',
+				'export function fn(a: unknown, d: unknown): void {}'
+			].join('\n')
+		);
+		assert.ok(result);
+		assert.deepEqual(
+			{ ...result.params },
+			{ a: 'd1', 'a.b': 'd2', 'a.b.c': 'd3', d: 'd4', 'd[].e': 'd5' }
+		);
+	});
+});
+
+describe('parseCommentText', () => {
+	test('parses the same as the JSDoc block the text came from', () => {
+		const block = [
+			'/**',
+			' * Docs with {@link a} and a list:',
+			' *',
+			' * - a',
+			' *   - b',
+			' *',
+			' * @example',
+			' * ```ts',
+			' * fn({',
+			' * \ta: 1',
+			' * });',
+			' * ```',
+			' * @see https://fuz.dev/a',
+			' *   continued',
+			' * @see {@link b}',
+			' * @throws {Error} when it fails',
+			' * @mutates a - Description 1',
+			' * @internal',
+			' * @since 1.0.0',
+			' */'
+		].join('\n');
+		const fromNode = parseFirstStatement(`${block}\nexport const a = 1;\n`);
+		const fromText = parseCommentText(cleanComment(block)!);
+		assert.ok(fromNode);
+		assert.deepStrictEqual(fromText, fromNode);
+		assert.deepStrictEqual(fromText?.seeAlso, ['https://fuz.dev/a continued', '{@link b}']);
+	});
+
+	test('restores a `*/` in the text, in prose and tags alike', () => {
+		const result = parseCommentText('a */ b\n\n@see c */ d\n@example\n/* e */');
+		assert.ok(result);
+		assert.strictEqual(result.text, 'a */ b');
+		assert.deepStrictEqual(result.seeAlso, ['c */ d']);
+		assert.deepStrictEqual(result.examples, ['/* e */']);
+	});
+
+	test('a mid-line `@` stays text, where TypeScript would start a tag', () => {
+		const result = parseCommentText('a `// @b c` d\ne @> f\n\n@see g @h {@link i}');
+		assert.ok(result);
+		assert.strictEqual(result.text, 'a `// @b c` d\ne @> f');
+		assert.deepStrictEqual(result.seeAlso, ['g @h {@link i}']);
+	});
+
+	test('escape placeholders never collide with private-use characters in the text', () => {
+		const text = `a ${String.fromCharCode(0xe000)} ${String.fromCharCode(0xe001)} b @ c */ d`;
+		const result = parseModuleComment(`${text}\n@module`);
+		assert.strictEqual(result?.text, text);
+	});
+
+	test('text with a `@module` line parses to undefined, like a module block on a node', () => {
+		assert.isUndefined(parseCommentText('Docs.\n@module'));
+	});
+});
+
+describe('parseModuleComment', () => {
+	test('drops `@module` lines, renames included, keeping prose after them', () => {
+		const result = parseModuleComment('@module custom-name\nDocs.\n\n@since 1.0.0');
+		assert.ok(result);
+		assert.strictEqual(result.text, 'Docs.');
+		assert.strictEqual(result.since, '1.0.0');
+	});
+
+	test('a bare `@module` parses to undefined', () => {
+		assert.isUndefined(parseModuleComment('@module'));
+	});
+
+	test('a tag-only comment parses, with empty prose', () => {
+		const result = parseModuleComment('@see https://fuz.dev\n@module');
+		assert.ok(result);
+		assert.strictEqual(result.text, '');
+		assert.deepStrictEqual(toModuleDocFields(result), { seeAlso: ['https://fuz.dev'] });
+	});
+
+	test('toModuleDocFields keeps only the tags a module carries', () => {
+		const result = parseModuleComment(
+			'Docs.\n\n@param a - b\n@returns c\n@throws {Error} d\n@mutates e - f\n@default 1\n@nodocs\n@deprecated\n@module'
+		);
+		assert.ok(result);
+		assert.deepStrictEqual(toModuleDocFields(result), {
+			moduleComment: 'Docs.',
+			deprecatedMessage: ''
+		});
 	});
 });

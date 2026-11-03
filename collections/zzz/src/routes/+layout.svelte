@@ -1,6 +1,22 @@
 <script lang="ts">
 	import 'virtual:fuz.css';
+	// declare every theme variable the imported stylesheets read (fuz_css also scans `.css`
+	// imports; these keep the set explicit) - first fuz_code's `theme.css` and
+	// `theme_highlight.css` (the same set)
+	// @fuz-variables palette_a_50 palette_b_50 palette_d_50 palette_e_50 palette_f_50
+	// @fuz-variables palette_g_50 palette_h_50 palette_i_50 palette_j_50 text_50
 	import '@fuzdev/fuz_code/theme.css';
+	import '@fuzdev/fuz_code/theme_highlight.css';
+	// then zzz's own `style.css`
+	// @fuz-variables border_color_30 border_radius_xs2 border_width_1 border_width_2
+	// @fuz-variables outline_color outline_width
+	// @fuz-variables distance_sm font_family_sans font_size_sm input_height
+	// @fuz-variables space_xs space_sm space_md space_xl7
+	// @fuz-variables shade_10 shade_20 shade_30 shade_60 text_70 text_80 text_90 text_color
+	// @fuz-variables palette_a_50
+	// @fuz-variables shadow_sm shadow_bottom_xs shadow_bottom_xl
+	// @fuz-variables shadow_inset_top_xs shadow_inset_top_sm shadow_inset_bottom_xs
+	// @fuz-variables shadow_color_umbra shadow_alpha_30 shadow_alpha_40
 	import './style.css';
 
 	import { untrack } from 'svelte';
@@ -16,50 +32,93 @@
 	import BootstrapForm from '@fuzdev/fuz_app/ui/BootstrapForm.svelte';
 	import Alert from '@fuzdev/fuz_ui/Alert.svelte';
 	import CopyToClipboard from '@fuzdev/fuz_ui/CopyToClipboard.svelte';
+	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
 
-	import { parse_url_param_uuid } from '$lib/url_params_helpers.ts';
-	import { App } from '$lib/app.svelte.ts';
-	import FrontendRoot from '$lib/FrontendRoot.svelte';
-	import { library_context } from '$lib/library.ts';
+	import { parse_url_param_uuid } from '#lib/nav.ts';
+	import { App } from '#lib/app.svelte.ts';
+	import FrontendRoot from '#lib/FrontendRoot.svelte';
+	import { library_context } from '#lib/library.ts';
 	import { SiteState, site_context } from '@fuzdev/fuz_ui/site.svelte.ts';
-	import { logo_zzz } from '$lib/logos.ts';
+	import { logo_zzz } from '#lib/logos.ts';
 	import { library_json_from_modules } from '@fuzdev/fuz_util/library_json.ts';
 	import { modules } from 'virtual:svelte-docinfo';
 	import pkg_json from 'virtual:pkg.json';
-	import { ProviderJson } from '$lib/provider.svelte.ts';
-	import create_zzz_config from '$lib/config.ts';
-	import { ModelJson } from '$lib/model.svelte.ts';
+	import { ProviderJson } from '#lib/provider.svelte.ts';
+	import create_zzz_config from '#lib/config.ts';
+	import { ModelJson } from '#lib/model.svelte.ts';
 	import { DOCS_PATH } from '@fuzdev/fuz_ui/docs_helpers.svelte.ts';
+	import { create_session_recheck } from '#lib/session_recheck.ts';
+	import {
+		backend_reachable_context,
+		is_public_route,
+		PUBLIC_ROUTE_PATHS,
+		to_auth_gate_state,
+		to_auth_redirect
+	} from '#lib/auth_gate.ts';
+	import { BackendProbe } from '@fuzdev/fuz_app/ui/backend_probe.svelte.ts';
+	import { create_detached } from '#lib/reactive_helpers.svelte.ts';
+	import { confirm_unload_with_unsaved_changes } from '#lib/diskfile_helpers.ts';
+	import { confirm_unload_while_recording } from '#lib/recording_helpers.ts';
+	import RecorderIndicator from '#lib/RecorderIndicator.svelte';
 
 	const { children, params } = $props();
 
 	const library_json = library_json_from_modules(pkg_json, modules);
 
-	// Auth state — gate all content behind authentication
+	// Auth state — gates every route but the public ones (about, docs) behind
+	// a session. Only the first check shows the gate's spinner: a later one
+	// (a login or bootstrap in flight, a recheck) keeps the form mounted.
 	const auth_state = auth_state_context.set(new AuthState());
-	void auth_state.check_session();
-
-	// Gate liveness probe — `check_session` can't distinguish a downed daemon
-	// from a logged-out 401, so probe `/health` to show a recovery hint instead
-	// of a dead login form. Browser-only.
-	let probing = $state.raw(true);
-	let backend_unreachable = $state.raw(false);
+	let session_checked = $state.raw(false);
 	if (BROWSER) {
-		void (async () => {
-			try {
-				const response = await fetch('/health');
-				backend_unreachable = !response.ok;
-			} catch {
-				backend_unreachable = true;
-			} finally {
-				probing = false;
-			}
-		})();
+		void auth_state.check_session().finally(() => {
+			session_checked = true;
+		});
 	}
+
+	// Gate liveness probe — `check_session` can't distinguish a missing daemon
+	// (a static build served on its own, or a stopped daemon) from a
+	// logged-out 401, so probe the backend to say the daemon is needed instead
+	// of showing a dead login form. Browser-only.
+	const backend = new BackendProbe();
+	if (BROWSER) void backend.probe();
+
+	const public_route = $derived(
+		is_public_route(
+			page.url.pathname,
+			PUBLIC_ROUTE_PATHS.map((path) => resolve(path))
+		)
+	);
+	const gate_state = $derived(
+		to_auth_gate_state({
+			session_checked,
+			backend_checked: backend.reachable !== null,
+			backend_reachable: backend.reachable === true,
+			verified: auth_state.verified,
+			needs_bootstrap: auth_state.needs_bootstrap
+		})
+	);
+	// a login or bootstrap returns to the page it replaced, deep link intact
+	const auth_redirect = $derived(to_auth_redirect(page.url, resolve('/')));
+	// public routes read this to say what they're missing (the daemon, or a login)
+	backend_reachable_context.set(() => backend.reachable);
 
 	// TODO should load granularly when needed (/docs, /about), but currently the capabilities page uses the package json data, how better to get that? generate a more minimal metadata file?
 	library_context.set(new Library(library_json));
 	site_context.set(new SiteState({ icon: logo_zzz, pkg_json }));
+
+	// Re-verify the session when the backend hints it's gone; `check_session`
+	// flips `verified` off, which tears the App down and shows the login gate.
+	// Only a definitive 401 counts, so a daemon restart doesn't log anyone out.
+	// A session still valid after a revoked socket means a revocation ended
+	// another session (another tab's logout, a token revoke-all) but closed
+	// every socket of the account — so reconnect.
+	const recheck_session = create_session_recheck({
+		on_invalid: () => auth_state.check_session(),
+		on_valid: () => {
+			app?.socket.reconnect_revoked();
+		}
+	});
 
 	// Create the frontend's App only after auth is verified
 	let app: App | undefined = $state.raw();
@@ -67,21 +126,55 @@
 	// TODO init properly from data
 	const init_app = (): void => {
 		const zzz_config = create_zzz_config();
-		const new_app = new App();
-		new_app.add_providers(zzz_config.providers.map((p) => ProviderJson.parse(p))); // TODO handle errors
-		new_app.models.add_many(zzz_config.models.map((m) => ModelJson.parse(m))); // TODO handle errors
+		// detached from the effect that runs this — the app outlives it (see `create_detached`)
+		const new_app = create_detached(() => {
+			const created = new App({ on_unauthenticated: () => void recheck_session() });
+			created.add_providers(zzz_config.providers.map((p) => ProviderJson.parse(p))); // TODO handle errors
+			created.models.add_many(zzz_config.models.map((m) => ModelJson.parse(m))); // TODO handle errors
+			return created;
+		});
 
 		app = new_app;
 
 		if (BROWSER) {
 			(window as any).app = new_app; // no types for this, just for runtime convenience
-			void new_app.api.session_load();
+			new_app.boot_session();
 		}
 	};
 
 	$effect.pre(() => {
 		if (!auth_state.verified || app) return;
 		untrack(init_app);
+	});
+
+	// Session gone (logout, or a recheck found it revoked/expired) — drop the
+	// App so its socket stops reconnecting and a fresh one starts after login.
+	$effect.pre(() => {
+		if (auth_state.verified || !app) return;
+		const old_app = app;
+		app = undefined;
+		untrack(() => old_app.dispose());
+		if (BROWSER && (window as any).app === old_app) (window as any).app = undefined;
+	});
+
+	// The server closed the socket as revoked, or reconnects keep failing (a
+	// browser can't tell an expired session's 401 upgrade from a downed daemon).
+	$effect(() => {
+		if (!app) return;
+		if (app.socket.revoked || app.socket.reconnect_count >= 2) {
+			void recheck_session();
+		}
+	});
+
+	// Feed each socket connect to `handle_socket_connect`: it runs the boot
+	// load that `boot_session` deferred to the first connect, and resyncs after
+	// a load the socket didn't carry (an HTTP fallback, or before a reconnect —
+	// notifications sent while the socket was down are lost).
+	$effect(() => {
+		if (!app) return;
+		const current_app = app;
+		const connect_time = current_app.socket.last_connect_time;
+		untrack(() => current_app.handle_socket_connect(connect_time));
 	});
 
 	// TODO refactor, maybe per route?
@@ -109,6 +202,14 @@
 	<title>Zzz</title>
 </svelte:head>
 
+<!-- drafts live only in memory, and leaving ends a recording, so either asks first -->
+<svelte:window
+	onbeforeunload={(e) => {
+		confirm_unload_with_unsaved_changes(e, app?.diskfiles);
+		confirm_unload_while_recording(e, app?.recorder);
+	}}
+/>
+
 <svelte:body
 	{@attach contextmenu_attachment([
 		{
@@ -135,6 +236,22 @@
 />
 
 {#if auth_state.verified && app}
+	{#if app.socket.superseded}
+		<!-- never reopened automatically: a reconnect can close another of the account's sockets -->
+		<div class="socket-notice shade_10 border_radius_xs">
+			<Alert status="error">
+				<p class="mt_0 mb_sm"><strong>Connection closed.</strong></p>
+				<p class="mb_sm">
+					This account has too many connections open, so the server closed this one, the oldest.
+					Live updates are paused until you reconnect, which closes the account's oldest connection
+					if it is still at the limit.
+				</p>
+				<button type="button" onclick={() => app?.socket.connect()}>reconnect</button>
+			</Alert>
+		</div>
+	{/if}
+	<!-- on every page while the microphone is live -->
+	<RecorderIndicator recorder={app.recorder} />
 	<!-- TODO hacky, docs need to nest gracefully with abosolute positioning, or at least support offset vars -->
 	{#if page.url.pathname === DOCS_PATH || page.url.pathname.startsWith(DOCS_PATH + '/')}
 		{@render children()}
@@ -143,34 +260,69 @@
 			{@render children()}
 		</FrontendRoot>
 	{/if}
+{:else if public_route}
+	<!-- about and docs need neither a session nor the daemon -->
+	{@render children()}
 {:else}
 	<div class="gate">
-		{#if auth_state.verifying || probing}
+		{#if gate_state === 'checking'}
 			<p class="text_50">verifying session...</p>
-		{:else if backend_unreachable}
+		{:else if gate_state === 'daemon_unreachable'}
+			<Svg data={logo_zzz} size="var(--icon_size_xl)" />
+			<h1>zzz</h1>
+			<blockquote>nice web things for the tired 💤</blockquote>
 			<div class="width_atmost_sm">
 				<Alert status="error">
-					<p class="mt_0 mb_sm"><strong>The zzz backend isn't responding.</strong></p>
+					<p class="mt_0 mb_sm"><strong>This page needs the zzz daemon.</strong></p>
 					<p class="mb_sm">Start it, then reload:</p>
+					<p class="row gap_sm mb_sm">
+						<code>zzz daemon start</code>
+						<CopyToClipboard text="zzz daemon start" />
+					</p>
+					<p class="mb_sm">(or run <code>zzz</code> to start it and open a browser)</p>
 					<p class="row gap_sm mb_0">
+						<span>in a zzz checkout:</span>
 						<code>cargo xtask dev</code>
 						<CopyToClipboard text="cargo xtask dev" />
 					</p>
 				</Alert>
 			</div>
-		{:else if auth_state.needs_bootstrap}
+			<p>
+				The <a href={resolve('/about')}>about page</a> and <a href={resolve('/docs')}>docs</a> work
+				without it.
+			</p>
+		{:else if gate_state === 'bootstrap'}
 			<h1>zzz</h1>
 			<p>No accounts exist yet. Create the first admin account.</p>
 			<p>
-				Get the bootstrap token: <code>cat .zzz/bootstrap_token</code>
-				<CopyToClipboard text="cat .zzz/bootstrap_token" />
+				The bootstrap token is in the file the daemon's <code>FUZ_BOOTSTRAP_TOKEN_PATH</code> names:
 			</p>
-			<BootstrapForm />
+			<ul>
+				<li class="row gap_sm">
+					<code>cat ~/.zzz/bootstrap_token</code>
+					<CopyToClipboard text="cat ~/.zzz/bootstrap_token" />
+					<span>(the <code>zzz</code> CLI)</span>
+				</li>
+				<li class="row gap_sm">
+					<code>cat .zzz/bootstrap_token</code>
+					<CopyToClipboard text="cat .zzz/bootstrap_token" />
+					<span>(<code>cargo xtask dev</code>, in the checkout)</span>
+				</li>
+			</ul>
+			<p>
+				Missing? It's deleted once an admin exists — <code>zzz init</code> creates a new one, then
+				restart the daemon.
+			</p>
+			<BootstrapForm redirect_on_bootstrap={auth_redirect} />
 		{:else}
 			<h1>zzz</h1>
 			<div class="width_atmost_sm">
-				<LoginForm />
+				<LoginForm redirect_on_login={auth_redirect} />
 			</div>
+			<p class="text_50">
+				No account yet? <code>zzz init</code> recreates the bootstrap token if it's gone (it's
+				deleted once the first admin exists); then restart the daemon.
+			</p>
 		{/if}
 	</div>
 {/if}
@@ -182,5 +334,15 @@
 		align-items: center;
 		margin: 0 auto;
 		padding: var(--space_xl5) var(--space_lg);
+	}
+	/* over the dashboard's fixed panes */
+	.socket-notice {
+		position: fixed;
+		bottom: var(--space_lg);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 2;
+		width: calc(100% - 2 * var(--space_lg));
+		max-width: var(--distance_sm);
 	}
 </style>

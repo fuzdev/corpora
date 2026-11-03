@@ -4,7 +4,7 @@
  */
 
 import { flushSync, type Component } from 'svelte';
-import { contextmenu_attachment, ContextmenuState } from '$lib/contextmenu_state.svelte.ts';
+import { contextmenu_attachment, ContextmenuState } from '#lib/contextmenu_state.svelte.ts';
 import { mount_component } from './test_helpers.ts';
 
 /**

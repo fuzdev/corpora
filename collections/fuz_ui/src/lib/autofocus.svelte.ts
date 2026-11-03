@@ -15,6 +15,5 @@ import type { Attachment } from 'svelte/attachments';
 export const autofocus =
 	(options?: FocusOptions): Attachment<HTMLElement | SVGElement> =>
 	(el) => {
-		// focusVisible missing from TS lib.dom.d.ts as of 5.9
-		el.focus({ focusVisible: true, ...options } as FocusOptions);
+		el.focus({ focusVisible: true, ...options });
 	};

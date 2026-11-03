@@ -6,7 +6,8 @@
   import type { Scheme } from './types.js';
   import { flush } from '$lib/flush.js';
   import * as pmtiles from 'pmtiles';
-  import maplibregl, { type RasterTileSource as MaplibreRasterTileSource } from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
+  import type { RasterTileSource as MaplibreRasterTileSource } from 'maplibre-gl';
 
   interface Props {
     id?: string;
@@ -116,6 +117,14 @@
     }
   });
 </script>
+
+<!-- @component
+Add a raster tile source to the map. Give the tiles with `tiles` (an array of tile URLs) or with `url`.
+
+Place a `RasterLayer` inside this component's children and it uses this source automatically. The children render only after the source is added.
+
+If `url` contains `pmtiles://`, the component registers the PMTiles protocol for you. When `tiles` changes, the component updates the tiles of the existing source. Most other props are applied only when the source is created.
+-->
 
 {#if source.value}
   {#key source.value}

@@ -25,7 +25,7 @@
 	<TomeSection>
 		<TomeSectionHeader text="Modules" />
 		{#if modules.length === 0}
-			<p class="color_c">No modules match your search.</p>
+			<p class="text_70">No modules match your search.</p>
 		{:else}
 			<ul class="modules-list">
 				{#each modules as module (module.path)}

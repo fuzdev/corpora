@@ -1,5 +1,6 @@
-import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { assert, describe, test, expect, vi, beforeEach } from 'vitest';
 import type { PackageJson } from '@fuzdev/fuz_util/package_json.ts';
+import { SchemaError } from '@fuzdev/fuz_schema/schema.ts';
 
 // Mock the git helpers so the cache-key/staleness logic can be tested in
 // isolation, without depending on the surrounding repo's git state.
@@ -46,7 +47,7 @@ import {
 	library_cache_read,
 	library_cache_write,
 	library_load_from_repo
-} from '$lib/library_load.ts';
+} from '#lib/library_load.ts';
 
 const mocked_commit = vi.mocked(git_current_commit_hash);
 const mocked_workspace = vi.mocked(git_check_workspace);
@@ -63,6 +64,38 @@ const mocked_library_json_from_modules = vi.mocked(library_json_from_modules);
 const fake_library = { name: 'example', version: '1.0.0' } as unknown as LibraryJson;
 const fake_package_json = { name: 'example', version: '1.0.0' } as unknown as PackageJson;
 const fake_result = { library_json: fake_library, package_json: fake_package_json };
+
+/**
+ * Serves `files` (absolute path to contents) through the mocked `readFile`,
+ * rejecting any other path the way a missing file does.
+ */
+const mock_files = (files: Record<string, string>): void => {
+	mocked_read.mockImplementation(async (path) => {
+		const contents = files[path as string];
+		if (contents === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+		return contents;
+	});
+};
+
+/**
+ * Makes the mocked `fs_exists` report exactly `paths` as present.
+ */
+const mock_existing = (paths: Array<string>): void => {
+	mocked_exists.mockImplementation(async (path) => paths.includes(path));
+};
+
+const KIT_TSCONFIG = '/repo/node_modules/$app/tsconfig.json';
+
+const create_mock_log = (): any => {
+	const child_log = { debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
+	return {
+		info: vi.fn(),
+		warn: vi.fn(),
+		debug: vi.fn(),
+		child: vi.fn(() => child_log),
+		child_log
+	};
+};
 
 describe('SVELTE_DOCINFO_VERSION', () => {
 	test('resolves the installed svelte-docinfo version', () => {
@@ -345,12 +378,138 @@ describe('library_load_from_repo', () => {
 		expect(mocked_write).not.toHaveBeenCalled();
 	});
 
-	// An empty name passes the `PackageJson` schema (`z.string()`), so this
-	// exercises gro's own guard rather than zod validation.
+	// An empty name passes the `PackageJson` schema (`s.string`), so this
+	// exercises gro's own guard rather than schema validation.
 	test('throws on an empty package.json name', async () => {
 		mocked_is_clean.mockReturnValue(false);
 		mocked_read.mockResolvedValue(JSON.stringify({ name: '', version: '1.0.0' }));
 
 		await expect(library_load_from_repo('/repo')).rejects.toThrow(/name/);
+	});
+
+	test('throws `SchemaError` on an invalid package.json, before analyzing', async () => {
+		mocked_is_clean.mockReturnValue(false);
+		mocked_read.mockResolvedValue(JSON.stringify({ name: 1, version: '1.0.0' }));
+
+		const error = await library_load_from_repo('/repo').catch((e: unknown) => e);
+		assert(error instanceof SchemaError);
+		assert.strictEqual(error.message, 'name: expected string, received number');
+		expect(mocked_analyze).not.toHaveBeenCalled();
+	});
+});
+
+describe('library_load_from_repo with a SvelteKit tsconfig', () => {
+	const package_json_contents = JSON.stringify({ name: 'example', version: '1.0.0' });
+	const kit_tsconfig_contents =
+		'{\n\t// SvelteKit projects extend the synced config\n\t"extends": "$app/tsconfig"\n}';
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mocked_commit.mockResolvedValue('abc123');
+		mocked_workspace.mockResolvedValue({} as any);
+		mocked_is_clean.mockReturnValue(true);
+		mocked_analyze.mockResolvedValue({ modules: [] } as any);
+		mocked_library_json_from_modules.mockReturnValue(fake_library);
+		mocked_mkdir.mockResolvedValue(undefined);
+		mocked_write.mockResolvedValue(undefined);
+		mock_files({
+			'/repo/package.json': package_json_contents,
+			'/repo/tsconfig.json': kit_tsconfig_contents
+		});
+	});
+
+	// An unsynced tree would analyze on default compiler options (external types
+	// as `any`), so it's refused before analysis and nothing is cached.
+	test('an unsynced tree throws without analyzing or writing the cache', async () => {
+		mock_existing([]);
+
+		const error = await library_load_from_repo('/repo').catch((e: unknown) => e);
+		assert(error instanceof Error);
+		expect(error.message).toContain('/repo/node_modules/$app/tsconfig.json');
+		expect(error.message).toMatch(/npm install/);
+		expect(error.message).toMatch(/gro sync/);
+		expect(mocked_analyze).not.toHaveBeenCalled();
+		expect(mocked_write).not.toHaveBeenCalled();
+	});
+
+	test('an unsynced dirty tree throws', async () => {
+		mocked_is_clean.mockReturnValue(false);
+		mock_existing([]);
+
+		await expect(library_load_from_repo('/repo')).rejects.toThrow(/gro sync/);
+		expect(mocked_analyze).not.toHaveBeenCalled();
+		expect(mocked_write).not.toHaveBeenCalled();
+	});
+
+	// The check runs only on a cache miss - a hit is served as written.
+	test('a cache hit for an unsynced tree is served without the unsynced check', async () => {
+		mock_files({
+			'/repo/package.json': package_json_contents,
+			'/repo/tsconfig.json': kit_tsconfig_contents,
+			'/repo/.gro/library.json': JSON.stringify({
+				hash: 'abc123',
+				version: LIBRARY_CACHE_VERSION,
+				svelte_docinfo_version: SVELTE_DOCINFO_VERSION,
+				...fake_result
+			})
+		});
+		mock_existing(['/repo/.gro/library.json']);
+		const log = create_mock_log();
+
+		const result = await library_load_from_repo('/repo', { log });
+		expect(result).toEqual(fake_result);
+		expect(mocked_analyze).not.toHaveBeenCalled();
+		expect(mocked_write).not.toHaveBeenCalled();
+		expect(log.warn).not.toHaveBeenCalled();
+	});
+
+	test('an unsynced tree throws under `cache: false` too', async () => {
+		mock_existing([]);
+
+		await expect(library_load_from_repo('/repo', { cache: false })).rejects.toThrow(/gro sync/);
+		expect(mocked_analyze).not.toHaveBeenCalled();
+		expect(mocked_write).not.toHaveBeenCalled();
+	});
+
+	test('a synced tree analyzes and caches as before', async () => {
+		mock_existing([KIT_TSCONFIG]);
+		const log = create_mock_log();
+
+		const result = await library_load_from_repo('/repo', { log });
+		expect(result.library_json).toBe(fake_library);
+		expect(log.warn).not.toHaveBeenCalled();
+		expect(mocked_exists).toHaveBeenCalledWith(KIT_TSCONFIG);
+		expect(mocked_analyze).toHaveBeenCalled();
+		const [path] = mocked_write.mock.calls[0]!;
+		expect(path).toBe('/repo/.gro/library.json');
+	});
+
+	test('a non-SvelteKit tsconfig analyzes and caches as before', async () => {
+		mock_files({
+			'/repo/package.json': package_json_contents,
+			'/repo/tsconfig.json': '{"compilerOptions": {"strict": true}}'
+		});
+		mock_existing([]);
+
+		await library_load_from_repo('/repo');
+		expect(mocked_analyze).toHaveBeenCalled();
+		expect(mocked_write).toHaveBeenCalled();
+	});
+
+	test('logs the analysis to a child of `log`, with its progress at debug level', async () => {
+		mock_existing([KIT_TSCONFIG]);
+		const log = create_mock_log();
+		const { child_log } = log;
+
+		await library_load_from_repo('/repo', { log });
+		expect(log.child).toHaveBeenCalledWith('repo');
+		const analysis_log = mocked_analyze.mock.calls[0]![0].log!;
+		analysis_log.info('progress');
+		analysis_log.warn('diagnostic');
+		analysis_log.error('failure');
+		expect(child_log.debug).toHaveBeenCalledWith('progress');
+		expect(child_log.warn).toHaveBeenCalledWith('diagnostic');
+		expect(child_log.error).toHaveBeenCalledWith('failure');
+		expect(log.info).not.toHaveBeenCalledWith('progress');
 	});
 });

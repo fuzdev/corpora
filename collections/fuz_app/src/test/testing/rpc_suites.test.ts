@@ -8,26 +8,31 @@
  */
 
 import { describe, test, assert } from 'vitest';
+import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import { z } from 'zod';
 
-import type { RequestResponseActionSpec } from '$lib/actions/action_spec.ts';
-import type { RpcAction } from '$lib/actions/action_rpc.ts';
-import { create_test_app_surface_spec } from '$lib/testing/stubs.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
-import { describe_rpc_attack_surface_tests } from '$lib/testing/rpc_attack_surface.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RpcEndpointSpec } from '$lib/http/surface.ts';
+import type { RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
+import type { RpcAction } from '#lib/actions/action_types.ts';
+import { create_test_app_surface_spec } from '#lib/testing/stubs.ts';
+import { AUTH_MIDDLEWARE_PATH } from '#lib/auth/middleware.ts';
+import { create_health_route_spec } from '#lib/http/common_routes.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
+import { describe_rpc_attack_surface_tests } from '#lib/testing/rpc_attack_surface.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RpcEndpointSpec } from '#lib/http/surface.ts';
 import {
 	create_rpc_post_init,
 	create_rpc_get_url,
+	create_rpc_request_text,
+	rpc_call_raw,
 	assert_jsonrpc_error_response,
 	assert_jsonrpc_success_response,
 	resolve_rpc_endpoints_for_setup
-} from '$lib/testing/rpc_helpers.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import { JSONRPC_VERSION } from '$lib/http/jsonrpc.ts';
+} from '#lib/testing/rpc_helpers.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { JSONRPC_VERSION } from '#lib/http/jsonrpc.ts';
 
 const session_options = create_session_config('test_rpc_session');
 
@@ -161,6 +166,33 @@ describe('rpc_helpers', () => {
 	test('create_rpc_get_url omits params for null', () => {
 		const url = create_rpc_get_url('/api/rpc', 'my_method', null);
 		assert.ok(!url.includes('params='));
+	});
+
+	test('create_rpc_request_text splices params_json verbatim', () => {
+		assert.strictEqual(
+			create_rpc_request_text('m', '{"limit":5.0,"offset":-0}', 'x'),
+			'{"jsonrpc":"2.0","method":"m","id":"x","params":{"limit":5.0,"offset":-0}}'
+		);
+		assert.strictEqual(
+			create_rpc_request_text('m', undefined, 1),
+			'{"jsonrpc":"2.0","method":"m","id":1}'
+		);
+	});
+
+	test('rpc_call_raw sends params_json verbatim on POST and GET', async () => {
+		const seen: Array<{ url: string; body: string | null }> = [];
+		const app = async (url: string, init?: RequestInit): Promise<Response> => {
+			seen.push({ url, body: typeof init?.body === 'string' ? init.body : null });
+			return new Response('{"jsonrpc":"2.0","id":"test","result":null}');
+		};
+		const params_json = '{"limit":1e1}';
+		await rpc_call_raw({ app, path: '/api/rpc', method: 'm', params_json });
+		await rpc_call_raw({ app, path: '/api/rpc', method: 'm', params_json, verb: 'GET' });
+		assert.ok(seen[0]!.body!.endsWith(',"params":{"limit":1e1}}'), seen[0]!.body!);
+		assert.strictEqual(new URL(seen[1]!.url, 'http://x').searchParams.get('params'), params_json);
+		await assert_rejects(() =>
+			rpc_call_raw({ app, path: '/api/rpc', method: 'm', params: {}, params_json })
+		);
 	});
 
 	test('assert_jsonrpc_error_response validates structure', () => {
@@ -322,5 +354,115 @@ describe('create_test_app_surface_spec — ws_endpoints', () => {
 		});
 		assert.strictEqual(spec.surface.ws_endpoints.length, 0);
 		assert.strictEqual(spec.ws_endpoints.length, 0);
+	});
+});
+
+// --- auth-scope check ---
+//
+// `create_test_app_surface_spec` runs the same `assert_endpoint_in_auth_scope`
+// `create_app_server` does, so a surface snapshot never records an endpoint
+// the real server refuses to start with.
+
+describe('create_test_app_surface_spec — auth scope', () => {
+	test('throws for an rpc_endpoints path outside AUTH_MIDDLEWARE_PATH', () => {
+		assert.throws(
+			() =>
+				create_test_app_surface_spec({
+					session_options,
+					create_route_specs: () => [],
+					rpc_endpoints: [{ path: '/rpc', actions: fixture_actions }]
+				}),
+			`rpc_endpoints path /rpc is outside the auth middleware's scope (${AUTH_MIDDLEWARE_PATH})`
+		);
+	});
+
+	test('throws for a ws_endpoints path outside AUTH_MIDDLEWARE_PATH', () => {
+		for (const path of ['/ws', '/apiws']) {
+			assert.throws(
+				() =>
+					create_test_app_surface_spec({
+						session_options,
+						create_route_specs: () => [],
+						ws_endpoints: [{ path, allowed_origins: [], actions: fixture_actions }]
+					}),
+				`ws_endpoints path ${path} is outside the auth middleware's scope (${AUTH_MIDDLEWARE_PATH})`
+			);
+		}
+	});
+
+	test('accepts the bare scope prefix /api, as Hono matches it', () => {
+		const spec = create_test_app_surface_spec({
+			session_options,
+			create_route_specs: () => [],
+			rpc_endpoints: [{ path: '/api', actions: fixture_actions }],
+			ws_endpoints: [{ path: '/api', allowed_origins: [], actions: fixture_actions }]
+		});
+		assert.strictEqual(spec.surface.rpc_endpoints[0]!.path, '/api');
+		assert.strictEqual(spec.surface.ws_endpoints[0]!.path, '/api');
+	});
+
+	test('throws for a carve-out that overlaps the auth scope, as create_app_server does', () => {
+		for (const path of ['/api/*', '/api/account/*', '/api/rpc']) {
+			assert.throws(
+				() =>
+					create_test_app_surface_spec({
+						session_options,
+						create_route_specs: () => [],
+						rpc_endpoints: [{ path: '/api/rpc', actions: fixture_actions }],
+						origin_carve_outs: [{ path, reason: 'too wide on purpose' }]
+					}),
+				`origin carve-out ${path} overlaps the auth middleware's scope (${AUTH_MIDDLEWARE_PATH})`
+			);
+		}
+	});
+
+	test('throws for a credential-minting route outside the auth scope, as create_app_server does', () => {
+		assert.throws(
+			() =>
+				create_test_app_surface_spec({
+					session_options,
+					create_route_specs: () => [
+						{
+							...create_health_route_spec(),
+							method: 'POST',
+							path: '/auth/login',
+							mints_credential: true
+						}
+					],
+					origin_carve_outs: [{ path: '/auth/*', reason: 'login CSRF on purpose' }]
+				}),
+			`route POST /auth/login mints a credential but is outside the auth middleware's scope (${AUTH_MIDDLEWARE_PATH})`
+		);
+	});
+
+	test("a carve-out keeps the origin check's 403 off the routes it covers, and only those", () => {
+		const spec = create_test_app_surface_spec({
+			session_options,
+			create_route_specs: () => [
+				create_health_route_spec(),
+				{ ...create_health_route_spec(), path: '/hooks/push' }
+			],
+			origin_carve_outs: [{ path: '/hooks/*', reason: 'refuses browser callers itself' }]
+		});
+		const origin = spec.surface.middleware.find((m) => m.name === 'origin')!;
+		assert.deepStrictEqual(origin.carve_outs, [
+			{ path: '/hooks/*', reason: 'refuses browser callers itself' }
+		]);
+		const statuses = (path: string): Array<string> =>
+			Object.keys(spec.surface.routes.find((r) => r.path === path)!.error_schemas ?? {});
+		assert.include(statuses('/health'), '403');
+		assert.notInclude(statuses('/hooks/push'), '403');
+	});
+
+	test('an origin-less ws spec without allowed_origins names the fix', () => {
+		assert.throws(
+			() =>
+				create_test_app_surface_spec({
+					session_options,
+					create_route_specs: () => [],
+					ws_endpoints: [{ path: '/api/ws', actions: fixture_actions }]
+				}),
+			"create_test_app_surface_spec's allowed_origins option"
+		);
 	});
 });

@@ -10,9 +10,9 @@
 		on_commit = () => {},
 		on_paint = () => {}
 	}: {
-		BenchmarkedComponent: Component<BenchmarkComponentProps> | null;
-		props: BenchmarkComponentProps | null;
-		/** Fires once the highlight work is committed and laid out (work boundary). */
+		BenchmarkedComponent?: Component<BenchmarkComponentProps> | null;
+		props?: BenchmarkComponentProps | null;
+		/** Fires once the styling work is committed and laid out (work boundary). */
 		on_commit?: () => void;
 		/** Fires once the browser has settled pixels, ~1-2 frames later (paint boundary). */
 		on_paint?: () => void;
@@ -22,10 +22,10 @@
 
 	// The child component mounts and inserts its DOM before this parent onMount
 	// runs, so reading layout here forces style + layout to complete synchronously.
-	// `on_commit` therefore marks the end of the actual highlight work (stylize +
+	// `on_commit` therefore marks the end of the actual styling work (stylize +
 	// DOM build + layout); `on_paint` fires after `ensure_paint` once pixels have
 	// settled. The two are reported separately so the frame-quantized paint wait
-	// doesn't get charged to the highlighter's compute cost.
+	// doesn't get charged to the styler's compute cost.
 	onMount(async () => {
 		// Force layout recalculation for all modes to ensure consistent timing,
 		// and read the values so they can't be optimized away.

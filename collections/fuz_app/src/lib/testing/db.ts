@@ -3,22 +3,23 @@ import './assert_dev_env.ts';
 /**
  * Test database fixtures for parameterized testing.
  *
- * Provides factory builders for creating test databases with pglite (in-memory)
- * and pg (PostgreSQL) drivers. Consumer projects provide their own schema
- * initialization via `run_migrations` and compose factories into test suites.
+ * Provides factory builders for creating test databases with pglet-wasm (the
+ * in-memory default), PGlite (in-memory) and pg (PostgreSQL) drivers. Consumer
+ * projects provide their own schema initialization via `run_migrations` and
+ * compose factories into test suites.
  *
  * @example
  * ```ts
- * import {create_pglite_factory, create_pg_factory} from '@fuzdev/fuz_app/testing/db.ts';
+ * import {create_default_db_factory, create_pg_factory} from '@fuzdev/fuz_app/testing/db.ts';
  * import {run_migrations} from '@fuzdev/fuz_app/db/migrate.ts';
- * import {auth_migration_ns} from '@fuzdev/fuz_app/auth/migrations.ts';
+ * import {AUTH_MIGRATION_NS} from '@fuzdev/fuz_app/auth/migrations.ts';
  *
  * const init_schema = async (db) => {
- *   await run_migrations(db, [auth_migration_ns]);
+ *   await run_migrations(db, [AUTH_MIGRATION_NS]);
  * };
- * const pglite_factory = create_pglite_factory(init_schema);
+ * const default_factory = create_default_db_factory(init_schema);
  * const pg_factory = create_pg_factory(init_schema, process.env.TEST_DATABASE_URL);
- * export const db_factories = [pglite_factory, pg_factory];
+ * export const db_factories = [default_factory, pg_factory];
  * ```
  *
  * @module
@@ -26,18 +27,19 @@ import './assert_dev_env.ts';
 
 import { describe, beforeAll, beforeEach, afterAll, assert } from 'vitest';
 import type { Pool } from 'pg';
-import { to_error_message } from '@fuzdev/fuz_util/error.ts';
 
 import type { Db } from '../db/db.ts';
 import { create_pglite_db } from '../db/db_pglite.ts';
+import { create_pglet_db_driver, create_pglet_instance } from '../db/db_pglet.ts';
 import { assert_valid_sql_identifier } from '../db/sql_identifier.ts';
-import { create_pg_db, register_pg_type_parsers } from '../db/db_pg.ts';
+import {
+	create_pg_db,
+	create_pg_pool,
+	DEFAULT_DB_CHECKOUT_TIMEOUT_MS,
+	register_pg_type_parsers
+} from '../db/db_pg.ts';
 import { query_public_columns } from '../db/schema_ready.ts';
-
-/**
- * CI detection — `CI=true` is set automatically by GitHub Actions, GitLab CI, etc.
- */
-export const IS_CI = process.env.CI === 'true';
+import { pg_error_code } from '../db/pg_error.ts';
 
 /**
  * Factory interface for creating test database instances.
@@ -51,65 +53,150 @@ export interface DbFactory {
 }
 
 /**
- * Reset a PGlite database to a clean state by dropping and recreating the public schema.
+ * Reset a test database to a clean slate by dropping and recreating the `public` schema.
  *
- * Removes all tables, sequences, indexes, types, and functions.
- * The database instance remains usable after reset.
+ * `DROP SCHEMA public CASCADE; CREATE SCHEMA public` in plain SQL, so it resets
+ * every driver: the in-memory factories call it on each `create()`, and it is
+ * recommended at the start of `init_schema` callbacks for `create_pg_factory`,
+ * whose persistent databases accumulate stale DDL across fuz_app versions.
+ * Drift-proof — it wipes every table, type, and sequence regardless of
+ * namespace, so it needs no upkeep when the schema gains a table. The database
+ * instance remains usable after reset.
  *
  * @mutates db - drops the `public` schema and recreates it; all rows in all
  *   tables are gone after this returns.
  */
-export const reset_pglite = async (db: Db): Promise<void> => {
+export const reset_public_schema = async (db: Db): Promise<void> => {
 	await db.query('DROP SCHEMA public CASCADE');
 	await db.query('CREATE SCHEMA public');
 };
 
-// Module-level PGlite cache — shared across all factories in the same vitest worker (one test file).
-// Each vitest file runs in its own worker thread, so no cross-file contamination.
-let module_db: Db | null = null;
+/**
+ * Builds a `DbFactory` from a schema initializer — the shape of every factory builder here.
+ */
+export type DbFactoryBuilder = (init_schema: (db: Db) => Promise<void>) => DbFactory;
 
 /**
- * Create a pglite (in-memory) database factory for tests.
+ * Build a factory over one module-level instance per driver: the first
+ * `create()` creates it, and each `create()` resets its `public` schema and
+ * runs `init_schema`, so only the first pays the WASM cold start.
  *
- * Always enabled — no external dependencies required.
- * Shares a single PGlite WASM instance across all factories in the same
- * vitest worker thread (one test file). Subsequent `create()` calls reset
- * the schema via `DROP SCHEMA public CASCADE` instead of paying the WASM
- * cold-start cost again.
+ * The instance lives as long as this module stays loaded — under the `db`
+ * project's `isolate: false` + `fileParallelism: false` that is the whole run;
+ * a project that isolates its files gets one per worker. A promise rather than
+ * a value, so two concurrent first `create()` calls build one instance, and a
+ * failed first load is the error every later `create()` reports.
+ */
+const create_shared_instance_factory = (
+	name: string,
+	resolve_db: () => Promise<Db>,
+	init_schema: (db: Db) => Promise<void>
+): DbFactory => {
+	return {
+		name,
+		skip: false,
+		async create() {
+			const db = await resolve_db();
+			// the instance is shared with every factory of this driver, so it may hold any schema
+			await reset_public_schema(db);
+			await init_schema(db);
+			return db;
+		},
+		async close() {
+			// No-op: the instance is module-level, so it lives as long as this module
+			// stays loaded. Nothing frees it earlier.
+		}
+	};
+};
+
+// The module-level instances the shared factories hand out, created on first use.
+let pglite_db: Promise<Db> | null = null;
+let pglet_wasm_db: Promise<Db> | null = null;
+
+const resolve_pglite_db = (): Promise<Db> =>
+	(pglite_db ??= (async () => {
+		const { PGlite } = await import('@electric-sql/pglite');
+		return create_pglite_db(new PGlite()).db;
+	})());
+
+const resolve_pglet_wasm_db = (): Promise<Db> =>
+	(pglet_wasm_db ??= create_pglet_instance().then((pglet) => create_pglet_db_driver(pglet).db));
+
+/**
+ * Create a PGlite (in-memory) database factory for tests.
+ *
+ * Always enabled — needs the optional `@electric-sql/pglite` peer installed.
+ * Shares one PGlite WASM instance across the PGlite factories this module
+ * builds; each `create()` resets the schema via `DROP SCHEMA public CASCADE`
+ * instead of paying the cold start again.
  *
  * @param init_schema - callback to initialize the database schema
  */
-export const create_pglite_factory = (init_schema: (db: Db) => Promise<void>): DbFactory => ({
-	name: 'pglite',
-	skip: false,
-	async create() {
-		if (module_db) {
-			await reset_pglite(module_db);
-		} else {
-			const { PGlite } = await import('@electric-sql/pglite');
-			const pglite = new PGlite();
-			module_db = create_pglite_db(pglite).db;
-		}
-		await init_schema(module_db);
-		return module_db;
-	},
-	async close() {
-		// No-op: shared instance lives for the worker thread's lifetime.
-		// PGlite is cleaned up when the vitest worker exits.
-	}
-});
+export const create_pglite_factory: DbFactoryBuilder = (init_schema) =>
+	create_shared_instance_factory('pglite', resolve_pglite_db, init_schema);
+
+/**
+ * Create a pglet-wasm (in-memory) database factory for tests.
+ *
+ * Always enabled — needs the optional `@fuzdev/pglet-wasm` peer installed.
+ * Shares one pglet instance across the pglet-wasm factories this module
+ * builds, created with fuz_app's value coercion (`PGLET_COERCION`); each
+ * `create()` resets the schema via `DROP SCHEMA public CASCADE`.
+ *
+ * @param init_schema - callback to initialize the database schema
+ */
+export const create_pglet_wasm_factory: DbFactoryBuilder = (init_schema) =>
+	create_shared_instance_factory('pglet-wasm', resolve_pglet_wasm_db, init_schema);
+
+// The builder `create_default_db_factory` uses, `null` for pglet-wasm.
+let default_db_factory_builder: DbFactoryBuilder | null = null;
+
+/**
+ * Install the builder `create_default_db_factory` uses, so suites written
+ * against the default run against another driver without being edited —
+ * `create_pglite_factory` to run them on PGlite. Pass `null` to restore
+ * pglet-wasm.
+ *
+ * The slot is read when a factory is built, not when it creates a database,
+ * so install before the first `create_default_db_factory` call — a vitest
+ * `setupFiles` entry, which runs ahead of every test file's imports, is the
+ * shape fuz_app's own `db` project uses. A factory built earlier (including
+ * the module-level fallback in `testing/app_server.ts`) keeps the driver it
+ * was built with, and uninstalling does not revert it.
+ *
+ * @param create_factory - the builder to install, or `null` to restore the default
+ * @returns the builder this replaced (`null` for pglet-wasm), so a caller can put it back
+ */
+export const set_default_db_factory = (
+	create_factory: DbFactoryBuilder | null
+): DbFactoryBuilder | null => {
+	const previous = default_db_factory_builder;
+	default_db_factory_builder = create_factory;
+	return previous;
+};
+
+/**
+ * Create the default in-memory database factory for tests: pglet-wasm, or the
+ * builder `set_default_db_factory` installed.
+ *
+ * The factory fuz_app's own test helpers fall back to when a suite passes none
+ * (`create_test_app_server`, `describe_rate_limiting_tests`,
+ * `describe_sse_route_tests`). Call `create_pglite_factory` or
+ * `create_pglet_wasm_factory` directly to pin a driver.
+ *
+ * @param init_schema - callback to initialize the database schema
+ */
+export const create_default_db_factory: DbFactoryBuilder = (init_schema) =>
+	(default_db_factory_builder ?? create_pglet_wasm_factory)(init_schema);
 
 /**
  * Create a pg (PostgreSQL) database factory for tests.
  *
- * Skipped when `test_url` is not provided.
- * Drops `schema_version` before running `init_schema`, forcing migrations
- * to re-evaluate against the actual tables. Prevents stale tracker rows
- * from skipping migrations when DDL changes between test sessions.
- *
- * For full clean-slate behavior (recommended), call `drop_auth_schema(db)`
- * at the start of `init_schema` before running migrations. This handles
- * upstream schema changes that go beyond adding new tables/columns.
+ * Skipped when `test_url` is not provided. Each `create()` opens a pool,
+ * resets the `public` schema (`reset_public_schema`) and runs `init_schema` —
+ * the lifecycle every factory here shares, so a persistent test database never
+ * carries stale DDL or tracker rows from an earlier run or another suite's
+ * schema. Point `test_url` at a database used only for tests.
  *
  * @param init_schema - callback to initialize the database schema
  * @param test_url - PostgreSQL connection URL (e.g. from `TEST_DATABASE_URL`)
@@ -145,26 +232,27 @@ export const create_pg_factory = (
 				}
 				pool_ref = null;
 			}
-			const { Pool } = await import('pg');
+			const { default: pg } = await import('pg');
 			// Mirror production's int8→number coercion (`create_db`) so the
 			// test pg pool reads `BIGSERIAL` columns (e.g. `audit_log.seq`)
 			// as numbers like PGlite does — without this the pg leg of a
 			// `.db.test.ts` sees `seq` as a string and wire-schema parses fail.
 			await register_pg_type_parsers();
-			const pool = new Pool({ connectionString: test_url });
+			// production's pool, so a test reads production's checkout semantics
+			const pool = create_pg_pool(pg, {
+				connection_string: test_url,
+				checkout_timeout_ms: DEFAULT_DB_CHECKOUT_TIMEOUT_MS
+			});
 			pool_ref = pool;
 			const { db } = create_pg_db(pool);
 			try {
-				// Drop schema_version so migrations re-evaluate against the actual
-				// tables. Prevents stale tracker rows from skipping migrations
-				// when DDL changes between test sessions. Migrations use
-				// IF NOT EXISTS guards, so re-running is safe.
-				await db.query('DROP TABLE IF EXISTS schema_version');
+				await reset_public_schema(db);
 				await init_schema(db);
 			} catch (error) {
 				await pool.end();
-				const msg = to_error_message(error);
-				if (msg.includes('does not exist')) {
+				// 3D000 invalid_catalog_name — the database itself is missing, not
+				// something a migration referenced
+				if (pg_error_code(error) === '3D000') {
 					const db_name = test_url.split('/').pop()?.split('?')[0] ?? 'test_db';
 					throw new Error(
 						`Database "${db_name}" does not exist. Create it with: createdb ${db_name}`
@@ -210,25 +298,6 @@ export const auth_truncate_tables = [
  * touch audit logging don't need to truncate it.
  */
 export const auth_integration_truncate_tables = [...auth_truncate_tables, 'audit_log'];
-
-/**
- * Reset the entire `public` schema for a clean slate before re-migration.
- *
- * Recommended at the start of `init_schema` callbacks for `create_pg_factory`.
- * Persistent test databases accumulate stale DDL across fuz_app versions;
- * `DROP SCHEMA public CASCADE; CREATE SCHEMA public` wipes every table, type,
- * and sequence regardless of namespace, so migrations always run against a
- * truly empty database. Drift-proof — unlike a hand-maintained drop list it
- * needs no upkeep when the schema gains a table. Despite the historical name,
- * this resets the whole schema, not just auth tables (the only documented use
- * is clean-slate re-migration, which always wanted a full reset).
- *
- * @mutates db - drops and recreates the `public` schema; all tables gone.
- */
-export const drop_auth_schema = async (db: Db): Promise<void> => {
-	await db.query('DROP SCHEMA public CASCADE');
-	await db.query('CREATE SCHEMA public');
-};
 
 /**
  * Create a `describe_db` function bound to specific factories and truncate tables.

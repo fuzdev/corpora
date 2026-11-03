@@ -13,21 +13,25 @@ import {
 	DaemonToken,
 	DAEMON_TOKEN_HEADER,
 	type DaemonTokenState
-} from '$lib/auth/daemon_token.ts';
+} from '#lib/auth/daemon_token.ts';
 import {
 	create_daemon_token_middleware,
 	resolve_keeper_account_id
-} from '$lib/auth/daemon_token_middleware.ts';
-import { ACCOUNT_ID_KEY, AUTH_API_TOKEN_ID_KEY, CREDENTIAL_TYPE_KEY } from '$lib/hono_context.ts';
-import { ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { QueryDeps } from '$lib/db/query_deps.ts';
+} from '#lib/auth/daemon_token_middleware.ts';
+import { create_bearer_auth_middleware } from '#lib/auth/bearer_auth.ts';
+import { create_request_context_middleware } from '#lib/auth/request_context.ts';
+import { get_resolved_auth, resolved_auth_api_token_id } from '#lib/auth/resolved_auth.ts';
+import { ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import type { QueryDeps } from '#lib/db/query_deps.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { RESOLVED_AUTH_KEY } from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
 import {
 	create_test_account,
 	create_test_actor,
+	create_test_raw_api_token,
 	create_test_role_grant
-} from '$lib/testing/entities.ts';
+} from '#lib/testing/entities.ts';
 
 // Mock module-level query functions used by daemon_token_middleware
 const {
@@ -44,13 +48,13 @@ const {
 	mock_query_role_grant_find_account_id_for_role: vi.fn()
 }));
 
-vi.mock('$lib/auth/account_queries.js', () => ({
+vi.mock('#lib/auth/account_queries.ts', () => ({
 	query_account_by_id: mock_query_account_by_id,
 	query_actor_by_id: mock_query_actor_by_id,
 	query_active_actors_by_account: mock_query_active_actors_by_account
 }));
 
-vi.mock('$lib/auth/role_grant_queries.js', () => ({
+vi.mock('#lib/auth/role_grant_queries.ts', () => ({
 	query_role_grant_find_active_for_actor: mock_query_role_grant_find_active_for_actor,
 	query_role_grant_find_account_id_for_role: mock_query_role_grant_find_account_id_for_role
 }));
@@ -68,16 +72,16 @@ const mock_deps = { db: {} } as unknown as QueryDeps;
 const test_log = new Logger('test', { level: 'off' });
 
 const setup_default_mocks = () => {
-	const account = create_test_account({ id: 'acct-keeper' as Uuid, username: 'keeper' });
+	const account = create_test_account({ id: 'acct-keeper', username: 'keeper' });
 	const actor = create_test_actor({
-		id: 'actor-keeper' as Uuid,
-		account_id: 'acct-keeper' as Uuid,
+		id: 'actor-keeper',
+		account_id: 'acct-keeper',
 		name: 'keeper'
 	});
 	const role_grants = [
 		create_test_role_grant({
-			id: 'role_grant-keeper' as Uuid,
-			actor_id: 'actor-keeper' as Uuid,
+			id: 'role_grant-keeper',
+			actor_id: 'actor-keeper',
 			role: 'keeper'
 		})
 	];
@@ -105,13 +109,12 @@ const create_daemon_app = (state: DaemonTokenState): Hono => {
 	const app = new Hono();
 	app.use('/*', create_daemon_token_middleware(state, mock_deps, test_log));
 	app.get('/test', (c) => {
-		const account_id = c.get(ACCOUNT_ID_KEY);
-		const credential_type = c.get(CREDENTIAL_TYPE_KEY);
-		const api_token_id = c.get(AUTH_API_TOKEN_ID_KEY);
+		const auth = get_resolved_auth(c);
 		return c.json({
-			context: account_id ? { account_id, actor_id: null } : null,
-			credential_type: credential_type ?? null,
-			api_token_id: api_token_id ?? null
+			context: auth ? { account_id: auth.account_id, actor_id: null } : null,
+			credential_type: auth?.credential_type ?? null,
+			api_token_id: resolved_auth_api_token_id(auth),
+			resolved: auth
 		});
 	});
 	return app;
@@ -232,6 +235,39 @@ describe('create_daemon_token_middleware', () => {
 		assert.strictEqual(body.credential_type, null);
 	});
 
+	test('starting the chain, it clears and logs a credential set before it', async () => {
+		const state = create_state();
+		const log = new Logger('test', { level: 'off' });
+		const debug = vi.spyOn(log, 'debug');
+		const app = new Hono();
+		app.use('/*', async (c, next) => {
+			// a layer mounted before the credential legs
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: 'acct-preset' })
+			);
+			await next();
+		});
+		app.use('/*', create_daemon_token_middleware(state, mock_deps, log));
+		app.get('/test', (c) => c.json({ resolved: get_resolved_auth(c) }));
+
+		const res = await app.request('/test');
+		assert.strictEqual((await res.json()).resolved, null);
+		assert.strictEqual(debug.mock.calls.length, 1);
+		assert.include(String(debug.mock.calls[0]![0]), 'cleared a credential (session)');
+	});
+
+	test('a clean start logs nothing', async () => {
+		const log = new Logger('test', { level: 'off' });
+		const debug = vi.spyOn(log, 'debug');
+		const app = new Hono();
+		app.use('/*', create_daemon_token_middleware(create_state(), mock_deps, log));
+		app.get('/test', (c) => c.json({ resolved: get_resolved_auth(c) }));
+
+		await app.request('/test');
+		assert.strictEqual(debug.mock.calls.length, 0);
+	});
+
 	test('valid current token sets account_id and credential_type', async () => {
 		const state = create_state();
 		const app = create_daemon_app(state);
@@ -248,6 +284,12 @@ describe('create_daemon_token_middleware', () => {
 		// auth requires role_grants or its input declares `acting`.
 		assert.strictEqual(body.credential_type, 'daemon_token');
 		assert.strictEqual(body.api_token_id, null);
+		// the daemon arm, with nothing of another credential's
+		assert.deepStrictEqual(body.resolved, {
+			credential_type: 'daemon_token',
+			account_id: 'acct-keeper',
+			credential_deadline: null
+		});
 	});
 
 	test('valid previous token sets account_id and credential_type', async () => {
@@ -372,33 +414,44 @@ describe('create_daemon_token_middleware', () => {
 		assert.strictEqual(state.keeper_account_id, 'acct-keeper');
 	});
 
-	test('overrides existing session context when daemon token header present', async () => {
+	test('the session and bearer legs after it skip, so neither credential is looked up', async () => {
+		// The chain order: daemon token, then session cookie, then bearer. A
+		// database that throws on any query proves the later legs never read
+		// the session row or validate (and so never touch) the bearer token.
 		const state = create_state();
+		const throwing_deps = {
+			db: {
+				query: () => {
+					throw new Error('the session and bearer legs must not query');
+				}
+			}
+		} as unknown as QueryDeps;
 		const app = new Hono();
-		// simulate session middleware setting account-only context first
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, 'acct-session-user');
-			c.set(CREDENTIAL_TYPE_KEY, 'session');
+			c.set('client_ip', '127.0.0.1');
+			c.set('pending_effects', []);
+			// what the session middleware leaves for a cookie sent beside the token
+			c.set('auth_session_id', 'raw-session-token');
 			await next();
 		});
 		app.use('/*', create_daemon_token_middleware(state, mock_deps, test_log));
-		app.get('/test', (c) => {
-			const account_id = c.get(ACCOUNT_ID_KEY);
-			const credential_type = c.get(CREDENTIAL_TYPE_KEY);
-			return c.json({
-				account_id: account_id ?? null,
-				credential_type: credential_type ?? null
-			});
-		});
+		app.use('/*', create_request_context_middleware(throwing_deps, { starts_chain: false }));
+		app.use('/*', create_bearer_auth_middleware(throwing_deps, test_log));
+		app.get('/test', (c) => c.json({ resolved: get_resolved_auth(c) }));
 
 		const res = await app.request('/test', {
-			headers: { [DAEMON_TOKEN_HEADER]: state.current_token }
+			headers: {
+				[DAEMON_TOKEN_HEADER]: state.current_token,
+				authorization: `Bearer ${create_test_raw_api_token()}`
+			}
 		});
 		assert.strictEqual(res.status, 200);
 		const body = await res.json();
-		// daemon token overrides the session-derived account id
-		assert.strictEqual(body.account_id, 'acct-keeper');
-		assert.strictEqual(body.credential_type, 'daemon_token');
+		assert.deepStrictEqual(body.resolved, {
+			credential_type: 'daemon_token',
+			account_id: 'acct-keeper',
+			credential_deadline: null
+		});
 	});
 });
 

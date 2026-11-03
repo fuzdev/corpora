@@ -11,10 +11,10 @@
 import { test, assert, describe } from 'vitest';
 import { join } from 'node:path';
 
-import { analyze } from '$lib/analyze.ts';
-import { hasErrors, hasWarnings } from '$lib/diagnostics.ts';
-import type { SourceFileInfo } from '$lib/source.ts';
-import { createSourceOptions } from '$lib/source-config.ts';
+import { analyze } from '#lib/analyze.ts';
+import { hasErrors, hasWarnings } from '#lib/diagnostics.ts';
+import type { SourceFileInfo } from '#lib/source.ts';
+import { createSourceOptions } from '#lib/source-config.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -304,11 +304,11 @@ let {label}: {label: string} = $props();
 		});
 	});
 
-	// Lock-in tests for the chained-namespace path-leak fix. Detection used to
-	// rely on `getImmediateAliasedSymbol(exportSymbol).declarations[0]` being a
-	// `NamespaceExport`, which fails when intermediate hops are `ExportSpecifier`
-	// nodes. The fix uses the `ValueModule` flag on the deeply-resolved alias,
-	// which is robust to arbitrary chain depth.
+	// Chained namespace re-exports must not leak paths. Checking that
+	// `getImmediateAliasedSymbol(exportSymbol).declarations[0]` is a
+	// `NamespaceExport` fails when intermediate hops are `ExportSpecifier`
+	// nodes; detection reads the `ValueModule` flag on the deeply-resolved
+	// alias, which is robust to arbitrary chain depth.
 	test('3-hop chain (origination → same-name → renamed) classifies as renamed and points aliasOf at the origination', async () => {
 		const files = {
 			'src/lib/x.ts': `export const a = 1;`,

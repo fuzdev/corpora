@@ -1,0 +1,37 @@
+/* Styles shared across the benchmarks components, which Svelte's scoped `<style>`
+   can't reach across. Imported by the benchmarks and conformance `+page.svelte`s
+   rather than the root stylesheet so they ship with those routes instead of every one. */
+
+/* a warning aside: the red tint over fuz_css's base aside styling, used by the
+   page's asides and the cross-runtime section's */
+.benchmarks-warning {
+	border-left-color: var(--palette_c_50);
+}
+
+/* a wide table scrolls in its own container, so the page body never scrolls sideways */
+.benchmarks-table-scroll {
+	overflow-x: auto;
+}
+
+/* a full-width data table whose first column names each row: the row headers
+   are `<th scope="row">` for assistive tech but read as the body text they sit in */
+.benchmarks-table {
+	width: 100%;
+	/* the same gap the bar groups leave before a note under them — set here because a
+	   table that is its wrapper's last child gets no flow margin */
+	margin-bottom: var(--space_md);
+}
+.benchmarks-table :is(th, td) {
+	padding-block: var(--space_xs);
+}
+.benchmarks-table tbody th {
+	font-weight: inherit;
+	text-align: left;
+}
+
+/* a right-aligned numeric table cell */
+.benchmarks-num {
+	text-align: right;
+	white-space: nowrap;
+	font-variant-numeric: tabular-nums;
+}

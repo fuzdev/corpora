@@ -2,7 +2,7 @@
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 	import CopyToClipboard from '@fuzdev/fuz_ui/CopyToClipboard.svelte';
 
-	import { parse_time, time_to_ms } from '$lib/time.ts';
+	import { parse_time, time_to_ms } from '#lib/time.ts';
 
 	/**
 	 * This component takes in a YouTube-formatted timestamp and outputs milliseconds.
@@ -24,7 +24,7 @@
 	<div class="font_size_xl">
 		{#if ms != null}{ms}{:else}null{/if}
 	</div>
-	<small class="display:block text_70">milliseconds </small>
+	<small class="display:block text_70">milliseconds</small>
 	<div class="copy">
 		<CopyToClipboard text={ms + ''} />
 	</div>

@@ -2,12 +2,15 @@
 
 Here's how to publish a new version of a repo with Gro, including for Gro itself.
 
+> Where it's going: on the [runtime](runtime.md), `publish` and `deploy` are the named unconfined phases,
+> shown that way in the policy diff, with credentials passed only to the process that needs them.
+
 ## svelte-package
 
 Gro uses SvelteKit's [`@sveltejs/package`](https://svelte.dev/docs/kit/packaging)
 with the task `gro publish` to publish packages to npm.
 Gro's default config enables [`@fuzdev/gro/gro_plugin_sveltekit_library.ts`](../lib/gro_plugin_sveltekit_library.ts)
-if it detects `@sveltejs/package` installed as a dependency in the package.json.
+if it detects `@sveltejs/package` (see [detection](gro_plugin_sveltekit_library.md#detection) for the full rule).
 See [the library plugin docs](gro_plugin_sveltekit_library.md) for full detection requirements and behavior.
 
 ```bash
@@ -100,9 +103,11 @@ and Gro makes some different choices for usability.
 Gro calls the GitHub API using the environment variable `SECRET_GITHUB_API_TOKEN` for authorization,
 which is a [GitHub token](https://github.com/settings/tokens)
 (with "public access" for public repos, no options selected)
-in either `process.env`, a project-local `.env`, or the parent directory at `../.env`
+in either `process.env` or a project-local `.env`
 (currently optional to read public repos, but it's recommended regardless,
 and you'll need to select options to support private repos).
+A parent directory's `.env` is not read.
+To use the GitHub CLI's login for one run: `SECRET_GITHUB_API_TOKEN=$(gh auth token) gro publish`
 
 You'll get a warning if the token is unavailable, but for light usage you won't hit rate limts.
 
@@ -124,7 +129,7 @@ Then publish:
 ```bash
 gro publish
 gro publish --help # view the options
-gro publish -- svelte-package -w # forward options
+gro publish -- svelte-package --types # forward options
 ```
 
 See [the SvelteKit packaging docs](https://svelte.dev/docs/kit/packaging) for more.

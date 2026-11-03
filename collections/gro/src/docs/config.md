@@ -7,11 +7,24 @@ If a project does not define a config, Gro imports a default config from
 which looks at your project for the familiar patterns and tries to do the right thing,
 without required deps.
 
+> Where it's going: config stays a TypeScript module.
+> On the [runtime](runtime.md) it runs confined like any other,
+> and `gro eval` gives any tool a confined, deterministic one-shot eval of a module like this one.
+
 > The [default config](/src/lib/gro.config.default.ts)
 > detects three types of projects that can coexist in one repo:
 > SvelteKit frontends,
 > Node libraries with [`@sveltejs/package`](https://svelte.dev/docs/kit/packaging),
 > and Node servers.
+> It inspects `package.json` and the filesystem when `gro dev` or `gro build` creates the plugins,
+> not on every task:
+>
+> - always [`gro_plugin_gen`](plugin.md)
+> - `@sveltejs/kit` in dependencies or devDependencies (not peer deps) →
+>   [`gro_plugin_sveltekit_app`](gro_plugin_sveltekit_app.md)
+> - that plus `@sveltejs/package` and the `src/lib/` directory →
+>   [`gro_plugin_sveltekit_library`](gro_plugin_sveltekit_library.md#detection)
+> - `server/server.ts` in the `src/lib/` directory → `gro_plugin_server`
 
 See [`src/lib/gro_config.ts`](/src/lib/gro_config.ts) for the config types and implementation.
 
@@ -38,28 +51,29 @@ export default config;
 The default export of a Gro config is `GroConfig | CreateGroConfig`:
 
 ```ts
-export interface CreateGroConfig {
-	(base_config: GroConfig): RawGroConfig | Promise<RawGroConfig>;
-}
+export type CreateGroConfig = (base_config: GroConfig) => RawGroConfig | Promise<RawGroConfig>;
 
 // The strict variant that's used internally and exposed to users in tasks and elsewhere.
 export interface GroConfig extends RawGroConfig {
 	plugins: PluginsCreateConfig;
-	map_package_json: MapPackageJson | null;
-	task_root_dirs: Array<PathId>;
+	map_package_json: PackageJsonMapper | null;
 	search_filters: Array<PathFilter>;
 	js_cli: string;
 	pm_cli: string;
+	build_cache_config_hash: string;
+	watch: WatchOptions;
 }
 
 // The relaxed variant that users can provide. Superset of `GroConfig`.
 export interface RawGroConfig {
 	plugins?: PluginsCreateConfig;
-	map_package_json?: MapPackageJson | null;
-	task_root_dirs?: Array<string>;
+	map_package_json?: PackageJsonMapper | null;
 	search_filters?: PathFilter | Array<PathFilter> | null;
 	js_cli?: string;
 	pm_cli?: string;
+	build_cache_config?:
+		Record<string, unknown> | (() => Record<string, unknown> | Promise<Record<string, unknown>>);
+	watch?: Partial<WatchOptions>;
 }
 ```
 
@@ -77,7 +91,7 @@ const config: CreateGroConfig = async (cfg) => {
 	// example setting your own plugins):
 	cfg.plugins = async () => [
 		gro_plugin_sveltekit_app(),
-		(await import('./src/custom_plugin.js')).plugin(),
+		(await import('./src/custom_plugin.ts')).plugin(),
 	];
 
 	// example extending the default plugins:
@@ -108,7 +122,6 @@ const config = create_empty_gro_config();
 
 // config.plugins = ...;
 // config.map_package_json = ...;
-// config.task_root_dirs = ...;
 // config.search_filters = ...;
 // config.js_cli = ...;
 // config.pm_cli = ...;
@@ -148,13 +161,16 @@ the `"exports"` property of your root `package.json`.
 The motivation is to streamline package publishing by supplementing
 [`@sveltejs/package`](https://svelte.dev/docs/kit/packaging).
 
-By default `package_json.exports` uses subpath wildcard patterns to include everything from `$lib/`
+By default `package_json.exports` uses subpath wildcard patterns to include everything from `src/lib/`
 except for some ignored files like tests and markdown.
 Every `internal/` directory is blocked at any depth by a null exports entry
-(`"./internal/*": null`, one per outermost internal directory),
+(`"./internal/*": null`, `"./domain/internal/*": null`, Node's explicit-exclusion form;
+an exports key allows one `*`, so there's one key per outermost internal directory,
+whose `*` covers anything nested below),
 so internal modules ship in dist for public modules to import
 but can't be imported by consumers,
 and internal files don't count toward which wildcard patterns are emitted.
+`svelte-docinfo` honors the same signal, excluding `internal/` from analysis at any depth by default.
 You can provide your own `map_package_json` hook to
 mutate and return the `package_json`, return a new one,
 or return `null` to opt out of transforming it completely.
@@ -202,31 +218,39 @@ export type PackageJsonMapper = (
 ) => PackageJson | null | Promise<PackageJson | null>;
 ```
 
-## `task_root_dirs`
-
-The Gro config option `task_root_dirs` allows customizing Gro's task resolution.
-When calling `gro [input_path]`, absolute and explicitly relative paths starting with `.`
-are resolved according to normal filesystem rules,
-but non-explicit input paths, like `foo`, are resolved by searching
-through `task_root_dirs` in order until a matching file or directory is found on the filesystem.
-
-The default task paths are `./src/lib`, then `.`, and then Gro's dist directory.
-
 ## `search_filters`
 
 The Gro config option `search_filters` allows customizing
-how Gro searches for tasks and genfiles on the filesystem.
-Directories and files are included if they pass all of these filters.
+how Gro searches for tasks, genfiles, and files to format on the filesystem.
+Directories and files are included if they pass all of these filters,
+each given the path relative to the project root, like `src/lib/foo.ts`,
+whichever directory a search starts in.
+Outside the root, a path is relative to the directory searched
+(or a glob's leading literal directory, for `gro format`),
+so `gro task ~/.cache/other/src` still finds its tasks,
+and any other path is given as its absolute id.
 
 By default, it uses the `SEARCH_EXCLUDER_DEFAULT` to exclude
 dot-prefixed directories, node_modules,
 and the build and dist directories for SvelteKit and Gro.
 
+## `watch`
+
+What the task context's `graph` and `watcher` watch:
+`dir`, the directory holding the project modules (default `src/`),
+and `filter`, a `PathFilter` excluding the paths it rejects (default `null`).
+Files outside `dir` enter the graph only when a project module imports them.
+
+`filter` is called with absolute paths,
+unlike [`search_filters`](#search_filters), which test relative paths (see above).
+It filters change events, not the directory walk:
+a directory it rejects is still watched, and each path below it is filtered on its own.
+
 ## `js_cli`
 
 > ⚠️ support is currently partial, help is welcome
 
-The CLI to use that's compatible with `node`.
+The CLI to use that's compatible with `node`. Defaults to `'node'`.
 
 ## `pm_cli`
 
@@ -239,18 +263,22 @@ Defaults to `'npm'`.
 
 The `build_cache_config` option defines custom build inputs
 that invalidate the [build cache](build.md#build-caching) when they change.
-Gro's build cache uses git commit hash to detect when code, dependencies, or
-configs change, and only works with a clean workspace (see [dirty workspace behavior](build.md#dirty-workspace-behavior)).
+Gro's build cache uses the git commit hash to detect when committed code or configs change,
+plus the Gro and Node versions and npm's record of the installed packages
+(see [cache key](build.md#cache-key)),
+and only works with a clean workspace (see [dirty workspace behavior](build.md#dirty-workspace-behavior)).
 Use `build_cache_config` when your build also depends on external
 factors like environment variables, remote data, or feature flags.
 
-This value is hashed before being stored in the cache metadata.
-The raw value is never logged or written to disk, protecting sensitive information.
+This value is hashed before being stored in the cache metadata,
+and the raw value is never logged or written to disk.
+The hash hides only high-entropy values (see [security considerations](#security-considerations)).
 
 ### when to use `build_cache_config`
 
-The build cache automatically invalidates on any git commit (source code, dependencies,
-configs -- assuming you commit changes before building in the normal case)
+The build cache automatically invalidates on any git commit (source code, `package.json`
+and the lockfile, configs -- assuming you commit changes before building in the normal case),
+on a Gro or Node upgrade, and when npm changes what's installed.
 Use `build_cache_config` when your build also depends on:
 
 - environment variables baked into the build (API endpoints, feature flags)
@@ -268,7 +296,6 @@ import {readFileSync} from 'node:fs';
 export default {
 	build_cache_config: {
 		// Environment variables that affect the build
-		// It's safe to include secrets here because they are hashed and `delete`d
 		api_endpoint: process.env.PUBLIC_API_URL,
 		analytics_key: process.env.PUBLIC_ANALYTICS_KEY,
 
@@ -308,25 +335,29 @@ export default {
 } satisfies GroConfig;
 ```
 
+On the [runtime](runtime.md) there's no global `fetch`:
+import `net` and call `net.fetch`, accepted for the host in the policy file.
+
 ### security considerations
 
 The `build_cache_config` value is hashed before being written to `.gro/build.json`.
-Only the hash is stored, never the raw values, so it's safe to include:
+Only the hash is stored, never the raw values.
+The hash is an unkeyed BLAKE3 of the object's deterministic JSON, so it hides only
+high-entropy values like random API keys. When every value is short or guessable,
+like flags, versions, and known URLs, anyone who can read `.gro/build.json`
+can recover them by hashing candidates.
 
-- API keys (though using them at build time should be carefully considered)
-- Internal URLs
-- Configuration secrets
-
-However, be aware that these values may still appear in:
+Be aware that these values may also appear in:
 
 - Build outputs if your code embeds them
 - Build logs if explicitly logged elsewhere
 - The config file itself (ensure `gro.config.ts` is not publicly committed if it contains secrets)
+- The Gro process, which keeps whatever it read, like `process.env`
 
 ### how it works
 
-The `build_cache_config` is hashed early during config normalization (in `load_gro_config()`).
-This protects sensitive values by ensuring the raw config never persists in memory.
+The `build_cache_config` is hashed early during config normalization (in `load_gro_config()`),
+which then drops the raw value from the config, so plugins and tasks see only the hash.
 
 During the build:
 
@@ -334,12 +365,11 @@ During the build:
 2. Loads previous build's cache metadata from `.gro/build.json` (missing/corrupt = rebuild)
 3. Compares current git commit against cached commit (different = rebuild)
 4. Compares current config hash against cached config hash (different = rebuild)
-5. If cache key matches, validates output files haven't been modified
-6. If all checks pass, uses the cached build
+5. Compares the Gro version, Node version, and installed-packages hash (different = rebuild)
+6. If cache key matches, validates output files haven't been modified
+7. If all checks pass, uses the cached build
 
-This ensures builds are correct while protecting sensitive configuration.
-Both cache factors (git commit and `build_cache_config` hash) are checked—if either changes,
-the cache is invalidated.
+Every cache key component is checked, and if any changes, the cache is invalidated.
 
 ### common patterns
 

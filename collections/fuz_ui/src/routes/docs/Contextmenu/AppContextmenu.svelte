@@ -1,10 +1,10 @@
 <script lang="ts">
-	import ContextmenuEntry from '$lib/ContextmenuEntry.svelte';
-	import ContextmenuLinkEntry from '$lib/ContextmenuLinkEntry.svelte';
-	import ContextmenuSeparator from '$lib/ContextmenuSeparator.svelte';
-	import Svg from '$lib/Svg.svelte';
-	import { logo_github } from '$lib/logos.ts';
-	import { icon_info } from '$lib/icons.ts';
+	import ContextmenuEntry from '#lib/ContextmenuEntry.svelte';
+	import ContextmenuLinkEntry from '#lib/ContextmenuLinkEntry.svelte';
+	import ContextmenuSeparator from '#lib/ContextmenuSeparator.svelte';
+	import Svg from '#lib/Svg.svelte';
+	import { logo_github } from '#lib/logos.ts';
+	import { icon_info } from '#lib/icons.ts';
 
 	const {
 		toggle_about_dialog

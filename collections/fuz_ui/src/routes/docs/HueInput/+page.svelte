@@ -1,11 +1,11 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import HueInput from '$lib/HueInput.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import HueInput from '#lib/HueInput.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 
 	const TOME_SLUG = 'HueInput';
 	const tome = tome_get_by_slug(TOME_SLUG);

@@ -1,18 +1,18 @@
 <script lang="ts" module>
-  export type {
-    TextProps,
-    TextPropsWithoutHTML,
-    TextSegment,
-  } from './Text.shared.svelte.js';
+  export type { TextProps, TextPropsWithoutHTML, TextSegment } from './Text.shared.svelte.js';
 </script>
 
 <script lang="ts">
   import { resolveColorProp, resolveStyleProp } from '$lib/utils/dataProp.js';
+  import { matrixToString } from '$lib/utils/isometric.js';
   import { getPixelValue, TextState, textMarkInfo, type TextProps } from './Text.shared.svelte.js';
 
   let { ...rest }: TextProps = $props();
 
   const c = new TextState(() => rest as TextProps);
+
+  /** For `viewport`, cancels the `isometric` view, between `translate` and `rotate` so it acts about the anchor */
+  const cancelView = $derived(c.viewportMatrix ? matrixToString(c.viewportMatrix) : '');
 
   c.chartCtx.registerComponent({
     name: 'Text',
@@ -37,7 +37,8 @@
       style:position="absolute"
       style:left="{getPixelValue(rest.dx ?? 0) + item.x}px"
       style:top="{getPixelValue(rest.dy ?? 0) + item.y}px"
-      style:transform="translate({translateX}, {translateY}) rotate({rest.rotate ?? 0}deg)"
+      style:transform="translate({translateX}, {translateY}) {cancelView} rotate({rest.rotate ??
+        0}deg)"
       style:transform-origin="{verticalAnchor === 'middle'
         ? 'center'
         : verticalAnchor === 'end'
@@ -46,9 +47,7 @@
       {textAnchor === 'middle' ? 'center' : textAnchor === 'end' ? 'right' : 'left'}"
       style:white-space="pre-wrap"
       style:line-height={rest.lineHeight ?? '1em'}
-      style:font-size={typeof rest.fontSize === 'number'
-        ? `${rest.fontSize}px`
-        : rest.fontSize}
+      style:font-size={typeof rest.fontSize === 'number' ? `${rest.fontSize}px` : rest.fontSize}
       style:color={resolvedFill}
       style:opacity={resolvedOpacity ?? resolvedFillOpacity}
       class={['lc-text', resolvedClass]}
@@ -68,7 +67,8 @@
       (typeof c.motionX === 'number' ? c.motionX : 0)}px"
     style:top="{(typeof rest.dy === 'number' ? rest.dy : 0) +
       (typeof c.motionY === 'number' ? c.motionY : 0)}px"
-    style:transform="translate({translateX}, {translateY}) rotate({rest.rotate ?? 0}deg)"
+    style:transform="translate({translateX}, {translateY}) {cancelView} rotate({rest.rotate ??
+      0}deg)"
     style:transform-origin="{verticalAnchor === 'middle'
       ? 'center'
       : verticalAnchor === 'end'
@@ -77,9 +77,7 @@
     {textAnchor === 'middle' ? 'center' : textAnchor === 'end' ? 'right' : 'left'}"
     style:white-space="pre-wrap"
     style:line-height={rest.lineHeight ?? '1em'}
-    style:font-size={typeof rest.fontSize === 'number'
-      ? `${rest.fontSize}px`
-      : rest.fontSize}
+    style:font-size={typeof rest.fontSize === 'number' ? `${rest.fontSize}px` : rest.fontSize}
     style:color={c.staticFill}
     style:opacity={c.staticOpacity ?? c.staticFillOpacity}
     class={['lc-text', c.staticClassName]}
@@ -102,6 +100,13 @@
     }
 
     /* Html layers */
+    :global(:where(.lc-layout-html .lc-text)) {
+      /* Trim the CSS line box down to the cap-height/baseline box so `verticalAnchor`
+         anchors the same glyph edges (cap-top / center / baseline) as the SVG and Canvas
+         layers, which position by cap height rather than the full line box. Browsers
+         without `text-box` support fall back to line-box anchoring (a few px looser). */
+      text-box: trim-both cap alphabetic;
+    }
     :global(:where(.lc-layout-html .lc-text):not([background-color])) {
       color: var(--fill-color);
     }

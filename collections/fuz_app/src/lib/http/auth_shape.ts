@@ -12,8 +12,7 @@
  * - `credential_types` — restricts the credential channel (e.g. daemon_token);
  *   absent = any authenticated credential.
  * - `required_scope` — the capability an api token's scope must admit to reach
- *   this route (`rpc:<method>` or `surface:<name>`); route specs only,
- *   absent = no scope gate.
+ *   this route (`surface:<name>`); route specs only, absent = no scope gate.
  *
  * The same shape governs both `ActionSpec.auth` (in `actions/action_spec.ts`)
  * and `RouteSpec.auth` (in `http/route_spec.ts`). The canonical schema
@@ -34,8 +33,8 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { zod_unwrap_to_object } from '@fuzdev/fuz_util/zod.ts';
+import { Uuid } from '../primitive_schemas.ts';
+import { zod_unwrap_to_object } from '../zod.ts';
 
 /**
  * `acting` field shared by every input that needs the caller's acting actor.
@@ -76,9 +75,12 @@ export type ActingActor = z.infer<typeof ActingActor>;
  * instead would put an input-shape complaint ahead of the authority gates,
  * which is the ordering this pipeline exists to avoid.
  *
- * Both callers pass through here so that rule has one home: the action
+ * The dispatchers pass through here so that rule has one home: the action
  * dispatcher's `read_acting` and the REST authorization handler's
- * `read_route_acting`. Twin of the Rust dispatcher's `read_acting`.
+ * `read_route_acting`. Twin of the Rust dispatcher's `read_acting`. The status
+ * route and the WS upgrade read the raw `?acting=` through it too; neither has
+ * an input schema behind it, so there a malformed selector is final (the
+ * status route answers account-only).
  *
  * @param value - the raw `acting` field, from params / query / body
  * @returns the actor id, or `undefined` when absent or malformed
@@ -143,11 +145,12 @@ export const RouteAuth = z
 		 *
 		 * - `surface:<name>` — a non-RPC surface, refused to every narrowed token
 		 *   whatever its method list says (token scoping's rule that a narrowed
-		 *   token is RPC-only). `surface:audit_stream` and `surface:fact_bare` are
-		 *   the spine's; a consumer names its own without registering it.
-		 * - `rpc:<method>` — one action method, refused unless the token lists it.
-		 *   What a route bridged from an `ActionSpec` declares: it carries the
-		 *   method's identity but never reaches the dispatcher's per-method gate.
+		 *   token is RPC-only). `surface:audit_stream`, `surface:fact_bare`,
+		 *   `surface:account_verify`, and `surface:app_surface` are the spine's
+		 *   route-spec ones; a consumer names its own without registering it.
+		 *
+		 * The `rpc:<method>` arm of that vocabulary is the dispatcher's per-method
+		 * gate, which a route never reaches, so a route may not declare it.
 		 *
 		 * Declaring it makes the guard resolver mount the refusal ahead of the role
 		 * gate, instead of the route hand-rolling the check in its handler (which
@@ -155,12 +158,18 @@ export const RouteAuth = z
 		 * account lacks the role would be told about the role rather than about the
 		 * scope).
 		 *
-		 * Opt-in rather than blanket: the account REST routes cross no boundary, and
-		 * the RPC endpoint runs its own per-method check inside the dispatcher — and
-		 * both are route specs too.
+		 * Opt-in rather than blanket: no narrowed token reaches login (which reads
+		 * no credential) or logout and the password change (session-only), the
+		 * RPC endpoint runs its own per-method check inside the dispatcher, the
+		 * `reads_credential` routes that answer anonymous callers (account status,
+		 * the cell-scoped fact read) can't take the field and answer a narrowed
+		 * token as anonymous in their handler (`get_public_account_id`), and the
+		 * server-status route admits a narrowed token by design — and all are
+		 * route specs too.
 		 *
 		 * Typed as a plain string here to keep `http/` from importing `auth/`; the
-		 * resolver parses it at registration and throws on a malformed one.
+		 * resolver checks it at registration and throws on anything but a
+		 * well-formed `surface:<name>`.
 		 */
 		required_scope: z.string().optional()
 	})
@@ -231,13 +240,6 @@ export const is_public_auth = (auth: RouteAuth): boolean =>
  */
 export const needs_actor = (auth: RouteAuth): boolean => auth.actor !== 'none';
 
-/**
- * True iff the route declares an account axis (`'optional'` or
- * `'required'`). Per registry-time invariant 3 this is implied by
- * `needs_actor(auth)` in v1 (no accountless actors yet).
- */
-export const needs_account = (auth: RouteAuth): boolean => auth.account !== 'none';
-
 /** True iff the route declares any role gate (`auth.roles?.length`). */
 export const is_role_auth = (auth: RouteAuth): boolean => !!auth.roles?.length;
 
@@ -246,18 +248,31 @@ export const is_credential_gated_auth = (auth: RouteAuth): boolean =>
 	!!auth.credential_types?.length;
 
 /**
- * True iff the route is the keeper bucket — credential gate restricted
- * to `daemon_token`. Keeper is the only credential gate today; if more
- * land, this filter widens. Knows the `'daemon_token'` literal directly
- * (the keeper composition is fuz_app's only registered credential gate).
+ * True iff the route is the keeper bucket — a credential gate admitting
+ * `daemon_token`. Knows the literal directly, because keeper is a named
+ * authority level rather than one channel among many: it is the ceiling
+ * sessions and api tokens cannot reach.
+ *
+ * Narrower than `is_credential_gated_auth`, which is true of every channel
+ * gate — including the session-only gates pointing the other way (the
+ * credential-minting actions, `POST /logout` / `POST /password`, the audit
+ * SSE stream). Reach for the general predicate when the question is "does a
+ * channel gate answer here"; reach for this one only when the question is
+ * about keeper specifically.
  */
 export const is_keeper_auth = (auth: RouteAuth): boolean =>
 	auth.credential_types?.includes('daemon_token') ?? false;
 
 /**
  * True iff the route is plain authenticated — `account === 'required'`
- * with no role gate and no credential gate. Account-grain authenticated
- * routes (logout, password change, account self-service) fall here.
+ * with no role gate and no credential gate: any credential the auth
+ * middleware resolved gets in.
+ *
+ * A channel gate takes a route out of this bucket, which is why the
+ * account-grain routes one might expect here are not — `POST /logout`,
+ * `POST /password`, and the `account_*` credential-lifecycle actions all
+ * declare `credential_types: ['session']` and answer to
+ * `is_credential_gated_auth` instead.
  */
 export const is_plain_authenticated_auth = (auth: RouteAuth): boolean =>
 	auth.account === 'required' && !is_role_auth(auth) && !is_credential_gated_auth(auth);

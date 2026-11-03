@@ -22,7 +22,8 @@
 		div_attrs,
 		children,
 		...rest
-	}: // generic element attrs, the common denominator of the rendered roots - // branch-specific attributes go in `button_attrs`/`div_attrs`
+	}: // generic element attrs, the common denominator of the rendered roots;
+		// branch-specific attributes go in `button_attrs` and `div_attrs`
 		HTMLAttributes<HTMLElement> & {
 			status?: AlertStatus;
 			color?: string;
@@ -32,7 +33,11 @@
 			/** Renders the alert as a `<button>` when provided. */
 			onclick?: (() => void) | undefined;
 			disabled?: boolean;
-			icon?: string | Snippet<[icon: string]> | null | undefined; // TODO experimenting with this, gets complex in the impl
+			/**
+			 * A decorative icon, hidden from assistive tech: a string, or a snippet given the
+			 * status's icon. Defaults to the status's icon, and `null` or an empty string is none.
+			 */
+			icon?: string | Snippet<[icon: string]> | null | undefined;
 			/** Button attributes, applied only when `onclick` renders the alert as a `<button>`. */
 			button_attrs?: SvelteHTMLElements['button'];
 			/** Div attributes, applied only when the alert renders as a `<div>` (no `onclick`). */
@@ -44,9 +49,7 @@
 	// TODO change this to use the hue and put transparency on the borders, or add a borderColor option
 	const { color: status_color, icon: status_icon } = $derived(options);
 	const final_color = $derived(color ?? status_color);
-	const final_icon = $derived(
-		typeof icon === 'string' ? icon : (status_icon ?? alert_status_options.inform.icon!)
-	);
+	const final_icon = $derived(typeof icon === 'string' ? icon : status_icon);
 </script>
 
 {#if onclick}
@@ -59,7 +62,7 @@
 		{onclick}
 		disabled={disabled ?? button_attrs?.disabled}
 	>
-		{@render content()}
+		{@render alert_content()}
 	</button>
 {:else}
 	<div
@@ -69,21 +72,21 @@
 		class="alert panel {rest.class} {div_attrs?.class}"
 		style:--text_color={final_color}
 	>
-		{@render content()}
+		{@render alert_content()}
 	</div>
 {/if}
 
-{#snippet content()}
-	{#if icon !== null}
-		<div class="icon">
-			{#if !icon || typeof icon === 'string'}
-				{final_icon}
-			{:else}
+{#snippet alert_content()}
+	<!-- the status's icon by default, or one given, and none for `null` or an empty string -->
+	{#if icon === undefined || icon}
+		<div class="icon" aria-hidden="true">
+			{#if typeof icon === 'function'}
 				{@render icon(final_icon)}
+			{:else}
+				{final_icon}
 			{/if}
 		</div>
 	{/if}
-	<!-- TODO conflict in the names of content as the snippet and this inner div -->
 	<div class="content">
 		{@render children()}
 	</div>

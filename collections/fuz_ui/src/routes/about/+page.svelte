@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { Library, library_context } from '$lib/library.svelte.ts';
-	import EcosystemLinksPanel from '$lib/EcosystemLinksPanel.svelte';
-	import LibraryDetail from '$lib/LibraryDetail.svelte';
-	import DocsFooter from '$lib/DocsFooter.svelte';
-	import Breadcrumb from '$lib/Breadcrumb.svelte';
-	import { FUZ_DEV_URL, MAIN_HEADER_MARGIN_TOP } from '$lib/constants.ts';
-	import { site_context } from '$lib/site.svelte.ts';
-	import { library_json } from '$routes/library.ts';
+	import { Library, library_context } from '#lib/library.svelte.ts';
+	import EcosystemLinksPanel from '#lib/EcosystemLinksPanel.svelte';
+	import LibraryDetail from '#lib/LibraryDetail.svelte';
+	import DocsFooter from '#lib/DocsFooter.svelte';
+	import Breadcrumb from '#lib/Breadcrumb.svelte';
+	import { FUZ_DEV_URL, MAIN_HEADER_MARGIN_TOP } from '#lib/constants.ts';
+	import { site_context } from '#lib/site.svelte.ts';
+	import { library_json } from '#routes/library.ts';
 
 	const library = new Library(library_json);
 	library_context.set(() => library);

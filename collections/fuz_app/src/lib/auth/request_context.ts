@@ -5,8 +5,9 @@
  *
  * 1. **Authentication (middleware)** — `create_request_context_middleware`,
  *    `bearer_auth`, and `daemon_token_middleware` validate the credential
- *    (session cookie, bearer token, daemon token) and set `c.var.account_id`
- *    + `c.var.credential_type` on the Hono context. They do not resolve
+ *    (daemon token, session cookie, bearer token — the first that
+ *    authenticates wins) and set one `ResolvedAuth` on the Hono context
+ *    (`get_resolved_auth`). They do not resolve
  *    an acting actor or load role_grants; `REQUEST_CONTEXT_KEY` stays null at
  *    this stage, so account-grain identity is the only thing known.
  * 2. **Authorization (route-spec wrapper / RPC dispatcher)** — after input
@@ -14,7 +15,7 @@
  *    schema declared `acting?: ActingActor` (reference equality with the
  *    canonical `ActingActor` schema) or the auth requires role_grants
  *    (`role` / `keeper`), `apply_authorization_phase` resolves the actor
- *    against `c.var.account_id` plus the validated `acting` value via
+ *    against the resolved account id plus the validated `acting` value via
  *    `resolve_acting_actor`, builds the `{account, actor, role_grants}`
  *    context via `build_request_context`, and sets it on
  *    `REQUEST_CONTEXT_KEY` before auth guards fire. Authenticated routes
@@ -36,6 +37,7 @@
  */
 
 import type { Context, MiddlewareHandler } from 'hono';
+import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import {
 	type Account,
@@ -52,19 +54,17 @@ import {
 import { query_role_grant_find_active_for_actor } from './role_grant_queries.ts';
 import type { QueryDeps } from '../db/query_deps.ts';
 import {
-	ACCOUNT_ID_KEY,
-	AUTH_API_TOKEN_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TOKEN_SCOPE_KEY,
-	TEST_CONTEXT_PRESET_KEY,
-	type CredentialType
+	has_test_context_preset,
+	RESOLVED_AUTH_KEY,
+	SESSION_COOKIE_EXPIRES_AT_KEY,
+	SESSION_TOKEN_KEY
 } from '../hono_context.ts';
+import { credential_deadline_after } from './credential_deadline.ts';
+import { get_resolved_auth, resolved_auth_scope } from './resolved_auth.ts';
 import {
-	parse_token_scope_capability,
-	token_scope_admits_capability,
-	token_scope_denied_body,
-	token_scope_full,
-	type TokenScopeCapability
+	is_route_scope_capability,
+	token_scope_admits_non_rpc,
+	token_scope_denied_body
 } from './token_scope.ts';
 import type { RouteSpec } from '../http/route_spec.ts';
 import { is_public_auth, needs_actor, parse_acting, type RouteAuth } from '../http/auth_shape.ts';
@@ -85,7 +85,7 @@ import {
  * `actor` is null on account-grain routes (no `acting` field on input,
  * no `role` / `keeper` auth) — those handlers don't trigger actor
  * resolution. `role_grants` is empty in that case. Role grant checks
- * (`has_role`, `has_scoped_role`, `has_any_scoped_role`) are
+ * (`has_scoped_role`, `has_any_scoped_role`) are
  * null-tolerant on `RequestContext | null`; they additionally treat
  * `actor: null` as "no role_grants" so callers don't have to narrow.
  *
@@ -103,24 +103,13 @@ export interface RequestContext {
 export const REQUEST_CONTEXT_KEY = 'request_context';
 
 /**
- * Hono context variable name for the authenticated session token hash.
- *
- * Set by `create_request_context_middleware` after a successful session lookup.
- * `null` when the request is unauthenticated or authenticated via a non-session
- * credential (bearer token, daemon token). Exposed so handlers can scope
- * per-session resources (e.g., SSE stream identity for targeted disconnection
- * on `session_revoke`) without re-hashing the token.
- */
-export const AUTH_SESSION_TOKEN_HASH_KEY = 'auth_session_token_hash';
-
-/**
  * Get the request context from a Hono context, or `null` if unauthenticated.
  *
  * @param c - the Hono context
  * @returns the request context, or `null`
  */
 export const get_request_context = (c: Context): RequestContext | null => {
-	return (c.get(REQUEST_CONTEXT_KEY) as RequestContext | undefined) ?? null;
+	return c.get(REQUEST_CONTEXT_KEY) ?? null;
 };
 
 /**
@@ -160,27 +149,6 @@ export interface RequestActorContext extends RequestContext {
 }
 
 /**
- * Check if a request context has an active role_grant for a given role.
- *
- * Checks the role_grants already loaded in the context (no DB query).
- * Null-tolerant — `null` ctx (unauthenticated) returns `false`. Symmetric
- * with `has_scoped_role` / `has_any_scoped_role` so the three helpers
- * compose freely in the same predicate (e.g.
- * `has_role(auth, ADMIN) || has_scoped_role(auth, role, scope)`).
- *
- * @param ctx - the request context, or `null` for unauthenticated callers
- * @param role - the role to check
- * @param now - current time (defaults to `new Date()`, pass for testability and hot-path efficiency)
- * @returns `true` if the actor has an active role_grant for the role
- */
-export const has_role = (
-	ctx: RequestContext | null,
-	role: string,
-	now: Date = new Date()
-): boolean =>
-	ctx?.role_grants.some((p) => p.role === role && is_role_grant_active(p, now)) ?? false;
-
-/**
  * Whether the request context holds an active role_grant for `role` at `scope_id`.
  *
  * Walks the in-memory `ctx.role_grants` snapshot loaded once per request by
@@ -193,11 +161,14 @@ export const has_role = (
  * provides.
  *
  * Null-tolerant — `null` ctx (unauthenticated) and account-grain
- * contexts (`actor: null`, empty `role_grants`) both return `false`. Same
- * convention as `has_role`; lets the helper drop into public
+ * contexts (`actor: null`, empty `role_grants`) both return `false`, which
+ * lets the helper drop into public
  * (`{account: 'none', actor: 'none'}`) and account-grain
  * (`{account: 'required', actor: 'none'}`) handlers without a manual
  * narrow. See `cell_authorize` for the resource-side analog.
+ *
+ * `has_scoped_role(ctx, ROLE_ADMIN, null)` is the admin check everywhere admin
+ * confers authority (builtin roles are global-only, see `is_builtin_role`).
  *
  * `scope_id` semantics: in-memory `role_grant.scope_id` is `string | null`, so
  * JS `===` matches the SQL `IS NOT DISTINCT FROM` semantics exactly:
@@ -276,6 +247,10 @@ export type ResolveActingActorResult =
  *   The available list is intentionally not echoed in this branch (treat
  *   as opaque rejection).
  *
+ * `acting_actor_id` is compared lowercased, the form actor ids are stored and
+ * read back in, so a caller passing an id that skipped the `Uuid` schema
+ * still matches its actor whatever its case.
+ *
  * @param deps - query dependencies
  * @param account_id - the authenticated account
  * @param acting_actor_id - the requested acting actor id, or `undefined`
@@ -295,100 +270,126 @@ export const resolve_acting_actor = async (
 			available: actors.map((a) => ({ id: a.id, name: a.name }))
 		};
 	}
-	const match = actors.find((a) => a.id === acting_actor_id);
+	const acting = acting_actor_id.toLowerCase();
+	const match = actors.find((a) => a.id === acting);
 	if (!match) return { ok: false, reason: 'actor_not_on_account' };
 	return { ok: true, actor_id: match.id };
 };
 
+/** Options for `create_request_context_middleware`. */
+export interface RequestContextMiddlewareOptions {
+	/**
+	 * Whether this leg starts the credential chain, clearing `RESOLVED_AUTH_KEY`
+	 * on entry so a layer mounted before the legs cannot pre-set an identity
+	 * that every leg would skip past. `false` only when an earlier credential
+	 * leg runs first and clears it itself — `create_auth_middleware_specs`
+	 * passes `false` when it composes the daemon-token leg.
+	 *
+	 * @default true
+	 */
+	starts_chain?: boolean;
+	/**
+	 * Debug-logs a start that clears a credential set before it — a hand-built
+	 * chain that puts this leg behind an earlier credential leg but leaves
+	 * `starts_chain` at its default.
+	 */
+	log?: Logger;
+}
+
 /**
- * Create middleware that authenticates the account from a session cookie.
+ * Create middleware that authenticates the account from a session cookie —
+ * the session leg of the auth middleware chain.
  *
- * Reads the session identity (set by session middleware), looks up the
- * `auth_session`, and on a valid session sets `c.var.auth_account_id`,
- * `CREDENTIAL_TYPE_KEY = 'session'`, and `AUTH_SESSION_TOKEN_HASH_KEY`.
- * Touches the session (fire-and-forget). Does not load actor or role_grants;
- * `REQUEST_CONTEXT_KEY` is left null — the route-spec / RPC dispatcher
- * authorization phase resolves the acting actor and builds the full
- * `RequestContext` when the route needs one.
+ * When it starts the chain (`starts_chain`, the default) it first clears
+ * `RESOLVED_AUTH_KEY`. It then skips when an earlier leg (the daemon token)
+ * already resolved the request. Otherwise reads the session token the session middleware set
+ * (`SESSION_TOKEN_KEY`), looks up
+ * the `auth_session`, and on a valid session sets the `session` arm of
+ * `ResolvedAuth` (`RESOLVED_AUTH_KEY`): the account, the session hash, and the
+ * credential deadline — the earlier of the cookie's signed expiry
+ * (`SESSION_COOKIE_EXPIRES_AT_KEY`) and the row's. Writes nothing to the
+ * session row. Does not load actor or role_grants; `REQUEST_CONTEXT_KEY` is
+ * left null — the route-spec / RPC dispatcher authorization phase resolves the
+ * acting actor and builds the full `RequestContext` when the route needs one.
  *
- * Invalid / missing session leaves all keys null and calls `next()` —
- * `require_auth` / `require_role` enforce.
+ * An invalid or missing session leaves the request unresolved and calls
+ * `next()` — the bearer leg may still resolve it, and `require_auth` /
+ * `require_role` enforce.
  *
  * @param deps - query dependencies (pool-level db for middleware)
- * @param session_context_key - the Hono context key where session middleware stored the session token
- * @mutates Hono context - sets `ACCOUNT_ID_KEY`, `CREDENTIAL_TYPE_KEY`, `AUTH_SESSION_TOKEN_HASH_KEY`, and `AUTH_API_TOKEN_ID_KEY`
+ * @param options - whether this leg starts the chain, and the logger for a start that clears a credential
+ * @mutates Hono context - resets `REQUEST_CONTEXT_KEY` (and `RESOLVED_AUTH_KEY` when it starts the chain), then on a valid session (and no credential already resolved) sets `RESOLVED_AUTH_KEY`
  */
 export const create_request_context_middleware = (
 	deps: QueryDeps,
-	session_context_key = 'auth_session_id'
+	options: RequestContextMiddlewareOptions = {}
 ): MiddlewareHandler => {
+	const { starts_chain = true, log } = options;
 	return async (c, next): Promise<Response | void> => {
 		c.set(REQUEST_CONTEXT_KEY, null);
-		c.set(ACCOUNT_ID_KEY, null);
-		c.set(CREDENTIAL_TYPE_KEY, null);
-		c.set(AUTH_SESSION_TOKEN_HASH_KEY, null);
-		c.set(AUTH_API_TOKEN_ID_KEY, null);
+		if (starts_chain) {
+			const cleared = get_resolved_auth(c);
+			if (cleared !== null) {
+				log?.debug(
+					`session leg cleared a credential (${cleared.credential_type}) set before it ` +
+						'(an earlier credential leg needs `starts_chain: false` behind it)'
+				);
+			}
+			c.set(RESOLVED_AUTH_KEY, null);
+		}
+		if (get_resolved_auth(c) !== null) {
+			await next();
+			return;
+		}
 
-		const session_token: string | null = c.get(session_context_key) ?? null;
+		const session_token = c.get(SESSION_TOKEN_KEY) ?? null;
 		if (!session_token) {
 			await next();
 			return;
 		}
 
-		const token_hash = hash_session_token(session_token);
-		const session = await query_session_get_valid(deps, token_hash);
+		const session_hash = hash_session_token(session_token);
+		const session = await query_session_get_valid(deps, session_hash);
 		if (!session) {
 			await next();
 			return;
 		}
 
-		c.set(ACCOUNT_ID_KEY, session.account_id);
-		c.set(CREDENTIAL_TYPE_KEY, 'session');
-		// A session is full account authority by construction.
-		c.set(TOKEN_SCOPE_KEY, token_scope_full());
-		c.set(AUTH_SESSION_TOKEN_HASH_KEY, token_hash);
+		// The earlier of the signed cookie's expiry (this server's wall clock,
+		// which signed it) and the row's (read on the database clock).
+		const cookie_expires_at = c.get(SESSION_COOKIE_EXPIRES_AT_KEY) ?? null;
+		c.set(RESOLVED_AUTH_KEY, {
+			credential_type: 'session',
+			account_id: session.account_id,
+			session_hash,
+			credential_deadline: credential_deadline_after([
+				cookie_expires_at === null ? null : cookie_expires_at * 1000 - Date.now(),
+				session.expires_in_ms
+			])
+		});
 
 		await next();
 	};
 };
 
 /**
- * Refuse a capability the calling credential's scope does not admit.
+ * Refuse a non-RPC surface to a narrowed token — rule 3. Under the Rust twin's
+ * name (`token_scope_surface_denied_response`).
  *
- * The decision every token-scope gate outside the action dispatcher shares.
- * Private because the two exported forms below are the whole surface: a route
- * spec declares `auth.required_scope` and gets `require_token_scope`; anything
- * that is not a route spec calls `token_scope_surface_denial`.
+ * The decision every token-scope gate outside the action dispatcher shares: a
+ * route spec declares `auth.required_scope` and gets `require_token_scope`,
+ * which calls this; a consumer gating something that is not a route spec calls
+ * it directly.
  *
- * An unset `TOKEN_SCOPE_KEY` is the anonymous caller, who holds no credential to
- * narrow, so it passes. Sharing that branch is the point — hand-rolled per
- * surface it is one `&&` from either refusing every anonymous read or admitting
- * an authenticated caller whose middleware forgot to set the key.
- */
-const token_scope_denial = (c: Context, capability: TokenScopeCapability): Response | null => {
-	const scope = c.get(TOKEN_SCOPE_KEY);
-	if (scope && !token_scope_admits_capability(scope, capability)) {
-		return c.json(token_scope_denied_body(capability.capability), 403);
-	}
-	return null;
-};
-
-/**
- * Refuse a non-RPC surface to a narrowed token — rule 3, for callers that are
- * not route specs. Under the Rust twin's name
- * (`token_scope_surface_denied_response`).
- *
- * The WS upgrade is the spine's one such caller: `upgradeWebSocket`'s callback
- * must return `WSEvents` and so cannot produce a denial, which is why the gate
- * runs as pre-upgrade middleware calling this rather than as a route-spec
- * declaration. A consumer hand-rolling its own upgrade is in the same position
- * and reaches for the same function.
+ * The anonymous caller holds no credential to narrow, so it passes
+ * (`resolved_auth_scope` answers `null`). Sharing that branch is the point —
+ * hand-rolled per surface it is one `&&` from refusing every anonymous read.
  *
  * Takes the whole capability string, not a bare surface name — one spelling
  * across route-spec declarations and direct calls alike, and the twin of the
  * Rust signature. It needs no parse: the surface arm's identifier is pure label,
  * since rule 3 never asks *which* surface. And it is deliberately not narrowed
- * to the spine's four — the name decides nothing, so there is nothing for a
+ * to the spine's own — the name decides nothing, so there is nothing for a
  * closed set to protect, while a consumer surface would have nothing to pass.
  * fuz_app's own uses are pinned two ways by the surface census: the exact call
  * site, and the scan asserting every `'surface:<name>'` literal in `src/lib`
@@ -398,8 +399,42 @@ const token_scope_denial = (c: Context, capability: TokenScopeCapability): Respo
  * @param capability - the `surface:<name>` this route demands; names itself in the denial
  * @returns the 403 to return, or `null` when the caller may proceed
  */
-export const token_scope_surface_denial = (c: Context, capability: string): Response | null =>
-	token_scope_denial(c, { kind: 'surface', capability });
+export const token_scope_surface_denial = (c: Context, capability: string): Response | null => {
+	const scope = resolved_auth_scope(get_resolved_auth(c));
+	if (scope !== null && !token_scope_admits_non_rpc(scope)) {
+		return c.json(token_scope_denied_body(capability), 403);
+	}
+	return null;
+};
+
+/**
+ * The account id a public route — one that answers anonymous callers and reads
+ * the credential (`reads_credential`) — may act on: `null` for the anonymous
+ * caller **and for a scope-narrowed API token**. Rule 3 in its
+ * anonymous-admitting disposition — the downgrade the Rust
+ * `AuthGate::public_request_context` applies.
+ *
+ * A narrowed token reaches no non-RPC surface that reads account data
+ * (`token_scope_admits_non_rpc`). On a route that refuses anonymous callers
+ * that is a 403 (`auth.required_scope`); on one that answers them, a 403
+ * would enforce nothing — the holder drops the `Authorization` header and
+ * reads the anonymous answer anyway — so the narrowed token *is* the
+ * anonymous caller there. Read the credential through this on any
+ * `reads_credential` route instead of `get_resolved_auth` directly, so the
+ * downgrade is one decision rather than an `&&` hand-rolled per handler.
+ *
+ * The RPC endpoint is the exception: its dispatcher gates each method against
+ * the scope, so it reads the full credential.
+ *
+ * @param c - the request context, after the auth middleware chain
+ * @returns the account id, or `null` for an anonymous caller or a narrowed token
+ */
+export const get_public_account_id = (c: Context): string | null => {
+	const auth = get_resolved_auth(c);
+	if (auth === null) return null;
+	if (!token_scope_admits_non_rpc(resolved_auth_scope(auth)!)) return null;
+	return auth.account_id;
+};
 
 /**
  * Create middleware refusing a route to a credential whose scope does not admit
@@ -413,19 +448,22 @@ export const token_scope_surface_denial = (c: Context, capability: string): Resp
  * Parses at construction, so a malformed capability is a registration-time
  * throw rather than a guard that mounts and reports nonsense.
  *
+ * Only the `surface:<name>` arm is accepted (`is_route_scope_capability`): an
+ * `rpc:<method>` capability is the dispatcher's per-method gate, which a route
+ * never reaches.
+ *
  * @param capability - the capability string this route demands, e.g. `surface:audit_stream`
- * @returns middleware that 403s a credential whose scope lacks it
- * @throws Error if `capability` is not a well-formed `rpc:<method>` / `surface:<name>` string
+ * @returns middleware that 403s a narrowed token
+ * @throws Error if `capability` is not a well-formed `surface:<name>` string
  */
 export const require_token_scope = (capability: string): MiddlewareHandler => {
-	const parsed = parse_token_scope_capability(capability);
-	if (parsed === null) {
+	if (!is_route_scope_capability(capability)) {
 		throw new Error(
-			`auth.required_scope "${capability}" is not a valid token-scope capability \u2014 expected 'rpc:<method>' or 'surface:<name>', where a surface name is lowercase letters and underscores`
+			`auth.required_scope "${capability}" is not a valid token-scope capability for a route \u2014 expected 'surface:<name>', where a surface name is lowercase letters and underscores ('rpc:<method>' is the action dispatcher's per-method gate, which a route never reaches)`
 		);
 	}
 	return async (c, next): Promise<Response | void> => {
-		const denied = token_scope_denial(c, parsed);
+		const denied = token_scope_surface_denial(c, capability);
 		if (denied) return denied;
 		await next();
 	};
@@ -434,10 +472,10 @@ export const require_token_scope = (capability: string): MiddlewareHandler => {
 /**
  * Middleware that requires authentication.
  *
- * Returns 401 if the auth middleware did not set `c.var.auth_account_id`.
+ * Returns 401 if the auth middleware resolved no credential.
  */
 export const require_auth: MiddlewareHandler = async (c, next): Promise<Response | void> => {
-	if (c.get(ACCOUNT_ID_KEY) == null) {
+	if (get_resolved_auth(c) === null) {
 		return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
 	}
 	await next();
@@ -456,9 +494,8 @@ export const require_auth: MiddlewareHandler = async (c, next): Promise<Response
  * **global / unscoped role_grants only**. A scoped role_grant
  * (`{role: 'admin', scope_id: <some uuid>}`) does not unlock route-spec
  * gates that are inherently global. The same scope-aware check is
- * mirrored in `actions/action_rpc.ts` (HTTP RPC dispatcher) and
- * `actions/register_action_ws.ts` (WS dispatcher) so all three
- * transports agree.
+ * run in `actions/perform_action.ts`, the core both the HTTP RPC and WS
+ * dispatchers call, so the transports agree.
  *
  * Multi-role disjunction (any-of) lets `auth.roles: ['admin', 'steward']`
  * specs translate to one middleware that admits either role. Single-role
@@ -468,7 +505,7 @@ export const require_auth: MiddlewareHandler = async (c, next): Promise<Response
  */
 export const require_role = (roles: ReadonlyArray<string>): MiddlewareHandler => {
 	return async (c, next): Promise<Response | void> => {
-		if (c.get(ACCOUNT_ID_KEY) == null) {
+		if (get_resolved_auth(c) === null) {
 			return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
 		}
 		const ctx = get_request_context(c);
@@ -487,8 +524,8 @@ export const require_role = (roles: ReadonlyArray<string>): MiddlewareHandler =>
  * `ERROR_CREDENTIAL_TYPE_REQUIRED` + `required_credential_types` echoing
  * the spec's allowlist when the wire-side credential isn't in it.
  *
- * Reads only `ACCOUNT_ID_KEY` + `CREDENTIAL_TYPE_KEY`, both set by the auth
- * middleware — never the resolved `RequestContext`. That is why
+ * Reads only the credential the auth middleware resolved (`get_resolved_auth`)
+ * — never the resolved `RequestContext`. That is why
  * `fuz_auth_guard_resolver` mounts it in the `pre_authorization` phase: a
  * wrong channel is refused before the route resolves an actor for it, so the
  * denial costs no DB work and discloses no account state.
@@ -505,11 +542,11 @@ export const require_credential_types = (
 	credential_types: ReadonlyArray<string>
 ): MiddlewareHandler => {
 	return async (c, next): Promise<Response | void> => {
-		if (c.get(ACCOUNT_ID_KEY) == null) {
+		const auth = get_resolved_auth(c);
+		if (auth === null) {
 			return c.json({ error: ERROR_AUTHENTICATION_REQUIRED }, 401);
 		}
-		const credential_type: CredentialType | null = c.get(CREDENTIAL_TYPE_KEY) ?? null;
-		if (!credential_type || !credential_types.includes(credential_type)) {
+		if (!credential_types.includes(auth.credential_type)) {
 			return c.json(
 				{
 					error: ERROR_CREDENTIAL_TYPE_REQUIRED,
@@ -733,6 +770,50 @@ export const apply_authorization_phase = async (
 };
 
 /**
+ * Run the authorization phase on a Hono request: resolve the acting actor from
+ * `acting` against the authenticated account, and set the resulting
+ * `RequestContext` on `REQUEST_CONTEXT_KEY` for the post-authorization guards
+ * (`require_role`, `require_credential_types`) and the handler.
+ *
+ * The phase every Hono-mounted surface shares — the route-spec handler
+ * (`create_fuz_authorization_handler`) and the WebSocket upgrade
+ * (`register_action_ws`, which reads `acting` off the query string). The HTTP
+ * RPC and WS dispatchers consume `apply_authorization_phase` per action
+ * directly instead.
+ *
+ * Skipped for a public `auth` shape, and under the test-preset escape hatch:
+ * harnesses that pre-populate `REQUEST_CONTEXT_KEY` set
+ * `TEST_CONTEXT_PRESET_KEY` to `TEST_CONTEXT_PRESET` so the phase trusts the supplied context
+ * instead of running DB-backed resolution. Production middleware never sets
+ * that flag.
+ *
+ * @param c - the request context, after the pre-authorization guards
+ * @param deps - query deps for actor resolution
+ * @param auth - the route's auth shape
+ * @param acting - the `acting` selector, already through `parse_acting`; `undefined` when absent
+ * @returns the refusal to answer (`400` actor selection, `500` a vanished
+ *   account), or nothing when the request may proceed
+ */
+export const run_authorization_phase = async (
+	c: Context,
+	deps: QueryDeps,
+	auth: RouteAuth,
+	acting: string | undefined
+): Promise<Response | void> => {
+	if (has_test_context_preset(c)) return;
+	if (is_public_auth(auth)) return;
+	const account_id = get_resolved_auth(c)?.account_id ?? null;
+	const result = await apply_authorization_phase(deps, account_id, auth, acting);
+	if (!result.ok) return c.json(result.body, result.status);
+	if (result.request_context !== null) {
+		c.set(REQUEST_CONTEXT_KEY, result.request_context);
+	}
+	// `request_context: null` — public action or unauthenticated optional axis.
+	// Leave `REQUEST_CONTEXT_KEY` null; downstream `require_role` /
+	// `require_credential_types` enforce.
+};
+
+/**
  * Create the route-spec authorization handler used by `apply_route_specs`.
  *
  * Reads the `acting` selector via `read_route_acting` — `c.var.validated_query`
@@ -755,23 +836,10 @@ export const create_fuz_authorization_handler = (
 	deps: QueryDeps
 ): ((c: Context, spec: RouteSpec) => Promise<Response | void>) => {
 	return async (c, spec) => {
-		// Test escape hatch: harnesses that pre-populate `REQUEST_CONTEXT_KEY`
-		// flag `TEST_CONTEXT_PRESET_KEY = true` so the authorization phase
-		// trusts the supplied context instead of running DB-backed resolution.
-		// Production middleware never sets this flag.
-		if (c.get(TEST_CONTEXT_PRESET_KEY)) return;
-		if (is_public_auth(spec.auth)) return;
+		// the same skips `run_authorization_phase` makes, ahead of reading a body
+		if (has_test_context_preset(c) || is_public_auth(spec.auth)) return;
 		const acting_value = needs_actor(spec.auth) ? await read_route_acting(c, spec) : undefined;
-		const account_id: string | null = c.get(ACCOUNT_ID_KEY) ?? null;
-		const result = await apply_authorization_phase(deps, account_id, spec.auth, acting_value);
-		if (!result.ok) return c.json(result.body, result.status);
-		if (result.request_context !== null) {
-			c.set(REQUEST_CONTEXT_KEY, result.request_context);
-		}
-		// `request_context: null` — public action or unauthenticated optional axis.
-		// Leave `REQUEST_CONTEXT_KEY` null; downstream `require_role` /
-		// `require_credential_types` enforce.
-		return;
+		return run_authorization_phase(c, deps, spec.auth, acting_value);
 	};
 };
 

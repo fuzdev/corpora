@@ -5,7 +5,7 @@ import './assert_dev_env.ts';
  *
  * `describe_standard_integration_tests` creates a composable test suite that
  * exercises the full middleware stack (origin, session, bearer_auth, request_context)
- * against a real PGlite database. Consumers call it with their route factory and
+ * against a real database. Consumers call it with their route factory and
  * session config — all auth route tests come for free.
  *
  * Tests use `stub_password_deps` (deterministic hashing, no Argon2 overhead).
@@ -51,9 +51,16 @@ import {
 import { invite_create_action_spec } from '../auth/admin_action_specs.ts';
 import { LoginOutput, AccountStatusOutput } from '../auth/account_route_schema.ts';
 import type { AppSurfaceSpec } from '../http/surface.ts';
+import type { RouteSpec } from '../http/route_spec.ts';
 import { test_if, type BackendCapabilities } from './cross_backend/capabilities.ts';
+import {
+	assert_iso8601_seconds,
+	assert_iso8601_seconds_nullable
+} from './cross_backend/wire_shapes.ts';
 import type { SetupTest } from './cross_backend/setup.ts';
 import { DEFAULT_TEST_PASSWORD } from './test_credentials.ts';
+import { create_test_request_headers, TEST_ORIGIN } from './test_origin.ts';
+import { create_test_raw_api_token } from './entities.ts';
 
 /**
  * Configuration for `describe_standard_integration_tests`.
@@ -162,23 +169,27 @@ export const describe_standard_integration_tests = (
 		// Error coverage tracking across test groups
 		const error_collector = new ErrorCoverageCollector();
 
+		// the auth routes this suite drives: login / logout / password, signup
+		// (when wired), and the shared RPC endpoint — admin-role routes belong to
+		// the admin suite
+		const is_suite_auth_route = (s: RouteSpec): boolean => {
+			if (s.auth.roles?.includes('admin') ?? false) return false;
+			const rest_suffixes = ['/login', '/logout', '/password', '/signup'];
+			if (rest_suffixes.some((suffix) => s.path.endsWith(suffix))) return true;
+			return s.path === rpc_path;
+		};
+
 		afterAll(() => {
 			// Scope coverage to auth routes this suite actually exercises:
 			// login / logout / password drivers + signup invite edge cases
 			// (when the consumer wires signup) + the shared RPC endpoint.
 			// Bootstrap (when the consumer wires it via the top-level `bootstrap`
 			// option in `mode: 'live'`) is intentionally excluded — this suite has
-			// no describe block that drives bootstrap; the dedicated
-			// `describe_bootstrap_success_tests` suite picks it up via
-			// `create_test_app_for_bootstrap`. Consumer-specific
+			// no describe block that drives bootstrap; the cross-backend harness
+			// drives the real `POST /bootstrap`. Consumer-specific
 			// routes would dilute the ratio; admin-role routes are scoped to
 			// the admin suite instead.
-			const auth_routes = route_specs.filter((s) => {
-				if (s.auth.roles?.includes('admin') ?? false) return false;
-				const rest_suffixes = ['/login', '/logout', '/password', '/signup'];
-				if (rest_suffixes.some((suffix) => s.path.endsWith(suffix))) return true;
-				return s.path === rpc_path;
-			});
+			const auth_routes = route_specs.filter(is_suite_auth_route);
 			assert_error_coverage(error_collector, auth_routes.length > 0 ? auth_routes : route_specs, {
 				min_coverage: options.error_coverage_min ?? DEFAULT_INTEGRATION_ERROR_COVERAGE,
 				// Authorization denials (403) on these scoped auth routes — the
@@ -205,11 +216,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: DEFAULT_TEST_PASSWORD
@@ -235,11 +244,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: 'wrong-password'
@@ -262,11 +269,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: 'nonexistent_user',
 						password: DEFAULT_TEST_PASSWORD
@@ -289,11 +294,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: `  ${fixture.account.username}  `,
 						password: DEFAULT_TEST_PASSWORD
@@ -321,11 +324,9 @@ export const describe_standard_integration_tests = (
 				// Login
 				const login_res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: DEFAULT_TEST_PASSWORD
@@ -340,11 +341,10 @@ export const describe_standard_integration_tests = (
 				assert.ok(cookie_match?.[1]);
 				const login_cookie = cookie_match[1];
 
-				const create_headers = () => ({
-					host: 'localhost',
-					origin: 'http://localhost:5173',
-					cookie: `${cookie_name}=${login_cookie}`
-				});
+				const create_headers = () =>
+					create_test_request_headers({
+						cookie: `${cookie_name}=${login_cookie}`
+					});
 
 				// Verify works
 				const verify_res = await rpc_call_for_spec({
@@ -359,7 +359,7 @@ export const describe_standard_integration_tests = (
 				// Logout
 				const logout_res = await fixture.transport(logout_route.path, {
 					method: 'POST',
-					headers: create_headers()
+					headers: { ...create_headers(), 'content-type': 'application/json' }
 				});
 				assert.strictEqual(logout_res.status, 200);
 				const logout_body = await logout_res.json();
@@ -396,11 +396,9 @@ export const describe_standard_integration_tests = (
 				const make_login = (username: string, password: string) =>
 					fixture.transport(login_route.path, {
 						method: 'POST',
-						headers: {
-							host: 'localhost',
-							origin: 'http://localhost:5173',
+						headers: create_test_request_headers({
 							'content-type': 'application/json'
-						},
+						}),
 						body: JSON.stringify({ username, password })
 					});
 
@@ -443,11 +441,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: DEFAULT_TEST_PASSWORD
@@ -514,6 +510,13 @@ export const describe_standard_integration_tests = (
 						parsed.role_grants.length > 0,
 						'single-actor keeper must have populated role_grants'
 					);
+					// Byte-shape gate: `z.string()` accepts a millisecond stamp too,
+					// so the schema parse above can't tell the two spines apart.
+					assert_iso8601_seconds(parsed.account.created_at, 'account.created_at');
+					for (const grant of parsed.role_grants) {
+						assert_iso8601_seconds(grant.created_at, 'role_grant.created_at');
+						assert_iso8601_seconds_nullable(grant.expires_at, 'role_grant.expires_at');
+					}
 				}
 			);
 		});
@@ -531,11 +534,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: DEFAULT_TEST_PASSWORD
@@ -606,7 +607,12 @@ export const describe_standard_integration_tests = (
 				});
 				assert.ok(list_res.ok, 'account_session_list should succeed');
 				assert.ok(list_res.result.sessions.length >= 1);
-				const session_id = list_res.result.sessions[0]!.id;
+				const session = list_res.result.sessions[0]!;
+				// Byte-shape gate on the session timestamps — see the account-status
+				// case for why the output schema alone can't catch the divergence.
+				assert_iso8601_seconds(session.created_at, 'session.created_at');
+				assert_iso8601_seconds(session.expires_at, 'session.expires_at');
+				const session_id = session.id;
 
 				// Revoke that session by ID
 				const revoke_res = await rpc_call_for_spec({
@@ -718,11 +724,9 @@ export const describe_standard_integration_tests = (
 				// Login with new password works
 				const login_res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: fixture.account.username,
 						password: 'new-password-456'
@@ -813,7 +817,8 @@ export const describe_standard_integration_tests = (
 					path: rpc_path,
 					spec: account_verify_action_spec,
 					params: undefined,
-					headers: { authorization: 'Bearer secret_fuz_token_invalid' },
+					// well-formed, so the refusal is the lookup's, not the shape precheck's
+					headers: { authorization: `Bearer ${create_test_raw_api_token('invalid')}` },
 					suppress_default_origin: true
 				});
 				assert.strictEqual(res.status, 401);
@@ -842,7 +847,11 @@ export const describe_standard_integration_tests = (
 					path: rpc_path,
 					spec: account_verify_action_spec,
 					params: undefined,
-					headers: { ...bearer_headers, origin: 'http://localhost:5173' }
+					headers: {
+						...bearer_headers,
+						origin: TEST_ORIGIN,
+						'content-type': 'application/json'
+					}
 				});
 				assert.strictEqual(res.status, 401);
 			});
@@ -922,7 +931,7 @@ export const describe_standard_integration_tests = (
 				// phase doesn't first demand an acting actor → `actor_required`)
 				// and input/param/query-free (params and query still validate ahead
 				// of the auth phase — only body validation moved behind the gates,
-				// per the 401 → authz → 403 → 400 order). Admin surfaces are
+				// per the 401 → authz → 403 → 429 → 400 order). Admin surfaces are
 				// RPC-first now; a consumer may expose no such REST route (fuz_app
 				// itself, zzz) — then this REST-era check is a no-op and RPC denial
 				// is covered by `describe_rpc_attack_surface_tests`.
@@ -1134,11 +1143,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.transport(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: 'nonexistent_user_xyz',
 						password: 'any-password'
@@ -1175,11 +1182,9 @@ export const describe_standard_integration_tests = (
 
 				const res = await fixture.fresh_transport()(logout_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({})
 				});
 				assert.strictEqual(res.status, 401);
@@ -1325,7 +1330,11 @@ export const describe_standard_integration_tests = (
 				});
 				const res = await fixture.fresh_transport()(logout_route.path, {
 					method: 'POST',
-					headers: { ...bearer_headers, origin: 'http://localhost:5173' }
+					headers: {
+						...bearer_headers,
+						origin: TEST_ORIGIN,
+						'content-type': 'application/json'
+					}
 				});
 				assert.strictEqual(
 					res.status,
@@ -1348,7 +1357,7 @@ export const describe_standard_integration_tests = (
 				});
 				const res = await fixture.fresh_transport()(password_route.path, {
 					method: 'POST',
-					headers: { ...bearer_headers, referer: 'http://localhost:5173/admin' }
+					headers: { ...bearer_headers, referer: `${TEST_ORIGIN}/admin` }
 				});
 				assert.strictEqual(
 					res.status,
@@ -1356,6 +1365,27 @@ export const describe_standard_integration_tests = (
 					'Bearer with Referer should be discarded → unauthenticated'
 				);
 				error_collector.record(route_specs, 'POST', password_route.path, 401);
+			});
+		});
+
+		// --- 12b. Content type: every JSON POST route refuses an untyped body ---
+
+		describe('JSON routes refuse an untyped POST', () => {
+			test('each scoped JSON POST route answers an untyped POST with 415', async () => {
+				const fixture = await options.setup_test();
+				const json_post_routes = route_specs.filter(
+					(s) => s.method === 'POST' && !s.raw_body && is_suite_auth_route(s)
+				);
+				assert.ok(json_post_routes.length > 0, 'Expected JSON POST routes');
+				for (const route of json_post_routes) {
+					// a byte body, so `fetch` adds no `Content-Type` of its own
+					const res = await fixture.fresh_transport()(route.path, {
+						method: 'POST',
+						body: new TextEncoder().encode('{}')
+					});
+					assert.strictEqual(res.status, 415, `untyped POST ${route.path}`);
+					await error_collector.assert_and_record(route_specs, 'POST', route.path, res);
+				}
 			});
 		});
 
@@ -1474,11 +1504,9 @@ export const describe_standard_integration_tests = (
 				// Try to sign up with a different email — should fail (no matching invite)
 				const signup_res = await fixture.transport(signup_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: 'eve_attacker',
 						password: 'test-password-123456',
@@ -1541,11 +1569,9 @@ export const describe_standard_integration_tests = (
 				// Attempt 1: signup with a non-matching email (no invite match) → 403
 				const no_match_res = await fixture.transport(signup_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: 'nomatch_user',
 						password: 'test-password-123456',
@@ -1572,11 +1598,9 @@ export const describe_standard_integration_tests = (
 				// Attempt 2: signup with the invited email but a colliding username → 409
 				const conflict_res = await fixture.transport(signup_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: existing_user.account.username,
 						password: 'test-password-123456',

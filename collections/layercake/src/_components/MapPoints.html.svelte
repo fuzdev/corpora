@@ -3,9 +3,10 @@
 	Generates HTML dots onto a map using [d3-geo](https://github.com/d3/d3-geo).
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, width, height } = getContext('LayerCake');
+	/** @type {import('layercake').LayerCakeContext<any, { features: Array<any> }>} */
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
@@ -13,9 +14,9 @@
 	 * @property {number} [r=3.5] - The point's radius.
 	 * @property {string} [fill='yellow'] - The point's fill color.
 	 * @property {string} [stroke='#000'] - The point's stroke color.
-	 * @property {number} [strokeWidth=1] - The point's stroke width, in pixels.
+	 * @property {number} [strokeWidth=1] - The point's stroke width in pixels.
 	 * @property {number} [opacity=1] - The point's opacity.
-	 * @property {Array<Object>|undefined} [features] - A list of GeoJSON features to plot. If unset, the plotted features will default to those in `$data.features`, assuming this field is a list of GeoJSON features.
+	 * @property {Array<Object>|undefined} [features] - A list of GeoJSON features to plot. If unset, the plotted features will default to those in `k.data.features`, assuming this field is a list of GeoJSON features.
 	 */
 
 	/** @type {Props} */
@@ -29,12 +30,12 @@
 		features
 	} = $props();
 
-	let projectionFn = $derived(projection().fitSize([$width, $height], $data));
+	let projectionFn = $derived(projection().fitSize([k.width, k.height], k.data));
 </script>
 
 <div class="points">
-	<!-- To scale the circle by size, set width and height to `$rGet(d.properties)` -->
-	{#each features || $data.features as d}
+	{#each features || k.data.features as d}
+		<!-- To size each circle from an r scale, set width and height from k.rGet(d.properties) -->
 		<div
 			class="point"
 			style="

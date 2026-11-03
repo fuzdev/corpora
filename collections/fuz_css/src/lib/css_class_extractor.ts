@@ -39,7 +39,8 @@ export interface ExtractionData {
 	classes: Map<string, Array<SourceLocation>> | null;
 	/**
 	 * Classes explicitly annotated via `@fuz-classes` comments, or null if none.
-	 * These produce errors if they can't be resolved during generation.
+	 * These produce errors if they can't be resolved during generation - by a
+	 * class definition or, when base styles are bundled, a base style rule.
 	 */
 	explicit_classes: Set<string> | null;
 	/** Diagnostics from the extraction phase, or null if none */
@@ -580,6 +581,10 @@ export const extract_css_classes_with_locations = (
 		return extract_from_svelte(source, file);
 	} else if (ext === '.ts' || ext === '.js' || ext === '.tsx' || ext === '.jsx') {
 		return extract_from_ts(source, file, acorn_plugins);
+	} else if (ext === '.css') {
+		// a stylesheet has no classes or elements to extract - its `var(--*)`
+		// references are detected by the variable scan every file gets
+		return empty_extraction_result([]);
 	}
 
 	// Default to Svelte-style extraction (handles both)

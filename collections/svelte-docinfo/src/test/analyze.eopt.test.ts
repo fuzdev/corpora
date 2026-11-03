@@ -18,9 +18,9 @@
 import { test, assert, describe } from 'vitest';
 import { join } from 'node:path';
 
-import type { MemberJson, ModuleJson, TypeJson } from '$lib/types.ts';
-import { createSourceOptions } from '$lib/source-config.ts';
-import { createAnalysisSession } from '$lib/session.ts';
+import type { MemberJson, ModuleJson, TypeJson } from '#lib/types.ts';
+import { createSourceOptions } from '#lib/source-config.ts';
+import { createAnalysisSession } from '#lib/session.ts';
 
 import { TEST_TSCONFIG_COMPILER_OPTIONS, withTestProject } from './test-helpers.ts';
 import { analyzeTestProject } from './test-module-helpers.ts';
@@ -109,7 +109,7 @@ describe('exactOptionalPropertyTypes property types', () => {
 
 	test('does not rebuild a type-parameter union', async () => {
 		// the multi-member fallback runs `getNonNullableType`, which rewrites
-		// bare type parameters as `E & {}` — corruption when nothing was widened
+		// bare type parameters as `NonNullable<E>` — corruption when nothing was widened
 		const module = await analyzeEoptFile('src/lib/a.ts', `export interface G<E, F> { tp?: E | F }`);
 
 		const declaration = module.declarations[0];

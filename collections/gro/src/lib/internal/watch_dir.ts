@@ -1,0 +1,109 @@
+import { watch, type ChokidarOptions, type FSWatcher, type Matcher } from 'chokidar';
+import { create_deferred, type Deferred } from '@fuzdev/fuz_util/async.ts';
+import type { PathFilter } from '@fuzdev/fuz_util/path.ts';
+import { EMPTY_OBJECT } from '@fuzdev/fuz_util/object.ts';
+
+const TMP_FILE_PATTERN = /\.tmp\./;
+
+// TODO pretty hacky
+
+export interface WatchNodeFs {
+	init: () => Promise<void>;
+	close: () => Promise<void>;
+}
+
+export interface WatcherChange {
+	type: WatcherChangeType;
+	path: string;
+	is_directory: boolean;
+}
+export type WatcherChangeType = 'add' | 'update' | 'delete';
+export type WatcherChangeCallback = (change: WatcherChange) => void;
+
+export interface WatchDirOptions {
+	dir: string;
+	on_change: WatcherChangeCallback;
+	filter?: PathFilter | null | undefined;
+	chokidar?: ChokidarOptions;
+	/**
+	 * Pattern to ignore files, merged into `chokidar.ignored` if also provided.
+	 * - `undefined` (default) ignores files matching `.tmp.` pattern
+	 * - `null` sets no default ignore pattern
+	 * - or some custom pattern
+	 */
+	ignored?: Matcher | null;
+	/**
+	 * Called with each error chokidar emits, like `EACCES` reading a directory,
+	 * which is otherwise thrown, crashing the process.
+	 */
+	on_error?: (error: unknown) => void;
+}
+
+/**
+ * Watch for changes on the filesystem using chokidar.
+ */
+export const watch_dir = ({
+	dir,
+	on_change,
+	filter,
+	chokidar,
+	ignored = TMP_FILE_PATTERN,
+	on_error
+}: WatchDirOptions): WatchNodeFs => {
+	let watcher: FSWatcher | undefined;
+	let initing: Deferred<void> | undefined;
+
+	return {
+		init: async () => {
+			if (initing) return initing.promise;
+			initing = create_deferred();
+			watcher = watch(dir, resolve_chokidar_options(chokidar, ignored));
+			watcher.on('add', (path) => {
+				if (filter && !filter(path, false)) return;
+				on_change({ type: 'add', path, is_directory: false });
+			});
+			watcher.on('addDir', (path) => {
+				if (filter && !filter(path, true)) return;
+				on_change({ type: 'add', path, is_directory: true });
+			});
+			watcher.on('change', (path, s) => {
+				// never stats, which could throw in a listener for a path already gone;
+				// chokidar reports `change` for files, with stats when it has them
+				const is_directory = s?.isDirectory() ?? false;
+				if (filter && !filter(path, is_directory)) return;
+				on_change({ type: 'update', path, is_directory });
+			});
+			watcher.on('unlink', (path) => {
+				if (filter && !filter(path, false)) return;
+				on_change({ type: 'delete', path, is_directory: false });
+			});
+			watcher.on('unlinkDir', (path) => {
+				if (filter && !filter(path, true)) return;
+				on_change({ type: 'delete', path, is_directory: true });
+			});
+			if (on_error) watcher.on('error', on_error);
+			// wait until ready
+			watcher.once('ready', () => initing?.resolve());
+			await initing.promise;
+		},
+		close: async () => {
+			initing = undefined;
+			if (!watcher) return;
+			await watcher.close();
+		}
+	};
+};
+
+const resolve_chokidar_options = (
+	options: ChokidarOptions | undefined,
+	ignored: Matcher | null
+): ChokidarOptions | undefined => {
+	if (ignored === null) return options;
+
+	const { ignored: i, ...rest } = options ?? EMPTY_OBJECT;
+
+	const resolved_ignored =
+		i === undefined ? ignored : Array.isArray(i) ? [...i, ignored] : [i, ignored];
+
+	return { ...rest, ignored: resolved_ignored };
+};

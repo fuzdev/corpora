@@ -9,32 +9,39 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import { create_rpc_endpoint, type RpcAction } from '$lib/actions/action_rpc.ts';
-import type { RequestResponseActionSpec } from '$lib/actions/action_spec.ts';
-import { apply_route_specs } from '$lib/http/route_spec.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { generate_app_surface } from '$lib/http/surface.ts';
-import { create_stub_db } from '$lib/testing/stubs.ts';
-import { REQUEST_CONTEXT_KEY } from '$lib/auth/request_context.ts';
+import { create_rpc_endpoint, RPC_GET_CACHE_CONTROL } from '#lib/actions/action_rpc.ts';
+import type { RpcAction } from '#lib/actions/action_types.ts';
+import type { RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
+import { apply_route_specs } from '#lib/http/route_spec.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { generate_app_surface } from '#lib/http/surface.ts';
+import { create_stub_db } from '#lib/testing/stubs.ts';
+import { REQUEST_CONTEXT_KEY } from '#lib/auth/request_context.ts';
 import {
-	ACCOUNT_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TEST_CONTEXT_PRESET_KEY,
-	TOKEN_SCOPE_KEY,
-	type CredentialType
-} from '$lib/hono_context.ts';
-import { create_test_request_context } from '$lib/testing/auth_apps.ts';
-import { create_test_actor } from '$lib/testing/entities.ts';
-import { jsonrpc_errors, JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import { token_scope_methods, type TokenScope } from '$lib/auth/token_scope.ts';
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import type { BuiltinCredentialType } from '#lib/auth/credential_type_schema.ts';
+import { create_test_request_context } from '#lib/testing/auth_apps.ts';
+import { create_test_actor } from '#lib/testing/entities.ts';
+import { jsonrpc_errors, JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { token_scope_methods, type TokenScope } from '#lib/auth/token_scope.ts';
 import {
 	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_INSUFFICIENT_PERMISSIONS,
+	ERROR_PARAMS_PROTO_KEY,
 	ERROR_TOKEN_SCOPE_REQUIRED
-} from '$lib/http/error_schemas.ts';
-import { RateLimiter } from '$lib/rate_limiter.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+} from '#lib/http/error_schemas.ts';
+import { RateLimiter } from '#lib/rate_limiter.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+
+import {
+	ForeignRpcError,
+	SecondCopyThrownJsonrpcError
+} from '../http/thrown_jsonrpc_error_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 const db = create_stub_db();
@@ -100,29 +107,41 @@ const create_test_app = (
 	{
 		auth_context,
 		credential_type,
-		token_scope
+		token_scope,
+		action_ip_rate_limiter,
+		action_account_rate_limiter
 	}: {
 		auth_context?: ReturnType<typeof create_test_request_context>;
-		credential_type?: CredentialType;
+		credential_type?: BuiltinCredentialType;
 		token_scope?: TokenScope;
+		action_ip_rate_limiter?: RateLimiter;
+		action_account_rate_limiter?: RateLimiter;
 	} = {}
 ): Hono => {
 	const app = new Hono();
 	if (auth_context) {
 		app.use('/*', async (c, next) => {
-			(c as any).set(ACCOUNT_ID_KEY, auth_context.account.id);
+			// a scope belongs to an API token alone
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({
+					credential_type: token_scope ? 'api_token' : (credential_type ?? 'session'),
+					account_id: auth_context.account.id,
+					scope: token_scope
+				})
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, auth_context);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-			if (credential_type) {
-				(c as any).set(CREDENTIAL_TYPE_KEY, credential_type);
-			}
-			if (token_scope) {
-				(c as any).set(TOKEN_SCOPE_KEY, token_scope);
-			}
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 	}
-	const route_specs = create_rpc_endpoint({ path: '/api/rpc', actions, log });
+	const route_specs = create_rpc_endpoint({
+		path: '/api/rpc',
+		actions,
+		log,
+		action_ip_rate_limiter: action_ip_rate_limiter ?? null,
+		action_account_rate_limiter: action_account_rate_limiter ?? null
+	});
 	apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
 	return app;
 };
@@ -130,6 +149,8 @@ const create_test_app = (
 describe('create_rpc_endpoint', () => {
 	test('returns two route specs (POST + GET) on same path', () => {
 		const specs = create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/api/rpc',
 			actions: [{ spec: create_post_spec(), handler: () => ({}) }],
 			log
@@ -143,6 +164,8 @@ describe('create_rpc_endpoint', () => {
 
 	test('both specs have auth none and transaction false', () => {
 		const specs = create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/api/rpc',
 			actions: [{ spec: create_post_spec(), handler: () => ({}) }],
 			log
@@ -157,6 +180,8 @@ describe('create_rpc_endpoint', () => {
 		assert.throws(
 			() =>
 				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/api/rpc',
 					actions: [
 						{ spec: create_post_spec(), handler: () => ({}) },
@@ -165,6 +190,31 @@ describe('create_rpc_endpoint', () => {
 					log
 				}),
 			/Duplicate RPC action method/
+		);
+	});
+
+	test('throws on z.void() output spec (a response always carries a result)', () => {
+		const void_output_spec: RequestResponseActionSpec = {
+			method: 'thing_void_output',
+			kind: 'request_response',
+			initiator: 'frontend',
+			auth: { account: 'none', actor: 'none' },
+			side_effects: true,
+			input: z.void(),
+			output: z.void(),
+			async: true,
+			description: 'Void-output action'
+		};
+		assert.throws(
+			() =>
+				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
+					path: '/api/rpc',
+					actions: [{ spec: void_output_spec, handler: () => undefined }],
+					log
+				}),
+			/RPC action "thing_void_output".*z\.void\(\) for output.*z\.null\(\)/s
 		);
 	});
 
@@ -183,6 +233,8 @@ describe('create_rpc_endpoint', () => {
 		assert.throws(
 			() =>
 				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/api/rpc',
 					actions: [{ spec: legacy_null_spec, handler: () => ({ ok: true as const }) }],
 					log
@@ -193,6 +245,8 @@ describe('create_rpc_endpoint', () => {
 
 	test('description includes method count', () => {
 		const specs = create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/api/rpc',
 			actions: [
 				{ spec: create_post_spec(), handler: () => ({}) },
@@ -228,6 +282,36 @@ describe('POST dispatcher', () => {
 		assert.strictEqual(body.result.id, 'created-test');
 	});
 
+	/**
+	 * A dispatched result and a dispatched error are written as text by
+	 * `serialize_action_result`, not by `c.json`; the content type must stay
+	 * the one `c.json` writes on every other response of the endpoint.
+	 */
+	test('a dispatched response carries the JSON content type', async () => {
+		const app = create_test_app([
+			{
+				spec: create_post_spec(),
+				handler: (input: any) => ({ id: `created-${input.name}` })
+			}
+		]);
+		const ok_app = create_test_app(
+			[{ spec: create_post_spec(), handler: (input: any) => ({ id: `created-${input.name}` }) }],
+			{ auth_context: create_test_request_context() }
+		);
+		const post = (target: Hono) =>
+			target.request('/api/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: rpc_request('thing_create', { name: 'test' })
+			});
+		const ok = await post(ok_app);
+		assert.strictEqual(ok.status, 200);
+		assert.strictEqual(ok.headers.get('content-type'), 'application/json');
+		const refused = await post(app);
+		assert.strictEqual(refused.status, 401);
+		assert.strictEqual(refused.headers.get('content-type'), 'application/json');
+	});
+
 	test('returns parse_error for invalid JSON body', async () => {
 		const app = create_test_app([{ spec: create_get_spec(), handler: () => ({ items: [] }) }]);
 
@@ -238,7 +322,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.parse_error as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.parse_error);
 	});
 
 	test('returns invalid_request for malformed envelope', async () => {
@@ -251,7 +335,26 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	test('a non-object body is invalid_request with id: null', async () => {
+		// A scalar body carries no id to echo. Reading it as its own id would
+		// answer `id: 5` to `POST 5`; the Rust twin's `classify` answers
+		// `id: null` for any non-object body.
+		const app = create_test_app([{ spec: create_get_spec(), handler: () => ({ items: [] }) }]);
+
+		for (const raw of ['5', '"thing_list"', 'true']) {
+			const res = await app.request('/api/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: raw
+			});
+			assert.strictEqual(res.status, 400, raw);
+			const body = await res.json();
+			assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request, raw);
+			assert.strictEqual(body.id, null, raw);
+		}
 	});
 
 	test('returns method_not_found for unknown method', async () => {
@@ -264,7 +367,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 404);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.method_not_found as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.method_not_found);
 		assert.ok(body.error.message.includes('nonexistent'));
 	});
 
@@ -278,9 +381,23 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 401);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.unauthenticated as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.unauthenticated);
 		// The pre-authorization 401 carries `data.reason` (symmetric with the 403
 		// gates) so callers can assert reason, not just status.
+		assert.strictEqual(body.error.data.reason, ERROR_AUTHENTICATION_REQUIRED);
+	});
+
+	test('the __proto__ refusal waits on the authority gates', async () => {
+		// a caller the gates refuse learns nothing about the params, the
+		// proto walk included
+		const app = create_test_app([{ spec: create_post_spec(), handler: () => ({ id: '1' }) }]);
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: '{"jsonrpc":"2.0","id":"1","method":"thing_create","params":{"name":"x","__proto__":{}}}'
+		});
+		assert.strictEqual(res.status, 401);
+		const body = await res.json();
 		assert.strictEqual(body.error.data.reason, ERROR_AUTHENTICATION_REQUIRED);
 	});
 
@@ -303,12 +420,12 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 	});
 
 	/**
 	 * The role gate is the *last* authority gate, so it is the one that pins
-	 * the whole 401 → authz → 403 → 400 order: if validation had stayed ahead
+	 * the whole 401 → authz → 403 → 429 → 400 order: if validation had stayed ahead
 	 * of it, malformed params would answer `invalid_params` here and describe
 	 * the method's input shape to a caller who may never call it. The
 	 * credential and scope gates are covered by their own siblings; this is
@@ -333,7 +450,28 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
+		assert.strictEqual(body.error.data.reason, ERROR_INSUFFICIENT_PERMISSIONS);
+	});
+
+	test('the role gate precedes the __proto__ refusal', async () => {
+		const admin_spec: RequestResponseActionSpec = {
+			...create_post_spec(),
+			method: 'admin_action',
+			auth: { account: 'required', actor: 'required', roles: ['admin'] },
+			input: z.strictObject({ name: z.string(), acting: ActingActor })
+		};
+		const app = create_test_app(
+			[{ spec: admin_spec, handler: () => ({ id: '1' }) }],
+			{ auth_context: create_test_request_context() } // no admin role
+		);
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: '{"jsonrpc":"2.0","id":"1","method":"admin_action","params":{"name":"x","__proto__":{}}}'
+		});
+		assert.strictEqual(res.status, 403);
+		const body = await res.json();
 		assert.strictEqual(body.error.data.reason, ERROR_INSUFFICIENT_PERMISSIONS);
 	});
 
@@ -357,7 +495,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 		assert.strictEqual(body.error.data.reason, ERROR_TOKEN_SCOPE_REQUIRED);
 	});
 
@@ -373,7 +511,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
 		assert.ok(body.error.data.issues);
 	});
 
@@ -421,6 +559,56 @@ describe('POST dispatcher', () => {
 		assert.strictEqual(received_auth, null);
 	});
 
+	test('an own __proto__ params key is refused on a void and a strict input, POST and GET alike', async () => {
+		// the classifier hands on the body as parsed, so the key reaches the
+		// input schema — a rebuilt copy dropped it, reading `{"__proto__": …}`
+		// as `{}` on POST while GET, which parses `params` itself, refused it
+		let called = 0;
+		const app = create_test_app([
+			{
+				spec: create_get_spec(),
+				handler: () => {
+					called++;
+					return { items: [] };
+				}
+			},
+			{
+				spec: create_get_with_input_spec(),
+				handler: () => {
+					called++;
+					return { results: [] };
+				}
+			}
+		]);
+		const proto = '{"__proto__":{"x":1}}';
+		const strict = '{"query":"q","limit":1,"__proto__":{"x":1}}';
+		const responses = [
+			await app.request('/api/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: `{"jsonrpc":"2.0","id":"1","method":"thing_list","params":${proto}}`
+			}),
+			await app.request('/api/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: `{"jsonrpc":"2.0","id":"1","method":"thing_search","params":${strict}}`
+			}),
+			await app.request(`/api/rpc?method=thing_list&id=1&params=${encodeURIComponent(proto)}`),
+			await app.request(`/api/rpc?method=thing_search&id=1&params=${encodeURIComponent(strict)}`)
+		];
+		for (const [i, res] of responses.entries()) {
+			const body = await res.json();
+			assert.strictEqual(res.status, 400, `${i}: ${JSON.stringify(body)}`);
+			assert.strictEqual(
+				body.error.code,
+				JSONRPC_ERROR_CODES.invalid_params,
+				`${i}: ${JSON.stringify(body)}`
+			);
+			assert.deepStrictEqual(body.error.data, { reason: ERROR_PARAMS_PROTO_KEY }, `${i}`);
+		}
+		assert.strictEqual(called, 0);
+	});
+
 	test('void input schemas accept missing params', async () => {
 		let received_input: unknown = 'sentinel';
 		const app = create_test_app([
@@ -442,17 +630,40 @@ describe('POST dispatcher', () => {
 		assert.strictEqual(received_input, undefined);
 	});
 
-	test('void input schemas reject params: {} with invalid_params', async () => {
-		const app = create_test_app([{ spec: create_get_spec(), handler: () => ({ items: [] }) }]);
+	test('void input schemas read params: {} as the no-arg call', async () => {
+		// an empty by-name structure carries no parameters, and published
+		// WebSocket clients send `{}` for a parameterless call
+		let received_input: unknown = 'sentinel';
+		const app = create_test_app([
+			{
+				spec: create_get_spec(),
+				handler: (input) => {
+					received_input = input;
+					return { items: [] };
+				}
+			}
+		]);
 
 		const res = await app.request('/api/rpc', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: rpc_request('thing_list', {})
 		});
+		assert.strictEqual(res.status, 200);
+		assert.strictEqual(received_input, undefined);
+	});
+
+	test('void input schemas reject a declared key with invalid_params', async () => {
+		const app = create_test_app([{ spec: create_get_spec(), handler: () => ({ items: [] }) }]);
+
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: rpc_request('thing_list', { nope: 1 })
+		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
 	});
 
 	test('void input schemas reject literal "params": null with invalid_request', async () => {
@@ -471,7 +682,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 	});
 
 	test('object input schemas treat missing params as empty object', async () => {
@@ -528,7 +739,7 @@ describe('POST dispatcher', () => {
 		const body = await res.json();
 		assert.strictEqual(body.jsonrpc, '2.0');
 		assert.strictEqual(body.id, '1');
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.not_found as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.not_found);
 		assert.strictEqual(body.error.message, 'thing not found');
 	});
 
@@ -556,7 +767,7 @@ describe('POST dispatcher', () => {
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
 		assert.strictEqual(body.id, 'salvage-me');
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 	});
 
 	test('rejects batch (array) requests', async () => {
@@ -569,7 +780,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 		assert.strictEqual(body.id, null); // array has no extractable id
 	});
 
@@ -592,7 +803,91 @@ describe('POST dispatcher', () => {
 		const body = await res.json();
 		assert.strictEqual(body.jsonrpc, '2.0');
 		assert.strictEqual(body.id, '1');
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.internal_error as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.internal_error);
+	});
+
+	// a numeric `code` alone is not a JSON-RPC error: a DOMException carries one
+	for (const [label, thrown] of [
+		['a DOMException', () => new DOMException('The operation was aborted.', 'AbortError')],
+		[
+			'an Error with a non-JSON-RPC numeric code',
+			() => Object.assign(new Error('x'), { code: 42 })
+		],
+		[
+			'an Error with a fractional code in the server range',
+			() => Object.assign(new Error('x'), { code: -32000.5 })
+		]
+	] as const) {
+		test(`${label} is an internal error, not its own code`, async () => {
+			const app = create_test_app([
+				{
+					spec: create_get_spec(),
+					handler: () => {
+						throw thrown();
+					}
+				}
+			]);
+
+			const res = await app.request('/api/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: rpc_request('thing_list')
+			});
+			assert.strictEqual(res.status, 500);
+			const body = await res.json();
+			assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.internal_error);
+		});
+	}
+
+	test('a foreign error class carrying a JSON-RPC code is an internal error, its data dropped', async () => {
+		const app = create_test_app([
+			{
+				spec: create_get_spec(),
+				handler: () => {
+					throw new ForeignRpcError(JSONRPC_ERROR_CODES.invalid_params, 'bad', {
+						secret: 'hunter2'
+					});
+				}
+			}
+		]);
+
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: rpc_request('thing_list')
+		});
+		assert.strictEqual(res.status, 500);
+		const text = await res.text();
+		assert.notInclude(text, 'hunter2');
+		const body = JSON.parse(text);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.internal_error);
+		assert.isUndefined(body.error.data);
+	});
+
+	test('a ThrownJsonrpcError from a second fuz_app copy keeps its code and data', async () => {
+		const app = create_test_app([
+			{
+				spec: create_get_spec(),
+				handler: () => {
+					throw new SecondCopyThrownJsonrpcError(JSONRPC_ERROR_CODES.conflict, 'taken', {
+						reason: 'name_taken'
+					});
+				}
+			}
+		]);
+
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: rpc_request('thing_list')
+		});
+		assert.strictEqual(res.status, 409);
+		const body = await res.json();
+		assert.deepStrictEqual(body.error, {
+			code: JSONRPC_ERROR_CODES.conflict,
+			message: 'taken',
+			data: { reason: 'name_taken' }
+		});
 	});
 
 	test('dispatches side_effects:false action via POST', async () => {
@@ -637,7 +932,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 	});
 
 	test('succeeds for keeper action with daemon_token and keeper role', async () => {
@@ -691,7 +986,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 	});
 
 	test('returns forbidden for keeper action with api_token credential', async () => {
@@ -718,7 +1013,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 	});
 
 	test('returns forbidden for keeper action with daemon_token but no keeper role', async () => {
@@ -745,7 +1040,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 403);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.forbidden);
 	});
 
 	test('wrong-type _meta produces invalid_params not invalid_request', async () => {
@@ -762,7 +1057,7 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
 	});
 
 	test('valid _meta passes through to handler', async () => {
@@ -803,13 +1098,45 @@ describe('POST dispatcher', () => {
 		});
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
 		assert.strictEqual(body.error.data.field, 'name');
 		assert.strictEqual(body.error.data.expected, 'string');
 	});
 });
 
 describe('GET dispatcher', () => {
+	/**
+	 * A read answers one caller at one moment, so no browser or proxy cache may
+	 * store it — on every GET response, refusals included — while the POST
+	 * route sends no such header.
+	 */
+	test('every GET response is Cache-Control: no-store, the POST route sets none', async () => {
+		const app = create_test_app(
+			[
+				{ spec: create_get_spec(), handler: () => ({ items: [] }) },
+				{ spec: create_post_spec(), handler: () => ({ id: 'x' }) }
+			],
+			{ auth_context: create_test_request_context() }
+		);
+		for (const url of [
+			'/api/rpc?method=thing_list&id=1',
+			'/api/rpc?method=nope&id=1',
+			'/api/rpc?method=thing_create&id=1',
+			'/api/rpc?id=1'
+		]) {
+			const res = await app.request(url);
+			assert.strictEqual(res.headers.get('cache-control'), RPC_GET_CACHE_CONTROL, url);
+		}
+		assert.strictEqual(RPC_GET_CACHE_CONTROL, 'no-store');
+		const post = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: rpc_request('thing_create', { name: 'x' })
+		});
+		assert.strictEqual(post.status, 200);
+		assert.isNull(post.headers.get('cache-control'));
+	});
+
 	test('dispatches side_effects:false action via query string', async () => {
 		let received_input: unknown = 'sentinel';
 		const app = create_test_app([
@@ -830,18 +1157,41 @@ describe('GET dispatcher', () => {
 		assert.strictEqual(received_input, undefined);
 	});
 
-	test('void input schemas reject ?params={} with invalid_params', async () => {
-		// GET parity for the POST-side void-schema reject test — the GET path
-		// parses `params` out of the query string (separate code path from the
-		// POST body parse), so a void-input method must reject `?params={}`
-		// with the same `invalid_params` shape.
+	test('void input schemas read ?params={} and ?params=null as the no-arg call', async () => {
+		// GET parity for the POST-side void-schema test — the GET path parses
+		// `params` out of the query string (separate code path from the POST
+		// body parse, and no envelope refuses `null` there)
+		for (const raw of ['{}', 'null']) {
+			let received_input: unknown = 'sentinel';
+			const app = create_test_app([
+				{
+					spec: create_get_spec(),
+					handler: (input) => {
+						received_input = input;
+						return { items: [] };
+					}
+				}
+			]);
+
+			const res = await app.request(
+				`/api/rpc?method=thing_list&id=1&params=${encodeURIComponent(raw)}`
+			);
+			assert.strictEqual(res.status, 200, `?params=${raw}`);
+			assert.strictEqual(received_input, undefined, `?params=${raw}`);
+		}
+	});
+
+	test('void input schemas reject any other ?params= with invalid_params', async () => {
 		const app = create_test_app([{ spec: create_get_spec(), handler: () => ({ items: [] }) }]);
 
-		const params = encodeURIComponent(JSON.stringify({}));
-		const res = await app.request(`/api/rpc?method=thing_list&id=1&params=${params}`);
-		assert.strictEqual(res.status, 400);
-		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		for (const raw of ['{"nope":1}', '[]', '1', '"x"']) {
+			const res = await app.request(
+				`/api/rpc?method=thing_list&id=1&params=${encodeURIComponent(raw)}`
+			);
+			assert.strictEqual(res.status, 400, `?params=${raw}`);
+			const body = await res.json();
+			assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params, `?params=${raw}`);
+		}
 	});
 
 	test('parses params from query string', async () => {
@@ -870,7 +1220,7 @@ describe('GET dispatcher', () => {
 		const res = await app.request('/api/rpc?method=thing_create&id=1');
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 		assert.ok(body.error.data.reason.includes('side effects'));
 	});
 
@@ -880,7 +1230,7 @@ describe('GET dispatcher', () => {
 		const res = await app.request('/api/rpc?id=1');
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 	});
 
 	test('returns error for missing id query param', async () => {
@@ -889,7 +1239,7 @@ describe('GET dispatcher', () => {
 		const res = await app.request('/api/rpc?method=thing_list');
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_request);
 	});
 
 	test('parses integer id from query string', async () => {
@@ -1002,7 +1352,7 @@ describe('GET dispatcher', () => {
 		const res = await app.request('/api/rpc?method=thing_search&id=1&params=not-json');
 		assert.strictEqual(res.status, 400);
 		const body = await res.json();
-		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params as number);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
 	});
 
 	test('duplicated method and id query keys take the first occurrence, not the last', async () => {
@@ -1041,6 +1391,8 @@ describe('GET dispatcher', () => {
 describe('RPC endpoint in app surface', () => {
 	test('endpoint route specs appear in surface.routes', () => {
 		const route_specs = create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/api/rpc',
 			actions: [
 				{ spec: create_post_spec(), handler: () => ({}) },
@@ -1064,7 +1416,13 @@ describe('RPC endpoint in app surface', () => {
 			{ spec: create_post_spec(), handler: () => ({}) },
 			{ spec: create_get_spec(), handler: () => ({}) }
 		];
-		const route_specs = create_rpc_endpoint({ path: '/api/rpc', actions, log });
+		const route_specs = create_rpc_endpoint({
+			path: '/api/rpc',
+			actions,
+			log,
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null
+		});
 
 		const surface = generate_app_surface({
 			middleware_specs: [],
@@ -1209,6 +1567,8 @@ describe('rate limit', () => {
 		assert.throws(
 			() =>
 				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/api/rpc',
 					actions: [{ spec: bad_spec, handler: () => ({ ok: true as const }) }],
 					log
@@ -1226,6 +1586,8 @@ describe('rate limit', () => {
 		assert.throws(
 			() =>
 				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/api/rpc',
 					actions: [{ spec: bad_spec, handler: () => ({ ok: true as const }) }],
 					log
@@ -1249,6 +1611,8 @@ describe('rate limit', () => {
 		assert.throws(
 			() =>
 				create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/api/rpc',
 					actions: [{ spec: bad_spec, handler: () => ({ ok: true as const }) }],
 					log
@@ -1265,6 +1629,8 @@ describe('rate limit', () => {
 		};
 		assert.doesNotThrow(() =>
 			create_rpc_endpoint({
+				action_ip_rate_limiter: null,
+				action_account_rate_limiter: null,
 				path: '/api/rpc',
 				actions: [{ spec: ok_spec, handler: () => ({ ok: true as const }) }],
 				log
@@ -1275,21 +1641,10 @@ describe('rate limit', () => {
 	test('account limiter blocks once exhausted', async () => {
 		const limiter = make_limiter(2);
 		const auth_context = create_test_request_context();
-		const app = new Hono();
-		app.use('/*', async (c, next) => {
-			(c as any).set(ACCOUNT_ID_KEY, auth_context.account.id);
-			(c as any).set(REQUEST_CONTEXT_KEY, auth_context);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-			(c as any).set(CREDENTIAL_TYPE_KEY, 'session' as CredentialType);
-			await next();
-		});
-		const route_specs = create_rpc_endpoint({
-			path: '/api/rpc',
-			actions: [{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
-			log,
-			action_account_rate_limiter: limiter
-		});
-		apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
+		const app = create_test_app(
+			[{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
+			{ auth_context, credential_type: 'session', action_account_rate_limiter: limiter }
+		);
 
 		const send = () =>
 			app.request(
@@ -1324,24 +1679,12 @@ describe('rate limit', () => {
 			actor: create_test_actor({ id: 'act_2', account_id: 'acc_2' })
 		};
 
-		const make_app = (auth_context: ReturnType<typeof create_test_request_context>) => {
-			const app = new Hono();
-			app.use('/*', async (c, next) => {
-				(c as any).set(ACCOUNT_ID_KEY, auth_context.account.id);
-				(c as any).set(REQUEST_CONTEXT_KEY, auth_context);
-				(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-				(c as any).set(CREDENTIAL_TYPE_KEY, 'session' as CredentialType);
-				await next();
-			});
-			const route_specs = create_rpc_endpoint({
-				path: '/api/rpc',
-				actions: [{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
-				log,
+		const make_app = (auth_context: ReturnType<typeof create_test_request_context>) =>
+			create_test_app([{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }], {
+				auth_context,
+				credential_type: 'session',
 				action_account_rate_limiter: limiter
 			});
-			apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
-			return app;
-		};
 
 		const app_a = make_app(actor_a);
 		const app_b = make_app(actor_b);
@@ -1373,22 +1716,12 @@ describe('rate limit', () => {
 	test('action without rate_limit is unaffected', async () => {
 		const limiter = make_limiter(1);
 		const auth_context = create_test_request_context();
-		const app = new Hono();
-		app.use('/*', async (c, next) => {
-			(c as any).set(ACCOUNT_ID_KEY, auth_context.account.id);
-			(c as any).set(REQUEST_CONTEXT_KEY, auth_context);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-			(c as any).set(CREDENTIAL_TYPE_KEY, 'session' as CredentialType);
-			await next();
-		});
 		// post_spec has no rate_limit set
-		const route_specs = create_rpc_endpoint({
-			path: '/api/rpc',
-			actions: [{ spec: create_post_spec(), handler: () => ({ id: 'x' }) }],
-			log,
+		const app = create_test_app([{ spec: create_post_spec(), handler: () => ({ id: 'x' }) }], {
+			auth_context,
+			credential_type: 'session',
 			action_account_rate_limiter: limiter
 		});
-		apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
 
 		const send = () =>
 			app.request(
@@ -1406,21 +1739,14 @@ describe('rate limit', () => {
 
 	test('null limiter skips check (silent partial enforcement)', async () => {
 		const auth_context = create_test_request_context();
-		const app = new Hono();
-		app.use('/*', async (c, next) => {
-			(c as any).set(ACCOUNT_ID_KEY, auth_context.account.id);
-			(c as any).set(REQUEST_CONTEXT_KEY, auth_context);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-			(c as any).set(CREDENTIAL_TYPE_KEY, 'session' as CredentialType);
-			await next();
-		});
-		const route_specs = create_rpc_endpoint({
-			path: '/api/rpc',
-			actions: [{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
-			log
-			// no limiter wired — declared `rate_limit: 'account'` is silently a no-op
-		});
-		apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
+		// no limiter wired — declared `rate_limit: 'account'` is silently a no-op
+		const app = create_test_app(
+			[{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
+			{
+				auth_context,
+				credential_type: 'session'
+			}
+		);
 
 		const send = () =>
 			app.request(
@@ -1437,14 +1763,247 @@ describe('rate limit', () => {
 		}
 	});
 
+	// The limiter runs ahead of param validation, matching the Rust
+	// dispatcher: a flood of malformed bodies must cost the sender its quota
+	// rather than slipping past on a cheap 400.
+	test('malformed params still charge the budget — third call is rate_limited', async () => {
+		const limiter = make_limiter(2);
+		const auth_context = create_test_request_context();
+		const app = create_test_app(
+			[{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
+			{ auth_context, credential_type: 'session', action_account_rate_limiter: limiter }
+		);
+
+		// `name` must be a string — every call is malformed.
+		const send = () =>
+			app.request(
+				new Request('http://localhost/api/rpc', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: rpc_request('thing_throttled', { name: 42 })
+				})
+			);
+
+		const first = await (await send()).json();
+		assert.strictEqual(first.error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		const second = await (await send()).json();
+		assert.strictEqual(second.error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		const third_response = await send();
+		const third = await third_response.json();
+		assert.strictEqual(third_response.status, 429);
+		assert.strictEqual(third.error?.code, JSONRPC_ERROR_CODES.rate_limited);
+	});
+
+	test('__proto__ params charge the budget — the second call is rate_limited', async () => {
+		const limiter = make_limiter(1);
+		const auth_context = create_test_request_context();
+		const app = create_test_app(
+			[{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }],
+			{ auth_context, credential_type: 'session', action_account_rate_limiter: limiter }
+		);
+		const send = () =>
+			app.request(
+				new Request('http://localhost/api/rpc', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: '{"jsonrpc":"2.0","id":"1","method":"thing_throttled","params":{"name":"a","__proto__":{}}}'
+				})
+			);
+		const first = await (await send()).json();
+		assert.deepStrictEqual(first.error?.data, { reason: ERROR_PARAMS_PROTO_KEY });
+		const second_response = await send();
+		assert.strictEqual(second_response.status, 429);
+	});
+
+	test('malformed params on a non-limited spec are still invalid_params', async () => {
+		const limiter = make_limiter(1);
+		const auth_context = create_test_request_context();
+		const app = create_test_app([{ spec: create_post_spec(), handler: () => ({ id: 'x' }) }], {
+			auth_context,
+			credential_type: 'session',
+			action_account_rate_limiter: limiter
+		});
+
+		const send = () =>
+			app.request(
+				new Request('http://localhost/api/rpc', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: rpc_request('thing_create', { name: 42 })
+				})
+			);
+
+		for (let i = 0; i < 3; i++) {
+			const body = await (await send()).json();
+			assert.strictEqual(body.error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		}
+	});
+
+	// The authority gates still precede the limiter: an anonymous caller on a
+	// public ip-keyed spec is answered by the 401 the spec's own auth demands,
+	// never by a 429, so the limiter can never mask an auth outcome.
+	test('an unauthenticated caller sees the 401 gate before the ip limiter', async () => {
+		const limiter = make_limiter(1);
+		const ip_keyed_spec: RequestResponseActionSpec = {
+			...account_keyed_spec(),
+			method: 'thing_ip_throttled',
+			auth: { account: 'required', actor: 'none' },
+			rate_limit: 'ip'
+		};
+		const app = create_test_app([{ spec: ip_keyed_spec, handler: () => ({ ok: true as const }) }], {
+			action_ip_rate_limiter: limiter
+		});
+
+		const send = () =>
+			app.request(
+				new Request('http://localhost/api/rpc', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: rpc_request('thing_ip_throttled', { name: 'a' })
+				})
+			);
+
+		// Budget is 1, but no call ever reaches the limiter: every one is 401.
+		for (let i = 0; i < 3; i++) {
+			const res = await send();
+			assert.strictEqual(res.status, 401);
+			const body = await res.json();
+			assert.strictEqual(body.error?.code, JSONRPC_ERROR_CODES.unauthenticated);
+		}
+	});
+
 	test('surface exposes rate_limit_key on RPC method', () => {
 		const actions = [{ spec: account_keyed_spec(), handler: () => ({ ok: true as const }) }];
-		const route_specs = create_rpc_endpoint({ path: '/api/rpc', actions, log });
+		const route_specs = create_rpc_endpoint({
+			path: '/api/rpc',
+			actions,
+			log,
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null
+		});
 		const surface = generate_app_surface({
 			middleware_specs: [],
 			route_specs,
 			rpc_endpoints: [{ path: '/api/rpc', actions }]
 		});
 		assert.strictEqual(surface.rpc_endpoints[0]!.methods[0]!.rate_limit_key, 'account');
+	});
+});
+
+describe('review probe: prototype-shaped params keys, POST and GET', () => {
+	const read_spec = (method: string, input: z.ZodType): RequestResponseActionSpec => ({
+		method,
+		kind: 'request_response',
+		initiator: 'frontend',
+		auth: { account: 'none', actor: 'none' },
+		side_effects: false,
+		input,
+		output: z.looseObject({}),
+		async: true,
+		description: method
+	});
+	const received: Array<{ method: string; input: unknown }> = [];
+	const app = create_test_app(
+		(
+			[
+				['p_void', z.void()],
+				['p_strict', z.strictObject({ a: z.string() })],
+				['p_loose', z.looseObject({ a: z.string() })],
+				['p_nested', z.strictObject({ f: z.strictObject({ a: z.string() }) })]
+			] as const
+		).map(([method, input]) => ({
+			spec: read_spec(method, input),
+			handler: (input: unknown) => {
+				received.push({ method, input });
+				const proto_x = (input as any)?.x;
+				return { proto_x: proto_x ?? null };
+			}
+		}))
+	);
+	const call = async (verb: 'POST' | 'GET', method: string, params_json: string) => {
+		const res =
+			verb === 'POST'
+				? await app.request('/api/rpc', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: `{"jsonrpc":"2.0","id":"1","method":"${method}","params":${params_json}}`
+					})
+				: await app.request(
+						`/api/rpc?method=${method}&id=1&params=${encodeURIComponent(params_json)}`
+					);
+		const body = await res.json();
+		return {
+			status: res.status,
+			code: body.error?.code ?? null,
+			reason: body.error?.data?.reason ?? null,
+			result: body.result
+		};
+	};
+	const PROTO = ERROR_PARAMS_PROTO_KEY;
+	// [method, params, expected status, expected reason] — POST and GET must
+	// agree; an own `__proto__` anywhere is the dispatcher's reasoned refusal,
+	// ahead of every schema, while `constructor` is an ordinary key
+	const cases: Array<[string, string, number, string | null]> = [
+		['p_void', '{"constructor":{"x":1}}', 400, null],
+		['p_void', '{"__proto__":null}', 400, PROTO],
+		['p_strict', '{"a":"x","constructor":{"x":1}}', 400, null],
+		['p_strict', '{"a":"x","__proto__":null}', 400, PROTO],
+		['p_strict', '{"a":"x","__proto__":{"x":1}}', 400, PROTO],
+		['p_strict', '{"a":1,"__proto__":{"x":1}}', 400, PROTO],
+		['p_loose', '{"a":"x","__proto__":{"x":1}}', 400, PROTO],
+		['p_loose', '{"a":"x","b":{"c":[{"__proto__":{"x":1}}]}}', 400, PROTO],
+		['p_loose', '{"a":"x","constructor":{"x":1}}', 200, null],
+		['p_nested', '{"f":{"a":"x","__proto__":{"x":1}}}', 400, PROTO],
+		['p_nested', '{"f":{"a":"x"},"__proto__":{"x":1}}', 400, PROTO]
+	];
+	for (const [method, params, expected, expected_reason] of cases) {
+		test(`${method} ${params} → ${expected} on POST and GET`, async () => {
+			received.length = 0;
+			const post = await call('POST', method, params);
+			const get = await call('GET', method, params);
+			assert.strictEqual(post.status, expected, `POST ${JSON.stringify(post)}`);
+			assert.deepStrictEqual(get, post, 'GET answers as POST');
+			if (expected === 400) assert.strictEqual(post.code, JSONRPC_ERROR_CODES.invalid_params);
+			assert.strictEqual(post.reason, expected_reason);
+			if (expected_reason === PROTO)
+				assert.deepStrictEqual(received, [], 'refused before dispatch');
+			for (const r of received) {
+				// nothing a handler sees inherits from a client-sent prototype
+				assert.strictEqual((r.input as any)?.x, undefined, 'no inherited x');
+			}
+		});
+	}
+
+	test('non-object GET params holding a __proto__ key are the schema refusal, without the reason', async () => {
+		// only object params are walked, as the Rust twin's shape check answers
+		// a non-object `params` ahead of its walk
+		for (const method of ['p_void', 'p_strict', 'p_loose']) {
+			received.length = 0;
+			const get = await call('GET', method, '[{"__proto__":{"x":1}}]');
+			assert.strictEqual(get.status, 400, method);
+			assert.strictEqual(get.code, JSONRPC_ERROR_CODES.invalid_params, method);
+			assert.strictEqual(get.reason, null, method);
+			assert.deepStrictEqual(received, [], method);
+		}
+	});
+
+	test('a frame-level own __proto__ cannot supply params, id, or method', async () => {
+		received.length = 0;
+		const res = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: '{"jsonrpc":"2.0","id":"1","method":"p_strict","__proto__":{"params":{"a":"x"}}}'
+		});
+		const body = await res.json();
+		assert.strictEqual(res.status, 400);
+		assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.invalid_params);
+		assert.deepStrictEqual(received, []);
+		const res2 = await app.request('/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: '{"jsonrpc":"2.0","__proto__":{"id":"1","method":"p_void"}}'
+		});
+		assert.strictEqual(res2.status, 400);
+		assert.strictEqual((await res2.json()).error.code, JSONRPC_ERROR_CODES.invalid_request);
 	});
 });

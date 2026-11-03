@@ -1,6 +1,6 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 
-import { is_build_cache_valid, save_build_cache_metadata } from '$lib/build_cache.ts';
+import { is_build_cache_valid, save_build_cache_metadata } from '#lib/build_cache.ts';
 
 import {
 	create_mock_logger,
@@ -9,11 +9,19 @@ import {
 } from './build_cache_test_helpers.ts';
 
 // Mock dependencies
+vi.mock('#lib/build_cache_dependencies.ts', () => ({
+	load_build_cache_dependencies: vi.fn(async () => ({
+		gro_version: '1.0.0',
+		node_version: 'v24.0.0',
+		package_lock_hash: 'lock123'
+	}))
+}));
+
 vi.mock('@fuzdev/fuz_util/git.js', () => ({
 	git_current_commit_hash: vi.fn()
 }));
 
-vi.mock('$lib/paths.js', () => ({
+vi.mock('#lib/paths.ts', () => ({
 	paths: {
 		root: './',
 		source: './src/',

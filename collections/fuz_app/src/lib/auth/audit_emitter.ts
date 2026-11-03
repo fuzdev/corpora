@@ -6,44 +6,107 @@
  * consumer's `audit_factory` callback on `CreateAppBackendOptions` —
  * `create_app_backend` invokes the factory once with its constructed
  * `{db, log}` and lands the result on `AppDeps.audit`. Consumers reach
- * for `deps.audit.emit(ctx, input)` and never see the pool — handlers
- * cannot accidentally emit an audit event against the request's
- * transactional `db` (which would be rolled back with the parent on a
- * handler throw).
+ * for `await deps.audit.emit(ctx, input)`; the emitter picks where the row
+ * is written (see "Where a row is written").
  *
- * Four methods cover every fan-out shape the auth domain needs:
+ * These methods cover every fan-out shape the auth domain needs
+ * (`add_listener` and `listener_count` manage the listener chain):
  *
- * - `emit(ctx, input)` — fire-and-forget pool write. Pushes the in-flight
- *   promise onto `ctx.pending_effects` for post-response flushing. Errors are
- *   logged, never thrown. Returns `void` so callers don't pile up `void`
- *   keywords or accidentally `await` something whose handle is already in
- *   `pending_effects`.
+ * - `emit(ctx, input)` — the request-scoped emit. A success row inside a
+ *   request transaction is written in it and the promise rejects when the
+ *   INSERT fails; every other row is a fire-and-forget pool write whose
+ *   in-flight promise goes on `ctx.pending_effects`, and the returned promise
+ *   resolves at once.
  * - `emit_role_grant_target(ctx, auth, input)` — wrapper that lifts the
  *   `actor_id` / `account_id` / `ip` boilerplate every role-grant-shape audit
  *   site repeated. Delegates to `emit`.
  * - `emit_pool(input)` — awaitable pool write for code paths without a
- *   `pending_effects` queue (cleanup sweeps, ad-hoc maintenance scripts).
- *   Same write-then-notify semantics as `emit`, just synchronous-with-await.
+ *   request transaction (maintenance scripts, a post-commit thunk). Writes,
+ *   then notifies.
  * - `notify(event)` — fan out an already-written audit row (e.g. rows
  *   returned by `query_accept_offer` that were inserted in-transaction by
- *   the query layer). Runs every registered listener; per-listener throws
- *   are isolated.
+ *   the query layer, or the offer-expiry rows `auth/cleanup.ts` writes in
+ *   its sweep transaction). Runs every registered listener; per-listener
+ *   throws are isolated.
+ * - `drain_inflight()` — test-binary barrier: await every in-flight `emit`
+ *   write, on an emitter built with `track_inflight: true`.
+ * - `is_tracking_inflight()` — whether that barrier can wait on anything, so a
+ *   test binary built without tracking is caught rather than racing.
+ *
+ * ## Where a row is written
+ *
+ * The routing reads two things: the row's outcome and whether `ctx.db` is a
+ * transaction (`Db.in_transaction`).
+ *
+ * - A **success** row emitted inside a request transaction (an action with
+ *   `side_effects`, a route with `transaction: true`) is written **in that
+ *   transaction**: the change and the row that reports it commit together or
+ *   not at all. The INSERT is awaited, and a failed one rejects `emit`, so the
+ *   handler throws and its transaction rolls back — a committed change is
+ *   never left unaudited.
+ * - A **failure** row is written on the pool, outside the request's
+ *   transaction, so it survives the rollback that usually follows it — the
+ *   forensic record of a refused attempt.
+ * - A success row emitted with no request transaction open (a `GET`, or a
+ *   route that runs `transaction: false` and opens its own around just its
+ *   writes, like `/login` and `/password`, which emit once that transaction
+ *   has committed) is written on the pool too — there is no transaction to
+ *   join.
+ *
+ * A pool write is fail-open: a failed one is counted
+ * (`get_audit_write_failures`) and logged as one `error` line carrying the
+ * whole row, secret metadata masked (`to_dropped_audit_row`), and the request
+ * goes on. Its checkout waits the backend's audit bound
+ * (`FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS`, 30 s by default — `create_app_backend`
+ * hands the factory its pool `Db` through `Db.with_checkout_timeout`), longer
+ * than a request's, so a pool saturated enough to shed requests with a 503
+ * does not also drop the failure rows recording them.
+ *
+ * This is the Rust spine's split: `fuz_auth`'s `route_audit_emit` writes an
+ * action's success row in the request transaction (`emit_in_tx`) and every
+ * failure row on the pool (`emit`), and its REST handlers (`/login`,
+ * `/password`, signup, bootstrap) emit on the pool. Two rows differ in
+ * routing between the twins, visible on the wire only when the audit INSERT
+ * fails: the TS `/logout` runs in a route transaction, so its success row is
+ * written in it (Rust writes it on the pool), and `db_admin_row_delete` is
+ * written on the pool after the commit on both (`http/db_routes.ts`, through
+ * `emit_pool`).
+ *
+ * ## When listeners hear about a row
+ *
+ * - A **failure** row is announced as soon as it is written. It records an
+ *   attempt, which happened whether or not the request's transaction commits.
+ * - A **success** row is announced only after the request's transaction
+ *   commits (after the handler returns, on a route without one), and never
+ *   when the handler throws: the fan-out is queued on
+ *   `ctx.post_commit_effects`. A success row reports a state change, and the
+ *   listeners act on it — the revocation listeners close connections, the
+ *   audit stream broadcasts it. Announced before the commit, a close could run
+ *   while the revoked credential still reads as valid, and a rolled-back
+ *   revocation would close connections anyway.
  *
  * Listeners are a documented registration seam — `create_app_server`
  * registers additional listeners via `add_listener` after the backend is
- * built (the factory-managed audit-log SSE, per-endpoint WS auth guards and
- * logout closers, any `extra_audit_handlers` on a `WsEndpointSpec`) before
- * the first request runs. Consumers can also register listeners directly on
- * the emitter they return from `audit_factory` for setups that don't pass
- * through `create_app_server`.
+ * built (the factory-managed audit-log SSE, the revocation guard) before the
+ * first request
+ * runs, and removes each through the remover `add_listener` returns when its
+ * assembly fails or the server closes. Consumers can also register
+ * listeners directly on the emitter they return from `audit_factory` for
+ * setups that don't pass through `create_app_server`.
  *
  * @module
  */
 
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { to_error_message } from '@fuzdev/fuz_util/error.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { Db } from '../db/db.ts';
+import type { QueryDeps } from '../db/query_deps.ts';
+import { MASKED_VALUE } from '../env/mask.ts';
+import { schema_sensitivity } from '../schema_meta.ts';
+import { zod_maybe_get_field_schema } from '../zod.ts';
+import { emit_after_commit, type EmitAfterCommitContext } from '../http/pending_effects.ts';
 import type { RequestActorContext } from './request_context.ts';
 import { query_audit_log } from './audit_log_queries.ts';
 import {
@@ -54,26 +117,22 @@ import {
 } from './audit_log_schema.ts';
 
 /**
- * Per-request context required by `AuditEmitter.emit` — just the eager
- * `pending_effects` queue. The bound emitter carries its own `log`
+ * Per-request context required by `AuditEmitter.emit` — the request's `db`
+ * and its two side-effect queues. The bound emitter carries its own `log`
  * reference inside the closure, so per-call contexts don't need one.
  *
- * Audit emits are eager by default: the bound emitter fires the
- * pool write immediately and pushes the in-flight `Promise<void>` here.
- * Attempt/failure audits never go through `emit_after_commit` —
- * pool-routed writes are already rollback-resilient because they run
- * outside the request transaction, so deferring them would only delay
- * forensic visibility without any safety benefit. The exception is a
- * **success-only** event paired with a state mutation (the
- * `db_admin_row_delete` emit in `http/db_routes.ts`): there the caller
- * wraps the emit in `emit_after_commit` so the trail can't claim a
- * mutation whose transaction failed at COMMIT.
+ * `db` decides where a success row is written: inside the request's
+ * transaction when `db.in_transaction`, else on the pool (module doc, "Where a
+ * row is written"). A pool write is eager — the emitter fires it immediately
+ * and pushes the in-flight `Promise<void>` onto `pending_effects`. A success
+ * row's listener fan-out goes on `post_commit_effects` (module doc, "When
+ * listeners hear about a row").
  *
  * Both `RouteContext` and `ActionContext` structurally satisfy this
- * shape (they each carry `pending_effects`), so handlers pass `route`
- * / `ctx` directly.
+ * shape, so handlers pass `route` / `ctx` directly. Never pass one from a
+ * post-commit thunk: its transaction has ended — use `emit_pool` there.
  */
-export interface AuditEmitterContext {
+export interface AuditEmitterContext extends EmitAfterCommitContext, QueryDeps {
 	pending_effects: Array<Promise<void>>;
 }
 
@@ -88,29 +147,50 @@ export interface AuditEmitRoleGrantContext extends AuditEmitterContext {
 }
 
 /**
+ * Input to `AuditEmitter.emit_role_grant_target` — the event fields that
+ * vary per call site; `actor_id`, `account_id`, and `ip` are lifted from
+ * the auth and request contexts.
+ */
+export interface AuditEmitRoleGrantInput<T extends string> {
+	event_type: T;
+	target_account_id: Uuid | null;
+	target_actor_id: Uuid | null;
+	metadata: AuditLogInput<T>['metadata'];
+	/** Default `'success'`, as for `emit`. */
+	outcome?: 'success' | 'failure';
+}
+
+/**
  * Bound audit-emit capability. Built once at backend assembly via
  * `create_audit_emitter`; lives on `AppDeps.audit` so factories never see
  * the pool.
  */
 export interface AuditEmitter {
 	/**
-	 * Fire-and-forget audit write via the captured pool.
+	 * Write an audit row for a request, routed by outcome and `ctx.db` (module
+	 * doc, "Where a row is written").
 	 *
-	 * The in-flight promise is pushed onto `ctx.pending_effects` so tests
-	 * with `await_pending_effects: true` can assert side effects inline.
-	 * Errors are logged, never thrown. Successful writes fan out to every
-	 * listener on the chain (`notify`).
+	 * A success row inside a request transaction is written in it: the
+	 * promise settles once the INSERT has run, and rejects when it fails, so
+	 * the handler throws and the change rolls back with its row. Any other row
+	 * is a fire-and-forget pool write: its in-flight promise goes on
+	 * `ctx.pending_effects` (so tests with `await_pending_effects: true` can
+	 * assert it inline), its errors are logged and counted, never thrown, and
+	 * the returned promise resolves at once.
 	 *
-	 * Returns `void` deliberately — the in-flight promise is already on
-	 * `ctx.pending_effects`, and exposing it would tempt callers to `await`
-	 * (sequencing audit writes onto the response hot path) or sprinkle
-	 * `void` to placate `no-floating-promises`. For awaitable writes from
-	 * code paths without `pending_effects`, use `emit_pool`.
+	 * A written row fans out to every listener on the chain (`notify`): a
+	 * failure row as soon as it is written, a success row from
+	 * `ctx.post_commit_effects` — after the request's transaction commits, and
+	 * never when the handler throws.
 	 *
-	 * @mutates `audit_log` table - inserts the row via the captured pool
-	 * @mutates `ctx.pending_effects` - appends the in-flight settled promise
+	 * Always `await` it — the twin of the Rust `ctx.audit_emit(db, input).await?`.
+	 *
+	 * @mutates `audit_log` table - inserts the row in `ctx.db`'s transaction or via the captured pool
+	 * @mutates `ctx.pending_effects` - appends a pool write's in-flight settled promise
+	 * @mutates `ctx.post_commit_effects` - appends a success row's listener fan-out
+	 * @throws Error when an in-transaction INSERT fails
 	 */
-	emit<T extends string>(ctx: AuditEmitterContext, input: AuditLogInput<T>): void;
+	emit<T extends string>(ctx: AuditEmitterContext, input: AuditLogInput<T>): Promise<void>;
 	/**
 	 * Emit a role-grant-shape audit event with `actor_id` / `account_id` /
 	 * `ip` lifted from `auth` + `ctx`. Delegates to `emit`.
@@ -122,22 +202,24 @@ export interface AuditEmitter {
 	emit_role_grant_target<T extends string>(
 		ctx: AuditEmitRoleGrantContext,
 		auth: RequestActorContext,
-		input: {
-			event_type: T;
-			target_account_id: Uuid | null;
-			target_actor_id: Uuid | null;
-			metadata: AuditLogInput<T>['metadata'];
-			outcome?: 'success' | 'failure';
-		}
-	): void;
+		input: AuditEmitRoleGrantInput<T>
+	): Promise<void>;
 	/**
-	 * Awaitable pool write for code paths without a `pending_effects` queue.
+	 * Awaitable pool write for code paths without a request transaction — a
+	 * maintenance script, or a post-commit thunk whose transaction has ended
+	 * (`db_admin_row_delete`, `http/db_routes.ts`).
 	 *
-	 * Same write-then-notify semantics as `emit`. Errors are logged and
-	 * swallowed (resolved void), so callers can sequence sweeps with
-	 * `await audit.emit_pool(...)` without try/catch boilerplate. The
-	 * primary user is `auth/cleanup.ts` — sweeps have no per-request
-	 * `pending_effects` to attach to.
+	 * Writes, then notifies the listeners, whatever the outcome — there is no
+	 * request transaction to order the fan-out against. Tracked by
+	 * `drain_inflight` like `emit`'s pool writes. Errors are logged and
+	 * swallowed (resolved void), so callers can sequence writes with
+	 * `await audit.emit_pool(...)` without try/catch boilerplate.
+	 *
+	 * Not for a success audit paired with a state mutation: the pool write
+	 * can't roll back with the state, and a swallowed error leaves the
+	 * mutation unaudited. Write those in the mutation's transaction
+	 * (`query_audit_log` against the tx) and `notify` after the commit — the
+	 * shape `auth/cleanup.ts`'s offer sweep and `query_accept_offer` use.
 	 *
 	 * @mutates `audit_log` table - inserts the row via the captured pool
 	 */
@@ -152,22 +234,67 @@ export interface AuditEmitter {
 	 */
 	notify(event: AuditLogEvent): void;
 	/**
-	 * Register an audit-event listener. Append-only — listeners fire in
-	 * registration order on every successful `emit` / `emit_pool` and on
-	 * every `notify`.
+	 * Register an audit-event listener. Listeners fire in registration order
+	 * for every row `emit` / `emit_pool` wrote and on every `notify`.
+	 *
+	 * Returns a remover that unregisters this registration. Each call is its
+	 * own registration: the same function registered twice fires twice, and
+	 * each remover takes out only the registration it was returned for,
+	 * leaving the others in place and in order. Calling a remover again is a
+	 * no-op. A `notify` already in progress still runs a listener removed
+	 * during its fan-out — it iterates a snapshot — and the next one does not.
 	 *
 	 * `create_app_server` registers the factory-managed audit-log SSE
-	 * listener and per-endpoint WS auth guards / logout closers here so
+	 * listener and the one revocation guard (`create_revocation_guard`) here so
 	 * SSE + WS fan-out compose on top of the consumer's `on_audit_event`
-	 * callback without shallow-copying `AppDeps`. Consumers can also
-	 * register listeners directly for setups that don't run through
-	 * `create_app_server`.
+	 * callback without shallow-copying `AppDeps`, and removes them when its
+	 * assembly fails or the server closes. Consumers can also register
+	 * listeners directly for setups that don't run through
+	 * `create_app_server`. The `on_audit_event` passed at construction has
+	 * no remover — it lives as long as the emitter.
 	 *
-	 * Twin of the Rust `fuz_auth` `AuditEmitter::add_listener`.
+	 * Twin of the Rust `fuz_auth` `AuditEmitter::add_listener` in what
+	 * registration means — firing order, snapshot-at-notify.
+	 *
+	 * @param listener - called with each announced audit row
+	 * @returns a remover for this registration, idempotent
 	 */
-	add_listener(listener: (event: AuditLogEvent) => void): void;
-	/** Count of registered listeners — introspection for tests and diagnostics. */
+	add_listener(listener: (event: AuditLogEvent) => void): () => void;
+	/**
+	 * Count of registered listeners, the construction-time `on_audit_event`
+	 * included — introspection for tests and diagnostics.
+	 */
 	listener_count(): number;
+	/**
+	 * Await every fire-and-forget `emit` write in flight — the deterministic
+	 * barrier behind the `_testing_drain_effects` test action.
+	 *
+	 * Waits until no tracked write is outstanding, so a write that starts
+	 * while the drain is waiting (an emit from a post-commit thunk) is awaited
+	 * too. Once it resolves, a following `audit_log_list` read sees every row
+	 * whose `emit` ran before the drain was called. A write that starts after
+	 * the drain resolves is not covered. A success row's listener fan-out runs
+	 * as a post-commit effect and is not tracked, so an SSE broadcast or an
+	 * auth-guard close driven by one isn't guaranteed done when the drain
+	 * resolves — the row itself is.
+	 *
+	 * Resolves at once unless the emitter was built with
+	 * `track_inflight: true` — production never tracks, so there is nothing
+	 * to wait for. Twin of the Rust `fuz_auth` `AuditEmitter::drain_inflight`.
+	 */
+	drain_inflight(): Promise<void>;
+	/**
+	 * Whether this emitter tracks its in-flight `emit` writes — `true` only
+	 * when built with `track_inflight: true`. When `false`, `drain_inflight`
+	 * resolves at once and waits on nothing.
+	 *
+	 * The `_testing_drain_effects` action reports it as `tracked`, and the
+	 * `list_audit_events` reads refuse `false`: a test binary whose emitter was
+	 * built without tracking would otherwise answer the drain at once and its
+	 * audit reads would race the writes. Twin of the Rust `fuz_auth`
+	 * `AuditEmitter::is_tracking_inflight`.
+	 */
+	is_tracking_inflight(): boolean;
 }
 
 /**
@@ -179,20 +306,18 @@ export interface AuditEmitter {
 export type AuditEmitFn = <T extends string>(
 	ctx: AuditEmitterContext,
 	input: AuditLogInput<T>
-) => void;
+) => Promise<void>;
 
 /**
  * Wrap the bound `emit` before it gets captured by `emit_role_grant_target`'s
  * closure and exposed on the returned `AuditEmitter`. Test instrumentation
- * uses this to record `emit` invocation ordering against external markers
- * (e.g. eager `ConnectionCloser` calls in `connection_closer.db.test.ts`)
- * without paying the freeze-breaking footgun the pre-decorator
- * `patch_audit_emit_capture` hot-patcher had.
+ * uses this to record `emit` invocations against external markers on a
+ * frozen emitter, whose slots can't be patched after construction.
  *
  * Because the inner closure captures the decorated function (not the
  * outer slot reference), `emit_role_grant_target` also routes through
- * the wrap — the close-vs-emit ordering helper sees role-grant-shape
- * emissions, not just bare `emit` calls. Production never sets this.
+ * the wrap — the decorator sees role-grant-shape emissions, not just bare
+ * `emit` calls. Production never sets this.
  */
 export type EmitDecorator = (inner: AuditEmitFn) => AuditEmitFn;
 
@@ -219,11 +344,84 @@ export interface CreateAuditEmitterOptions {
 	 * the function exposed on the returned `AuditEmitter`, so both call
 	 * shapes route through it — see `EmitDecorator` for the rationale.
 	 *
-	 * Leave unset in production. The intended caller is
-	 * `create_emit_ordering_audit_factory` in `testing/audit_drift_guard.ts`.
+	 * Leave unset in production — it is a test instrumentation seam.
 	 */
 	emit_decorator?: EmitDecorator;
+	/**
+	 * Track every in-flight `emit` write so `drain_inflight` can await it.
+	 * Defaults to `false`, which makes `drain_inflight` resolve at once.
+	 *
+	 * Test binaries only. A transport can reply before a request's writes
+	 * settle — a WebSocket message is answered before its effects flush — so
+	 * a test reading the audit log after a reply needs this barrier. In
+	 * production the tracking is pure overhead and nothing drains it. Twin of
+	 * the Rust `fuz_auth` `AuditEmitter::new_with_inflight_tracking`.
+	 */
+	track_inflight?: boolean;
 }
+
+/**
+ * Process-wide counter for audit rows an emitter failed to write on the pool.
+ * The pool write behind `emit` / `emit_pool` / `emit_role_grant_target` is
+ * fail-open — a refused `INSERT` is logged and the request proceeds — so a
+ * lost row is otherwise visible only in the log. An in-transaction write is
+ * not counted: its failure rejects `emit` and fails the request. Same posture and lifetime as the drift
+ * counters in `auth/audit_log_queries.ts`: in-process, resets on restart, and
+ * asserted zero per test by `install_audit_drift_guard`.
+ */
+let audit_write_failures = 0;
+
+/**
+ * The whole row a dropped pool write would have inserted, as the one JSON
+ * object its `audit row dropped` log line carries: `event_type`, `outcome`, the
+ * four id columns, `ip`, and `metadata` — with each metadata field whose
+ * schema in `config` is marked `sensitivity: 'secret'` replaced by
+ * `MASKED_VALUE`. No builtin event declares a secret field, so a builtin row
+ * logs whole, as the Rust twin's `fuz_auth::dropped_row_json` does.
+ *
+ * The masking reads only the top-level fields of an object metadata schema. A
+ * secret field nested under an object field, or declared in a union or
+ * discriminated-union schema, is logged in clear, and so is every
+ * `sensitivity: 'personal'` field. Keep secrets out of audit metadata — they
+ * would land in `audit_log` too.
+ *
+ * @param input - the row's input
+ * @param config - the emitter's `AuditLogConfig`, whose event schemas mark secret fields
+ * @returns the row, ready to `JSON.stringify`
+ */
+export const to_dropped_audit_row = <T extends string>(
+	input: AuditLogInput<T>,
+	config: AuditLogConfig
+): Record<string, unknown> => {
+	let metadata: unknown = input.metadata ?? null;
+	const schema = config.metadata_schemas[input.event_type];
+	if (schema && metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata)) {
+		const masked: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(metadata)) {
+			const field = zod_maybe_get_field_schema(schema, key);
+			masked[key] = field && schema_sensitivity(field) === 'secret' ? MASKED_VALUE : value;
+		}
+		metadata = masked;
+	}
+	return {
+		event_type: input.event_type,
+		outcome: input.outcome ?? 'success',
+		actor_id: input.actor_id ?? null,
+		account_id: input.account_id ?? null,
+		target_account_id: input.target_account_id ?? null,
+		target_actor_id: input.target_actor_id ?? null,
+		ip: input.ip ?? null,
+		metadata
+	};
+};
+
+/** Number of audit rows an emitter failed to write since process start. */
+export const get_audit_write_failures = (): number => audit_write_failures;
+
+/** Reset the counter — for tests only. */
+export const reset_audit_write_failures = (): void => {
+	audit_write_failures = 0;
+};
 
 /**
  * Build a bound `AuditEmitter`. Typical caller is the consumer's
@@ -235,18 +433,27 @@ export interface CreateAuditEmitterOptions {
  * @returns the bound emitter; closes over the pool + config + listener chain
  */
 export const create_audit_emitter = (options: CreateAuditEmitterOptions): AuditEmitter => {
-	const { db, log, audit_log_config = builtin_audit_log_config, emit_decorator } = options;
+	const {
+		db,
+		log,
+		audit_log_config = builtin_audit_log_config,
+		emit_decorator,
+		track_inflight = false
+	} = options;
 	// Closure-private listener list — no mutable array is exposed on the
 	// returned (frozen) emitter; registration goes through `add_listener`.
-	const listeners: Array<(event: AuditLogEvent) => void> = [];
-	if (options.on_audit_event) listeners.push(options.on_audit_event);
+	// One entry object per registration, so a remover takes out its own
+	// registration even when the same function is registered twice.
+	const listeners: Array<{ listener: (event: AuditLogEvent) => void }> = [];
+	if (options.on_audit_event) listeners.push({ listener: options.on_audit_event });
 
 	const notify = (event: AuditLogEvent): void => {
 		// Snapshot-at-notify: iterate a copy so a listener that registers
 		// another listener mid-fan-out doesn't have the newcomer fire for the
-		// in-flight event (it fires on the next `notify`). Converges with the
-		// Rust twin, which clones the listener vec before iterating.
-		for (const listener of [...listeners]) {
+		// in-flight event (it fires on the next `notify`), and one removed
+		// mid-fan-out still hears the in-flight event. Converges with the Rust
+		// twin, which clones the listener vec before iterating.
+		for (const { listener } of [...listeners]) {
 			try {
 				listener(event);
 			} catch (err) {
@@ -255,17 +462,81 @@ export const create_audit_emitter = (options: CreateAuditEmitterOptions): AuditE
 		}
 	};
 
-	const emit_pool = async <T extends string>(input: AuditLogInput<T>): Promise<void> => {
+	// The pool write. Never rejects: a failed write is counted and logged with
+	// the whole row, and resolves `null`, so there is no row to announce.
+	const write = async <T extends string>(
+		input: AuditLogInput<T>
+	): Promise<AuditLogEvent | null> => {
 		try {
-			const event = await query_audit_log({ db }, input, audit_log_config);
-			notify(event);
+			return await query_audit_log({ db }, input, audit_log_config);
 		} catch (err) {
-			log.error('Audit log write failed:', err);
+			audit_write_failures++;
+			log.error(
+				`audit row dropped: ${JSON.stringify(to_dropped_audit_row(input, audit_log_config))} error: ${to_error_message(err)}`
+			);
+			return null;
 		}
 	};
 
-	const base_emit: AuditEmitFn = (ctx, input) => {
-		ctx.pending_effects.push(emit_pool(input));
+	const write_and_notify = async <T extends string>(input: AuditLogInput<T>): Promise<void> => {
+		const event = await write(input);
+		if (event) notify(event);
+	};
+
+	// In-flight `emit` writes, when tracked — each removed as it settles, so
+	// the set is empty exactly when nothing is outstanding. Neither tracked
+	// promise rejects (`write` and `notify` log their failures).
+	const inflight: Set<Promise<unknown>> | null = track_inflight ? new Set() : null;
+	const track = <T>(promise: Promise<T>): Promise<T> => {
+		if (inflight) {
+			inflight.add(promise);
+			const remove = (): void => {
+				inflight.delete(promise);
+			};
+			void promise.then(remove, remove);
+		}
+		return promise;
+	};
+
+	const drain_inflight = async (): Promise<void> => {
+		if (!inflight) return;
+		// Wait for zero, not for a snapshot: a write started while waiting —
+		// an emit from a post-commit thunk — joins the set and is awaited on
+		// the next pass. The removal reactions were registered before these,
+		// so a settled write is gone from the set by the time a pass resumes.
+		while (inflight.size > 0) {
+			await Promise.allSettled(inflight);
+		}
+	};
+
+	const is_tracking_inflight = (): boolean => inflight !== null;
+
+	const emit_pool = <T extends string>(input: AuditLogInput<T>): Promise<void> =>
+		track(write_and_notify(input));
+
+	// The routing — see the module doc, "Where a row is written".
+	const base_emit: AuditEmitFn = async (ctx, input) => {
+		if (input.outcome === 'failure') {
+			// an attempt happened whether or not the transaction commits
+			ctx.pending_effects.push(emit_pool(input));
+			return;
+		}
+		if (ctx.db.in_transaction) {
+			// Written in the request's transaction, so it commits or rolls back
+			// with the change it reports; a throw here fails the handler. The
+			// fan-out waits for the commit and is discarded on rollback.
+			const event = await query_audit_log({ db: ctx.db }, input, audit_log_config);
+			emit_after_commit(ctx, () => notify(event));
+			return;
+		}
+		// No transaction to join: written on the pool now, announced once the
+		// handler has returned — and not at all if it throws.
+		const written = track(write(input));
+		ctx.pending_effects.push(written.then(() => undefined));
+		emit_after_commit(ctx, async () => {
+			const event = await written;
+			if (event) notify(event);
+		});
 	};
 	// The decorated `emit` is what `emit_role_grant_target` captures below
 	// and what gets exposed on the returned object — both call shapes
@@ -276,14 +547,8 @@ export const create_audit_emitter = (options: CreateAuditEmitterOptions): AuditE
 	const emit_role_grant_target = <T extends string>(
 		ctx: AuditEmitRoleGrantContext,
 		auth: RequestActorContext,
-		input: {
-			event_type: T;
-			target_account_id: Uuid | null;
-			target_actor_id: Uuid | null;
-			metadata: AuditLogInput<T>['metadata'];
-			outcome?: 'success' | 'failure';
-		}
-	): void => {
+		input: AuditEmitRoleGrantInput<T>
+	): Promise<void> =>
 		emit<T>(ctx, {
 			event_type: input.event_type,
 			actor_id: auth.actor.id,
@@ -294,31 +559,34 @@ export const create_audit_emitter = (options: CreateAuditEmitterOptions): AuditE
 			ip: ctx.client_ip,
 			metadata: input.metadata
 		});
-	};
 
-	const add_listener = (listener: (event: AuditLogEvent) => void): void => {
-		listeners.push(listener);
+	const add_listener = (listener: (event: AuditLogEvent) => void): (() => void) => {
+		const entry = { listener };
+		listeners.push(entry);
+		return () => {
+			const index = listeners.indexOf(entry);
+			if (index !== -1) listeners.splice(index, 1);
+		};
 	};
 	const listener_count = (): number => listeners.length;
 
 	// Freeze the slot layout so consumers cannot hot-patch `emit` /
-	// `emit_role_grant_target` / `emit_pool` / `notify` after construction.
-	// The previous test helper `patch_audit_emit_capture` did exactly this
-	// and only happened to work because the four slots were writable —
+	// `emit_role_grant_target` / `emit_pool` / `notify` after construction —
+	// a patched `emit` would miss role-grant-shape emits anyway, since
 	// `emit_role_grant_target` calls the closed-over inner `emit`, not
-	// `this.emit`, so the patch silently bypassed role-grant-shape emits.
-	// Tests that need instrumentation pass `emit_decorator` so the wrap
-	// is captured by the closure before the freeze (see
-	// `create_emit_ordering_audit_factory`). The listener list stays
-	// closure-private; registration is append-only via `add_listener`
-	// (`create_app_server` registers its SSE + WS listeners post-assembly,
-	// by design).
+	// `this.emit`. Tests that need instrumentation pass `emit_decorator` so the
+	// wrap is captured by the closure before the freeze. The listener list stays
+	// closure-private; it changes only through `add_listener` and the remover
+	// it returns (`create_app_server` registers its SSE + WS listeners after
+	// the emitter is built, by design, and removes them on close).
 	return Object.freeze({
 		emit,
 		emit_role_grant_target,
 		emit_pool,
 		notify,
 		add_listener,
-		listener_count
+		listener_count,
+		drain_inflight,
+		is_tracking_inflight
 	});
 };

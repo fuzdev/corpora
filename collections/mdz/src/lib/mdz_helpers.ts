@@ -7,13 +7,18 @@
  * @module
  */
 
+import { DEV } from 'esm-env';
+import type { Component } from 'svelte';
+
 import type {
+	MdzAttribute,
 	MdzNode,
 	MdzNodeText,
 	MdzNodeComponent,
 	MdzNodeElement,
 	MdzTableAlign
 } from './mdz.ts';
+import type { MdzComponentConfig, MdzComponentProps } from './mdz_contexts.ts';
 
 // Character codes for performance
 /** @nodocs */
@@ -75,6 +80,8 @@ export const PERCENT = 37; // %
 export const AMPERSAND = 38; // &
 /** @nodocs */
 export const APOSTROPHE = 39; // '
+/** @nodocs */
+export const DOUBLE_QUOTE = 34; // "
 /** @nodocs */
 export const PLUS = 43; // +
 /** @nodocs */
@@ -788,6 +795,93 @@ const VOID_ELEMENTS = new Set([
 export const mdz_is_void_element = (name: string): boolean => VOID_ELEMENTS.has(name);
 
 /**
+ * The closed, global set of attribute names allowed on rendered HTML elements.
+ * Every name is inert on any element (no URL, no script, no focus or DOM
+ * clobbering), so element safety is independent of which element names a
+ * consumer registers. Anything outside this set is dropped by
+ * `mdz_filter_element_attributes`.
+ */
+export const ALLOWED_ELEMENT_ATTRIBUTES: ReadonlySet<string> = new Set([
+	'class',
+	'title',
+	'lang',
+	'dir',
+	'role',
+	'aria-label',
+	'aria-hidden',
+	'aria-describedby',
+	'aria-labelledby'
+]);
+
+// filters an element's parsed attributes against the allowlist, returning a
+// name→value object ready to spread onto `<svelte:element {...}>`. Disallowed
+// names are dropped (DEV-warned). Used identically by MdzNodeView,
+// MdzStreamNodeView, and mdz_to_svelte, so precompiled and runtime output match.
+export const mdz_filter_element_attributes = (
+	element_name: string,
+	attributes: Array<MdzAttribute>,
+	allowlist: ReadonlySet<string>
+): Record<string, string | true> => {
+	const filtered: Record<string, string | true> = {};
+	for (const attr of attributes) {
+		if (allowlist.has(attr.name)) {
+			filtered[attr.name] = attr.value;
+		} else if (DEV) {
+			console.warn(
+				`mdz: dropped disallowed attribute \`${attr.name}\` on <${element_name}> — not in the element attribute allowlist`
+			);
+		}
+	}
+	return filtered;
+};
+
+// filters a component's parsed attributes against its registered `props`,
+// returning a name→value props object spread onto `<Component {...props}>`.
+// Omitted `props` passes nothing, `'all'` passes everything; dropped names are
+// DEV-warned. Used identically by MdzNodeView, MdzStreamNodeView, and
+// mdz_to_svelte, so precompiled and runtime output match.
+export const mdz_filter_component_attributes = (
+	component_name: string,
+	attributes: Array<MdzAttribute>,
+	props: MdzComponentProps | undefined
+): Record<string, string | true> => {
+	const filtered: Record<string, string | true> = {};
+	for (const attr of attributes) {
+		if (props === 'all' || props?.includes(attr.name)) {
+			filtered[attr.name] = attr.value;
+		} else if (DEV) {
+			console.warn(
+				`mdz: dropped attribute \`${attr.name}\` on <${component_name}> — not in its registered props`
+			);
+		}
+	}
+	return filtered;
+};
+
+// normalizes a component registry entry to its config form
+export const mdz_component_config = (
+	entry: Component<any, any> | MdzComponentConfig
+): MdzComponentConfig => (typeof entry === 'function' ? { component: entry } : entry);
+
+// reconstructs authored attribute text (` name="value"` / ` name`) for the
+// unregistered-tag literal placeholder. The quote char is chosen so a value
+// containing one quote type stays balanced — a parsed value holds at most one
+// (a `"`-delimited value can't contain `"`, a `'`-delimited one can't contain
+// `'`). The caller interpolates the result as Svelte text (auto-escaped).
+export const mdz_format_unregistered_attributes = (attributes: Array<MdzAttribute>): string => {
+	let text = '';
+	for (const attr of attributes) {
+		if (attr.value === true) {
+			text += ` ${attr.name}`;
+		} else {
+			const quote = attr.value.includes('"') ? "'" : '"';
+			text += ` ${attr.name}=${quote}${attr.value}${quote}`;
+		}
+	}
+	return text;
+};
+
+/**
  * Resolves a relative path (`./` or `../`) against a base path.
  * The base is treated as a directory regardless of trailing slash
  * (`'/docs/usage'` and `'/docs/usage/'` behave identically).
@@ -817,6 +911,20 @@ export const mdz_resolve_relative_path = (reference: string, base: string): stri
 	return segments.join('/');
 };
 
+// `/a` → `a`, `//a` → `a` — the pathname form `resolve()` takes; `\` counts as a
+// slash too, and tab/LF/CR are dropped, since browsers read `/\host` and
+// `/<tab>/host` as protocol-relative
+const strip_leading_slashes = (path: string): string => {
+	let i = 0;
+	for (;;) {
+		const c = path.charCodeAt(i);
+		if (c !== SLASH && c !== BACKSLASH && c !== TAB && c !== NEWLINE && c !== CARRIAGE_RETURN)
+			break;
+		i++;
+	}
+	return path.slice(i);
+};
+
 /**
  * How a `Link` node's `reference` should render, shared by all three renderers
  * (`MdzNodeView`, `MdzStreamNodeView`, `mdz_to_svelte`) so the safety gate and
@@ -826,8 +934,13 @@ export const mdz_resolve_relative_path = (reference: string, base: string): stri
 export type MdzLinkRender =
 	/** Unsafe protocol — render children only, no `<a>`. */
 	| { kind: 'unsafe' }
-	/** Route/relative path — wrap in `resolve()` (needs `$app/paths`). */
-	| { kind: 'resolve'; href: string }
+	/**
+	 * Absolute path — render `resolve(path)` (needs `$app/paths`). `path` is the
+	 * reference minus its leading slash, SvelteKit's pathname form, which only
+	 * prepends the base path (or `#` under hash routing; a relative `./`/`../`
+	 * prefix under `paths.relative` SSR) and keeps the rest verbatim.
+	 */
+	| { kind: 'resolve'; path: string }
 	/** Internal fragment/query/relative/bare ref — raw `href`, no `resolve()`. */
 	| { kind: 'internal'; href: string }
 	/** External link — raw `href` plus `target="_blank" rel="noopener"`. */
@@ -836,6 +949,13 @@ export type MdzLinkRender =
 /**
  * Classify a `Link` reference into how it should render. Pure — no rendering,
  * no context; `base` is the resolved base path (or `undefined`).
+ *
+ * Absolute references are authored URLs, not SvelteKit route ids: they classify
+ * as `resolve` with the base-relative pathname, never a leading-slash route id,
+ * whose resolution would drop `(group)` and empty segments, decode `[x+nn]`
+ * escapes, and throw on `[param]` segments. A leading `/` followed by any `/`
+ * or `\` run collapses to one `/`, so `//host` and `/\host` stay under the base
+ * rather than becoming protocol-relative.
  * @nodocs
  */
 export const mdz_classify_link = (
@@ -846,19 +966,14 @@ export const mdz_classify_link = (
 	if (!mdz_is_safe_reference(reference)) return { kind: 'unsafe' };
 	if (link_type === 'internal') {
 		if (reference.startsWith('.') && base) {
-			return { kind: 'resolve', href: mdz_resolve_relative_path(reference, base) };
+			return {
+				kind: 'resolve',
+				path: strip_leading_slashes(mdz_resolve_relative_path(reference, base))
+			};
 		}
-		// fragment/query/relative/bare — `resolve()` only accepts absolute paths or
-		// route ids and throws on anything else
-		if (
-			reference.startsWith('#') ||
-			reference.startsWith('?') ||
-			reference.startsWith('.') ||
-			!reference.startsWith('/')
-		) {
-			return { kind: 'internal', href: reference };
-		}
-		return { kind: 'resolve', href: reference };
+		// fragment/query/relative/bare — not under the base, so a raw `href`
+		if (!reference.startsWith('/')) return { kind: 'internal', href: reference };
+		return { kind: 'resolve', path: strip_leading_slashes(reference) };
 	}
 	return { kind: 'external', href: reference };
 };

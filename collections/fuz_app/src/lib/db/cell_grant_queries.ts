@@ -23,10 +23,11 @@
  */
 
 import type { QueryDeps } from './query_deps.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 import type { CellGrantLevel } from '../auth/cell_grant_action_specs.ts';
 import { assert_row } from './assert_row.ts';
-import { columns_sql, qualify_columns } from './sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from './sql_columns.ts';
+import { cell_viewer_params, type CellViewer } from './cell_view_sql.ts';
 
 /** Row shape returned by `cell_grant` SELECTs. */
 export interface CellGrantRow {
@@ -37,7 +38,7 @@ export interface CellGrantRow {
 	role: string | null;
 	scope_id: Uuid | null;
 	granted_by: Uuid | null;
-	created_at: Date;
+	created_at: string;
 }
 
 /**
@@ -56,6 +57,9 @@ export const CELL_GRANT_COLUMNS = [
 	'granted_by',
 	'created_at'
 ] as const satisfies ReadonlyArray<keyof CellGrantRow>;
+
+/** The `cell_grant` timestamp override, by row qualifier (`''` bare, `g` for the cell-joined reads). */
+const cell_grant_expr = iso8601_timestamp_expr(CELL_GRANT_COLUMNS, ['created_at']);
 
 /**
  * Discriminated principal input for `query_cell_grant_create`. Wire
@@ -99,7 +103,7 @@ export const query_cell_grant_create = async (
 			 VALUES ($1, $2, $3, $4)
 			 ON CONFLICT (cell_id, actor_id) WHERE actor_id IS NOT NULL
 			 DO UPDATE SET level = EXCLUDED.level, granted_by = EXCLUDED.granted_by
-			 RETURNING ${columns_sql(CELL_GRANT_COLUMNS)}`,
+			 RETURNING ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))}`,
 			[cell_id, level, principal.actor_id, granted_by]
 		);
 		return assert_row(row, 'INSERT INTO cell_grant (actor)');
@@ -109,7 +113,7 @@ export const query_cell_grant_create = async (
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (cell_id, role, scope_id) WHERE role IS NOT NULL
 		 DO UPDATE SET level = EXCLUDED.level, granted_by = EXCLUDED.granted_by
-		 RETURNING ${columns_sql(CELL_GRANT_COLUMNS)}`,
+		 RETURNING ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))}`,
 		[cell_id, level, principal.role, principal.scope_id, granted_by]
 	);
 	return assert_row(row, 'INSERT INTO cell_grant (role)');
@@ -127,7 +131,7 @@ export const query_cell_grant_get = async (
 	grant_id: Uuid
 ): Promise<CellGrantRow | null> => {
 	const row = await deps.db.query_one<CellGrantRow>(
-		`SELECT ${columns_sql(CELL_GRANT_COLUMNS)} FROM cell_grant WHERE id = $1`,
+		`SELECT ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))} FROM cell_grant WHERE id = $1`,
 		[grant_id]
 	);
 	return row ?? null;
@@ -136,22 +140,28 @@ export const query_cell_grant_get = async (
 /**
  * Delete a grant by id, returning the deleted row.
  *
+ * With `expected_level`, only a grant still at that level is deleted — a
+ * caller whose decision read the level fences the delete to the row it
+ * decided on, so a level change landing in between deletes nothing.
+ *
  * Returning the row lets the caller audit the principal + level after the
  * delete and (for self-revoke) recompute `still_admitted` against the
  * remaining grants on the cell without a second fetch.
  *
  * @param deps - query deps
  * @param grant_id - grant id
+ * @param expected_level - when given, the level the grant must still hold
  * @returns the deleted row or `null` when no row matched
  * @mutates `cell_grant` - deletes one row
  */
 export const query_cell_grant_delete = async (
 	deps: QueryDeps,
-	grant_id: Uuid
+	grant_id: Uuid,
+	expected_level?: CellGrantLevel
 ): Promise<CellGrantRow | null> => {
 	const row = await deps.db.query_one<CellGrantRow>(
-		`DELETE FROM cell_grant WHERE id = $1 RETURNING ${columns_sql(CELL_GRANT_COLUMNS)}`,
-		[grant_id]
+		`DELETE FROM cell_grant WHERE id = $1 AND ($2::text IS NULL OR level = $2) RETURNING ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))}`,
+		[grant_id, expected_level ?? null]
 	);
 	return row ?? null;
 };
@@ -171,9 +181,9 @@ export const query_cell_grant_list_for_cell = async (
 	cell_id: Uuid
 ): Promise<Array<CellGrantRow>> =>
 	deps.db.query<CellGrantRow>(
-		`SELECT ${columns_sql(CELL_GRANT_COLUMNS)} FROM cell_grant
+		`SELECT ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))} FROM cell_grant
 		 WHERE cell_id = $1
-		 ORDER BY created_at ASC`,
+		 ORDER BY cell_grant.created_at ASC`,
 		[cell_id]
 	);
 
@@ -194,9 +204,9 @@ export const query_cell_grant_list_for_cells = async (
 ): Promise<Array<CellGrantRow>> => {
 	if (cell_ids.length === 0) return [];
 	return deps.db.query<CellGrantRow>(
-		`SELECT ${columns_sql(CELL_GRANT_COLUMNS)} FROM cell_grant
+		`SELECT ${columns_sql(CELL_GRANT_COLUMNS, cell_grant_expr(''))} FROM cell_grant
 		 WHERE cell_id = ANY($1::uuid[])
-		 ORDER BY cell_id, created_at ASC`,
+		 ORDER BY cell_grant.cell_id, cell_grant.created_at ASC`,
 		[cell_ids]
 	);
 };
@@ -209,24 +219,22 @@ export const query_cell_grant_list_for_cells = async (
  *
  * @param deps - query deps
  * @param cell_ids - cells to fetch grants for
- * @param caller_actor_id - actor id of the caller (null for unauth)
- * @param role_grant_roles - active role_grant roles (parallel array)
- * @param role_grant_scope_ids - active role_grant scope ids (parallel array, parallel to roles)
+ * @param viewer - the caller, as `cell_list` bound its visibility predicate; its admin flag is not consulted
  * @returns matching grants (may include grants the caller doesn't match; caller's
  * list handler must filter when returning to the API)
+ * @throws {Error} when the viewer's role-grant arrays aren't parallel
  */
 export const query_cell_grants_for_caller_in_cells = async (
 	deps: QueryDeps,
 	cell_ids: ReadonlyArray<Uuid>,
-	caller_actor_id: Uuid | null,
-	role_grant_roles: ReadonlyArray<string>,
-	role_grant_scope_ids: ReadonlyArray<Uuid | null>
+	viewer: CellViewer
 ): Promise<Array<CellGrantRow>> => {
 	if (cell_ids.length === 0) {
 		return [];
 	}
+	const [, actor_id, role_grant_roles, role_grant_scope_ids] = cell_viewer_params(viewer);
 	return deps.db.query<CellGrantRow>(
-		`SELECT ${qualify_columns(CELL_GRANT_COLUMNS, 'g')} FROM cell_grant g
+		`SELECT ${qualify_columns(CELL_GRANT_COLUMNS, 'g', cell_grant_expr('g'))} FROM cell_grant g
 		 WHERE g.cell_id = ANY($1::uuid[])
 		   AND (
 		     g.actor_id = $2
@@ -238,6 +246,6 @@ export const query_cell_grants_for_caller_in_cells = async (
 		     )
 		   )
 		 ORDER BY g.cell_id, g.created_at ASC`,
-		[cell_ids, caller_actor_id, role_grant_roles, role_grant_scope_ids]
+		[cell_ids, actor_id, role_grant_roles, role_grant_scope_ids]
 	);
 };

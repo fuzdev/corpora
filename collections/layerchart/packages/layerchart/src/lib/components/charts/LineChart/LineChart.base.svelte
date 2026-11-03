@@ -37,7 +37,8 @@
     props = {},
     profile = false,
     tooltipContext = true,
-    marks,
+    marks: marksProp,
+    ref = $bindable(),
     context = $bindable(),
     ...restProps
   }: LineChartBaseProps<TData> = $props();
@@ -81,6 +82,7 @@
 </script>
 
 <Chart
+  bind:ref
   bind:context
   {data}
   {xScale}
@@ -114,9 +116,9 @@
   {legend}
   {props}
 >
-  {#snippet marks({ context }: { context: any })}
-    {#if typeof marks === 'function'}
-      {@render marks({ context })}
+  {#snippet marks({ context, facet }: { context: any; facet: any })}
+    {#if typeof marksProp === 'function'}
+      {@render marksProp({ context, facet })}
     {:else}
       {#each context.series.visibleSeries as s, i (s.key)}
         <Spline seriesKey={s.key} {...props.spline} />

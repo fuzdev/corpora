@@ -1,4 +1,5 @@
-import { z } from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 import { styleText as st } from 'node:util';
 import { git_check_clean_workspace, git_current_commit_hash } from '@fuzdev/fuz_util/git.ts';
 import { rm } from 'node:fs/promises';
@@ -14,29 +15,31 @@ import {
 	save_build_cache_metadata,
 	discover_build_output_dirs
 } from './build_cache.ts';
+import { load_build_cache_dependencies } from './build_cache_dependencies.ts';
 import { paths } from './paths.ts';
 
 /** @nodocs */
-export const Args = z.strictObject({
-	sync: z.boolean().meta({ description: 'dual of no-sync' }).default(true),
-	'no-sync': z.boolean().meta({ description: 'opt out of gro sync' }).default(false),
-	gen: z.boolean().meta({ description: 'dual of no-gen' }).default(true),
-	'no-gen': z.boolean().meta({ description: 'opt out of gro gen' }).default(false),
-	install: z.boolean().meta({ description: 'dual of no-install' }).default(true),
-	'no-install': z // convenience, same as `gro build -- gro sync --no-install` but the latter takes precedence
-		.boolean()
-		.meta({ description: 'opt out of installing packages before building' })
-		.default(false),
-	force_build: z
-		.boolean()
-		.meta({ description: 'force a fresh build, ignoring the cache' })
-		.default(false),
-	allow_dirty: z
-		.boolean()
-		.meta({ description: 'skip the post-build dirty workspace check' })
-		.default(false)
+export const Args = s.object({
+	sync: s.with_default(meta(s.boolean, { description: 'dual of no-sync' }), true),
+	'no-sync': s.with_default(meta(s.boolean, { description: 'opt out of gro sync' }), false),
+	gen: s.with_default(meta(s.boolean, { description: 'dual of no-gen' }), true),
+	'no-gen': s.with_default(meta(s.boolean, { description: 'opt out of gro gen' }), false),
+	install: s.with_default(meta(s.boolean, { description: 'dual of no-install' }), true),
+	// convenience, same as `gro build -- gro sync --no-install` but the latter takes precedence
+	'no-install': s.with_default(
+		meta(s.boolean, { description: 'opt out of installing packages before building' }),
+		false
+	),
+	force_build: s.with_default(
+		meta(s.boolean, { description: 'force a fresh build, ignoring the cache' }),
+		false
+	),
+	allow_dirty: s.with_default(
+		meta(s.boolean, { description: 'skip the post-build dirty workspace check' }),
+		false
+	)
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
 /**
  * Length of git commit hash when displayed in logs (standard git convention).
@@ -67,10 +70,12 @@ export const task: Task<Args> = {
 			await invoke_task('gen');
 		}
 
-		// Batch git calls upfront for performance (spawning processes is expensive)
-		const [workspace_status, initial_commit] = await Promise.all([
+		// Batch git calls upfront for performance (spawning processes is expensive),
+		// and load the dependency key components once so the check and the save agree
+		const [workspace_status, initial_commit, cache_dependencies] = await Promise.all([
 			git_check_clean_workspace(),
-			git_current_commit_hash()
+			git_current_commit_hash(),
+			load_build_cache_dependencies()
 		]);
 		const workspace_dirty = !!workspace_status;
 
@@ -79,7 +84,12 @@ export const task: Task<Args> = {
 
 		// Check build cache unless force_build is set or workspace is dirty
 		if (!workspace_dirty && !force_build) {
-			const cache_valid = await is_build_cache_valid(config, log, initial_commit);
+			const cache_valid = await is_build_cache_valid(
+				config,
+				log,
+				initial_commit,
+				cache_dependencies
+			);
 			if (cache_valid) {
 				log.info(
 					st('cyan', 'skipping build, cache is valid'),
@@ -148,7 +158,13 @@ export const task: Task<Args> = {
 				);
 			} else {
 				// Commit is stable - safe to save cache
-				const metadata = await create_build_cache_metadata(config, log, initial_commit, build_dirs);
+				const metadata = await create_build_cache_metadata(
+					config,
+					log,
+					initial_commit,
+					build_dirs,
+					cache_dependencies
+				);
 				await save_build_cache_metadata(metadata, log);
 				log.debug('Build cache metadata saved');
 			}

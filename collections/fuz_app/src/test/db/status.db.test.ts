@@ -10,13 +10,13 @@
 
 import { describe, assert, test, beforeAll, beforeEach } from 'vitest';
 
-import { Db, no_nested_transaction } from '$lib/db/db.ts';
-import { run_migrations, type Migration, type MigrationNamespace } from '$lib/db/migrate.ts';
-import { query_db_status, format_db_status } from '$lib/db/status.ts';
-import { create_pglite_factory, reset_pglite } from '$lib/testing/db.ts';
+import { Db, no_nested_transaction } from '#lib/db/db.ts';
+import { run_migrations, type Migration, type MigrationNamespace } from '#lib/db/migrate.ts';
+import { query_db_status, format_db_status } from '#lib/db/status.ts';
+import { create_default_db_factory, reset_public_schema } from '#lib/testing/db.ts';
 
 const noop_init = async (_db: Db): Promise<void> => {};
-const factory = create_pglite_factory(noop_init);
+const factory = create_default_db_factory(noop_init);
 let db: Db;
 
 beforeAll(async () => {
@@ -24,7 +24,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-	await reset_pglite(db);
+	await reset_public_schema(db);
 	// `run_migrations` always creates the new-shape `schema_version` tracker
 	// before its namespace loop; an empty namespace creates the table with no
 	// rows so the tests below can seed divergent histories directly.
@@ -69,9 +69,14 @@ describe('query_db_status name-divergence detection', () => {
 
 		// `format_db_status` renders DIVERGED with the detail, not up-to-date
 		const formatted = format_db_status(status);
-		assert.ok(formatted.includes('DIVERGED'), formatted);
-		assert.ok(formatted.includes("database has 'cell_v0', code has 'full_cell_schema'"), formatted);
-		assert.ok(!formatted.includes('fuz_cell: up to date'), formatted);
+		assert.ok(formatted.includes('    fuz_cell  DIVERGED     1/1  latest: cell_v0\n'), formatted);
+		assert.ok(
+			formatted.includes(
+				'diverged: position 0: database has `cell_v0`, code has `full_cell_schema`'
+			),
+			formatted
+		);
+		assert.ok(!formatted.includes('up-to-date'), formatted);
 	});
 
 	test('name mismatch with applied.length === code.length (overlap-end) → DIVERGED', async () => {
@@ -114,8 +119,12 @@ describe('query_db_status name-divergence detection', () => {
 		assert.deepStrictEqual(m.divergence, { kind: 'binary_older', applied: 3, declared: 2 });
 		assert.deepStrictEqual(m.pending_names, []);
 
+		// the denominator is the declared count (2), not applied + pending (3)
 		const formatted = format_db_status(status);
-		assert.ok(formatted.includes('DIVERGED'), formatted);
+		assert.ok(
+			formatted.includes('    older_ns  DIVERGED     3/2  latest: m2_unknown\n'),
+			formatted
+		);
 		assert.ok(formatted.includes('binary older than database'), formatted);
 	});
 
@@ -135,7 +144,7 @@ describe('query_db_status name-divergence detection', () => {
 		assert.deepStrictEqual(m.pending_names, []);
 
 		const formatted = format_db_status(status);
-		assert.ok(formatted.includes('clean_ns: up to date'), formatted);
+		assert.ok(formatted.includes('    clean_ns  up-to-date   2/2  latest: m1\n'), formatted);
 	});
 
 	test('per-namespace independence: clean + diverged in one report', async () => {
@@ -164,8 +173,14 @@ describe('query_db_status name-divergence detection', () => {
 		});
 
 		const formatted = format_db_status(status);
-		assert.ok(formatted.includes('clean_auth: up to date'), formatted);
-		assert.ok(formatted.includes('diverged_cell: DIVERGED'), formatted);
+		assert.ok(
+			formatted.includes('    clean_auth     up-to-date   1/1  latest: full_auth_schema\n'),
+			formatted
+		);
+		assert.ok(
+			formatted.includes('    diverged_cell  DIVERGED     1/1  latest: cell_v0\n'),
+			formatted
+		);
 	});
 
 	test('non-diverging partial prefix → not up_to_date, pending tail, no divergence', async () => {
@@ -184,14 +199,17 @@ describe('query_db_status name-divergence detection', () => {
 		assert.deepStrictEqual(m.pending_names, ['m1']);
 
 		const formatted = format_db_status(status);
-		assert.ok(formatted.includes('partial_ns: applied 1/2 (pending: m1)'), formatted);
+		assert.strictEqual(
+			formatted.slice(formatted.indexOf('  migrations:\n')),
+			'  migrations:\n    partial_ns  PENDING 1    1/2  latest: m0\n                  pending: m1\n'
+		);
 	});
 });
 
 describe('query_db_status connectivity and tables', () => {
 	test('connectivity failure → connected false with the error message', async () => {
 		// The connectivity probe (`SELECT 1`) throwing is the not-connected signal;
-		// a throwing client stub drives it without tearing down the shared PGlite.
+		// a throwing client stub drives it without tearing down the shared database.
 		const failing_db = new Db({
 			client: {
 				query: () => {
@@ -233,7 +251,7 @@ describe('query_db_status connectivity and tables', () => {
 	});
 });
 
-describe('query_db_status tracker shape', () => {
+describe('query_db_status tracker absence', () => {
 	test('no schema_version table → namespaces report nothing applied yet', async () => {
 		await db.query('DROP TABLE schema_version');
 		const ns: MigrationNamespace = { namespace: 'fresh', migrations: [named('m0'), named('m1')] };
@@ -241,74 +259,14 @@ describe('query_db_status tracker shape', () => {
 		const status = await query_db_status(db, [ns]);
 		const m = status.migrations.find((x) => x.namespace === 'fresh')!;
 
-		assert.strictEqual(status.old_tracker_shape, undefined);
 		assert.deepStrictEqual(m.applied_names, []);
 		assert.deepStrictEqual(m.pending_names, ['m0', 'm1']);
 		assert.strictEqual(m.up_to_date, false);
 		assert.strictEqual(m.divergence, undefined);
-	});
-
-	test('pre-0.42 tracker shape (version column) → old_tracker_shape flagged, nothing applied', async () => {
-		await db.query('DROP TABLE schema_version');
-		await db.query(`
-			CREATE TABLE schema_version (
-			  namespace TEXT PRIMARY KEY,
-			  version INTEGER NOT NULL DEFAULT 0,
-			  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		assert.ok(
+			format_db_status(status).endsWith(
+				'  migrations:\n    fresh  PENDING 2    0/2  latest: (none)\n             pending: m0, m1\n'
 			)
-		`);
-		const ns: MigrationNamespace = {
-			namespace: 'fuz_auth',
-			migrations: [named('full_auth_schema')]
-		};
-
-		const status = await query_db_status(db, [ns]);
-		const m = status.migrations.find((x) => x.namespace === 'fuz_auth')!;
-
-		assert.strictEqual(status.old_tracker_shape, true);
-		// the old shape is never name-read, so every namespace shows nothing-applied
-		assert.deepStrictEqual(m.applied_names, []);
-		assert.deepStrictEqual(m.pending_names, ['full_auth_schema']);
-		assert.strictEqual(m.up_to_date, false);
-		assert.strictEqual(m.divergence, undefined);
-	});
-});
-
-describe('format_db_status', () => {
-	test('not connected → renders Connection: FAILED with the error', () => {
-		const out = format_db_status({
-			connected: false,
-			error: 'connection refused',
-			table_count: 0,
-			tables: [],
-			migrations: []
-		});
-		assert.ok(out.includes('Connection: FAILED'), out);
-		assert.ok(out.includes('connection refused'), out);
-	});
-
-	test('connected → renders OK, table count, per-table rows, and no Migrations section when empty', () => {
-		const out = format_db_status({
-			connected: true,
-			table_count: 1,
-			tables: [{ name: 'widget', row_count: 3 }],
-			migrations: []
-		});
-		assert.ok(out.includes('Connection: OK'), out);
-		assert.ok(out.includes('Tables: 1'), out);
-		assert.ok(out.includes('widget'), out);
-		assert.ok(out.includes('3 rows'), out);
-		assert.ok(!out.includes('Migrations:'), out);
-	});
-
-	test('old_tracker_shape → renders the pre-0.42 remediation hint', () => {
-		const out = format_db_status({
-			connected: true,
-			table_count: 1,
-			tables: [{ name: 'schema_version', row_count: 0 }],
-			migrations: [],
-			old_tracker_shape: true
-		});
-		assert.ok(out.includes('pre-0.42 schema_version shape'), out);
+		);
 	});
 });

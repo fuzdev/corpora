@@ -10,14 +10,12 @@ import {
 	type ActionEventStep,
 	type ActionExecutor,
 	action_event_step_transitions,
-	action_event_phase_by_kind,
 	action_event_phase_transitions
 } from './action_event_types.ts';
 import type {
 	ActionEventData,
 	ActionEventRequestResponseData,
-	ActionEventRemoteNotificationData,
-	ActionEventLocalCallData
+	ActionEventRemoteNotificationData
 } from './action_event_data.ts';
 import type { ActionEventPhase, ActionInitiator, ActionKind } from './action_spec.ts';
 import type { JsonrpcErrorObject } from '../http/jsonrpc.ts';
@@ -28,65 +26,16 @@ export const is_request_response = (
 	data: ActionEventData
 ): data is ActionEventRequestResponseData => data.kind === 'request_response';
 
-export const is_remote_notification = (
-	data: ActionEventData
-): data is ActionEventRemoteNotificationData => data.kind === 'remote_notification';
-
-export const is_local_call = (data: ActionEventData): data is ActionEventLocalCallData =>
-	data.kind === 'local_call';
-
 // Type guards for specific states
 export const is_send_request = (
 	data: ActionEventData
 ): data is ActionEventRequestResponseData & { phase: 'send_request' } =>
 	data.kind === 'request_response' && data.phase === 'send_request';
 
-export const is_receive_request = (
-	data: ActionEventData
-): data is ActionEventRequestResponseData & { phase: 'receive_request' } =>
-	data.kind === 'request_response' && data.phase === 'receive_request';
-
-export const is_send_response = (
-	data: ActionEventData
-): data is ActionEventRequestResponseData & { phase: 'send_response' } =>
-	data.kind === 'request_response' && data.phase === 'send_response';
-
-export const is_receive_response = (
-	data: ActionEventData
-): data is ActionEventRequestResponseData & { phase: 'receive_response' } =>
-	data.kind === 'request_response' && data.phase === 'receive_response';
-
 export const is_notification_send = (
 	data: ActionEventData
 ): data is ActionEventRemoteNotificationData & { phase: 'send' } =>
 	data.kind === 'remote_notification' && data.phase === 'send';
-
-export const is_notification_receive = (
-	data: ActionEventData
-): data is ActionEventRemoteNotificationData & { phase: 'receive' } =>
-	data.kind === 'remote_notification' && data.phase === 'receive';
-
-export const is_execute = (
-	data: ActionEventData
-): data is ActionEventLocalCallData & { phase: 'execute' } =>
-	data.kind === 'local_call' && data.phase === 'execute';
-
-// Step state guards
-export const is_initial = (data: ActionEventData): data is ActionEventData & { step: 'initial' } =>
-	data.step === 'initial';
-
-export const is_parsed = (data: ActionEventData): data is ActionEventData & { step: 'parsed' } =>
-	data.step === 'parsed';
-
-export const is_handling = (
-	data: ActionEventData
-): data is ActionEventData & { step: 'handling' } => data.step === 'handling';
-
-export const is_handled = (data: ActionEventData): data is ActionEventData & { step: 'handled' } =>
-	data.step === 'handled';
-
-export const is_failed = (data: ActionEventData): data is ActionEventData & { step: 'failed' } =>
-	data.step === 'failed';
 
 // Combined type guards for specific states with parsed input
 // These check for 'parsed' or 'handling' steps since protocol messages
@@ -115,18 +64,6 @@ export const is_notification_send_with_parsed_input = <TMethod extends string = 
 export const validate_step_transition = (from: ActionEventStep, to: ActionEventStep): void => {
 	if (!action_event_step_transitions[from].includes(to)) {
 		throw new Error(`Invalid step transition from '${from}' to '${to}'`);
-	}
-};
-
-/**
- * Validate that `phase` is one of the phases allowed for `kind` per
- * `action_event_phase_by_kind`.
- *
- * @throws Error if `phase` is not valid for `kind`
- */
-export const validate_phase_for_kind = (kind: ActionKind, phase: ActionEventPhase): void => {
-	if (!action_event_phase_by_kind[kind].includes(phase)) {
-		throw new Error(`Invalid phase '${phase}' for ${kind} action`);
 	}
 };
 

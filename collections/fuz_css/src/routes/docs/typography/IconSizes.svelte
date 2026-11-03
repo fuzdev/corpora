@@ -3,15 +3,14 @@
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 	import StyleVariableButton from '@fuzdev/fuz_ui/StyleVariableButton.svelte';
 
-	import { ICON_SIZES, icon_size_variants } from '$lib/variable_data.ts';
+	import { ICON_SIZES, icon_size_variants } from '#lib/variable_data.ts';
 </script>
 
 <TomeSection>
 	<TomeSectionHeader text="Icon sizes" />
 	<aside>
 		unlike <code>--font_size_</code> variables, <code>--icon_</code> variables are in
-		<code>px</code>
-		not <code>rem</code>, so they're insensitive to browser font size
+		<code>px</code> not <code>rem</code>, so they're insensitive to browser font size
 	</aside>
 </TomeSection>
 <div class="icon_sizes">

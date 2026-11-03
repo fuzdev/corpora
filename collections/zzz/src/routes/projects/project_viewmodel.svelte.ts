@@ -1,16 +1,14 @@
 // @slop Claude Opus 4
 
-import { z } from 'zod';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { create_uuid, type Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Domain } from './domain.svelte.ts';
 import { Page } from './page.svelte.ts';
 import { Projects } from './projects.svelte.ts';
 import { Repo } from './repo.svelte.ts';
-import { get_unique_name } from '$lib/helpers.ts';
+import { get_unique_name } from '#lib/helpers.ts';
 
 export interface ProjectViewmodelOptions {
 	projects: Projects;
@@ -142,7 +140,9 @@ export class ProjectViewmodel {
 		});
 
 		this.project.add_page(page);
-		void goto(resolve(`/projects/${this.project_id}/pages/${page_id}`));
+		void goto(
+			resolve('/projects/[project_id]/pages/[page_id]', { project_id: this.project_id, page_id })
+		);
 	}
 
 	/**
@@ -167,7 +167,12 @@ export class ProjectViewmodel {
 		});
 
 		this.project.add_domain(domain);
-		void goto(resolve(`/projects/${this.project_id}/domains/${domain_id}`));
+		void goto(
+			resolve('/projects/[project_id]/domains/[domain_id]', {
+				project_id: this.project_id,
+				domain_id
+			})
+		);
 	}
 
 	/**
@@ -193,8 +198,8 @@ export class ProjectViewmodel {
 		this.project.add_repo(repo);
 
 		// Navigate to the repo
-		void goto(resolve(`/projects/${this.project_id}/repos/${repo_id}`));
+		void goto(
+			resolve('/projects/[project_id]/repos/[repo_id]', { project_id: this.project_id, repo_id })
+		);
 	}
 }
-
-export const ProjectViewmodelSchema = z.instanceof(ProjectViewmodel);

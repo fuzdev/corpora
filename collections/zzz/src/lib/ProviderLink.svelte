@@ -7,7 +7,7 @@
 
 	import type { SvgData } from '@fuzdev/fuz_ui/svg.ts';
 	import { icon_provider } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 
 	import type { Provider } from './provider.svelte.ts';
 	import ProviderLogo from './ProviderLogo.svelte';
@@ -47,25 +47,30 @@
 	}
 
 	const selected = $derived(
-		!!provider && page.url.pathname === resolve(`/providers/${provider.name}`)
+		!!provider && page.url.pathname === resolve('/providers/[slug]', { slug: provider.name })
 	);
 </script>
 
 <!-- whitespace is tricky here, the icon branches control it with an explicit nbsp -->
 {#if provider}
-	<a {...rest} href={resolve(`/providers/${provider.name}`)} class="selected-plain" class:selected>
+	<a
+		{...rest}
+		href={resolve('/providers/[slug]', { slug: provider.name })}
+		class="selected-plain"
+		class:selected
+	>
 		{#if children}
 			{@render children()}
 		{:else}
 			{#if icon === 'logo'}
 				<ProviderLogo name={provider.name} {...icon_props} />&nbsp;
 			{:else if icon}
-				<Svg data={icon} inline {...icon_props} />&nbsp;
+				<Icon data={icon} {...icon_props} />&nbsp;
 			{/if}{label === 'name' ? provider.name : provider.title}
 		{/if}
 	</a>
 {:else if fallback}
 	{@render fallback()}
 {:else}
-	<small class="font_family_mono color_c_50"><Svg data={icon_provider} /> missing provider</small>
+	<small class="font_family_mono color_c_60"><Icon data={icon_provider} /> missing provider</small>
 {/if}

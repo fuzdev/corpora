@@ -65,7 +65,7 @@ export interface CreateCspDirectivesOptions {
 }
 
 /**
- * Builds a CSP directives map for use with SvelteKit's `kit.csp.directives` option.
+ * Builds a CSP directives map for use with SvelteKit's `csp.directives` option (passed to `sveltekit()`).
  *
  * Restrictive by default; opt into specific permissions via `extend` (append) or
  * `overrides` (replace). Designed to read as an audit log: every user-added source

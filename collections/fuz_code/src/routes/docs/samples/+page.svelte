@@ -1,6 +1,6 @@
 <script lang="ts">
 	// the Highlight API rules live in theme_highlight.css (not theme.css)
-	import '$lib/theme_highlight.css';
+	import '#lib/theme_highlight.css';
 
 	import { page } from '$app/state';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -10,11 +10,11 @@
 	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
 	import DeclarationLink from '@fuzdev/fuz_ui/DeclarationLink.svelte';
 
-	import Code from '$lib/Code.svelte';
-	import CodeHighlight from '$lib/CodeHighlight.svelte';
-	import { sample_langs } from '$lib/code_sample.ts';
-	import { samples } from '$routes/samples/all.ts';
-	import { lang_colors } from '$routes/lang_color.ts';
+	import Code from '#lib/Code.svelte';
+	import CodeHighlight from '#lib/CodeHighlight.svelte';
+	import { sample_langs } from '#lib/code_sample.ts';
+	import { samples } from '#routes/samples/all.ts';
+	import { lang_colors } from '#routes/lang_color.ts';
 
 	const TOME_SLUG = 'samples';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -55,10 +55,9 @@
 	{#if at_root}
 		<section>
 			<p>
-				Syntax-highlighted <TomeLink slug="samples" /> in every supported language, rendered with
-				<DeclarationLink name="Code" /> and the experimental <DeclarationLink
-					name="CodeHighlight"
-				/>.
+				Syntax-styled <TomeLink slug="samples" /> in every supported language, rendered with
+				<DeclarationLink name="Code" /> and the experimental
+				<DeclarationLink name="CodeHighlight" />.
 			</p>
 		</section>
 	{:else}
@@ -66,15 +65,15 @@
 			<p>
 				Code samples in every supported language. Filter by language and toggle the renderers:
 				<DeclarationLink name="Code" /> (standard HTML with <code>.token_*</code> classes) and the
-				experimental <DeclarationLink name="CodeHighlight" /> (CSS Custom Highlight API, ranges). With
-				both on, each sample renders side by side.
+				experimental <DeclarationLink name="CodeHighlight" /> (CSS Custom Highlight API, ranges).
+				With both on, each sample renders side by side.
 			</p>
 
 			<div class="row gap_xs flex-wrap:wrap mb_md">
 				{#each sample_langs as lang (lang)}
 					<button
 						type="button"
-						class="sm deselectable {lang_colors[lang]}"
+						class="sized_sm deselectable {lang_colors[lang]}"
 						class:selected={shown_langs.has(lang)}
 						onclick={() => toggle_lang(lang)}
 					>
@@ -83,7 +82,7 @@
 				{/each}
 				<button
 					type="button"
-					class="sm deselectable"
+					class="sized_sm deselectable"
 					class:selected={all_shown}
 					onclick={toggle_all}
 				>
@@ -114,11 +113,12 @@
 				<aside class="panel p_md mb_lg">
 					<p>
 						⚠️ <strong>Experimental:</strong> the <code>highlight</code> renderer uses the
-						<a href="https://developer.mozilla.org/en-US/docs/Web/API/CSS_Custom_Highlight_API"
-							>CSS Custom Highlight API</a
-						>, which has limited browser support and can't apply layout-affecting styles like font
-						weight (<a href="https://github.com/w3c/csswg-drafts/issues/8355">csswg-drafts#8355</a
-						>). It requires <code>theme_highlight.css</code> instead of <code>theme.css</code>.
+						<a href="https://developer.mozilla.org/en-US/docs/Web/API/CSS_Custom_Highlight_API">
+							CSS Custom Highlight API
+						</a>, which has limited browser support and can't apply layout-affecting styles like
+						font weight
+						(<a href="https://github.com/w3c/csswg-drafts/issues/8355">csswg-drafts#8355</a>). It
+						requires <code>theme_highlight.css</code> instead of <code>theme.css</code>.
 					</p>
 				</aside>
 			{/if}

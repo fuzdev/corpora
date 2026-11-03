@@ -2,7 +2,7 @@ import { test, assert, describe } from 'vitest';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import { COLOR_SCHEME_SCRIPT, COLOR_SCHEME_SCRIPT_HASH } from '$lib/csp.ts';
+import { COLOR_SCHEME_SCRIPT, COLOR_SCHEME_SCRIPT_HASH } from '#lib/csp.ts';
 
 // The CSP admits the color-scheme loader by hash, so three things have to agree byte-for-byte:
 // the inline script in `app.html`, the `COLOR_SCHEME_SCRIPT` copy of it, and the hash of that

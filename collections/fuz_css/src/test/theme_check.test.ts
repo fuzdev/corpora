@@ -1,287 +1,86 @@
 import { test, assert, describe } from 'vitest';
+import { readFileSync } from 'node:fs';
+import {
+	oklab_to_srgb,
+	oklch_to_srgb,
+	srgb_to_oklab,
+	type Oklab,
+	type RgbUnit
+} from '@fuzdev/fuz_util/oklch.ts';
 
 import {
-	validate_theme,
 	check_theme,
-	create_theme_resolver,
+	type ThemeCheckReport,
 	GATE_BODY_TEXT,
 	GATE_SUBTLE_TEXT,
 	GATE_LINK,
 	GATE_UI,
 	GATE_FILL_TEXT,
 	GATE_SELECTED_TEXT,
+	GATE_PALETTE_TEXT,
 	GATE_BORDER,
 	GATE_BORDER_DIVIDER
-} from '$lib/theme_check.ts';
-import { resolve_theme_stance } from '$lib/theme_stance.ts';
-import { compose_themes } from '$lib/theme.ts';
-import type { Theme } from '$lib/variable.ts';
-import { default_themes, contrast_modifiers } from '$lib/themes.ts';
-import { low_contrast_theme } from '$lib/themes/low_contrast.ts';
-import { high_contrast_theme } from '$lib/themes/high_contrast.ts';
-import { smolder_theme } from '$lib/themes/smolder.ts';
-import { parchment_theme } from '$lib/themes/parchment.ts';
-import { concrete_theme } from '$lib/themes/concrete.ts';
-import { phosphor_theme } from '$lib/themes/phosphor.ts';
-import { neon_theme } from '$lib/themes/neon.ts';
-import { nineties_theme } from '$lib/themes/nineties.ts';
-import { create_monochrome_theme } from './test_helpers.ts';
+} from '#lib/theme_check.ts';
+import { validate_theme } from '#lib/theme_validate.ts';
+import { compose_themes } from '#lib/theme.ts';
+import type { Theme } from '#lib/variable.ts';
+import { contrast_modifiers } from '#lib/themes.ts';
+import { base_theme } from '#lib/themes/base.ts';
+import { low_contrast_theme } from '#lib/themes/low_contrast.ts';
+import { high_contrast_theme } from '#lib/themes/high_contrast.ts';
+import { zine_theme } from '#lib/themes/zine.ts';
+import { phosphor_theme } from '#lib/themes/phosphor.ts';
+import { marquee_theme } from '#lib/themes/marquee.ts';
+import { shipped_base_themes } from './theme_test_helpers.ts';
 import {
-	PALETTE_HUES,
-	PALETTE_CHROMA_KNOBS,
 	PALETTE_CHROMA_MULTIPLIERS,
-	SHADE_LIGHTNESS_KNOBS,
-	NEUTRAL_CHROMA,
-	BORDER_CHROMA_MULTIPLIER,
+	neutral_ground_chroma_weight,
 	palette_stop_oklch,
 	shade_stop_oklch
-} from '$lib/ramps.ts';
-import { oklch_to_srgb } from '$lib/oklch.ts';
-import { wcag_contrast_ratio } from '$lib/wcag.ts';
+} from '#lib/ramps.ts';
+import { wcag_contrast_ratio } from '#lib/wcag.ts';
+import {
+	palette_variants,
+	color_scheme_variants,
+	type NumericScaleVariant
+} from '#lib/variable_data.ts';
 
-const base_theme = default_themes[0]!;
+// the `.palette_X` button label on each of its fills: at rest, hovered, and
+// pressed by mouse (hovered, so the hovered label) and by keyboard
+const button_label_subjects = (letter: string): Array<string> => [
+	`palette_${letter}_70 on palette_${letter} button fill`,
+	`palette_${letter}_70 on palette_${letter} active fill`,
+	`palette_${letter}_70 hovered on palette_${letter} hover fill`,
+	`palette_${letter}_70 hovered on palette_${letter} active fill`
+];
 
-// per-call resolver over the shared resolution core, for direct tests of the
-// resolution rules (binding chains, cycles, unresolvable expressions)
-const resolve_theme_knob = (theme: Theme, name: string, scheme: 'light' | 'dark'): number | null =>
-	create_theme_resolver(theme).resolve(name, scheme);
+// the chip label on its stop-10 tint
+const chip_subject = (letter: string): string => `palette_${letter}_60 on palette_${letter}_10`;
 
-describe('validate_theme', () => {
-	test('registry and exemplar themes produce no errors', () => {
-		const themes = [
-			...default_themes,
-			smolder_theme,
-			parchment_theme,
-			concrete_theme,
-			phosphor_theme,
-			neon_theme,
-			nineties_theme,
-			create_monochrome_theme(70) // amber, exercises the palette-tier collapse
-		];
-		for (const theme of themes) {
-			const errors = validate_theme(theme).filter((issue) => issue.level === 'error');
-			assert.deepEqual(errors, [], `${theme.name}: ${JSON.stringify(errors)}`);
-		}
-	});
-
-	test('an empty theme is valid', () => {
-		assert.deepEqual(validate_theme({ name: 'base', variables: [] }), []);
-	});
-
-	test('a blank name is an error', () => {
-		assert.isTrue(validate_theme({ name: '', variables: [] }).some((i) => i.level === 'error'));
-	});
-
-	test('an unknown variable name is an error', () => {
-		const issues = validate_theme({
-			name: 't',
-			variables: [{ name: 'not_a_real_var', light: '1' }]
-		});
-		assert.isTrue(issues.some((i) => i.level === 'error' && i.variable === 'not_a_real_var'));
-	});
-
-	test('a malformed StyleVariable is an error', () => {
-		// light === dark trips the schema refine
-		const issues = validate_theme({
-			name: 't',
-			variables: [{ name: 'chroma_scale', light: '1', dark: '1' }]
-		});
-		assert.isTrue(issues.some((i) => i.level === 'error'));
-	});
-
-	test('an out-of-range number is a warning, not an error', () => {
-		const issues = validate_theme({ name: 't', variables: [{ name: 'chroma_scale', light: '5' }] });
-		assert.isTrue(issues.some((i) => i.level === 'warning' && i.variable === 'chroma_scale'));
-		assert.isFalse(issues.some((i) => i.level === 'error'));
-	});
-
-	test('a bad enum value is a warning', () => {
-		const issues = validate_theme({
-			name: 't',
-			variables: [{ name: 'border_style', light: 'wavy' }]
-		});
-		assert.isTrue(issues.some((i) => i.level === 'warning' && i.variable === 'border_style'));
-		assert.isFalse(issues.some((i) => i.level === 'error'));
-	});
-
-	test('a var(--hue_X) binding on a hue knob is accepted', () => {
-		assert.deepEqual(
-			validate_theme({ name: 't', variables: [{ name: 'hue_accent', light: 'var(--hue_d)' }] }),
-			[]
-		);
-	});
-
-	test('scheme stance values validate', () => {
-		assert.deepEqual(validate_theme({ name: 't', variables: [], scheme: 'dual' }), []);
-		for (const scheme of ['light', 'dark'] as const) {
-			assert.deepEqual(
-				validate_theme(resolve_theme_stance({ name: 't', variables: [], scheme })),
-				[]
-			);
-		}
-		const issues = validate_theme({ name: 't', variables: [], scheme: 'dusk' as 'dark' });
-		assert.isTrue(issues.some((i) => i.level === 'error'));
-	});
-
-	test('a single-scheme stance without a resolved mirror is a warning', () => {
-		for (const scheme of ['light', 'dark'] as const) {
-			const issues = validate_theme({ name: 't', variables: [], scheme });
-			assert.isTrue(
-				issues.some((i) => i.level === 'warning' && i.message.includes('resolve_theme_stance'))
-			);
-			assert.isFalse(issues.some((i) => i.level === 'error'));
-			// resolving clears it
-			assert.deepEqual(
-				validate_theme(resolve_theme_stance({ name: 't', variables: [], scheme })),
-				[]
-			);
-		}
-	});
-
-	test('a dark slot under a single-scheme stance is a warning, not an error', () => {
-		for (const scheme of ['light', 'dark'] as const) {
-			const issues = validate_theme({
-				name: 't',
-				scheme,
-				variables: [{ name: 'neutral_chroma', light: '0.02', dark: '0.03' }]
-			});
-			assert.isTrue(issues.some((i) => i.level === 'warning' && i.variable === 'neutral_chroma'));
-			assert.isFalse(issues.some((i) => i.level === 'error'));
-		}
-		// single-slot stanced and dual-slot unstanced themes stay clean
-		assert.deepEqual(
-			validate_theme(
-				resolve_theme_stance({
-					name: 't',
-					scheme: 'dark',
-					variables: [{ name: 'neutral_chroma', light: '0.02' }]
-				})
-			),
-			[]
-		);
-		assert.deepEqual(
-			validate_theme({
-				name: 't',
-				variables: [{ name: 'neutral_chroma', light: '0.02', dark: '0.03' }]
-			}),
-			[]
-		);
-	});
-
-	test('binding an intent to the muted brown slot warns about the dropped character', () => {
-		const issues = validate_theme({
-			name: 't',
-			variables: [{ name: 'hue_accent', light: 'var(--hue_f)' }]
-		});
-		assert.isTrue(issues.some((i) => i.level === 'warning' && i.variable === 'hue_accent'));
-	});
-
-	test('setting the intent chroma twin to match the bound slot silences the pairing warning', () => {
-		const issues = validate_theme({
-			name: 't',
-			variables: [
-				{ name: 'hue_accent', light: 'var(--hue_f)' },
-				{ name: 'accent_chroma_scale', light: String(PALETTE_CHROMA_MULTIPLIERS.f) }
-			]
-		});
-		assert.deepEqual(issues, []);
-	});
-
-	test('muting a letter warns through the default binding that points at it', () => {
-		// hue_negative defaults to var(--hue_c)
-		const issues = validate_theme({
-			name: 't',
-			variables: [{ name: 'palette_c_chroma_scale', light: '0.5' }]
-		});
-		assert.isTrue(issues.some((i) => i.level === 'warning' && i.variable === 'hue_negative'));
-	});
-
-	test('a literal intent hue never triggers the pairing warning', () => {
-		const issues = validate_theme({
-			name: 't',
-			variables: [
-				{ name: 'hue_negative', light: '20' },
-				{ name: 'palette_c_chroma_scale', light: '0.5' }
-			]
-		});
-		assert.deepEqual(issues, []);
-	});
-});
-
-describe('resolution', () => {
-	test('intent hues follow their default letter binding', () => {
-		assert.strictEqual(resolve_theme_knob(base_theme, 'hue_accent', 'light'), PALETTE_HUES.a);
-		assert.strictEqual(resolve_theme_knob(base_theme, 'hue_neutral', 'light'), PALETTE_HUES.f);
-	});
-
-	test('binding chains resolve through an explicit override', () => {
-		const theme: Theme = {
-			name: 't',
-			variables: [
-				{ name: 'hue_accent', light: 'var(--hue_d)' },
-				{ name: 'hue_d', light: '123' }
-			]
-		};
-		assert.strictEqual(resolve_theme_knob(theme, 'hue_accent', 'light'), 123);
-	});
-
-	test('an intent follows an overridden default-bound letter', () => {
-		const theme: Theme = { name: 't', variables: [{ name: 'hue_a', light: '99' }] };
-		assert.strictEqual(resolve_theme_knob(theme, 'hue_accent', 'light'), 99);
-	});
-
-	test('chroma multipliers resolve to their defaults and honor pins', () => {
-		const empty: Theme = { name: 't', variables: [] };
-		assert.strictEqual(
-			resolve_theme_knob(empty, 'palette_f_chroma_scale', 'light'),
-			PALETTE_CHROMA_MULTIPLIERS.f
-		);
-		assert.strictEqual(resolve_theme_knob(empty, 'palette_a_chroma_scale', 'light'), 1);
-		assert.strictEqual(resolve_theme_knob(empty, 'accent_chroma_scale', 'light'), 1);
-		const pinned: Theme = {
-			name: 't',
-			variables: [{ name: 'palette_f_chroma_scale', light: '1' }]
-		};
-		assert.strictEqual(resolve_theme_knob(pinned, 'palette_f_chroma_scale', 'light'), 1);
-	});
-
-	test('self and mutual cycles resolve to null without hanging', () => {
-		const self: Theme = { name: 't', variables: [{ name: 'hue_a', light: 'var(--hue_a)' }] };
-		assert.strictEqual(resolve_theme_knob(self, 'hue_a', 'light'), null);
-		const mutual: Theme = {
-			name: 't',
-			variables: [
-				{ name: 'hue_a', light: 'var(--hue_b)' },
-				{ name: 'hue_b', light: 'var(--hue_a)' }
-			]
-		};
-		assert.strictEqual(resolve_theme_knob(mutual, 'hue_a', 'light'), null);
-	});
-
-	test('a cyclic theme still yields a report, unchecked and not ok', () => {
-		const mutual: Theme = {
-			name: 't',
-			variables: [
-				{ name: 'hue_a', light: 'var(--hue_b)' },
-				{ name: 'hue_b', light: 'var(--hue_a)' }
-			]
-		};
-		const report = check_theme(mutual);
-		assert.isFalse(report.ok);
-		assert.isAbove(report.unchecked.length, 0);
-	});
-
-	test('an unresolvable calc on a lightness knob leaves the affected gates unchecked', () => {
-		const theme: Theme = {
-			name: 't',
-			variables: [{ name: 'text_lightness_curve', light: 'calc(1 + 2)' }]
-		};
-		assert.strictEqual(resolve_theme_knob(theme, 'text_lightness_50', 'light'), null);
-		const report = check_theme(theme);
-		assert.isFalse(report.ok);
-		assert.isTrue(report.unchecked.some((u) => u.variable === 'text_lightness_curve'));
-	});
-});
+/**
+ * Asserts a report's failing contrast entries are exactly the declared
+ * exceptions, in emission order - all in light, each within its `margin` of
+ * its threshold. Exact, so a regression inside an excepted theme still shows.
+ */
+const assert_declared_contrast_failures = (
+	report: ThemeCheckReport,
+	expected_subjects: Array<string>,
+	margin: number,
+	name: string
+): void => {
+	const contrast = report.entries.filter((e) => e.gate === 'contrast');
+	assert.isAbove(contrast.length, 0, `${name}: contrast gates resolved`);
+	const failing = contrast.filter((e) => !e.pass);
+	assert.deepEqual(
+		failing.map((e) => e.subject),
+		expected_subjects,
+		`${name}: ${JSON.stringify(failing)}`
+	);
+	for (const e of failing) {
+		assert.strictEqual(e.scheme, 'light', `${name}: ${e.subject}`);
+		assert.isAbove(e.value, e.threshold * margin, `${name}: ${e.subject} stays marginal`);
+	}
+};
 
 describe('check_theme', () => {
 	test('the base theme passes every gate with nothing unchecked', () => {
@@ -310,58 +109,129 @@ describe('check_theme', () => {
 	});
 
 	test('low contrast passes every gate', () => {
-		// tuned to the softest shade compression that clears the fixed AA/AAA
-		// thresholds, so the whole registry passes its own gates
 		const report = check_theme(low_contrast_theme);
+		assert.isTrue(report.ok, JSON.stringify(report.entries.filter((e) => !e.pass)));
 		assert.strictEqual(report.unchecked.length, 0);
-		assert.isTrue(report.ok, JSON.stringify(report.entries.filter((e) => !e.pass)));
 	});
 
-	test('concrete passes every gate', () => {
-		assert.isTrue(check_theme(concrete_theme).ok);
+	// every shipped base theme is gated on its own, discovered by glob: it
+	// passes every gate unless it is named here, and each name here has its
+	// own test below for exactly what it gives up
+	const standalone_exceptions = new Set([marquee_theme.name]);
+
+	test('every shipped base theme passes every gate, bar the declared exemplars', () => {
+		for (const theme of shipped_base_themes) {
+			if (standalone_exceptions.has(theme.name)) continue;
+			assert.isTrue(check_theme(theme).ok, theme.name);
+		}
 	});
 
-	test('parchment passes every gate in both schemes', () => {
-		assert.isTrue(check_theme(parchment_theme).ok);
-	});
-
-	test('nineties passes every gate - no clipping, its ground stays inside them', () => {
-		// the theme's whole premise is a ground off the paper-white extreme, and
-		// how far it can step is exactly what these gates bound
-		const report = check_theme(nineties_theme);
-		assert.isTrue(report.ok, JSON.stringify(report.entries.filter((e) => !e.pass)));
-	});
-
-	test('phosphor keeps its contrast gates', () => {
-		const contrast = check_theme(phosphor_theme).entries.filter((e) => e.gate === 'contrast');
-		assert.isAbove(contrast.length, 0, 'contrast gates resolved');
-		assert.isTrue(contrast.every((e) => e.pass));
-	});
-
-	// gamut regression floors for the vivid pair: the deliberate clipping is
-	// part of their design, but a knob edit that doubles it should not land
-	// silently - update these recorded counts when retuning on purpose
-	test.each([
-		['neon', neon_theme, 72],
-		['smolder', smolder_theme, 68]
-	])('%s clips gamut by design but keeps all contrast', (_name, theme, expected_gamut_fails) => {
-		const report = check_theme(theme);
+	// gamut regression floor for the one vivid exemplar: the deliberate
+	// clipping is part of its design, but a knob edit that doubles it should
+	// not land silently - update the recorded count when retuning on purpose
+	test('marquee clips gamut by design and keeps its contrast', () => {
+		const report = check_theme(marquee_theme);
 		const gamut_fails = report.entries.filter((e) => e.gate === 'gamut' && !e.pass);
 		assert.strictEqual(
 			gamut_fails.length,
-			expected_gamut_fails,
+			72,
 			'chroma_scale > 1 clips a recorded set of weak-hue stops'
 		);
-		const contrast = report.entries.filter((e) => e.gate === 'contrast');
-		assert.isAbove(contrast.length, 0, 'contrast gates resolved');
-		assert.isTrue(
-			contrast.every((e) => e.pass),
-			'lightness holds through chroma clipping'
-		);
+		// lightness holds through chroma clipping
+		assert_declared_contrast_failures(report, [], 0.95, marquee_theme.name);
 	});
 
-	test('a mid lightness stop pinned out of order fails monotonicity', () => {
-		const theme: Theme = { name: 't', variables: [{ name: 'shade_lightness_50', light: '0.99' }] };
+	test('the button label gates match the fills and labels a browser renders', () => {
+		// read the recipe from the stylesheet so the gates can't drift from it:
+		// each fill is the fill stop at the alpha `style.css` mixes it to,
+		// composited over the page in gamma-encoded sRGB, and a hovered label
+		// mixes toward `shade_max` in oklab
+		const style = readFileSync('./src/lib/style.css', 'utf8');
+		const fill_alpha = (variable: string): number => {
+			const m = new RegExp(
+				String.raw`--${variable}: color-mix\(in oklab, var\(--fill, var\(--shade_50\)\) (\d+)%, transparent\);`,
+				'u'
+			).exec(style);
+			assert(m, `style.css declares --${variable}`);
+			return Number(m[1]) / 100;
+		};
+		const rest = fill_alpha('button_fill');
+		const hover = fill_alpha('button_fill_hover');
+		const active = fill_alpha('button_fill_active');
+		const hover_mix =
+			/--button_text_color: color-mix\(in oklab, var\(--text_color\) (\d+)%, var\(--shade_max\)\);/u.exec(
+				style
+			);
+		assert(hover_mix, 'style.css declares the hovered button label');
+		const hover_weight = Number(hover_mix[1]) / 100;
+		const report = check_theme(base_theme);
+		const clamp_unit = (c: number): number => Math.min(1, Math.max(0, c));
+		for (const scheme of color_scheme_variants) {
+			const ground = oklch_to_srgb(shade_stop_oklch('00', scheme));
+			// `shade_max` is the far end from the ground: black in light
+			const shade_max: RgbUnit = scheme === 'light' ? [0, 0, 0] : [1, 1, 1];
+			for (const letter of palette_variants) {
+				// the stops the `.palette_X` rule paints its label and tints its fills with
+				const rule = new RegExp(
+					String.raw`button:not\(\.unstyled\)\.palette_${letter}\) \{\s*--text_color: var\(--palette_${letter}_(\d+)\);\s*--fill: var\(--palette_${letter}_(\d+)\);`,
+					'u'
+				).exec(style);
+				assert(rule, `style.css declares the .palette_${letter} button`);
+				const label = oklch_to_srgb(
+					palette_stop_oklch(letter, rule[1] as NumericScaleVariant, scheme)
+				);
+				const fill_color = oklch_to_srgb(
+					palette_stop_oklch(letter, rule[2] as NumericScaleVariant, scheme)
+				);
+				const fill = (alpha: number): RgbUnit =>
+					fill_color.map((c, i) => alpha * c + (1 - alpha) * ground[i]!) as RgbUnit;
+				const label_lab = srgb_to_oklab(label);
+				const max_lab = srgb_to_oklab(shade_max);
+				const hovered = oklab_to_srgb(
+					label_lab.map((c, i) => hover_weight * c + (1 - hover_weight) * max_lab[i]!) as Oklab
+				).map(clamp_unit) as RgbUnit;
+				const expected = [
+					wcag_contrast_ratio(label, fill(rest)),
+					wcag_contrast_ratio(label, fill(active)),
+					wcag_contrast_ratio(hovered, fill(hover)),
+					wcag_contrast_ratio(hovered, fill(active))
+				];
+				button_label_subjects(letter).forEach((subject, i) => {
+					assert(subject.startsWith(`palette_${letter}_${rule[1]} `), subject);
+					const entry = report.entries.find(
+						(e) => e.gate === 'contrast' && e.scheme === scheme && e.subject === subject
+					);
+					assert(entry, `${scheme} ${subject} exists`);
+					assert.closeTo(entry.value, expected[i]!, 1e-9, `${scheme} ${subject}`);
+					assert.strictEqual(entry.threshold, GATE_PALETTE_TEXT);
+					assert.isTrue(entry.pass, `${scheme} ${subject}: ${entry.value}`);
+				});
+				// each step of tint costs contrast against the bare page
+				const on_page = wcag_contrast_ratio(label, ground);
+				assert.isBelow(expected[0]!, on_page, letter);
+				assert.isBelow(expected[1]!, expected[0]!, letter);
+			}
+		}
+	});
+
+	test('a flat lightness curve fails monotonicity', () => {
+		// pow(t, 0) is 1 past the ground, so every stop above 00 lands on 100
+		const theme: Theme = { name: 't', variables: [{ name: 'shade_lightness_curve', base: '0' }] };
+		const entry = check_theme(theme).entries.find(
+			(e) => e.gate === 'monotonicity' && e.scheme === 'light' && e.subject === 'shade_lightness'
+		);
+		assert(entry, 'monotonicity entry exists');
+		assert.isFalse(entry.pass);
+	});
+
+	test('an intermediate a theme carries anyway is ignored, as the renderer drops it', () => {
+		const theme: Theme = { name: 't', variables: [{ name: '_shade_lightness_50', base: '0.99' }] };
+		assert.deepEqual(check_theme(theme), check_theme({ name: 't', variables: [] }));
+	});
+
+	test('stops overshooting the lightness range fail monotonicity as the browser clamps them', () => {
+		// 00 through 10 all overshoot 1 and render at the same lightness
+		const theme: Theme = { name: 't', variables: [{ name: 'shade_lightness_00', base: '1.1' }] };
 		const entry = check_theme(theme).entries.find(
 			(e) => e.gate === 'monotonicity' && e.scheme === 'light' && e.subject === 'shade_lightness'
 		);
@@ -373,7 +243,7 @@ describe('check_theme', () => {
 		// the cyan slot binds the worst-hue caps, so 1.4x pushes past sRGB
 		const theme: Theme = {
 			name: 't',
-			variables: [{ name: 'palette_i_chroma_scale', light: '1.4' }]
+			variables: [{ name: 'palette_i_chroma_scale', base: '1.4' }]
 		};
 		const failing = check_theme(theme).entries.filter(
 			(e) => e.gate === 'gamut' && !e.pass && e.subject.startsWith('palette_i_')
@@ -386,7 +256,7 @@ describe('check_theme', () => {
 		// different chroma, so the accent gets its own gamut entries
 		const unpaired: Theme = {
 			name: 't',
-			variables: [{ name: 'hue_accent', light: 'var(--hue_f)' }]
+			variables: [{ name: 'hue_accent', base: 'var(--hue_f)' }]
 		};
 		assert.isTrue(
 			check_theme(unpaired).entries.some((e) => e.gate === 'gamut' && e.subject === 'accent_50')
@@ -395,38 +265,85 @@ describe('check_theme', () => {
 		const paired: Theme = {
 			name: 't',
 			variables: [
-				{ name: 'hue_accent', light: 'var(--hue_f)' },
-				{ name: 'accent_chroma_scale', light: String(PALETTE_CHROMA_MULTIPLIERS.f) }
+				{ name: 'hue_accent', base: 'var(--hue_f)' },
+				{ name: 'accent_chroma_scale', base: String(PALETTE_CHROMA_MULTIPLIERS.f) }
 			]
 		};
 		assert.isFalse(
 			check_theme(paired).entries.some((e) => e.gate === 'gamut' && e.subject === 'accent_50')
 		);
 	});
+
+	test('a ground tint reaches the gates measured against the page', () => {
+		const body = (theme: Theme): number =>
+			check_theme(theme).entries.find(
+				(e) => e.scheme === 'light' && e.subject === 'text_80 on shade_00'
+			)!.value;
+		const tinted: Theme = {
+			name: 't',
+			// near a light ground's gamut edge - 0.02 already clips at the default 0.97
+			variables: [{ name: 'shade_chroma_00', base: '0.012' }]
+		};
+		const report = check_theme(tinted);
+		assert.isTrue(report.ok);
+		assert.notStrictEqual(body(tinted), body(base_theme));
+	});
+
+	test('a ground tint past sRGB fails gamut at the ground', () => {
+		const report = check_theme({
+			name: 't',
+			variables: [{ name: 'shade_chroma_00', base: '0.1' }]
+		});
+		const ground = report.entries.find(
+			(e) => e.gate === 'gamut' && e.scheme === 'light' && e.subject === 'shade_00'
+		);
+		assert(ground, 'shade_00 gamut entry exists');
+		assert.isFalse(ground.pass);
+		// the near-ground stops carry their share of it, past sRGB too
+		const near_ground = report.entries.find(
+			(e) => e.gate === 'gamut' && e.scheme === 'light' && e.subject === 'shade_05'
+		);
+		assert(near_ground, 'shade_05 gamut entry exists');
+		assert.isFalse(near_ground.pass);
+		// the stops past the tint's reach don't carry it
+		const past_reach = report.entries.filter(
+			(e) =>
+				e.gate === 'gamut' &&
+				e.subject.startsWith('shade_') &&
+				neutral_ground_chroma_weight(
+					'shade',
+					e.subject.slice('shade_'.length) as NumericScaleVariant
+				) === 0
+		);
+		assert.isNotEmpty(past_reach);
+		assert.isTrue(past_reach.every((e) => e.pass));
+	});
+
+	test('a ground tint that resolves to no number leaves the near-ground stops unchecked', () => {
+		const report = check_theme({
+			name: 't',
+			variables: [{ name: 'shade_chroma_00', base: 'calc(0.01 * 2)' }]
+		});
+		assert.isFalse(report.ok);
+		assert.isTrue(report.unchecked.some((u) => u.variable === 'shade_chroma_00'));
+	});
+
+	test('ramp intermediates a theme sets are ignored, as the renderer drops them', () => {
+		// the schema refuses these and the renderer drops them, so the gates
+		// measure the derived ramps the page renders
+		const report = check_theme({
+			name: 't',
+			variables: [
+				{ name: '_palette_lightness_60', base: '0.99' },
+				{ name: '_palette_chroma_60', base: '0.4' }
+			]
+		});
+		assert.deepEqual(report, check_theme({ name: 't', variables: [] }));
+		assert.isTrue(report.ok);
+	});
 });
 
 describe('scheme stance', () => {
-	test('a dark stance resolves light-scheme knobs to the dark defaults', () => {
-		const theme: Theme = { name: 't', variables: [], scheme: 'dark' };
-		assert.strictEqual(
-			resolve_theme_knob(theme, 'shade_lightness_00', 'light'),
-			SHADE_LIGHTNESS_KNOBS.dark.lightness_00
-		);
-		assert.strictEqual(
-			resolve_theme_knob(theme, 'palette_chroma_max', 'light'),
-			PALETTE_CHROMA_KNOBS.dark.chroma_max
-		);
-	});
-
-	test('an authored value beats the stance mirror', () => {
-		const theme: Theme = {
-			name: 't',
-			variables: [{ name: 'shade_lightness_00', light: '0.5' }],
-			scheme: 'dark'
-		};
-		assert.strictEqual(resolve_theme_knob(theme, 'shade_lightness_00', 'light'), 0.5);
-	});
-
 	test('a dark stance evaluates the same reality in both schemes', () => {
 		const report = check_theme({ name: 't', variables: [], scheme: 'dark' });
 		assert.isTrue(report.ok, JSON.stringify(report.entries.filter((e) => !e.pass)));
@@ -461,7 +378,7 @@ describe('scheme stance', () => {
 		expect_subject('text_80 on shade_00', GATE_BODY_TEXT);
 		expect_subject('text_80 on shade_05', GATE_BODY_TEXT);
 		expect_subject('text_80 on shade_10', GATE_BODY_TEXT);
-		expect_subject('text_00 on shade_50', GATE_SELECTED_TEXT);
+		expect_subject('text_00 on shade_60', GATE_SELECTED_TEXT);
 		expect_subject('text_50 on shade_00', GATE_SUBTLE_TEXT);
 		expect_subject('shade_30 vs shade_00', GATE_BORDER);
 		expect_subject('border_color_30 over shade_00', GATE_BORDER_DIVIDER);
@@ -469,12 +386,17 @@ describe('scheme stance', () => {
 		for (const letter of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']) {
 			expect_subject(`palette_${letter}_50 vs shade_00`, GATE_UI);
 			expect_subject(`text_max on palette_${letter}_50`, GATE_FILL_TEXT);
-			expect_subject(`text_00 on palette_${letter}_50`, GATE_SELECTED_TEXT);
+			expect_subject(`text_00 on palette_${letter}_60`, GATE_SELECTED_TEXT);
+			expect_subject(`palette_${letter}_60 on shade_00`, GATE_PALETTE_TEXT);
+			for (const subject of button_label_subjects(letter)) {
+				expect_subject(subject, GATE_PALETTE_TEXT);
+			}
+			expect_subject(chip_subject(letter), GATE_PALETTE_TEXT);
 		}
 	});
 
 	test('the stanced exemplars pass their contrast gates in both schemes', () => {
-		for (const theme of [neon_theme, phosphor_theme]) {
+		for (const theme of [marquee_theme, phosphor_theme]) {
 			const contrast = check_theme(theme).entries.filter((e) => e.gate === 'contrast');
 			assert.isAbove(contrast.length, 0, `${theme.name}: contrast gates resolved`);
 			assert.isTrue(
@@ -485,99 +407,10 @@ describe('scheme stance', () => {
 	});
 });
 
-describe('create_theme_resolver', () => {
-	test('resolves the derived border_color_chroma default per scheme', () => {
-		const resolver = create_theme_resolver({ name: 't', variables: [] });
-		assert.closeTo(
-			resolver.resolve('border_color_chroma', 'light')!,
-			NEUTRAL_CHROMA.light * BORDER_CHROMA_MULTIPLIER.light,
-			1e-9
-		);
-		assert.closeTo(
-			resolver.resolve('border_color_chroma', 'dark')!,
-			NEUTRAL_CHROMA.dark * BORDER_CHROMA_MULTIPLIER.dark,
-			1e-9
-		);
-	});
-
-	test('the derivation tracks a theme-pinned neutral_chroma', () => {
-		const resolver = create_theme_resolver({
-			name: 't',
-			variables: [{ name: 'neutral_chroma', light: '0.05' }]
-		});
-		assert.closeTo(
-			resolver.resolve('border_color_chroma', 'light')!,
-			0.05 * BORDER_CHROMA_MULTIPLIER.light,
-			1e-9
-		);
-	});
-
-	test('a pinned border_color_chroma wins over the derivation', () => {
-		const resolver = create_theme_resolver({
-			name: 't',
-			variables: [{ name: 'border_color_chroma', light: '0.09' }]
-		});
-		assert.strictEqual(resolver.resolve('border_color_chroma', 'light'), 0.09);
-	});
-
-	test('pinned() reports authored variables only, excluding stance-mirror entries', () => {
-		const resolver = create_theme_resolver({
-			name: 't',
-			variables: [{ name: 'chroma_scale', light: '0.5' }],
-			scheme: 'dark'
-		});
-		assert.isTrue(resolver.pinned('chroma_scale'));
-		assert.isFalse(resolver.pinned('shade_lightness_00'));
-		// the mirror still resolves through: light reads the dark default
-		assert.strictEqual(
-			resolver.resolve('shade_lightness_00', 'light'),
-			SHADE_LIGHTNESS_KNOBS.dark.lightness_00
-		);
-	});
-
-	test('a dark stance derives border_color_chroma identically in both schemes', () => {
-		const resolver = create_theme_resolver(neon_theme);
-		const light = resolver.resolve('border_color_chroma', 'light');
-		const dark = resolver.resolve('border_color_chroma', 'dark');
-		assert.isNotNull(light);
-		assert.strictEqual(light, dark);
-	});
-
-	test('values outside the color system resolve to null', () => {
-		const resolver = create_theme_resolver({ name: 't', variables: [] });
-		assert.isNull(resolver.resolve('space_md', 'light'));
-		assert.isNull(resolver.resolve('button_shadow', 'light'));
-	});
-});
-
 describe('contrast modifier compositions', () => {
-	// discover the shipped themes by glob like themes.test.ts, so a new
+	// the shipped themes come from a glob (see theme_test_helpers.ts), so a new
 	// exemplar module can't be silently left out of the composition matrix
-	const theme_modules = import.meta.glob('../lib/themes/*.ts', { eager: true });
-	const is_theme = (value: unknown): value is Theme =>
-		value !== null &&
-		typeof value === 'object' &&
-		'name' in value &&
-		'variables' in value &&
-		Array.isArray((value as Theme).variables);
-	const modifier_names = new Set(contrast_modifiers.map((t) => t.name));
-	const bases: Array<Theme> = Object.values(theme_modules)
-		.flatMap((mod) => Object.values(mod as Record<string, unknown>).filter(is_theme))
-		.filter((t) => !modifier_names.has(t.name));
-
-	test('the glob discovers every hand-known base', () => {
-		const names = new Set(bases.map((t) => t.name));
-		for (const expected of [
-			default_themes[0]!.name,
-			smolder_theme.name,
-			parchment_theme.name,
-			concrete_theme.name,
-			phosphor_theme.name,
-			neon_theme.name
-		]) {
-			assert.isTrue(names.has(expected), expected);
-		}
-	});
+	const bases = shipped_base_themes;
 
 	test('every base × modifier validates with no errors', () => {
 		for (const base of bases) {
@@ -588,11 +421,6 @@ describe('contrast modifier compositions', () => {
 			}
 		}
 	});
-
-	// declared exception: smolder's past-cap cyan/teal UI fills sit just
-	// under the 3:1 fill gate against low contrast's raised background floor
-	// (~2.89 to 2.91) - a marginal, known combination cost, not a regression
-	const known_failing = new Set(['smolder (low contrast)']);
 
 	test('every base × modifier resolves fully and keeps its lightness ramps monotonic', () => {
 		for (const base of bases) {
@@ -610,22 +438,38 @@ describe('contrast modifier compositions', () => {
 		}
 	});
 
-	test('every base × modifier keeps its contrast gates, minus declared exceptions', () => {
+	test('every base × modifier keeps its contrast gates', () => {
 		for (const base of bases) {
 			for (const modifier of contrast_modifiers) {
 				const composed = compose_themes(base, modifier);
-				const contrast = check_theme(composed).entries.filter((e) => e.gate === 'contrast');
-				assert.isAbove(contrast.length, 0, `${composed.name}: contrast gates resolved`);
-				const failing = contrast.filter((e) => !e.pass);
-				if (known_failing.has(composed.name)) {
-					// the exception stays marginal: only near-threshold fill gates fail
-					assert.isAbove(failing.length, 0, `${composed.name}: exception no longer needed`);
-					for (const e of failing) {
-						assert.isAbove(e.value, e.threshold * 0.9, `${composed.name}: ${e.subject}`);
-					}
-				} else {
-					assert.deepEqual(failing, [], `${composed.name}: ${JSON.stringify(failing)}`);
-				}
+				assert_declared_contrast_failures(check_theme(composed), [], 1, composed.name);
+			}
+		}
+	});
+
+	test('a base with stronger rules cedes them to high contrast, down to the floor and no further', () => {
+		// a base with stronger rules of its own (zine) cedes them to the modifier,
+		// so the floor is what every composition is held to, not the base's value
+		const composed = check_theme(compose_themes(zine_theme, high_contrast_theme));
+		const own = check_theme(zine_theme);
+		const border = (report: ThemeCheckReport, scheme: string): number =>
+			report.entries.find((e) => e.subject === 'border_color vs shade_00' && e.scheme === scheme)!
+				.value;
+		for (const scheme of color_scheme_variants) {
+			assert.isBelow(border(composed, scheme), border(own, scheme), scheme);
+			assert.isAtLeast(border(composed, scheme), GATE_UI, scheme);
+		}
+	});
+
+	test('high contrast holds control borders at the non-text floor over every base', () => {
+		// at the extreme ground an input's sunken fill can't separate from the
+		// page, so the border is what marks a control - WCAG 1.4.11's 3:1
+		for (const base of bases) {
+			const report = check_theme(compose_themes(base, high_contrast_theme));
+			const borders = report.entries.filter((e) => e.subject === 'border_color vs shade_00');
+			assert.isAbove(borders.length, 0, `${base.name}: the border pairing resolved`);
+			for (const e of borders) {
+				assert.isAtLeast(e.value, GATE_UI, `${base.name} ${e.scheme}`);
 			}
 		}
 	});

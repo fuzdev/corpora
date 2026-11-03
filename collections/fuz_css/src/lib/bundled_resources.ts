@@ -1,11 +1,11 @@
 /**
- * Construction of the bundled CSS resources (style-rule index, variable graph,
- * class→variable index) shared by the Gro generator and the Vite plugin.
+ * Construction of the bundled CSS resources (style-rule index and variable
+ * graph) the generator core renders with.
  *
- * The two generators consume these differently - the Gro generator caches one
- * bundle per instance, the Vite plugin loads lazily on first virtual-module
- * access - but build them identically from the same options. This keeps that
- * construction in one place.
+ * The Vite plugin loads them eagerly at dev-server startup and on first
+ * virtual-module access in a build, once per plugin instance, through
+ * `css_generator.ts`. This keeps their construction from the options in one
+ * place.
  *
  * @module
  */
@@ -20,10 +20,9 @@ import {
 	type VariableDependencyGraph,
 	build_variable_graph_from_options
 } from './variable_graph.ts';
-import { type CssClassVariableIndex, build_class_variable_index } from './class_variable_index.ts';
-import type { CssClassDefinition } from './css_class_generation.ts';
 import type { BaseCssOption, VariablesOption } from './css_plugin_options.ts';
 import type { Theme } from './variable.ts';
+import type { ResolvedTheme } from './theme.ts';
 import type { CacheDeps } from './deps.ts';
 
 /**
@@ -33,7 +32,6 @@ import type { CacheDeps } from './deps.ts';
 export interface BundledCssResources {
 	style_rule_index: StyleRuleIndex;
 	variable_graph: VariableDependencyGraph;
-	class_variable_index: CssClassVariableIndex;
 }
 
 export interface CreateBundledResourcesOptions {
@@ -41,23 +39,26 @@ export interface CreateBundledResourcesOptions {
 	base_css: BaseCssOption;
 	/** Theme variables source. */
 	variables: VariablesOption;
-	/** Optional theme baked into the variables, overlaid last-wins by name. */
-	theme?: Theme | null;
-	/** Merged class definitions, indexed to their referenced variables. */
-	class_definitions: Record<string, CssClassDefinition | undefined>;
+	/**
+	 * Optional theme baked into the variables, overlaid last-wins by name with
+	 * the mirror and caps `bake_theme` derives for it.
+	 */
+	theme?: Theme | ResolvedTheme | null;
 	/** Filesystem deps for loading the default `style.css`. */
 	deps: CacheDeps;
 }
 
 /**
- * Builds the bundled CSS resources from generator options. The `style.css`
- * index is always built (even when only theme output is enabled), matching the
- * generators' prior behavior.
+ * Builds the bundled CSS resources from generator options. The style-rule
+ * index is always built, even when only theme output is enabled - from the
+ * default `style.css` unless `base_css` supplies a stylesheet.
+ *
+ * @throws if `base_css` supplies something that isn't parseable CSS, including a callback that returns a non-string
  */
 export const create_bundled_resources = async (
 	options: CreateBundledResourcesOptions
 ): Promise<BundledCssResources> => {
-	const { base_css, variables, theme, class_definitions, deps } = options;
+	const { base_css, variables, theme, deps } = options;
 
 	let style_rule_index: StyleRuleIndex;
 	if (typeof base_css === 'string') {
@@ -65,8 +66,15 @@ export const create_bundled_resources = async (
 		style_rule_index = create_style_rule_index(base_css);
 	} else if (typeof base_css === 'function') {
 		// callback to modify the default CSS
-		const default_css = await load_default_style_css(deps);
-		style_rule_index = create_style_rule_index(base_css(default_css));
+		const result: unknown = base_css(await load_default_style_css(deps));
+		if (typeof result !== 'string') {
+			throw new Error(
+				`The base_css callback must return a CSS string, got ${
+					result === null ? 'null' : typeof result
+				}`
+			);
+		}
+		style_rule_index = create_style_rule_index(result);
 	} else {
 		// default style.css (undefined or null)
 		style_rule_index = await load_style_rule_index(deps);
@@ -74,7 +82,6 @@ export const create_bundled_resources = async (
 
 	return {
 		style_rule_index,
-		variable_graph: build_variable_graph_from_options(variables, theme),
-		class_variable_index: build_class_variable_index(class_definitions)
+		variable_graph: build_variable_graph_from_options(variables, theme)
 	};
 };

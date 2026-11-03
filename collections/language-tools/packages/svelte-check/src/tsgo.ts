@@ -1,5 +1,6 @@
-import * as syncApi from '@typescript/native-preview/unstable/sync';
-import * as syncAst from '@typescript/native-preview/unstable/ast';
+import * as syncApi from '@typescript/native/unstable/sync';
+import * as syncAst from '@typescript/native/unstable/ast';
+import * as syncFs from '@typescript/native/unstable/fs';
 import { pathToFileURL } from 'url';
 
 interface PkgInfo {
@@ -14,10 +15,27 @@ interface PkgInfo {
 }
 
 export function tryParseTsGoVersion(tsconfigPath: string): PkgInfo | null {
-    // TODO: Most likely it'll eventually be released under the 'typescript' package.
-    // When it happened, check where the nightly versions are released and decide which package to prioritize.
+    const pkg =
+        tryParsePkg(tsconfigPath, '@typescript/native') ??
+        tryParsePkg(tsconfigPath, '@typescript/native-preview');
 
-    return tryParsePkg(tsconfigPath, '@typescript/native-preview');
+    if (
+        pkg &&
+        (pkg.pkgJsonName === 'typescript' || pkg.pkgJsonName === '@typescript/native-preview') &&
+        pkg.major >= 7
+    ) {
+        return pkg;
+    }
+
+    return null;
+}
+
+export function formatTsGoNotFoundError(flagName: string) {
+    return (
+        `svelte-check ${flagName} requires TypeScript 7 to be installed in the workspace.` +
+        `You can setup TypeScript 7 with an npm alias via the following command.\n` +
+        `npm install --save-dev typescript@~6 @typescript/native@npm:typescript@7\n`
+    );
 }
 
 function tryParsePkg(tsconfigPath: string, name: string): PkgInfo | null {
@@ -54,20 +72,33 @@ export async function tryLoadApi(
     tsconfigPath: string,
     info: PkgInfo
 ): Promise<typeof syncApi | null> {
-    return (
-        (await tryImport(info.moduleName + '/unstable/sync', tsconfigPath)) ??
-        (await tryImport(info.moduleName + '/sync', tsconfigPath))
-    );
+    if (shouldLoadStableApi(info)) {
+        return await tryImport(info.moduleName + '/sync', tsconfigPath);
+    }
+
+    return await tryImport(info.moduleName + '/unstable/sync', tsconfigPath);
 }
 
 export async function tryLoadAst(
     tsconfigPath: string,
     info: PkgInfo
 ): Promise<typeof syncAst | null> {
-    return (
-        (await tryImport(info.moduleName + '/unstable/ast', tsconfigPath)) ??
-        (await tryImport(info.moduleName + '/ast', tsconfigPath))
-    );
+    if (shouldLoadStableApi(info)) {
+        return await tryImport(info.moduleName + '/ast', tsconfigPath);
+    }
+
+    return await tryImport(info.moduleName + '/unstable/ast', tsconfigPath);
+}
+
+export async function tryLoadFs(
+    tsconfigPath: string,
+    info: PkgInfo
+): Promise<typeof syncFs | null> {
+    if (shouldLoadStableApi(info)) {
+        return await tryImport(info.moduleName + '/fs', tsconfigPath);
+    }
+
+    return await tryImport(info.moduleName + '/unstable/fs', tsconfigPath);
 }
 
 async function tryImport(moduleName: string, tsconfigPath: string): Promise<any | null> {
@@ -79,4 +110,8 @@ async function tryImport(moduleName: string, tsconfigPath: string): Promise<any 
     } catch (e) {
         return null;
     }
+}
+
+function shouldLoadStableApi(pkg: PkgInfo) {
+    return pkg.major > 7 || (pkg.major === 7 && pkg.minor >= 1);
 }

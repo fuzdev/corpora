@@ -32,11 +32,15 @@ import { parseComment } from './tsdoc.ts';
 import {
 	getLocalExportStatement,
 	isDeclaredInFile,
+	isStrayComponentTypedef,
 	selectDeclarationNode
 } from './typescript-extract-shared.ts';
 import {
 	isAliasLostType,
+	isTypeAliasLike,
 	namedSymbolName,
+	linkableAliasSymbol,
+	typeAliasTypeParameters,
 	unionMemberSetKey,
 	type AliasRegistry,
 	type AliasRegistryEntry
@@ -59,10 +63,14 @@ export interface AliasRegistrySource {
 }
 
 /**
- * Depth bound for the safety-gate walk, alongside the seen-set — the set is
- * what terminates cycles (zod 4's documented recursive getter pattern produces
- * cyclic lost types that overflow an unguarded walk); the bound caps
- * pathological non-cyclic nesting.
+ * Depth bound for the safety-gate walk, alongside the seen-set. The walk
+ * follows only union/intersection members and array/tuple/reference type
+ * arguments, never properties, and stops at any aliased or anonymous
+ * component, so a cyclic lost object type (what a getter-based recursive
+ * schema infers) qualifies at its root without descending. The set is
+ * defensive against revisiting a shared component; the bound stops a
+ * deeply nested container from registering: past it the alias stays
+ * unregistered and `alias_lost` reports it.
  */
 const MAX_GATE_WALK_DEPTH = 10;
 
@@ -70,7 +78,8 @@ const MAX_GATE_WALK_DEPTH = 10;
  * The safety gate: whether a type recursively contains at least one component
  * the checker cannot name — an anonymous object/function/mapped shape, keyed
  * on `namedSymbolName`'s `__`-prefix rule (never `ObjectFlags.Anonymous`: real
- * zod outputs are `Mapped | Instantiated`, not `Anonymous`).
+ * inferred schema outputs, zod's and valibot's, are `Mapped | Instantiated`,
+ * not `Anonymous`).
  *
  * Two things ride on it:
  *
@@ -96,8 +105,9 @@ const containsAnonymousComponent = (
 	if (depth > MAX_GATE_WALK_DEPTH) return false;
 	if (seen.has(type)) return false;
 	seen.add(type);
-	// an aliased component prints by its alias name — readable, stop
-	if (type.aliasSymbol !== undefined) return false;
+	// an aliased component prints by its alias name — readable, stop (a
+	// svelte2tsx-generated alias doesn't count: its name is a dead lookup key)
+	if (linkableAliasSymbol(type) !== undefined) return false;
 	if (type.isUnion() || type.isIntersection()) {
 		return type.types.some((t) => containsAnonymousComponent(t, checker, seen, depth + 1));
 	}
@@ -139,11 +149,13 @@ const winsTieBreak = (next: AliasRegistryEntry, incumbent: AliasRegistryEntry): 
  * it:
  *
  * - survives the svelte2tsx filters on virtuals (`default` and generated
- *   `$$`/`__sveltets_` names skipped)
+ *   `$$`/`__sveltets_` names skipped, and stray HTML-comment typedefs,
+ *   `isStrayComponentTypedef`)
  * - is declared in the file (star-projected bindings skipped, mirroring
  *   `analyzeExports`'s locality rule)
  * - resolves — through local export clauses, `@nodocs`-free ones only — to a
- *   `TypeAliasDeclaration` in the *same* file (a re-export of another module's
+ *   type alias (`isTypeAliasLike`: a `TypeAliasDeclaration` or a JSDoc
+ *   `@typedef`/`@callback`) in the *same* file (a re-export of another module's
  *   alias registers from that module when it's emitted, and never when it's
  *   gated — gated aliases have no doc page for a reference to land on;
  *   merged value+type symbols select the type-space node via
@@ -178,7 +190,12 @@ export const buildAliasRegistry = (
 
 		for (const exportSymbol of checker.getExportsOfModule(moduleSymbol)) {
 			const name = exportSymbol.name;
-			if (isVirtual && isSvelte2tsxGeneratedExport(name)) continue;
+			if (
+				isVirtual &&
+				(isSvelte2tsxGeneratedExport(name) || isStrayComponentTypedef(exportSymbol))
+			) {
+				continue;
+			}
 			if (!isDeclaredInFile(exportSymbol, currentFileName)) continue;
 
 			let resolved = exportSymbol;
@@ -195,11 +212,11 @@ export const buildAliasRegistry = (
 			}
 
 			const declNode = selectDeclarationNode(resolved);
-			if (!declNode || !ts.isTypeAliasDeclaration(declNode)) continue;
+			if (!declNode || !isTypeAliasLike(declNode)) continue;
 			// canonical declared elsewhere: its own module's walk registers it (or
 			// deliberately doesn't, when that module is gated from output)
 			if (stripVirtualSuffix(declNode.getSourceFile().fileName) !== currentFileName) continue;
-			if (declNode.typeParameters?.length) continue;
+			if (typeAliasTypeParameters(declNode).length) continue;
 			if (hasNodocs(declNode)) continue;
 			// merged value+type pair: @nodocs on either declaration suppresses,
 			// matching analyzeDeclaration's rule

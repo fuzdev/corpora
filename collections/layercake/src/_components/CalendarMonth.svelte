@@ -1,71 +1,70 @@
 <!--
 	@component
-	Generates an SVG calendar chart.
+	Generates an SVG calendar for one month, one square per day, colored by the `c` scale. The x accessor must give each row a `YYYY-MM-DD` date string, and the x scale should be a `scaleBand()` since the dates are categories, not numbers.
+
+	The squares are sized from the chart's width and height, which are pixels. Inside a `<ScaledSvg>` the drawing happens in a 0-100 viewBox instead, so pass `calcCellSize` and return a size in those units, e.g. `calcCellSize={() => 100 / 7}` to fit seven columns across.
  -->
 <script>
-	import { getContext } from 'svelte';
 	import { utcFormat } from 'd3-time-format';
 	import { utcDay } from 'd3-time';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { width, height, data, x, z, zScale, extents } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {(w: number, h: number) => number} [calcCellSize] - A function given the canvas width and height as arguments and expects a return number that will be used as the width and height for each cell. The default will choose a size that fits seven cells across and five rows top to bottom.
+	 * @property {(w: number, h: number) => number} [calcCellSize] - Returns the size of each day's square. It's called with the chart's width and height, which are always pixels. Inside a `<ScaledSvg>` ignore both and return a size in viewBox units. The default fits seven columns across and one row for every week the month spans.
 	 */
 
 	/** @type {Props} */
-	let { calcCellSize = (w, h) => Math.min(w / 7, h / 5) } = $props();
+	let { calcCellSize = (w, h) => Math.min(w / 7, h / rows) } = $props();
 
 	const getDate = utcFormat('%Y-%m-%d');
 	const getDayOfWeek = utcFormat('%w');
 	const getWeekOfYear = utcFormat('%U');
 
-	let count = $derived(date => {
-		const stringDate = date.toISOString().split('T')[0];
-		const days = $data.filter(d => $x(d) === stringDate)[0];
-		if (days) {
-			return $z(days);
-		}
-		return 0;
-	});
+	// The c value of the row for this day, or undefined when the day has no row
+	/** @param {Date} date */
+	function getDayValue(date) {
+		const dateString = date.toISOString().split('T')[0];
+		const row = k.data.find(d => k.x(d) === dateString);
+		return row === undefined ? undefined : k.c?.(row);
+	}
 
-	let fillColor = $derived(day => {
-		const n = count(day);
-		return n ? $zScale(n) : '#fff';
-	});
+	// Days with no row, and charts with no c dimension, stay white
+	/** @param {Date} day */
+	function getFill(day) {
+		const value = getDayValue(day);
+		return value === undefined ? '#fff' : (k.cScale?.(value) ?? '#fff');
+	}
 
-	let cellSize = $derived(calcCellSize($width, $height));
-
-	/**
-	 * Calculate what month we're in and generate the full days of that month
-	 */
+	// Every day of the month that the earliest x value falls in. The extent is a
+	// min and max on a linear scale and a list of values on a band scale, so
+	// sort either way.
 	/** @type {Date[]} */
 	let days = $derived.by(() => {
-		const minDate = $extents.x[0];
-		const parts = minDate.split('-').map(d => +d);
-
-		return utcDay.range(
-			new Date(Date.UTC(parts[0], parts[1] - 1, 1)),
-			new Date(Date.UTC(parts[0], parts[1], 1))
-		);
+		const earliest = [...k.extents.x].map(String).sort()[0];
+		const [year, month] = earliest.split('-').map(Number);
+		return utcDay.range(new Date(Date.UTC(year, month - 1, 1)), new Date(Date.UTC(year, month, 1)));
 	});
 
-	let rectX = $derived(day => +getDayOfWeek(day) * cellSize);
-	let rectY = $derived(day => {
-		const startWeek = +getWeekOfYear(
-			new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), 1))
-		);
-		const thisWeek = +getWeekOfYear(day);
-		const weekDiff = thisWeek - startWeek;
+	// The week rows this month covers, counting the part-weeks at either end.
+	// Most months take five, some take six.
+	let rows = $derived(Math.ceil((+getDayOfWeek(days[0]) + days.length) / 7));
+
+	// Pixels, unless the caller's calcCellSize returns some other unit
+	let cellSize = $derived(calcCellSize(k.width, k.height));
+
+	// Columns are days of the week, rows are weeks counted from the month's first day
+	/** @param {Date} day */
+	function rectX(day) {
+		return +getDayOfWeek(day) * cellSize;
+	}
+	/** @param {Date} day */
+	function rectY(day) {
+		const firstOfMonth = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), 1));
+		const weekDiff = +getWeekOfYear(day) - +getWeekOfYear(firstOfMonth);
 		return weekDiff * cellSize;
-	});
-
-	/**
-	 * @param {Date} day
-	 */
-	function showCount(day) {
-		console.log(day, count(day));
 	}
 </script>
 
@@ -76,9 +75,7 @@
 		height={cellSize}
 		x={rectX(day)}
 		y={rectY(day)}
-		style="fill:{fillColor(day)};"
-		onmouseenter={() => showCount(day)}
-		role="tooltip"><title>{getDate(day)}</title></rect
+		style="fill:{getFill(day)};"><title>{getDate(day)}</title></rect
 	>
 {/each}
 

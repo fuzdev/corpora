@@ -10,20 +10,16 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
 import {
 	role_grant_offer_create_action_spec,
 	role_grant_offer_retract_action_spec,
 	ERROR_ROLE_GRANT_OFFER_NOT_FOUND
-} from '$lib/auth/role_grant_offer_action_specs.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import {
-	RPC_PATH,
-	create_route_specs,
-	describe_db,
-	session_options
-} from './role_grant_offer_test_helpers.ts';
+} from '#lib/auth/role_grant_offer_action_specs.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { RPC_PATH, create_route_specs, session_options } from './role_grant_offer_test_helpers.ts';
 
 describe_db('role_grant_offer_actions.retract', (get_db) => {
 	describe('role_grant_offer_retract', () => {
@@ -54,7 +50,9 @@ describe_db('role_grant_offer_actions.retract', (get_db) => {
 			});
 			assert.ok(res.ok);
 			assert.strictEqual(res.status, 200);
-			assert.deepStrictEqual(res.result, { ok: true });
+			// the terminal offer, as accept answers its own
+			assert.strictEqual(res.result.offer.id, offer_id);
+			assert.ok(res.result.offer.retracted_at);
 		});
 
 		test('non-grantor retract attempt returns offer_not_found', async () => {

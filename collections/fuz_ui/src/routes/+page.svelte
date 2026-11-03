@@ -1,15 +1,14 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	import DocsFooter from '$lib/DocsFooter.svelte';
-	import Card from '$lib/Card.svelte';
-	import ProjectActivityChart from '$lib/ProjectActivityChart.svelte';
-	import ProjectLinks from '$lib/ProjectLinks.svelte';
-	import { site_context } from '$lib/site.svelte.ts';
-	import Svg from '$lib/Svg.svelte';
-	import { logo_fuz_ui } from '$lib/logos.ts';
-	import { FUZ_DEV_URL, MAIN_HEADER_MARGIN_TOP } from '$lib/constants.ts';
-	import { DOCS_PATH } from '$lib/docs_helpers.svelte.ts';
+	import DocsFooter from '#lib/DocsFooter.svelte';
+	import Card from '#lib/Card.svelte';
+	import ProjectLinks from '#lib/ProjectLinks.svelte';
+	import { site_context } from '#lib/site.svelte.ts';
+	import Svg from '#lib/Svg.svelte';
+	import { logo_fuz_ui } from '#lib/logos.ts';
+	import { FUZ_DEV_URL, MAIN_HEADER_MARGIN_TOP } from '#lib/constants.ts';
+	import { DOCS_PATH } from '#lib/docs_helpers.svelte.ts';
 
 	const site = site_context.get();
 </script>
@@ -25,16 +24,15 @@
 			<div class="mb_lg p_xs2 shadow_md border_radius_sm">
 				<div class="width_atmost_sm panel p_lg shadow_inset_xs shade_00">
 					<p>
-						fuz_ui is a Svelte UI library with components and helpers for making zippy websites.
-						It's built on <a href="https://css.fuz.dev/">fuz_css</a>
-						and provides a documentation system built on
-						<a href="https://svelte-docinfo.fuz.dev/">svelte-docinfo</a>. fuz_ui emphasizes
-						capability and efficiency and tries to be simple for those goals.
+						fuz_ui is a Svelte component library with frontend helpers for making zippy websites.
+						It's built on <a href="https://css.fuz.dev/">fuz_css</a> and provides a documentation
+						system built on <a href="https://svelte-docinfo.fuz.dev/">svelte-docinfo</a>. fuz_ui
+						emphasizes capability and efficiency and tries to be simple for those goals.
 					</p>
 					<p>
 						<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-						To learn more see <a href={DOCS_PATH}>the docs</a>
-						and <a href="https://github.com/fuzdev/fuz_ui#readme">readme</a>. Feel free to take the
+						To learn more see <a href={DOCS_PATH}>the docs</a> and
+						<a href="https://github.com/fuzdev/fuz_ui#readme">readme</a>. Feel free to take the
 						ideas and <a href="https://github.com/fuzdev/fuz_ui">code</a> for your own purposes.
 					</p>
 				</div>
@@ -42,14 +40,10 @@
 		</section>
 		<section>
 			<!-- TODO add color variants -->
-			<Card href={DOCS_PATH}>docs{#snippet icon()}{site.glyph}{/snippet}</Card>
+			<Card href={DOCS_PATH} icon={site.glyph}>docs</Card>
 		</section>
 		<section class="panel p_lg shadow_inset_xs">
 			<ProjectLinks />
-		</section>
-		<section class="panel p_lg shadow_inset_xs">
-			<ProjectActivityChart />
-			<small class="display:block text-align:right">weekly commit activity, all projects</small>
 		</section>
 		<section>
 			<DocsFooter repo_url={site.repo_url} root_url={FUZ_DEV_URL}>

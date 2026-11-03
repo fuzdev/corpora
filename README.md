@@ -46,7 +46,7 @@ module-type or config file a runtime reads to load the source as written, such a
 `package.json` whose `"type": "module"` tells Node the `.ts` files are ESM. Each must exist
 at the pinned commit.
 
-Each collection is tagged `shaped_by` (`tsv`, `prettier`, `none`): who last formatted
+Each collection is tagged `shaped_by` (`tsv`, `prettier`, `oxfmt`, `none`): who last formatted
 it. A formatter benchmarked on code it already shaped measures its idempotent path, so
 consumers can select a fair subset.
 

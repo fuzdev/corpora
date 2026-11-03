@@ -4,6 +4,9 @@ Gro's [SvelteKit library plugin](/src/lib/gro_plugin_sveltekit_library.ts)
 uses [`svelte-package`](https://svelte.dev/docs/kit/packaging)
 to build libraries from `src/lib/` for publishing to npm.
 
+> Where it's going: on the [runtime](runtime.md), `svelte-package` runs as a subprocess under the run's kernel rules;
+> the published output doesn't change.
+
 ## detection
 
 The [default config](/src/lib/gro.config.default.ts) enables this plugin
@@ -11,10 +14,7 @@ when all three conditions are met:
 
 1. `@sveltejs/kit` is a dependency in `package.json`
 2. `@sveltejs/package` is listed in `package.json` dependencies
-3. `src/lib/` directory exists (or the path configured by `kit.files.lib`)
-
-They're checked in that order, so a project that isn't a library never reads the
-Svelte config, which is the only one of the three that costs anything.
+3. `src/lib/` directory exists
 
 Only `dependencies` and `devDependencies` count for the first two - a peer dep
 declares what a package works alongside, not what the package itself is.
@@ -40,7 +40,7 @@ already-`.js` specifiers are left untouched.
 In development (`gro dev`), does nothing — `svelte-package` is a build-time tool.
 
 During `adapt`, if `package.json` has a `bin` field,
-the plugin makes the binaries executable and runs `npm link -f`
+the plugin makes the binaries executable and runs `npm link -f` (the config's `pm_cli`)
 so CLI commands are available locally after building.
 
 ## configuration
@@ -64,18 +64,18 @@ const config: CreateGroConfig = async (cfg) => {
 export default config;
 ```
 
-Options are forwarded to `svelte-package`.
+Options are passed to `svelte-package` as flags, a `false` boolean as `--no-x`.
+Args forwarded with `-- svelte-package` follow them verbatim
+and replace a configured option of the same spelling,
+so `gro build -- svelte-package --output x` overrides a configured `output`.
 See [`SveltePackageOptions`](/src/lib/sveltekit_helpers.ts)
 and the [SvelteKit packaging docs](https://svelte.dev/docs/kit/packaging#options).
 
 ## exports
 
 When this plugin is active, `gro sync` auto-generates `package.json` `"exports"`
-using wildcard subpath patterns for `.js`, `.ts`, `.svelte`, `.json`, and `.css` files in `src/lib/`.
-Every `internal/` directory is blocked from consumer imports at any depth by a null
-exports entry (`"./internal/*": null`, one per outermost internal directory)
-while its files still ship in `dist/`,
-and internal files don't count toward which wildcard patterns are emitted.
-Customize via [`map_package_json` in the config](config.md#map_package_json).
+using wildcard subpath patterns for `.js`, `.ts`, `.svelte`, `.json`, and `.css` files in `src/lib/`,
+with every `internal/` directory blocked from consumer imports.
+[`map_package_json` in the config](config.md#map_package_json) has the rules and customizes it.
 
 For the full publishing workflow, see [publish.md](publish.md).

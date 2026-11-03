@@ -1,18 +1,18 @@
 <!--
 	@component
-	Generates an SVG scatter plot. This component can also work if the x- or y-scale is ordinal, i.e. it has a `.bandwidth` method. See the [timeplot chart](https://layercake.graphics/example/Timeplot) for an example.
+	Generates an SVG scatter plot. If the x or y scale is a band scale, each circle sits in the middle of its band. See the [timeplot chart](https://layercake.graphics/example/Timeplot) for an example.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, xGet, yGet, xScale, yScale } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
 	 * @property {number} [r=5] - The circle's radius.
 	 * @property {string} [fill='#0cf'] - The circle's fill color.
 	 * @property {string} [stroke='#000'] - The circle's stroke color.
-	 * @property {number} [strokeWidth=0] - The circle's stroke width.
+	 * @property {number} [strokeWidth=0] - The circle's stroke width in pixels.
 	 */
 
 	/** @type {Props} */
@@ -20,10 +20,10 @@
 </script>
 
 <g class="scatter-group">
-	{#each $data as d}
+	{#each k.data as d}
 		<circle
-			cx={$xGet(d) + ($xScale.bandwidth ? $xScale.bandwidth() / 2 : 0)}
-			cy={$yGet(d) + ($yScale.bandwidth ? $yScale.bandwidth() / 2 : 0)}
+			cx={k.xGet(d) + (k.xScale.bandwidth ? k.xScale.bandwidth() / 2 : 0)}
+			cy={k.yGet(d) + (k.yScale.bandwidth ? k.yScale.bandwidth() / 2 : 0)}
 			{r}
 			{fill}
 			{stroke}

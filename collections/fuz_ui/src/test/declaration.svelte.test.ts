@@ -2,8 +2,8 @@ import { test, assert, describe } from 'vitest';
 import type { DeclarationJsonInput, TypeJson } from 'svelte-docinfo/types.js';
 import { typeJsonToText } from 'svelte-docinfo/declaration-helpers.js';
 
-import { Declaration } from '$lib/declaration.svelte.ts';
-import type { Module } from '$lib/module.svelte.ts';
+import { Declaration } from '#lib/declaration.svelte.ts';
+import type { Module } from '#lib/module.svelte.ts';
 
 // The fields under test read only `declaration_json` and `name`, so a bare
 // module stub suffices; the loose input cast mirrors the runtime's untyped
@@ -98,5 +98,42 @@ describe('merged_value', () => {
 	test('absent on the wire (stripped default) reads as undefined', () => {
 		const declaration = create_declaration({ name: 'A', kind: 'type' });
 		assert.strictEqual(declaration.merged_value, undefined);
+	});
+});
+
+describe('css_custom_properties', () => {
+	test('absent on the wire (stripped default) reads as undefined', () => {
+		const declaration = create_declaration({ name: 'A', kind: 'component' });
+		assert.strictEqual(declaration.css_custom_properties, undefined);
+	});
+
+	test('an empty array reads as empty', () => {
+		const declaration = create_declaration({
+			name: 'A',
+			kind: 'component',
+			cssCustomProperties: []
+		});
+		assert.deepEqual(declaration.css_custom_properties, []);
+	});
+
+	test('reads the entries in wire order', () => {
+		const css_custom_properties = [
+			{
+				name: '--a_color',
+				description: 'the color',
+				syntax: '<color>',
+				fallback: 'red',
+				default: 'red',
+				sourceLine: 3,
+				documented: true
+			},
+			{ name: '--b', fallback: 'var(--c, 1px)', sourceLine: 9 }
+		];
+		const declaration = create_declaration({
+			name: 'A',
+			kind: 'component',
+			cssCustomProperties: css_custom_properties
+		});
+		assert.strictEqual(declaration.css_custom_properties, css_custom_properties);
 	});
 });

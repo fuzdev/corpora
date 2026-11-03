@@ -9,7 +9,9 @@
  * domain dedup rules ride on top).
  *
  * Reads filter both endpoints by `cell.deleted_at IS NULL` so items
- * dangling off a soft-deleted cell don't surface.
+ * dangling off a soft-deleted cell don't surface, and the list reads apply
+ * the view predicate (`db/cell_view_sql.ts`) to the far end before `LIMIT` —
+ * a page is up to `limit` edges whose far end the caller can view.
  *
  * `query_cell_item_insert` returns the inserted row OR throws the
  * underlying `23505` (Postgres unique violation) on a `(parent_id,
@@ -21,16 +23,22 @@
  */
 
 import type { QueryDeps } from './query_deps.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 import { assert_row } from './assert_row.ts';
-import { columns_sql, qualify_columns } from './sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from './sql_columns.ts';
+import {
+	can_view_cell_sql,
+	caller_role_grants_cte,
+	cell_viewer_params,
+	type CellViewer
+} from './cell_view_sql.ts';
 
 /** Row shape returned by `cell_item` SELECTs. */
 export interface CellItemRow {
 	parent_id: Uuid;
 	position: string;
 	child_id: Uuid;
-	created_at: Date;
+	created_at: string;
 }
 
 /**
@@ -45,6 +53,9 @@ export const CELL_ITEM_COLUMNS = [
 	'child_id',
 	'created_at'
 ] as const satisfies ReadonlyArray<keyof CellItemRow>;
+
+/** The `cell_item` timestamp override, by row qualifier (`''` bare, `i` for the cell-joined reads). */
+const cell_item_expr = iso8601_timestamp_expr(CELL_ITEM_COLUMNS, ['created_at']);
 
 /** Input for `query_cell_item_insert`. */
 export interface CellItemInsertQueryInput {
@@ -71,28 +82,10 @@ export const query_cell_item_insert = async (
 	const row = await deps.db.query_one<CellItemRow>(
 		`INSERT INTO cell_item (parent_id, position, child_id)
 		 VALUES ($1, $2, $3)
-		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS)}`,
+		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS, cell_item_expr(''))}`,
 		[input.parent_id, input.position, input.child_id]
 	);
 	return assert_row(row, 'INSERT INTO cell_item');
-};
-
-/**
- * Fetch one item row by `(parent_id, position)`. Used by move + delete
- * handlers to confirm the row exists before issuing the mutation.
- *
- * @returns the row or `null` when not found
- */
-export const query_cell_item_get = async (
-	deps: QueryDeps,
-	parent_id: Uuid,
-	position: string
-): Promise<CellItemRow | null> => {
-	const row = await deps.db.query_one<CellItemRow>(
-		`SELECT ${columns_sql(CELL_ITEM_COLUMNS)} FROM cell_item WHERE parent_id = $1 AND position = $2`,
-		[parent_id, position]
-	);
-	return row ?? null;
 };
 
 /**
@@ -118,7 +111,7 @@ export const query_cell_item_move = async (
 		`UPDATE cell_item
 		 SET position = $3
 		 WHERE parent_id = $1 AND position = $2
-		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS)}`,
+		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS, cell_item_expr(''))}`,
 		[parent_id, position_old, position_new]
 	);
 	return row ?? null;
@@ -139,7 +132,7 @@ export const query_cell_item_delete = async (
 ): Promise<CellItemRow | null> => {
 	const row = await deps.db.query_one<CellItemRow>(
 		`DELETE FROM cell_item WHERE parent_id = $1 AND position = $2
-		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS)}`,
+		 RETURNING ${columns_sql(CELL_ITEM_COLUMNS, cell_item_expr(''))}`,
 		[parent_id, position]
 	);
 	return row ?? null;
@@ -148,58 +141,67 @@ export const query_cell_item_delete = async (
 /**
  * Forward items list (`parent.items[]`), ordered by lex `position`.
  *
- * Filters child by `deleted_at IS NULL` so items pointing at tombstoned
- * cells don't surface; the parent filter is the caller's responsibility
- * (gated upstream by `can_view_cell(parent)`).
+ * Up to `limit` items whose child is live and one `viewer` may view
+ * (`can_view_cell_sql`, applied before the limit); `position_after` pages on.
+ * The parent-view gate is the caller's responsibility.
  *
  * @param deps - query deps
+ * @param viewer - who is reading; `CELL_VIEWER_UNRESTRICTED` filters nothing
  * @param parent_id - parent cell id
- * @param options - `limit` caps the row count (passes through to SQL `LIMIT`);
+ * @param options - `limit` caps the row count (omitted = unbounded);
  *   `position_after` resumes after a position (keyset pagination)
  * @returns matching rows in lex `position` order
  */
 export const query_cell_item_list_for_parent = async (
 	deps: QueryDeps,
+	viewer: CellViewer,
 	parent_id: Uuid,
 	options?: { limit?: number; position_after?: string }
 ): Promise<Array<CellItemRow>> => {
 	const limit = options?.limit ?? null;
 	const position_after = options?.position_after ?? null;
 	return deps.db.query<CellItemRow>(
-		`SELECT ${qualify_columns(CELL_ITEM_COLUMNS, 'i')} FROM cell_item i
+		`WITH ${caller_role_grants_cte('$6', '$7')}
+		 SELECT ${qualify_columns(CELL_ITEM_COLUMNS, 'i', cell_item_expr('i'))} FROM cell_item i
 		 JOIN cell c ON c.id = i.child_id
 		 WHERE i.parent_id = $1
 		   AND c.deleted_at IS NULL
+		   AND ${can_view_cell_sql('c', { is_admin: '$4', actor_id: '$5' })}
 		   AND ($3::text IS NULL OR i.position > $3)
 		 ORDER BY i.position ASC
 		 LIMIT $2`,
-		[parent_id, limit, position_after]
+		[parent_id, limit, position_after, ...cell_viewer_params(viewer)]
 	);
 };
 
 /**
  * Reverse items list (`child.lists[]`).
  *
- * Returns rows whose `child_id = $1`, joined to `cell` on `parent_id` so
- * items from tombstoned parents don't surface. The caller-side authz
- * filter (per-parent `can_view_cell`) runs after the SQL fetch — see
- * the 2-layer authz contract on `cell_item_list({child_id})`.
+ * Up to `limit` items whose parent is live and one `viewer` may view —
+ * filtered before the limit (`can_view_cell_sql`), so parents the caller
+ * can't see never crowd out ones it can. The child-view gate is the
+ * caller's responsibility.
  *
- * Bounded by `limit` (the wire `cell_item_list` cap) so a heavily
- * inbound-linked child can't force an unbounded fetch + per-parent authz
- * pass on the public, IP-rate-limited reverse endpoint.
+ * @param deps - query deps
+ * @param viewer - who is reading; `CELL_VIEWER_UNRESTRICTED` filters nothing
+ * @param child_id - child cell id
+ * @param options - `limit` caps the row count (omitted = unbounded)
+ * @returns matching rows, oldest item first (by the item row's `created_at`, then its key)
  */
 export const query_cell_item_list_for_child = async (
 	deps: QueryDeps,
+	viewer: CellViewer,
 	child_id: Uuid,
 	options?: { limit?: number }
 ): Promise<Array<CellItemRow>> =>
 	deps.db.query<CellItemRow>(
-		`SELECT ${qualify_columns(CELL_ITEM_COLUMNS, 'i')} FROM cell_item i
+		`WITH ${caller_role_grants_cte('$5', '$6')}
+		 SELECT ${qualify_columns(CELL_ITEM_COLUMNS, 'i', cell_item_expr('i'))} FROM cell_item i
 		 JOIN cell p ON p.id = i.parent_id
 		 WHERE i.child_id = $1
 		   AND p.deleted_at IS NULL
-		 ORDER BY i.created_at ASC
+		   AND ${can_view_cell_sql('p', { is_admin: '$3', actor_id: '$4' })}
+		 ORDER BY i.created_at ASC, i.parent_id ASC, i.position ASC
 		 LIMIT $2`,
-		[child_id, options?.limit ?? null]
+		[child_id, options?.limit ?? null, ...cell_viewer_params(viewer)]
 	);

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 	import Mdz from '@fuzdev/mdz/Mdz.svelte';
+	import { mdz_from_tsdoc } from '@fuzdev/mdz/tsdoc_mdz.ts';
 	import {
 		mdz_code_context,
 		mdz_codeblock_context,
@@ -8,6 +9,7 @@
 	} from '@fuzdev/mdz/mdz_contexts.ts';
 
 	import { set_library_context_with_fallback, type Library } from './library.svelte.ts';
+	import type { Module } from './module.svelte.ts';
 	import { tome_get_by_slug, type Tome } from './tome.ts';
 	import TomeContent from './TomeContent.svelte';
 	import TomeSection from './TomeSection.svelte';
@@ -70,6 +72,20 @@
 	const source_url = $derived(module?.url_github);
 </script>
 
+<!-- Marker chips from the module comment, shared by the module page and directory listings. -->
+{#snippet doc_chips(m: Module)}
+	{#if m.is_deprecated || m.is_internal}
+		<p class="row gap_md flex-wrap:wrap">
+			{#if m.is_deprecated}
+				<span class="chip">⚠️ deprecated</span>
+			{/if}
+			{#if m.is_internal}
+				<span class="chip">internal</span>
+			{/if}
+		</p>
+	{/if}
+{/snippet}
+
 <svelte:head>
 	<title>{module_name} - API docs - {library.pkg_json.name}</title>
 </svelte:head>
@@ -92,6 +108,7 @@
 					{#each directory_modules as child_module (child_module.path)}
 						<li>
 							<h3><ModuleLink module_path={child_module.path} /></h3>
+							{@render doc_chips(child_module)}
 							{#if child_module.module_comment}
 								<Mdz content={child_module.module_comment} />
 							{/if}
@@ -101,9 +118,33 @@
 			</section>
 		{/if}
 	{:else}
-		{#if module.module_comment}
+		<!-- module comment: mirrors the compact `doc_extras` form in `DeclarationDetail` -->
+		{#if module.has_module_doc}
 			<section>
-				<Mdz content={module.module_comment} />
+				{@render doc_chips(module)}
+				{#if module.deprecated_message}
+					<p>{module.deprecated_message}</p>
+				{/if}
+				{#if module.internal_message}
+					<p>{module.internal_message}</p>
+				{/if}
+				{#if module.module_comment}
+					<Mdz content={module.module_comment} />
+				{/if}
+				{#if module.since}
+					<p><strong>since</strong> {module.since}</p>
+				{/if}
+				{#each module.examples as example (example)}
+					<Mdz content={example} />
+				{/each}
+				{#if module.see_also.length}
+					<p><strong>see also</strong></p>
+					<ul>
+						{#each module.see_also as ref (ref)}
+							<li><Mdz content={mdz_from_tsdoc(ref)} /></li>
+						{/each}
+					</ul>
+				{/if}
 			</section>
 		{/if}
 		{#if source_url}

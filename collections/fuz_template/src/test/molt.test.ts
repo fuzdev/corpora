@@ -1,38 +1,62 @@
 // Twin of the tests in `crates/molt` — verifies the TS ejector's anchors
-// against the working tree and exercises both sample plans end to end, so a
+// against the working tree and exercises the sample plans end to end, so a
 // template edit that would break `npm run molt` fails `gro test` (and CI) at
 // the same commit, exactly like the Rust twin fails `cargo test`.
 
-import { cpSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+	cpSync,
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assert, describe, test } from 'vitest';
+import { format_file } from '@fuzdev/gro/format_file.ts';
 
 import {
 	CLI,
+	CliError,
 	DOCS,
+	DOCS_NEEDS_REPO,
 	FEATURES,
+	FOUNDATION_NEEDED,
 	GITHUB_EXTRAS,
 	RUST,
+	SVELTEKIT,
+	type Action,
 	apply,
 	apply_gate,
 	build_plan,
 	check_all,
+	conflicts,
 	empty_groups,
+	git_output,
+	has_foundation,
 	json_escape,
+	lines_with_prefix,
 	load_templates,
+	members_force_strip,
 	members_of,
 	normalize_remote_url,
+	parse_optional_repo_url,
+	parse_repo_url,
+	parse_top_level,
 	render,
 	resolve,
+	resolve_config,
 	sample_configs,
+	to_repo_url,
 	validate_description,
 	validate_domain,
 	validate_name,
 	validate_npm_name,
 	verify
-} from '../lib/molt.ts';
+} from '#lib/molt.ts';
 
 const repo_root = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -42,7 +66,11 @@ const copy_template = (destination: string): void => {
 		cpSync(join(repo_root, dir), join(destination, dir), { recursive: true });
 	}
 	for (const file of [
+		'.gitattributes',
 		'package.json',
+		'package-lock.json',
+		'tsconfig.json',
+		'eslint.config.js',
 		'README.md',
 		'CLAUDE.md',
 		'LICENSE',
@@ -65,9 +93,26 @@ const scratch_dir = (label: string): string => {
 
 const read = (root: string, path: string): string => readFileSync(join(root, path), 'utf8');
 
+/**
+ * Asserts every `.svelte`/`.ts` file the applied `plan` wrote is already
+ * formatted, so molted projects pass `gro check`'s format step. Uses gro's
+ * in-process formatter, backed by tsv's native addon. The twins' output is
+ * byte-identical, so this covers the Rust twin too.
+ */
+const assert_formatted = (dir: string, plan: Array<Action>): void => {
+	for (const action of plan) {
+		const { kind } = action;
+		if (kind === 'rename_dir' || kind === 'delete_file' || kind === 'delete_dir') continue;
+		if (!/\.(svelte|ts)$/.test(action.path)) continue;
+		const content = read(dir, action.path);
+		assert.strictEqual(format_file(content, { filepath: action.path }), content, action.path);
+	}
+};
+
 describe('check', () => {
 	test('anchors match the template', () => {
-		const issues = check_all(repo_root);
+		const { drift, conflicts: conflict_issues } = check_all(repo_root);
+		const issues = [...drift, ...conflict_issues];
 		assert.deepEqual(issues, [], `template drifted from molt's anchors:\n${issues.join('\n')}`);
 	});
 });
@@ -81,6 +126,7 @@ describe('apply', () => {
 		const plan = build_plan(config, load_templates(dir));
 		const issues = verify(dir, plan);
 		assert.deepEqual(issues, []);
+		assert.deepEqual(conflicts(dir, plan), []);
 		apply(dir, plan);
 
 		const package_json = read(dir, 'package.json');
@@ -89,7 +135,7 @@ describe('apply', () => {
 		assert.ok(package_json.includes('"homepage": "https://sample.example.com/"'));
 		assert.strictEqual(read(dir, 'static/CNAME'), 'sample.example.com\n');
 
-		// the template's MIT license never ships in a molted project
+		// the template's 0BSD license never ships in a molted project
 		assert.ok(!existsSync(join(dir, 'LICENSE')));
 		assert.ok(!package_json.includes('"license"'));
 
@@ -97,6 +143,9 @@ describe('apply', () => {
 		assert.ok(!package_json.includes('"molt"'));
 		assert.ok(!existsSync(join(dir, 'src/lib/molt.ts')));
 		assert.ok(!existsSync(join(dir, 'src/test/molt.test.ts')));
+		// nor do molt's notes in the files that outlive it
+		assert.ok(!read(dir, '.gitattributes').includes('molt'));
+		assert.ok(read(dir, '.gitattributes').includes('eol=lf'));
 
 		const layout = read(dir, 'src/routes/+layout.svelte');
 		assert.ok(!layout.includes('logo_fuz_template'));
@@ -110,14 +159,20 @@ describe('apply', () => {
 		assert.ok(!existsSync(join(dir, 'src/lib/Mreows.svelte')));
 		assert.ok(!existsSync(join(dir, 'src/lib/Positioned.svelte')));
 
-		// docs kept
+		// docs kept, with a starter module so the API docs have a page
 		assert.ok(existsSync(join(dir, 'src/routes/docs')));
+		assert.ok(read(dir, 'src/lib/example.ts').includes('from sample_app'));
 		assert.ok(existsSync(join(dir, 'src/routes/library.ts')));
 
-		assert.ok(read(dir, 'README.md').startsWith('# @sample/sample_app'));
+		const readme = read(dir, 'README.md');
+		assert.ok(readme.startsWith('# @sample/sample_app'));
+		assert.ok(readme.includes('## web app'));
+		assert.ok(readme.includes('cargo run -p sample_app'));
 		const claude = read(dir, 'CLAUDE.md');
 		assert.ok(claude.startsWith('# sample_app'));
+		assert.ok(claude.includes('## Web app'));
 		assert.ok(claude.includes('## Rust workspace'));
+		assert.ok(claude.includes('crates/sample_app'));
 		assert.ok(claude.includes('src/routes/docs'));
 
 		// github-extras kept: personalized, never the template author's links
@@ -128,11 +183,14 @@ describe('apply', () => {
 		assert.ok(issue_config.includes('https://github.com/sample/sample_app/discussions/new/choose'));
 		assert.ok(!issue_config.includes('fuzdev/fuz_template'));
 		assert.ok(!read(dir, '.github/ISSUE_TEMPLATE/preapproved.md').includes('fuzdev/fuz_template'));
-		assert.ok(read(dir, '.github/workflows/check.yml').includes('cargo clippy'));
+		const workflow = read(dir, '.github/workflows/check.yml');
+		assert.ok(workflow.includes('cargo clippy'));
+		assert.ok(workflow.includes('npx @fuzdev/gro check'));
+		assert.ok(!workflow.includes('molt'));
 
 		// docs kept: the svelte-docinfo tooling stays
 		assert.ok(package_json.includes('svelte-docinfo'));
-		assert.ok(read(dir, 'vite.config.ts').includes('svelte_docinfo()'));
+		assert.ok(read(dir, 'vite.config.ts').includes("svelte_docinfo({ onDuplicates: 'throw' })"));
 
 		const workspace = read(dir, 'Cargo.toml');
 		assert.ok(workspace.includes('members = ["crates/sample_app"]'));
@@ -151,6 +209,8 @@ describe('apply', () => {
 		assert.ok(!main_rs.includes('app_cli'));
 		assert.ok(!read(dir, 'crates/sample_app/src/error.rs').includes('app_cli'));
 
+		assert_formatted(dir, plan);
+
 		rmSync(dir, { recursive: true });
 	});
 
@@ -162,6 +222,7 @@ describe('apply', () => {
 		const plan = build_plan(config, load_templates(dir));
 		const issues = verify(dir, plan);
 		assert.deepEqual(issues, []);
+		assert.deepEqual(conflicts(dir, plan), []);
 		apply(dir, plan);
 
 		const package_json = read(dir, 'package.json');
@@ -185,10 +246,12 @@ describe('apply', () => {
 		const workflow = read(dir, '.github/workflows/check.yml');
 		assert.ok(!workflow.includes('cargo'));
 		assert.ok(workflow.includes('npx @fuzdev/gro check'));
+		assert.ok(!workflow.includes('molt'));
 
 		// docs stripped, along with the svelte-docinfo tooling
 		assert.ok(!existsSync(join(dir, 'src/routes/docs')));
 		assert.ok(!existsSync(join(dir, 'src/routes/library.ts')));
+		assert.ok(!existsSync(join(dir, 'src/lib/example.ts')));
 		const page = read(dir, 'src/routes/+page.svelte');
 		assert.ok(!page.includes("resolve('/docs')"));
 		assert.ok(page.includes("resolve('/about')"));
@@ -205,6 +268,266 @@ describe('apply', () => {
 		assert.ok(!claude.includes('## Rust workspace'));
 		assert.ok(!claude.includes('src/routes/docs'));
 
+		assert_formatted(dir, plan);
+
+		rmSync(dir, { recursive: true });
+	});
+
+	test('rust-only sample', () => {
+		const [, , config] = sample_configs();
+		const dir = scratch_dir('rust_only');
+		copy_template(dir);
+
+		const plan = build_plan(config, load_templates(dir));
+		const issues = verify(dir, plan);
+		assert.deepEqual(issues, []);
+		assert.deepEqual(conflicts(dir, plan), []);
+		apply(dir, plan);
+
+		// the SvelteKit app and its npm toolchain are gone, molt's TS twin with them
+		for (const path of [
+			'src',
+			'static',
+			'package.json',
+			'package-lock.json',
+			'vite.config.ts',
+			'tsconfig.json',
+			'eslint.config.js',
+			'LICENSE',
+			'.cargo',
+			'crates/molt'
+		]) {
+			assert.ok(!existsSync(join(dir, path)), `${path} survived`);
+		}
+
+		// the Rust workspace stays, personalized
+		assert.ok(read(dir, 'Cargo.toml').includes('members = ["crates/rusty_app"]'));
+		assert.ok(
+			read(dir, 'crates/rusty_app/Cargo.toml').includes('description = "a Rust-only sample"')
+		);
+
+		// CI keeps only the rust job, with no Node.js header or molt notes
+		const workflow = read(dir, '.github/workflows/check.yml');
+		assert.ok(workflow.startsWith('# Checks the project.\n'));
+		assert.ok(!workflow.includes('build:'));
+		assert.ok(!workflow.includes('npm'));
+		assert.ok(!workflow.includes('node'));
+		assert.ok(!workflow.includes('molt'));
+		assert.ok(workflow.includes('jobs:\n  rust:\n'));
+		assert.ok(workflow.includes('cargo clippy'));
+
+		// the regenerated docs describe a Rust project, titled by its name
+		const readme = read(dir, 'README.md');
+		assert.ok(readme.startsWith('# rusty_app\n\n> a Rust-only sample\n'));
+		assert.ok(!readme.includes('## web app'));
+		assert.ok(readme.includes('## rust'));
+		assert.ok(readme.includes('cargo run -p rusty_app'));
+		const claude = read(dir, 'CLAUDE.md');
+		assert.ok(claude.startsWith('# rusty_app'));
+		assert.ok(!claude.includes('gro check'));
+		assert.ok(!claude.includes('src/routes'));
+		assert.ok(claude.includes('## Rust workspace'));
+
+		// github-extras kept, linked to the project's repo
+		assert.ok(
+			read(dir, '.github/ISSUE_TEMPLATE/config.yml').includes(
+				'https://github.com/sample/rusty_app/discussions/new/choose'
+			)
+		);
+
+		rmSync(dir, { recursive: true });
+	});
+
+	test('rendered files leave no placeholders', () => {
+		// sections render their own placeholders before insertion, since
+		// `render` never rescans inserted values
+		for (const config of sample_configs()) {
+			for (const action of build_plan(config, load_templates(repo_root))) {
+				if (action.kind !== 'replace_file' && action.kind !== 'create_file') continue;
+				const label = `${config.name}: ${action.path}`;
+				assert.ok(!action.content.includes('__'), label);
+				if (action.path.endsWith('.md')) {
+					assert.ok(action.content.endsWith('\n'), label);
+					assert.ok(!action.content.endsWith('\n\n'), label);
+				}
+			}
+		}
+	});
+});
+
+describe('plan', () => {
+	test('lines_with_prefix matches whole lines', () => {
+		const content = '{\n  "a": "^1.0.0",\nx  "a": "mid",\n  "a": "^2.0.0"';
+		// only line starts count, not the prefix mid-line
+		const ranges = lines_with_prefix(content, '  "a": "');
+		assert.strictEqual(ranges.length, 2);
+		assert.strictEqual(content.slice(ranges[0]!.start, ranges[0]!.end), '  "a": "^1.0.0",\n');
+		// the last line has no trailing newline
+		assert.strictEqual(content.slice(ranges[1]!.start, ranges[1]!.end), '  "a": "^2.0.0"');
+		assert.strictEqual(lines_with_prefix(content, '  "c": ').length, 0);
+		assert.strictEqual(lines_with_prefix('', 'x').length, 0);
+	});
+
+	test('remove_line requires exactly one match', () => {
+		const dir = scratch_dir('remove_line');
+		const plan: Array<Action> = [
+			{
+				kind: 'remove_line',
+				path: 'package.json',
+				prefix: '  "a": "',
+				suffix: '",\n',
+				label: 'remove a'
+			}
+		];
+		for (const [content, expected_issues] of [
+			['{\n  "a": "^1.0.0",\n  "b": "^1.0.0"\n}\n', 0],
+			['{\n  "b": "^1.0.0"\n}\n', 1],
+			['{\n  "a": "^1.0.0",\n  "a": "^2.0.0"\n}\n', 1],
+			// the last entry has no trailing comma — removing it would leave
+			// the previous line's comma dangling, so it's refused
+			['{\n  "b": "^1.0.0",\n  "a": "^1.0.0"\n}\n', 1],
+			// a CRLF line ends in `,\r\n` — refused like every other anchor
+			// under CRLF (`.gitattributes` forces LF)
+			['{\r\n  "a": "^1.0.0",\r\n  "b": "^1.0.0"\r\n}\r\n', 1]
+		] as const) {
+			writeFileSync(join(dir, 'package.json'), content);
+			assert.strictEqual(verify(dir, plan).length, expected_issues, content);
+		}
+		writeFileSync(join(dir, 'package.json'), '{\n  "a": "^1.0.0",\n  "b": "^1.0.0"\n}\n');
+		apply(dir, plan);
+		assert.strictEqual(read(dir, 'package.json'), '{\n  "b": "^1.0.0"\n}\n');
+		rmSync(dir, { recursive: true });
+	});
+
+	test('create_file conflicts are not drift', () => {
+		const dir = scratch_dir('create_file');
+		const plan: Array<Action> = [
+			{ kind: 'create_file', path: 'example.ts', content: '', label: 'create' }
+		];
+		assert.deepEqual(conflicts(dir, plan), []);
+		writeFileSync(join(dir, 'example.ts'), '');
+		assert.strictEqual(conflicts(dir, plan).length, 1);
+		assert.deepEqual(verify(dir, plan), []);
+		rmSync(dir, { recursive: true });
+	});
+});
+
+describe('resolve_config', () => {
+	const top = (args: Array<string>) => parse_top_level(args)!;
+
+	test('keeping docs needs a repo url when non-interactive', async () => {
+		// its own origin-less repo, so no repo url derives from any enclosing
+		// checkout (`git_output` also clears an inherited `GIT_DIR`)
+		const dir = scratch_dir('docs_repo');
+		assert.notStrictEqual(git_output(dir, ['init', '-q']), null);
+		for (const args of [
+			['--name', 'demo_app'],
+			['--name', 'demo_app', '--keep', 'docs'],
+			['--name', 'demo_app', '--repo', ' ']
+		]) {
+			const err = await resolve_config(top(args), dir, false).then(
+				() => null,
+				(e: unknown) => e
+			);
+			assert(err instanceof CliError, args.join(' '));
+			assert.strictEqual(err.message, DOCS_NEEDS_REPO);
+			assert.strictEqual(err.exit_code(), 2);
+		}
+		const config = await resolve_config(
+			top(['--name', 'demo_app', '--repo', 'https://github.com/me/demo_app']),
+			dir,
+			false
+		);
+		assert.ok(config.kept.has(DOCS));
+		// an ssh remote pasted as --repo still yields https source links
+		const ssh = await resolve_config(
+			top(['--name', 'demo_app', '--repo', 'git@github.com:me/demo_app.git']),
+			dir,
+			false
+		);
+		assert.strictEqual(ssh.repo_url, 'https://github.com/me/demo_app');
+		const invalid = await resolve_config(
+			top(['--name', 'demo_app', '--repo', 'me/demo_app']),
+			dir,
+			false
+		).then(
+			() => null,
+			(e: unknown) => e
+		);
+		assert(invalid instanceof CliError);
+		assert.strictEqual(invalid.exit_code(), 2);
+		const stripped = await resolve_config(
+			top(['--name', 'demo_app', '--strip', 'docs']),
+			dir,
+			false
+		);
+		assert.ok(!stripped.kept.has(DOCS));
+		assert.strictEqual(stripped.repo_url, null);
+		rmSync(dir, { recursive: true });
+	});
+
+	test('stripping sveltekit needs rust and refuses its flags', async () => {
+		const dir = scratch_dir('strip_sveltekit');
+		assert.notStrictEqual(git_output(dir, ['init', '-q']), null);
+		// a Rust-only project needs no repo url: docs go with the app
+		const config = await resolve_config(
+			top(['--name', 'demo_app', '--strip', 'sveltekit']),
+			dir,
+			false
+		);
+		assert.ok(!config.kept.has(SVELTEKIT));
+		assert.ok(!config.kept.has(DOCS));
+		assert.ok(config.kept.has(RUST));
+		assert.strictEqual(config.npm_name, 'demo_app');
+		assert.strictEqual(config.domain, null);
+		const err = await resolve_config(
+			top(['--name', 'demo_app', '--strip', 'sveltekit,rust']),
+			dir,
+			false
+		).then(
+			() => null,
+			(e: unknown) => e
+		);
+		assert(err instanceof CliError);
+		assert.strictEqual(err.message, FOUNDATION_NEEDED);
+		assert.strictEqual(err.exit_code(), 2);
+		// an empty --domain means no domain, not a SvelteKit-only flag
+		await resolve_config(
+			top(['--name', 'demo_app', '--strip', 'sveltekit', '--domain', ' ']),
+			dir,
+			false
+		);
+		// stripping cli forces rust out, and rust is the last foundation
+		// kept, so the error can't suggest stripping rust too
+		const last_err = await resolve_config(
+			top(['--name', 'demo_app', '--strip', 'sveltekit,cli']),
+			dir,
+			false
+		).then(
+			() => null,
+			(e: unknown) => e
+		);
+		assert(last_err instanceof CliError);
+		assert.ok(
+			last_err.message.endsWith('rust is the last of sveltekit and rust kept'),
+			last_err.message
+		);
+		for (const [flag, value] of [
+			['--npm-name', 'demo'],
+			['--domain', 'example.com']
+		] as const) {
+			const flag_err = await resolve_config(
+				top(['--name', 'demo_app', '--strip', 'sveltekit', flag, value]),
+				dir,
+				false
+			).then(
+				() => null,
+				(e: unknown) => e
+			);
+			assert(flag_err instanceof CliError, flag);
+			assert.ok(flag_err.message.startsWith(flag), flag_err.message);
+			assert.strictEqual(flag_err.exit_code(), 2);
+		}
 		rmSync(dir, { recursive: true });
 	});
 });
@@ -230,7 +553,7 @@ describe('apply_gate', () => {
 describe('features', () => {
 	test('defaults', () => {
 		const { kept, explicit } = resolve([], []);
-		assert.deepEqual(Array.from(kept).sort(), [CLI, DOCS, RUST]);
+		assert.deepEqual(Array.from(kept).sort(), [CLI, DOCS, RUST, SVELTEKIT]);
 		assert.strictEqual(explicit.size, 0);
 	});
 
@@ -248,6 +571,20 @@ describe('features', () => {
 		assert.ok(!kept.has(CLI));
 	});
 
+	test('strip sveltekit cascades to docs', () => {
+		const { kept } = resolve([], ['sveltekit']);
+		assert.ok(!kept.has(SVELTEKIT));
+		assert.ok(!kept.has(DOCS));
+		assert.ok(kept.has(RUST));
+		assert.ok(has_foundation(kept));
+		assert.throws(() => resolve(['docs'], ['sveltekit']));
+	});
+
+	test('foundations', () => {
+		assert.ok(has_foundation(resolve([], ['rust']).kept));
+		assert.ok(!has_foundation(resolve([], ['sveltekit,rust']).kept));
+	});
+
 	test('conflicts error', () => {
 		assert.throws(() => resolve(['rust'], ['rust']));
 		assert.throws(() => resolve(['cli'], ['rust']));
@@ -262,13 +599,22 @@ describe('features', () => {
 		assert.deepEqual(empty_groups(resolve([], ['cli']).kept), [RUST]);
 	});
 
+	test('members_force_strip needs every member explicitly stripped', () => {
+		const stripped = resolve([], ['cli']);
+		assert.ok(members_force_strip(RUST, stripped.kept, stripped.explicit));
+		const defaults = resolve([], []);
+		assert.ok(!members_force_strip(RUST, defaults.kept, defaults.explicit));
+		// a feature with no members is never forced
+		assert.ok(!members_force_strip(SVELTEKIT, defaults.kept, defaults.explicit));
+	});
+
 	test('members derive from the registry', () => {
 		assert.deepEqual(
 			members_of(RUST).map((f) => f.id),
 			[CLI]
 		);
 		assert.strictEqual(members_of(DOCS).length, 0);
-		assert.strictEqual(FEATURES.length, 4);
+		assert.strictEqual(FEATURES.length, 5);
 	});
 });
 
@@ -327,6 +673,31 @@ describe('config', () => {
 		assert.strictEqual(json_escape('a "b" c'), 'a \\"b\\" c');
 		assert.strictEqual(json_escape('line\nbreak'), 'line\\nbreak');
 	});
+
+	test('repo url parsing', () => {
+		assert.strictEqual(
+			parse_repo_url(' git@github.com:me/demo_app.git '),
+			'https://github.com/me/demo_app'
+		);
+		const err = (() => {
+			try {
+				parse_repo_url('me/demo_app');
+				return null;
+			} catch (e) {
+				return e;
+			}
+		})();
+		assert(err instanceof CliError);
+		assert.strictEqual(err.exit_code(), 2);
+		assert.ok(err.message.startsWith('invalid repository url "me/demo_app"'));
+		// control characters quote the same in both twins
+		assert.throws(
+			() => parse_repo_url('me\u0001app'),
+			CliError,
+			'invalid repository url "me\\u0001app"'
+		);
+		assert.strictEqual(parse_optional_repo_url(' \ufeff'), null);
+	});
 });
 
 describe('templates', () => {
@@ -366,6 +737,65 @@ describe('git', () => {
 		);
 		assert.strictEqual(normalize_remote_url('git@github.com:fuzdev/fuz_template.git'), null);
 		assert.strictEqual(normalize_remote_url('https://github.com/fuzdev/fuz_template'), null);
+		assert.strictEqual(normalize_remote_url('https://github.com/FuzDev/Fuz_Template.git'), null);
 		assert.strictEqual(normalize_remote_url('/local/path'), null);
+		// a user's own http origin is kept as-is rather than dropped
+		assert.strictEqual(
+			normalize_remote_url('http://git.example.com/you/app.git'),
+			'http://git.example.com/you/app'
+		);
+		// a CI or embedded-token origin never leaks its credentials
+		assert.strictEqual(
+			normalize_remote_url('https://x-access-token:ghs_secret@github.com/you/app.git\n'),
+			'https://github.com/you/app'
+		);
+	});
+
+	test('repo url conversion', () => {
+		for (const [input, expected] of [
+			['git@github.com:me/demo_app.git', 'https://github.com/me/demo_app'],
+			['ssh://git@github.com/me/demo_app.git', 'https://github.com/me/demo_app'],
+			['https://github.com/me/demo_app/', 'https://github.com/me/demo_app'],
+			['http://github.com/me/demo_app', 'http://github.com/me/demo_app'],
+			// explicit input skips the template check
+			['https://github.com/fuzdev/fuz_template.git', 'https://github.com/fuzdev/fuz_template'],
+			// credentials and user names are dropped
+			['https://user:token@github.com/me/demo_app', 'https://github.com/me/demo_app'],
+			['https://user@github.com/me/demo_app', 'https://github.com/me/demo_app'],
+			['https://user:token@', null],
+			// an ssh port is dropped; an https port is kept
+			['ssh://git@git.example.com:2222/me/demo_app.git', 'https://git.example.com/me/demo_app'],
+			['https://git.example.com:8443/me/demo_app', 'https://git.example.com:8443/me/demo_app'],
+			// schemes are case-insensitive; a byte-order mark is trimmed
+			['HTTPS://github.com/me/demo_app', 'https://github.com/me/demo_app'],
+			['SSH://git@github.com/me/demo_app', 'https://github.com/me/demo_app'],
+			['\ufeffhttps://github.com/me/demo_app', 'https://github.com/me/demo_app'],
+			['ssh://me@github.com/me/demo_app', null],
+			['ftp://github.com/me/demo_app', null],
+			// an empty host is refused, whatever follows it
+			['https://user:token@/me/app', null],
+			['https://@/me/app', null],
+			['https:///me/app', null],
+			['ssh://git@/me/app', null],
+			['git@:me/app', null],
+			['https://:8443/me/app', null],
+			['ssh://git@::22/me/app', null],
+			['ssh://git@:8443:22/me/app', null],
+			['https://user@:443/me/app', null],
+			// an empty https port is dropped, like an empty ssh port
+			['https://github.com:/me/demo_app', 'https://github.com/me/demo_app'],
+			// the authority ends at `?` or `#` too, and a query or fragment
+			// is dropped
+			['https://github.com?x@evil.com/me/app', 'https://github.com'],
+			['https://github.com#@evil.com/me/app', 'https://github.com'],
+			['https://github.com/me/demo_app?tab=readme#top', 'https://github.com/me/demo_app'],
+			// an empty ssh port is dropped too
+			['ssh://git@git.example.com:/me/demo_app', 'https://git.example.com/me/demo_app'],
+			['me/demo_app', null],
+			['https://', null],
+			['', null]
+		] as const) {
+			assert.strictEqual(to_repo_url(input), expected, input);
+		}
 	});
 });

@@ -20,7 +20,7 @@ import {
 	type JsonrpcErrorCode
 } from '../http/jsonrpc.ts';
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
-import type { RpcAction } from '../actions/action_rpc.ts';
+import type { RpcAction } from '../actions/action_types.ts';
 import type {
 	AppSurfaceRpcEndpoint,
 	AppSurfaceRpcMethod,
@@ -29,6 +29,7 @@ import type {
 import type { AppServerContext } from '../server/app_server_context.ts';
 import type { SessionOptions } from '../auth/session_cookie.ts';
 import { create_stub_app_server_context } from './stubs.ts';
+import { TEST_ORIGIN } from './test_origin.ts';
 
 /**
  * Union accepted by the suite-level `rpc_endpoints` option — eager array or
@@ -120,6 +121,28 @@ export const create_rpc_post_init = (
 };
 
 /**
+ * Build a JSON-RPC request envelope as text with `params_json` spliced in
+ * verbatim as its `params`.
+ *
+ * For params `JSON.stringify` cannot spell: it writes `5.0` as `5` and `-0`
+ * as `0`, so a value can't carry a float-spelled integer to the server. The
+ * text is not checked; a malformed one reaches the server as sent.
+ *
+ * @param method - the JSON-RPC method
+ * @param params_json - the params as raw JSON text, or `undefined` to omit them
+ * @param id - request id (default `'test'`)
+ * @returns the envelope's JSON text
+ */
+export const create_rpc_request_text = (
+	method: string,
+	params_json: string | undefined,
+	id: string | number = 'test'
+): string => {
+	const head = JSON.stringify({ jsonrpc: JSONRPC_VERSION, method, id });
+	return params_json === undefined ? head : `${head.slice(0, -1)},"params":${params_json}}`;
+};
+
+/**
  * Build a GET URL with JSON-RPC query parameters.
  *
  * @param endpoint_path - the RPC endpoint path (e.g., `/api/rpc`)
@@ -156,7 +179,7 @@ export const assert_jsonrpc_error_response = (
 	if (expected_code !== undefined) {
 		assert.strictEqual(
 			result.data.error.code,
-			expected_code as number,
+			expected_code,
 			`expected error code ${expected_code}, got ${result.data.error.code}`
 		);
 	}
@@ -257,6 +280,11 @@ export interface RpcCallArgs {
 	 * affordance and JSON-RPC 2.0 §4.2's prohibition on `params: null`.
 	 */
 	params?: unknown;
+	/**
+	 * Params as raw JSON text, sent verbatim in place of `params` — for a
+	 * spelling `JSON.stringify` loses (`5.0`, `-0`). Exclusive with `params`.
+	 */
+	params_json?: string;
 	/** Extra request headers (session cookie, bearer, etc.). Overrides defaults. */
 	headers?: Record<string, string>;
 	/** Request id. Defaults to `'test'`. */
@@ -278,10 +306,126 @@ const RPC_CALL_DEFAULT_HEADERS_BASE: Readonly<Record<string, string>> = {
 	'Content-Type': 'application/json'
 };
 
+/**
+ * Merge header records case-insensitively, later sources replacing earlier
+ * ones — a plain spread would keep `Content-Type` and `content-type` as two
+ * keys, which `fetch` joins into one comma-separated value. Names come out
+ * lowercased; values pass through unvalidated, so a test can still send a
+ * malformed header to the server.
+ */
+const merge_header_records = (
+	...sources: Array<Readonly<Record<string, string>> | undefined>
+): Record<string, string> => {
+	const merged: Record<string, string> = {};
+	for (const source of sources) {
+		if (!source) continue;
+		for (const [name, value] of Object.entries(source)) merged[name.toLowerCase()] = value;
+	}
+	return merged;
+};
+
 /** Default headers merged into every `rpc_call` request. Includes `origin`. */
 const RPC_CALL_DEFAULT_HEADERS: Readonly<Record<string, string>> = {
 	...RPC_CALL_DEFAULT_HEADERS_BASE,
-	origin: 'http://localhost:5173'
+	origin: TEST_ORIGIN
+};
+
+/**
+ * The unparsed response `rpc_call_raw` returns: the HTTP status, the
+ * response-headers snapshot (lowercased keys), and the JSON body exactly as
+ * the server sent it — the whole envelope, `jsonrpc` and `id` included.
+ */
+export interface RpcCallRawResult {
+	status: number;
+	headers: Record<string, string>;
+	body: unknown;
+}
+
+/**
+ * Send one JSON-RPC request the way `rpc_call` does — same defaults, verbs
+ * and header merging — and return the response unparsed.
+ *
+ * For callers that compare whole bodies (the cross-backend differential),
+ * where `rpc_call`'s envelope parse would hide anything outside `result` /
+ * `error`.
+ *
+ * @throws Error if the response body is not JSON
+ */
+export const rpc_call_raw = async (args: RpcCallArgs): Promise<RpcCallRawResult> => {
+	const {
+		app,
+		path,
+		method,
+		params,
+		params_json,
+		headers,
+		id = 'test',
+		verb = 'POST',
+		suppress_default_origin
+	} = args;
+	if (params !== undefined && params_json !== undefined) {
+		throw new Error(`rpc_call: pass params or params_json, not both (method=${method})`);
+	}
+
+	const defaults = suppress_default_origin
+		? RPC_CALL_DEFAULT_HEADERS_BASE
+		: RPC_CALL_DEFAULT_HEADERS;
+
+	let url: string;
+	let init: RequestInit;
+	if (verb === 'GET') {
+		url = create_rpc_get_url(path, method, params, id);
+		if (params_json !== undefined) {
+			url += `&${new URLSearchParams({ params: params_json }).toString()}`;
+		}
+		init = { method: 'GET', headers: merge_header_records(defaults, headers) };
+	} else {
+		url = path;
+		const post = create_rpc_post_init(method, params, id);
+		init = {
+			method: 'POST',
+			headers: merge_header_records(defaults, post.headers as Record<string, string>, headers),
+			body: params_json === undefined ? post.body : create_rpc_request_text(method, params_json, id)
+		};
+	}
+
+	const res = await (typeof app === 'function' ? app(url, init) : app.request(url, init));
+	return { status: res.status, headers: headers_to_record(res.headers), body: await res.json() };
+};
+
+/**
+ * Parse a raw JSON-RPC response into `rpc_call`'s discriminated result.
+ *
+ * @param raw - the response `rpc_call_raw` returned
+ * @param method - the method called, for the error message
+ * @returns the success or error branch
+ * @throws Error if the body is neither a valid `JsonrpcResponse` nor
+ *   `JsonrpcErrorResponse` envelope
+ */
+export const parse_rpc_call_result = (raw: RpcCallRawResult, method: string): RpcCallResult => {
+	const { status, headers, body } = raw;
+	const success = JsonrpcResponse.safeParse(body);
+	if (success.success) {
+		return { ok: true, status, headers, result: success.data.result };
+	}
+	const error = JsonrpcErrorResponse.safeParse(body);
+	if (error.success) {
+		return {
+			ok: false,
+			status,
+			headers,
+			error: {
+				code: error.data.error.code,
+				message: error.data.error.message,
+				data: error.data.error.data
+			}
+		};
+	}
+	throw new Error(
+		`rpc_call: response is not a valid JSON-RPC envelope (method=${method}, status=${
+			status
+		}): ${JSON.stringify(body)}`
+	);
 };
 
 /**
@@ -296,69 +440,8 @@ const RPC_CALL_DEFAULT_HEADERS: Readonly<Record<string, string>> = {
  *   should never tolerate. All JSON-RPC errors come back via `{ok: false, error}`
  *   so assertions can focus on `error.code` / `error.data.reason`.
  */
-export const rpc_call = async (args: RpcCallArgs): Promise<RpcCallResult> => {
-	const {
-		app,
-		path,
-		method,
-		params,
-		headers,
-		id = 'test',
-		verb = 'POST',
-		suppress_default_origin
-	} = args;
-
-	const defaults = suppress_default_origin
-		? RPC_CALL_DEFAULT_HEADERS_BASE
-		: RPC_CALL_DEFAULT_HEADERS;
-
-	let url: string;
-	let init: RequestInit;
-	if (verb === 'GET') {
-		url = create_rpc_get_url(path, method, params, id);
-		init = { method: 'GET', headers: { ...defaults, ...headers } };
-	} else {
-		url = path;
-		const post = create_rpc_post_init(method, params, id);
-		init = {
-			method: 'POST',
-			headers: {
-				...defaults,
-				...(post.headers as Record<string, string>),
-				...headers
-			},
-			body: post.body
-		};
-	}
-
-	const res = await (typeof app === 'function' ? app(url, init) : app.request(url, init));
-	const status = res.status;
-	const response_headers = headers_to_record(res.headers);
-	const body = await res.json();
-
-	const success = JsonrpcResponse.safeParse(body);
-	if (success.success) {
-		return { ok: true, status, headers: response_headers, result: success.data.result };
-	}
-	const error = JsonrpcErrorResponse.safeParse(body);
-	if (error.success) {
-		return {
-			ok: false,
-			status,
-			headers: response_headers,
-			error: {
-				code: error.data.error.code,
-				message: error.data.error.message,
-				data: error.data.error.data
-			}
-		};
-	}
-	throw new Error(
-		`rpc_call: response is not a valid JSON-RPC envelope (method=${method}, status=${
-			status
-		}): ${JSON.stringify(body)}`
-	);
-};
+export const rpc_call = async (args: RpcCallArgs): Promise<RpcCallResult> =>
+	parse_rpc_call_result(await rpc_call_raw(args), args.method);
 
 /**
  * Same as `rpc_call` but without the default `origin` header. Use for

@@ -2,12 +2,15 @@
 
 import { test, vi, beforeEach, describe, assert } from 'vitest';
 import { z } from 'zod';
-import { create_uuid, UuidWithDefault } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import {
+	create_uuid,
+	get_datetime_now,
+	UuidWithDefault
+} from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Cell, type CellOptions } from '$lib/cell.svelte.ts';
-import { CellJson } from '$lib/cell_types.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
+import { Cell, type CellOptions } from '#lib/cell.svelte.ts';
+import { CellJson } from '#lib/cell_types.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -266,7 +269,7 @@ describe('Cell id handling', () => {
 		// Attempt to set invalid id
 		assert.throws(() => {
 			cell.set_json_partial({
-				id: 'not-a-valid-uuid' as any
+				id: 'not-a-valid-uuid'
 			});
 		});
 	});

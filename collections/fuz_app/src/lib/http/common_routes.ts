@@ -13,7 +13,7 @@ import { z } from 'zod';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import type { RouteSpec } from './route_spec.ts';
-import type { AppSurface } from './surface.ts';
+import { HEALTH_PATH, HealthResponse } from './health_schema.ts';
 import {
 	check_schema_drift,
 	format_schema_drift,
@@ -29,12 +29,12 @@ import {
  */
 export const create_health_route_spec = (): RouteSpec => ({
 	method: 'GET',
-	path: '/health',
+	path: HEALTH_PATH,
 	auth: { account: 'none', actor: 'none' },
-	handler: (c) => c.json({ status: 'ok' }),
+	handler: (c) => c.json({ status: 'ok' } satisfies HealthResponse),
 	description: 'Health check',
 	input: z.null(),
-	output: z.strictObject({ status: z.literal('ok') })
+	output: HealthResponse
 });
 
 /** Module-level cache of loaded expected-schema fixtures, keyed by URL. */
@@ -100,7 +100,7 @@ export interface ReadyRouteOptions {
  * else `503 {error}` (`schema_drift` when columns are missing, `db_unreachable`
  * when the introspection query throws). The detailed drift goes to the server
  * log only — the public body stays a minimal code so the endpoint doesn't leak
- * schema structure (mirrors why `/api/surface` is authenticated). A deploy poll
+ * schema structure (mirrors why `/api/surface` is admin-only). A deploy poll
  * treats `503` as a failed release and rolls back, turning a silent
  * schema-drift auth outage into a loud blocked deploy. See `db/schema_ready.ts`
  * for the column-presence rationale and `auth/migrations.ts` for the
@@ -166,29 +166,4 @@ export const create_server_status_route_spec = (options: ServerStatusOptions): R
 	description: 'Server version and uptime',
 	input: z.null(),
 	output: z.looseObject({ version: z.string(), uptime_ms: z.number() })
-});
-
-/** Options for the surface explorer route. */
-export interface SurfaceRouteOptions {
-	/** The generated app surface to serve. */
-	surface: AppSurface;
-}
-
-/**
- * Create an authenticated route spec that serves the `AppSurface` as JSON.
- *
- * Surface data reveals API structure (routes, auth, schemas), so this
- * requires authentication like the server status route.
- */
-export const create_surface_route_spec = (options: SurfaceRouteOptions): RouteSpec => ({
-	method: 'GET',
-	path: '/api/surface',
-	auth: { account: 'required', actor: 'none' },
-	handler: (c) => c.json(options.surface),
-	description: 'Application surface (routes, middleware, schemas)',
-	input: z.null(),
-	output: z.looseObject({
-		routes: z.array(z.looseObject({})),
-		middleware: z.array(z.looseObject({}))
-	})
 });

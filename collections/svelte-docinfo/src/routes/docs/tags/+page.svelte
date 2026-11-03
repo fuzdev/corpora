@@ -20,17 +20,25 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			svelte-docinfo extracts TSDoc/JSDoc tags from source comments and surfaces them as structured
-			fields on the <TomeLink slug="output-format">output</TomeLink>. This page lists every tag that
-			is parsed, where its value lands, and the rules that decide which symbol receives it. The set
-			is the common doc tags of <a href="https://jsdoc.app/">JSDoc</a> and the
-			<a href="https://tsdoc.org/">TSDoc spec</a> as used across the TypeScript ecosystem — where
-			the two standards spell a tag differently (JSDoc <code>@default</code> vs TSDoc
-			<code>@defaultValue</code>, JSDoc's <code>@return</code> synonym vs <code>@returns</code>),
-			both spellings are accepted — plus the custom tags <code>@nodocs</code> and
-			<code>@mutates</code>. Inline tags like <code>{`{@link}`}</code> are not processed: they stay verbatim
-			in the extracted text, and rendering them is the consumer's concern. Please submit issues if it's
-			missing something you need or if any tags are off-spec.
+			svelte-docinfo extracts TSDoc/JSDoc tags from source comments into structured fields on the
+			<TomeLink slug="output-format">output</TomeLink>. This page lists every parsed tag, where its
+			value lands, and which symbol receives it. JSDoc's type tags (<code>@type</code>,
+			<code>@typedef</code>, <code>@template</code>, <code>@overload</code>) are covered in
+			<TomeLink slug="js" />.
+		</p>
+		<p>
+			The set is the common tags of <a href="https://jsdoc.app/">JSDoc</a> and the
+			<a href="https://tsdoc.org/">TSDoc spec</a>, plus the custom <code>@nodocs</code> and
+			<code>@mutates</code>, and the Custom Elements Manifest's <code>@cssprop</code> for a
+			component's CSS custom properties. Where the standards spell a tag differently, both spellings
+			work (<code>@default</code> / <code>@defaultValue</code>, <code>@return</code> /
+			<code>@returns</code>, <code>@cssprop</code> / <code>@cssproperty</code>).
+		</p>
+		<p>
+			Inline tags like <code>{`{@link}`}</code> are kept in the extracted text for the consumer to
+			render. TypeScript reprints <code>{`{@link A|b}`}</code> as <code>{`{@link A |b}`}</code>;
+			<code>@see</code> keeps its source text exactly. Please open an issue if a tag you need is
+			missing or off-spec.
 		</p>
 
 		<TomeSection>
@@ -56,14 +64,18 @@
 						<td><code>@returns</code></td>
 						<td>
 							<code>returnDescription</code> on functions, function members, and per-overload
-							<DeclarationLink name="OverloadJson" />. <code>@return</code> (JSDoc synonym) parses identically
+							<DeclarationLink name="OverloadJson" />. <code>@return</code> (JSDoc synonym) parses
+							identically
 						</td>
 					</tr>
 					<tr>
 						<td><code>@throws</code></td>
 						<td>
-							<code>throws</code> array on the parent declaration. <code>{`{Type}`}</code> hints are extracted
-							as the leading error type
+							<code>throws</code> array on the parent declaration. A braced type
+							(<code>{`@throws {TypeError} - description`}</code>, unions included) lands in
+							<code>type</code>; the description may be empty or multiline. Without braces the first
+							word is the type (<code>@throws TypeError if …</code>), so <code>@throws if …</code>
+							records <code>if</code> as the type. A lone unbraced word is the description
 						</td>
 					</tr>
 					<tr>
@@ -73,23 +85,22 @@
 					<tr>
 						<td><code>@deprecated</code></td>
 						<td>
-							<code>deprecatedMessage</code> on the parent declaration. Empty body still marks the symbol
-							deprecated
+							<code>deprecatedMessage</code> on the parent declaration. An empty body still marks
+							the symbol deprecated
 						</td>
 					</tr>
 					<tr>
 						<td><code>@internal</code></td>
 						<td>
-							<code>internalMessage</code> on the parent declaration or member. A marker, not an exclusion
-							— the declaration stays documented; trailing prose is kept, and an empty body still marks
-							the symbol internal
+							<code>internalMessage</code> on the parent declaration, member, or component prop. A
+							marker, not an exclusion (see <a href="#internal">@internal</a>)
 						</td>
 					</tr>
 					<tr>
 						<td><code>@see</code></td>
 						<td>
-							<code>seeAlso</code> array. Plain URLs, <code>{`{@link}`}</code> syntax, and module names
-							all preserved in their source form
+							<code>seeAlso</code> array, each entry in its source form (URLs,
+							<code>{`{@link}`}</code>, module names)
 						</td>
 					</tr>
 					<tr>
@@ -99,36 +110,48 @@
 					<tr>
 						<td><code>@default</code></td>
 						<td>
-							<code>defaultValue</code> on variable declarations and on members of both kinds — for
-							a function member it documents the behavior used when the callback is omitted; falls
-							back for <DeclarationLink name="ComponentPropJson" />.<code>defaultValue</code> when
-							no destructuring default is present. Never lands on top-level function declarations or
-							overloads. <code>@defaultValue</code> (TSDoc spelling) and
-							<code>@defaultvalue</code> (JSDoc synonym) parse identically
+							<code>defaultValue</code> on variable declarations and on variable and function
+							members (for a function member, the behavior when the callback is omitted). Also fills
+							<DeclarationLink name="ComponentPropJson" />.<code>defaultValue</code> when the prop
+							has no destructuring default. Never on top-level functions, overloads, or
+							constructors. <code>@defaultValue</code> and <code>@defaultvalue</code> parse
+							identically
 						</td>
 					</tr>
 					<tr>
 						<td><code>@mutates</code></td>
 						<td>
-							Non-standard tag for documenting mutations to parameters or external state:
-							<code>@mutates target - description</code>, splitting at the first
-							<code>-</code> separator so the target can be a compound path or multi-word phrase
+							<code>mutates</code> record of target to description (see
+							<a href="#mutates">@mutates</a>)
 						</td>
 					</tr>
 					<tr>
 						<td><code>@nodocs</code></td>
 						<td>
-							Non-standard tag that excludes the declaration from output entirely; also excludes it
-							from flat-namespace duplicate checking. Declaration- and statement-level only — in a
-							<code>@module</code> comment it has no effect and warns
+							Excludes the declaration from output and from the opt-in duplicate-name check (see
+							<a href="#nodocs">@nodocs</a>). Applies to declarations and export statements only: in
+							a <code>@module</code> comment it warns <code>misplaced_tag</code> and is dropped, and
+							on a member or component prop it silently does nothing
+						</td>
+					</tr>
+					<tr>
+						<td><code>@cssprop</code></td>
+						<td>
+							A Svelte component's CSS custom property, in
+							<DeclarationLink name="ComponentDeclarationJson" />.<code>cssCustomProperties</code>
+							(see <TomeLink slug="component-styling" />). Read from the component's doc comment
+							only; on any other declaration or in a <code>@module</code> comment it warns
+							<code>misplaced_tag</code> and is dropped. <code>@cssproperty</code> parses
+							identically
 						</td>
 					</tr>
 					<tr>
 						<td><code>@module</code></td>
 						<td>
-							Promotes the comment to <DeclarationLink name="ModuleJson" />.<code
-								>moduleComment</code
-							> instead of attaching to a declaration
+							Makes the comment document the file: its prose becomes
+							<DeclarationLink name="ModuleJson" />.<code>moduleComment</code> and its tags the
+							module's own fields, instead of a declaration's doc (see
+							<a href="#module">@module</a>)
 						</td>
 					</tr>
 				</tbody>
@@ -152,11 +175,11 @@
 				</li>
 			</ul>
 			<p>
-				Placing a symbol-scope tag on a non-primary overload emits
-				<code>misplaced_tag</code> and the tag is dropped, with no synthetic content and no silent
-				loss. Move it to the primary signature (typically the first overload, or the implementation
-				signature's JSDoc which feeds the symbol-level extraction). See
-				<TomeLink slug="diagnostics" /> for the diagnostic details.
+				Put symbol-scope tags on the first overload: its JSDoc documents the symbol, while JSDoc on
+				a later overload documents only that overload, and a symbol-scope tag there warns
+				<code>misplaced_tag</code>. JSDoc on the implementation is hidden and warns
+				<code>implementation_doc_hidden</code>. For JS <code>@overload</code> tags, see
+				<TomeLink slug="js" hash="overload">JS and JSDoc</TomeLink>.
 			</p>
 			<Code
 				lang="ts"
@@ -175,36 +198,33 @@ export function double(n: number | bigint): number | bigint {
 		<TomeSection>
 			<TomeSectionHeader text="@param matching and unknown_param" />
 			<p>
-				<code>@param</code> keys are matched against actual parameter names. The leading
-				<code>-</code> separator is stripped (TypeScript's parser keeps it as syntax, not content).
-				A bare key matches the parameter name; a dotted key (<code>obj.prop</code>) documents a
+				<code>@param</code> keys are matched against parameter names, and the leading <code>-</code>
+				separator is stripped from the description. A dotted key (<code>obj.prop</code>) documents a
 				property of a named object parameter.
 			</p>
 			<p>
-				Dotted keys whose root segment is a real parameter (<code>obj</code> in
-				<code>obj.prop</code>) land in <DeclarationLink name="ParameterJson" />'s
-				<code>propertyDescriptions</code> record, keyed by the sub-path (<code>obj.prop</code> →
-				<code>prop</code>, <code>obj.a.b</code> → <code>a.b</code>). The property segment is not
-				validated against the parameter's type. Matching is by parameter name, so destructured
-				parameters (<code>{`fn({a, b}: T)`}</code>, which TypeScript names <code>__0</code>) are not
-				covered.
+				Dotted keys land in <DeclarationLink name="ParameterJson" />'s
+				<code>propertyDescriptions</code>, keyed by sub-path (<code>obj.prop</code> →
+				<code>prop</code>, <code>obj.a.b</code> → <code>a.b</code>). The property path isn't checked
+				against the parameter's type. Destructured parameters
+				(<Code lang="ts" inline content={'fn({a, b}: T)'} />, which TypeScript names
+				<code>__0</code>) can't be matched by name, so they aren't covered.
 			</p>
 			<p>
-				A key matching no parameter — or a dotted key whose root segment matches none — drops its
-				description and fires an <code>unknown_param</code> diagnostic with the orphaned key, usually
-				a typo or stale doc after a rename. Fix the JSDoc rather than relying on the silent fallback.
+				A key whose name (or dotted root) matches no parameter drops its description and emits
+				<code>unknown_param</code> with the key, usually a typo or a stale doc after a rename.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="@mutates" />
 			<p>
-				Non-standard tag for documenting mutations to parameters or external state, in the form
+				A non-standard tag for documenting mutations to parameters or external state:
 				<code>@mutates target - description</code>. The target is everything before the first
-				<code>-</code> separator — unlike <code>@param</code> it isn't restricted to a single
-				identifier — and targets are <strong>not validated</strong> against the parameter list.
-				Backticks are stripped from the target, so <code>`options`</code> and
-				<code>options</code> are the same key. Anything goes:
+				<code>{` - `}</code> (space-hyphen-space), so unlike <code>@param</code> it can be a
+				hyphenated name or a phrase. Targets are <strong>not validated</strong> against the
+				parameters, and backticks are stripped, so <code>`options`</code> and <code>options</code>
+				are the same key:
 			</p>
 			<ul>
 				<li>
@@ -222,110 +242,131 @@ export function double(n: number | bigint): number | bigint {
 				</li>
 			</ul>
 			<p>
-				The output is a <code>Record&lt;string, string&gt;</code> mapping each target to its description
-				— empty for the bare form. Without a separator the first line is the target and any continuation
-				lines are the description. Consumers decide how to render or group by key shape.
+				The output is a <Code lang="ts" inline content={'Record<string, string>'} /> of target to
+				description, empty for the bare form. Without a separator, the first line is the target and
+				any following lines are the description.
+			</p>
+			<p>
+				On a component prop, <code>@mutates</code> declares that the component writes into the
+				object or array it's handed, the same contract a function declares for a parameter:
+				<code>@mutates items - appends the selected entry</code>. Reassigning a prop isn't a
+				mutation in this sense; <code>bindable</code> covers that. The two combine: Svelte warns
+				when a component mutates state the parent didn't bind, so an in-place write into a parent's
+				<code>$state</code> usually sits on a <code>$bindable</code> prop.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="@internal" />
 			<p>
-				<code>@internal</code> marks a symbol as "not stable public API" per TSDoc semantics,
-				landing as <code>internalMessage</code> on declarations and members of every kind. Presence
-				means the tag was written — a bare tag yields an empty string, and trailing prose (common in
-				JSDoc corpora: <code>@internal used during development</code>) is kept as the field's value,
-				separate from <code>docComment</code>.
+				<code>@internal</code> marks a symbol as not stable public API, per TSDoc. It lands as
+				<code>internalMessage</code> on declarations and members of every kind, and on component
+				props: an empty string for a bare tag, or the trailing prose
+				(<code>@internal used during development</code>), kept separate from
+				<code>docComment</code>.
 			</p>
 			<p>
-				It is a <strong>marker, not an exclusion</strong>: the declaration remains fully documented,
-				so consumers can render a badge or filter as they see fit. To remove a declaration from
-				output entirely, use <code>@nodocs</code>; to omit whole modules, use
-				<code>exclude</code> patterns.
+				It's a <strong>marker, not an exclusion</strong>: the declaration stays fully documented, so
+				consumers can badge or filter it. To remove a declaration from output, use
+				<code>@nodocs</code>; to omit whole modules, use <code>exclude</code> patterns.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="@nodocs" />
 			<p>
-				<code>@nodocs</code> on a declaration removes it from the analysis output entirely. Two follow-on
-				effects:
+				<code>@nodocs</code> on a declaration removes it from the output entirely. It doesn't apply
+				to members or component props, which stay in the output with no warning. It also affects:
 			</p>
 			<ul>
 				<li>
-					<strong>Flat-namespace duplicate checking skips it</strong>: a hidden helper named
-					<code>parse</code> can coexist with a public <code>parse</code> in another module without
-					triggering <code>duplicate_declaration</code>.
+					<strong>Duplicate checking</strong> (opt-in, via <code>onDuplicates</code>): a hidden
+					helper named <code>parse</code> can coexist with a public <code>parse</code> in another
+					module without <code>duplicate_declaration</code>.
 				</li>
 				<li>
-					<strong>Re-export synthesis is suppressed</strong>: <code>@nodocs</code> on a re-export
-					statement drops both the <code>alsoExportedFrom</code> link and any synthesized alias declaration.
-					The canonical entry stays untouched.
+					<strong>Re-exports</strong>: on a re-export statement, it drops the
+					<code>alsoExportedFrom</code> link, any synthesized alias, and the module's
+					<code>reExports</code>, <code>starExports</code>, or <code>externalReExports</code> /
+					<code>externalStarExports</code> entry. The canonical declaration is unaffected. In JS, a
+					<code>@nodocs</code> in a <code>@typedef</code> block above the statement hides the
+					typedef instead, and the re-export stays.
 				</li>
 				<li>
-					<strong>Merged value+type pairs honor it from either side</strong>: a
-					<code>const Foo</code> + <code>type Foo</code> pair is one merged symbol, so the tag on either
-					declaration excludes the pair's single declaration.
+					<strong>Merged value+type pairs</strong>: a <Code lang="ts" inline content="const Foo" />
+					+ <Code lang="ts" inline content="type Foo" /> pair is one symbol, so the tag on either
+					excludes it.
 				</li>
 			</ul>
 		</TomeSection>
 
 		<TomeSection>
+			<TomeSectionHeader text="@cssprop" />
+			<p>
+				<code>@cssprop {'{<syntax>}'} [--name=default] - description</code> documents a CSS custom
+				property in a Svelte component's doc comment, in the Custom Elements Manifest form; the
+				syntax and brackets are optional. A tag naming no <code>--</code> property warns
+				<code>malformed_tag</code> and is dropped; a second tag for the same name warns
+				<code>duplicate_tag</code> and the first wins. The bracketed default lands in
+				<code>default</code>, beside the <code>fallback</code> the style gives; when the two
+				disagree, <code>cssprop_default_mismatch</code> warns. See
+				<TomeLink slug="component-styling" />.
+			</p>
+		</TomeSection>
+
+		<TomeSection>
 			<TomeSectionHeader text="@module" />
 			<p>
-				A comment tagged <code>@module</code> attaches to the file rather than to the next
-				declaration. The text lands on <code>ModuleJson.moduleComment</code> and is suppressed from
-				any declaration <code>docComment</code> that might otherwise capture it.
+				A comment tagged <code>@module</code> documents the file, not the next declaration. Its
+				prose lands on <code>ModuleJson.moduleComment</code> and never in a declaration's
+				<code>docComment</code>. Its tags parse as a declaration's do, into the module's fields of
+				the same names: <code>examples</code>, <code>deprecatedMessage</code>, <code>seeAlso</code>,
+				<code>since</code>, and <code>internalMessage</code>. Tags that only describe a declaration
+				(<code>@param</code>, <code>@returns</code>, <code>@mutates</code>, <code>@throws</code>,
+				<code>@default</code>, <code>@nodocs</code>, <code>@cssprop</code>) warn
+				<code>misplaced_tag</code> and are dropped, and unknown tags drop silently. A comment of
+				tags alone has no <code>moduleComment</code>. In a module comment only an <code>@</code>
+				that starts a line starts a tag, so a mid-line <code>@</code> stays in the text. The comment
+				counts as a module comment only when a line starts with <code>@module</code> (a one-line
+				<Code lang="ts" inline content="/** @module */" /> counts); in
+				<Code lang="ts" inline content="/** Text @module */" /> the text documents the next
+				declaration instead.
 			</p>
 			<Code
 				lang="ts"
 				content={`/**
  * Date math utilities.
  *
+ * @see https://tc39.es/proposal-temporal/
+ * @since 0.2.0
  * @module
  */
 
 export function add_days(d: Date, n: number): Date { /* ... */ }`}
 			/>
 			<p>
-				Svelte files have a second module-comment source: an HTML comment directly above
-				<code>&lt;script&gt;</code>. When both an HTML and a JSDoc <code>@module</code> comment
-				supply a value for the same target, <code>duplicate_comment</code> fires with
-				<code>commentType: "module_comment"</code>. The same diagnostic covers declaration-level
-				collisions (<code>commentType: "doc_comment"</code>).
+				A Svelte file's module comment comes from the first of: a JSDoc <code>@module</code> in the
+				instance <Code lang="svelte" inline content={'<' + 'script>'} />, one in
+				<Code lang="svelte" inline content={'<' + 'script module>'} />, and an HTML comment with
+				<code>@module</code> at a line start. More than one warns <code>duplicate_comment</code>.
 			</p>
-		</TomeSection>
-
-		<TomeSection>
-			<TomeSectionHeader text="Re-exports inherit comments selectively" />
 			<p>
-				A re-export that carries its own JSDoc synthesizes an alias in the re-exporting module so
-				the local content has somewhere to live, even when the name is unchanged. See
-				<TomeLink slug="output-format">Re-exports</TomeLink> for the full encoding rules and merge order.
+				A component's doc comment is its JSDoc above <code>$props()</code>, else its HTML
+				<code>@component</code> comment, the first with <code>@component</code> at a line start. A
+				JSDoc with prose beside an HTML comment warns <code>duplicate_comment</code>. Editor hover
+				takes the last comment containing <code>@component</code> anywhere, so
+				<code>component_comment_mismatch</code> warns when the two picks differ.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="Tag-related diagnostics" />
-			<p>Three diagnostic kinds surface tag-handling problems:</p>
-			<ul>
-				<li>
-					<code>misplaced_tag</code>: symbol-scope tag on a non-primary overload signature, or
-					<code>@nodocs</code> in a <code>@module</code> comment (no module-level meaning — use
-					<code>exclude</code> patterns to omit a module)
-				</li>
-				<li>
-					<code>unknown_param</code>: <code>@param</code> key with no matching parameter
-				</li>
-				<li>
-					<code>duplicate_comment</code>: two sources supplied a comment for the same target (HTML +
-					JSDoc <code>@module</code>, or any other collision)
-				</li>
-			</ul>
 			<p>
-				All three are warnings; analysis still completes and the declaration is included. See
-				<ModuleLink module_path="tsdoc.ts">tsdoc.ts</ModuleLink> for the parser internals and
-				<TomeLink slug="diagnostics" /> for the full diagnostic schema.
+				Tag problems surface as warnings: <code>misplaced_tag</code>,
+				<code>implementation_doc_hidden</code>, <code>unknown_param</code>,
+				<code>unknown_cssprop</code>, and <code>duplicate_comment</code>, described in the sections
+				above and in <TomeLink slug="diagnostics" />. The parser is
+				<ModuleLink module_path="tsdoc.ts">tsdoc.ts</ModuleLink>.
 			</p>
 		</TomeSection>
 	</section>

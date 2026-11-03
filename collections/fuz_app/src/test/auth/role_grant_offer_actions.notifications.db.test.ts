@@ -15,32 +15,26 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { TEST_ORIGIN } from '#lib/testing/test_origin.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
 import {
 	role_grant_offer_create_action_spec,
 	role_grant_offer_accept_action_spec,
 	role_grant_offer_decline_action_spec,
 	role_grant_offer_retract_action_spec
-} from '$lib/auth/role_grant_offer_action_specs.ts';
+} from '#lib/auth/role_grant_offer_action_specs.ts';
 import {
 	ROLE_GRANT_OFFER_ACCEPTED_NOTIFICATION_METHOD,
 	ROLE_GRANT_OFFER_DECLINED_NOTIFICATION_METHOD,
 	ROLE_GRANT_OFFER_RECEIVED_NOTIFICATION_METHOD,
 	ROLE_GRANT_OFFER_RETRACTED_NOTIFICATION_METHOD,
 	ROLE_GRANT_OFFER_SUPERSEDE_NOTIFICATION_METHOD
-} from '$lib/auth/role_grant_offer_notifications.ts';
-import { create_rpc_post_init } from '$lib/testing/rpc_helpers.ts';
-import type { Db } from '$lib/db/db.ts';
+} from '#lib/auth/role_grant_offer_notifications.ts';
+import { create_rpc_post_init } from '#lib/testing/rpc_helpers.ts';
 import type { Hono } from 'hono';
+import { describe_db } from '../auth_db_default.ts';
 import {
 	NOTIFICATION_TEST_RPC_PATH,
 	create_capture_sender,
@@ -50,12 +44,6 @@ import {
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = NOTIFICATION_TEST_RPC_PATH;
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 const send_rpc = async (
 	app: Hono,
@@ -70,7 +58,7 @@ const send_rpc = async (
 		headers: {
 			'Content-Type': 'application/json',
 			host: 'localhost',
-			origin: 'http://localhost:5173',
+			origin: TEST_ORIGIN,
 			...headers
 		}
 	});
@@ -354,6 +342,41 @@ describe_db('role_grant_offer_actions notifications', (get_db) => {
 			);
 			assert.strictEqual(res.status, 403);
 			assert.strictEqual(calls.length, 0);
+		});
+
+		test('a replay of an accepted offer produces no notification', async () => {
+			const calls: Array<CapturedNotificationCall> = [];
+			const sender = create_capture_sender(calls);
+			const test_app = await create_test_app({
+				session_options,
+				create_route_specs: create_notification_route_specs_factory(sender),
+				db: get_db(),
+				roles: [ROLE_ADMIN]
+			});
+			const recipient = await test_app.create_account({ username: 'notif_replay_recipient' });
+
+			const create_res = await send_rpc(
+				test_app.app,
+				RPC_PATH,
+				role_grant_offer_create_action_spec.method,
+				{ to_account_id: recipient.account.id, role: ROLE_ADMIN },
+				test_app.create_session_headers()
+			);
+			const offer_id = (await create_res.json()).result.offer.id;
+			const accept = (): Promise<Response> =>
+				send_rpc(
+					test_app.app,
+					RPC_PATH,
+					role_grant_offer_accept_action_spec.method,
+					{ offer_id },
+					recipient.create_session_headers()
+				);
+			assert.strictEqual((await accept()).status, 200);
+			calls.length = 0;
+
+			const replay = await accept();
+			assert.strictEqual(replay.status, 200);
+			assert.strictEqual(calls.length, 0, 'the grantor was notified once, by the accept');
 		});
 
 		test('decline on terminal offer produces no notification', async () => {

@@ -12,6 +12,7 @@
  * @module
  */
 
+import { dirname, resolve } from 'node:path';
 import ts from 'typescript';
 
 import type {
@@ -21,8 +22,16 @@ import type {
 	DeclarationJsonBuild
 } from './declaration-build.ts';
 import type { ReExportJsonInput, ExternalReExportJsonInput } from './types.ts';
-import type { Diagnostic } from './diagnostics.ts';
-import { parseComment, applyToDeclaration, cleanComment, hasDocContent } from './tsdoc.ts';
+import type { Diagnostic, MisplacedTagDiagnostic } from './diagnostics.ts';
+import {
+	parseComment,
+	applyToDeclaration,
+	cleanComment,
+	hasDocContent,
+	hasModuleTag,
+	parseModuleComment,
+	type TsdocParsedComment
+} from './tsdoc.ts';
 import {
 	type SourceFileInfo,
 	isSvelte2tsxGeneratedExport,
@@ -30,25 +39,26 @@ import {
 	stripVirtualSuffix,
 	getComponentName
 } from './source.ts';
-import {
-	type ModuleSourceOptions,
-	extractDependencies,
-	extractPath,
-	isSource
-} from './source-config.ts';
+import { type ModuleSourceOptions, extractDependencies, extractPath } from './source-config.ts';
 import { createIsExternalPath } from './typescript-program.ts';
+import { toPosixPath } from './paths.ts';
 import {
 	getLocalExportStatement,
 	getNodeLocation,
 	inferDeclarationKind,
 	isDeclaredInFile,
 	selectDeclarationNode,
-	type ExtractContext
+	type ExtractContext,
+	type IsEmittedFile
 } from './typescript-extract-shared.ts';
 import {
 	isAliasLostType,
 	isBrandLikeIntersection,
-	isLiteralOnlyUnion
+	isLiteralOnlyUnion,
+	isJavaScriptNode,
+	isTypeAliasLike,
+	typeAliasTypeNode,
+	type TypeAliasLike
 } from './typescript-extract-type-json.ts';
 import { extractFunctionInfo, extractVariableInfo } from './typescript-extract-function.ts';
 import { extractTypeInfo, extractEnumInfo } from './typescript-extract-type.ts';
@@ -57,11 +67,9 @@ import { extractClassInfo } from './typescript-extract-class.ts';
 /**
  * Analyze a TypeScript file and extract module metadata.
  *
- * Wraps `analyzeExports` and adds dependency information via `extractDependencies`
- * from the source file info if available.
- *
- * This is a high-level function suitable for building documentation or library metadata.
- * For lower-level analysis, use `analyzeExports` directly.
+ * The TypeScript arm of `analyzeModule`: wraps `analyzeExports` and adds
+ * dependency information via `extractDependencies`. For whole-project analysis
+ * use `analyze`/`analyzeFromFiles`.
  *
  * @param sourceFileInfo - the source file info (from file system, build pipeline, or other source)
  * @param tsSourceFile - TypeScript source file from the program
@@ -79,7 +87,7 @@ export const analyzeTypescriptModule = (
 ): ModuleAnalysis => {
 	// Use the mid-level helper for core analysis
 	const {
-		moduleComment,
+		moduleDoc,
 		declarations,
 		reExports,
 		starExports,
@@ -92,7 +100,7 @@ export const analyzeTypescriptModule = (
 
 	return {
 		path: modulePath,
-		moduleComment,
+		moduleDoc,
 		declarations,
 		dependencies,
 		dependents,
@@ -103,30 +111,69 @@ export const analyzeTypescriptModule = (
 	};
 };
 
+/** Whether `symbol` is a local import binding: a default, named, or namespace import. */
+const isImportBinding = (symbol: ts.Symbol): boolean => {
+	const decl = symbol.declarations?.[0];
+	return (
+		!!decl && (ts.isImportClause(decl) || ts.isImportSpecifier(decl) || ts.isNamespaceImport(decl))
+	);
+};
+
 /**
- * Walk the immediate-alias chain while names match, returning the deepest
- * symbol whose name still equals `exportSymbol.name`. Used by both the
- * namespace classifier and the standard alias path in `analyzeExports` to
- * locate the canonical-for-this-name (which may be an upstream alias
- * declaration, not the deeply-resolved root — relevant when a chain renames
- * partway through).
+ * The next export hop behind `symbol`: its immediate alias, stepping through
+ * import bindings to the binding the imported module exports (for a
+ * namespace import, the module symbol itself). `undefined` for a non-alias.
+ *
+ * An import binding is a local name, not a re-export — `import {foo as bar}
+ * from './x'; export {bar}` takes `foo` from `x` as `export {foo as bar}
+ * from './x'` does — so rename detection and the same-name walk compare
+ * against the name past it, and each import-then-export form documents like
+ * its export-from twin.
+ */
+const nextExportHop = (symbol: ts.Symbol, checker: ts.TypeChecker): ts.Symbol | undefined => {
+	let hop: ts.Symbol = symbol;
+	// bounded: an alias cycle is a type error, but must not hang the walk
+	for (let i = 0; i < 64; i++) {
+		if ((hop.flags & ts.SymbolFlags.Alias) === 0) return undefined;
+		const next = checker.getImmediateAliasedSymbol(hop);
+		if (!next || !isImportBinding(next)) return next;
+		hop = next;
+	}
+	return undefined;
+};
+
+/**
+ * Whether an export hop is a module itself rather than an export of one —
+ * what `nextExportHop` reaches past a namespace import.
+ */
+const isModuleHop = (hop: ts.Symbol): boolean =>
+	(hop.flags & ts.SymbolFlags.Alias) === 0 && (hop.flags & ts.SymbolFlags.ValueModule) !== 0;
+
+/**
+ * Walk the export-hop chain (`nextExportHop`, so import bindings are stepped
+ * through) while names match, returning the deepest symbol whose name still
+ * equals `exportSymbol.name`. Used by both the namespace classifier and the
+ * standard alias path in `analyzeExports` to locate the canonical-for-this-name
+ * (which may be an upstream alias declaration, not the deeply-resolved root —
+ * relevant when a chain renames partway through).
  *
  * `getImmediateAliasedSymbol` asserts on non-alias symbols, so the walk also
- * stops when the chain reaches a real declaration.
+ * stops when the chain reaches a real declaration. It also stops at the hop
+ * declared by `stopAt`, past which the chain can't be read (a `.svelte` file
+ * with no virtual, where the checker may resolve the `svelte` package's
+ * ambient module, depending on unrelated files).
  */
 const walkSameNameCanonical = (
 	exportSymbol: ts.Symbol,
-	immediateAlias: ts.Symbol | undefined,
-	checker: ts.TypeChecker
+	checker: ts.TypeChecker,
+	stopAt?: ts.Node
 ): ts.Symbol => {
 	let canonical: ts.Symbol = exportSymbol;
-	let next: ts.Symbol | undefined = immediateAlias;
+	let next = nextExportHop(exportSymbol, checker);
 	while (next && next.name === exportSymbol.name) {
 		canonical = next;
-		next =
-			(next.flags & ts.SymbolFlags.Alias) !== 0
-				? checker.getImmediateAliasedSymbol(next)
-				: undefined;
+		if (stopAt && next.declarations?.[0] === stopAt) break;
+		next = nextExportHop(next, checker);
 	}
 	return canonical;
 };
@@ -136,7 +183,8 @@ const walkSameNameCanonical = (
  * forwarding re-exports of such bindings.
  *
  * Three shapes:
- * - **origination** — this file declares the namespace via `export * as ns from './x'`.
+ * - **origination** — this file declares the namespace via `export * as ns from './x'`,
+ *   or exports a namespace import (`import * as ns from './x'; export {ns}`).
  * - **same-name** — this file forwards an existing namespace by the same name
  *   (`export {ns} from './has-namespace'`, or N-hop chains of such specifiers
  *   where names match). Linked via `alsoExportedFrom`.
@@ -145,9 +193,10 @@ const walkSameNameCanonical = (
  *   with `aliasOf` pointing at the canonical.
  *
  * Star-projected namespace bindings (`export * from` a module whose export
- * table contains `ns`) never reach classification — the caller's locality
- * skip filters them first; `starExports` is their sole encoding like every
- * other star-projected binding.
+ * table contains `ns`) never reach classification when the star's target
+ * emits a module — the caller's locality skip filters them first, and
+ * `starExports` is their sole encoding like every other star-projected
+ * binding. Over a target that emits nothing they classify as same-name.
  */
 type NamespaceClassification =
 	| { kind: 'origination'; sourceModule: string }
@@ -188,7 +237,9 @@ const classifyNamespaceReExport = (
 	checker: ts.TypeChecker,
 	currentFileName: string,
 	options: ModuleSourceOptions,
-	isExternalPath: (file: string) => boolean
+	isExternalPath: (file: string) => boolean,
+	isEmittedFile: IsEmittedFile,
+	starProjected: boolean
 ): NamespaceClassification | null => {
 	const deeplyAliased = checker.getAliasedSymbol(exportSymbol);
 	if ((deeplyAliased.flags & ts.SymbolFlags.ValueModule) === 0) return null;
@@ -199,44 +250,75 @@ const classifyNamespaceReExport = (
 	// './internal/x.ts'` documents as a namespace instead of falling through
 	// to the external arm with a relative path as its "package" specifier.
 	// Truly external targets (`export * as ns from 'pkg'`) return null and
-	// take the external arm as before.
+	// take the external arm.
 	const sourceModuleFile = getPrimaryDeclarationFile(deeplyAliased);
 	if (!sourceModuleFile || isExternalPath(sourceModuleFile)) return null;
 
 	// Origination: export's first declaration is itself a NamespaceExport in
 	// this file. The caller's locality skip filters star-projected bindings
 	// before classification, but merged symbols could put a foreign
-	// declaration first — bail rather than misclassify.
+	// declaration first — bail rather than misclassify. The one foreign
+	// NamespaceExport that does classify is a binding materialized from a
+	// star (see `collectMaterializedStars`): this module forwards the
+	// namespace under its own name, which is the same-name shape, with the
+	// defining file as canonical.
 	const exportDecl = exportSymbol.declarations?.[0];
 	if (exportDecl && ts.isNamespaceExport(exportDecl)) {
 		const definingFile = stripVirtualSuffix(exportDecl.getSourceFile().fileName);
-		if (definingFile !== currentFileName) return null;
+		if (definingFile !== currentFileName) {
+			if (!starProjected || isExternalPath(definingFile)) return null;
+			return {
+				kind: 'same-name',
+				canonicalModule: extractPath(definingFile, options),
+				sourceModule: extractPath(sourceModuleFile, options),
+				canonicalGated: !isEmittedFile(definingFile)
+			};
+		}
 		return { kind: 'origination', sourceModule: extractPath(sourceModuleFile, options) };
 	}
 
-	// Re-export specifier (`export {ns ...} from`). Use immediate-alias name
-	// comparison for rename detection — this matches the existing non-namespace
-	// rename semantics and stays correct for chains.
-	const immediateAlias = checker.getImmediateAliasedSymbol(exportSymbol);
+	// Re-export specifier (`export {ns ...} from`, or `export {ns}` over an
+	// import). Use next-hop name comparison for rename detection — this
+	// matches the non-namespace rename semantics and stays correct for chains.
+	const immediateAlias = nextExportHop(exportSymbol, checker);
 	if (!immediateAlias) return null;
 
+	// A namespace import exported from this file (`import * as ns from './x';
+	// export {ns}`, under any name) originates the namespace here, as
+	// `export * as ns from './x'` does: the hop past the import is the module
+	// itself, not an export of it. Declared in another file, it's a binding
+	// materialized from a star, classified like a foreign `NamespaceExport`
+	// above.
+	if (isModuleHop(immediateAlias)) {
+		const definingFile = exportDecl && stripVirtualSuffix(exportDecl.getSourceFile().fileName);
+		if (definingFile && definingFile !== currentFileName) {
+			if (!starProjected || isExternalPath(definingFile)) return null;
+			return {
+				kind: 'same-name',
+				canonicalModule: extractPath(definingFile, options),
+				sourceModule: extractPath(sourceModuleFile, options),
+				canonicalGated: !isEmittedFile(definingFile)
+			};
+		}
+		return { kind: 'origination', sourceModule: extractPath(sourceModuleFile, options) };
+	}
+
 	if (exportSymbol.name !== immediateAlias.name) {
-		// Renamed: walk forward until we hit the canonical NamespaceExport.
+		// Renamed: walk forward until we hit the canonical — a NamespaceExport,
+		// or the export of a namespace import (the hop past it is the module).
 		// That's the namespace-defining file (where the binding originates).
 		let cursor: ts.Symbol | undefined = immediateAlias;
 		let namespaceDefiningFile: string | undefined;
 		let canonicalName: string | undefined;
 		while (cursor) {
 			const decl = cursor.declarations?.[0];
-			if (decl && ts.isNamespaceExport(decl)) {
+			const next = nextExportHop(cursor, checker);
+			if (decl && (ts.isNamespaceExport(decl) || (next && isModuleHop(next)))) {
 				namespaceDefiningFile = stripVirtualSuffix(decl.getSourceFile().fileName);
 				canonicalName = cursor.name;
 				break;
 			}
-			cursor =
-				(cursor.flags & ts.SymbolFlags.Alias) !== 0
-					? checker.getImmediateAliasedSymbol(cursor)
-					: undefined;
+			cursor = next;
 		}
 		if (!namespaceDefiningFile || !canonicalName) return null;
 		if (isExternalPath(namespaceDefiningFile)) return null;
@@ -250,7 +332,7 @@ const classifyNamespaceReExport = (
 
 	// Same-name: the canonical-for-this-name may be an upstream renamed alias
 	// declaration, not the original NamespaceExport.
-	const canonical = walkSameNameCanonical(exportSymbol, immediateAlias, checker);
+	const canonical = walkSameNameCanonical(exportSymbol, checker);
 	const canonicalDecl = canonical.declarations?.[0];
 	if (!canonicalDecl) return null;
 	const canonicalFile = stripVirtualSuffix(canonicalDecl.getSourceFile().fileName);
@@ -260,7 +342,7 @@ const classifyNamespaceReExport = (
 		kind: 'same-name',
 		canonicalModule: extractPath(canonicalFile, options),
 		sourceModule: extractPath(sourceModuleFile, options),
-		canonicalGated: !isSource(canonicalFile, options)
+		canonicalGated: !isEmittedFile(canonicalFile)
 	};
 };
 
@@ -289,13 +371,15 @@ const getPrimaryDeclarationFile = (symbol: ts.Symbol): string | undefined => {
 /**
  * Whether a local export statement/specifier pair is type-only — either
  * statement-level (`export type {…} from`) or specifier-level
- * (`export {type A} from`). Type-only names are erased at runtime.
+ * (`export {type A} from`). Type-only names are erased at runtime. An
+ * `export default x` never is.
  */
 const isTypeOnlyLocalExport = (local: {
-	node: ts.ExportSpecifier | ts.NamespaceExport;
-	statement: ts.ExportDeclaration;
+	node: ExportNode;
+	statement: ts.ExportDeclaration | ts.ExportAssignment;
 }): boolean =>
-	local.statement.isTypeOnly || (ts.isExportSpecifier(local.node) && local.node.isTypeOnly);
+	ts.isExportDeclaration(local.statement) &&
+	(local.statement.isTypeOnly || (ts.isExportSpecifier(local.node) && local.node.isTypeOnly));
 
 /**
  * Public name for a cross-file re-export: `default` re-keys to the
@@ -315,16 +399,171 @@ const reExportPublicName = (
 		: exportName;
 
 /**
+ * The project file a relative `.svelte` specifier names, resolved against the
+ * file that wrote it, or `undefined` for any other specifier.
+ */
+const relativeSvelteSpecifierFile = (
+	specifier: ts.Expression | undefined,
+	currentFileName: string
+): string | undefined => {
+	if (!specifier || !ts.isStringLiteral(specifier)) return undefined;
+	if (!specifier.text.startsWith('.') || !specifier.text.endsWith('.svelte')) return undefined;
+	return toPosixPath(resolve(dirname(currentFileName), specifier.text));
+};
+
+/** A re-export of a `.svelte` file the program has no virtual for (see `virtuallessSvelteReExport`). */
+interface VirtuallessSvelteReExport {
+	/**
+	 * The component's file, or `undefined` when there's nothing to document —
+	 * the file is missing (a mistyped specifier) or outside the project.
+	 */
+	file: string | undefined;
+	/**
+	 * The binding taken from the component: `'default'`, `'*'` for a namespace,
+	 * or a `<script module>` export's name.
+	 */
+	importedName: string;
+	/**
+	 * The export that publishes the binding straight off the component, in the
+	 * file that wrote it — this module's own statement, or a module further
+	 * down the chain. `declaredName` is what that file documents it as: the
+	 * component's name for `export {default} from './X.svelte'`, else the
+	 * exported name.
+	 */
+	declaring: { file: string; node: ExportNode; declaredName: string };
+}
+
+/** An export hop's declaration node. */
+type ExportNode = ts.ExportSpecifier | ts.NamespaceExport | ts.ExportAssignment;
+
+/**
+ * The statement an export node belongs to, where its JSDoc lives: the
+ * `ExportDeclaration` of a specifier or `export * as`, else the node itself
+ * (`export default X`).
+ */
+const exportStatementOf = (node: ExportNode): ts.ExportDeclaration | ts.ExportAssignment =>
+	ts.isExportSpecifier(node) ? node.parent.parent : ts.isNamespaceExport(node) ? node.parent : node;
+
+/**
+ * Read a re-export whose chain reaches a relative `.svelte` specifier naming a
+ * file the program has no svelte2tsx virtual for — its transform failed, or
+ * it was never supplied (the context closure off). Returns `undefined` for
+ * any other re-export, which resolves the ordinary way.
+ *
+ * Decided by path and `ExtractContext.svelteFileStatus`, never by what the
+ * checker resolves the specifier to: with no virtual, that is nothing, or the
+ * `svelte` package's ambient `declare module '*.svelte'` once some file in the
+ * program imports `svelte`, so a symbol-based reading would turn on unrelated
+ * files. The walk follows immediate aliases syntactically — export
+ * specifiers, `export * as`, `export default X`, and imports, in this file
+ * or through other modules — until a hop takes the default or namespace of a
+ * relative `.svelte` file, or reaches a real declaration. A `<script module>`
+ * name taken from a component that has a virtual walks on through it, so a
+ * component's own re-export of a failed one is reached too. Non-relative
+ * specifiers (a `paths` alias) are not read.
+ */
+const virtuallessSvelteReExport = (
+	exportSymbol: ts.Symbol,
+	ctx: ExtractContext,
+	isExternalPath: (file: string) => boolean
+): VirtuallessSvelteReExport | undefined => {
+	// the latest export hop, and whether it is `export {default} from`, which
+	// its file documents under the component's name
+	let declaring: { file: string; node: ExportNode; name: string; slot: boolean } | undefined;
+	let hop: ts.Symbol | undefined = exportSymbol;
+	// bounded: an alias cycle is a type error, but must not hang the walk
+	for (let i = 0; hop && i < 64; i++) {
+		const decl: ts.Declaration | undefined = hop.declarations?.[0];
+		if (!decl) return undefined;
+		const hopFile = stripVirtualSuffix(decl.getSourceFile().fileName);
+		let specifier: ts.Expression | undefined;
+		let importedName: string | undefined;
+		if (ts.isExportSpecifier(decl)) {
+			specifier = decl.parent.parent.moduleSpecifier;
+			importedName = (decl.propertyName ?? decl.name).text;
+		} else if (ts.isNamespaceExport(decl)) {
+			specifier = decl.parent.moduleSpecifier;
+			importedName = '*';
+		} else if (ts.isExportAssignment(decl)) {
+			// `export default X`: the binding comes from `X`'s own hop
+		} else if (ts.isImportClause(decl)) {
+			specifier = decl.parent.moduleSpecifier;
+			importedName = 'default';
+		} else if (ts.isNamespaceImport(decl)) {
+			specifier = decl.parent.parent.moduleSpecifier;
+			importedName = '*';
+		} else if (ts.isImportSpecifier(decl)) {
+			specifier = decl.parent.parent.parent.moduleSpecifier;
+			importedName = (decl.propertyName ?? decl.name).text;
+		} else {
+			return undefined;
+		}
+		if (ts.isExportSpecifier(decl) || ts.isNamespaceExport(decl) || ts.isExportAssignment(decl)) {
+			const slot = hop.name === 'default' && !!specifier && importedName === 'default';
+			declaring = { file: hopFile, node: decl, name: hop.name, slot };
+		} else if (declaring?.file === hopFile && declaring.name === 'default') {
+			// an import binding exported into the default slot (`import X from
+			// './X.svelte'; export default X`) is `export {default} from` (see
+			// `nextExportHop`)
+			declaring.slot = importedName === 'default';
+		}
+		const file = relativeSvelteSpecifierFile(specifier, hopFile);
+		const status = file === undefined ? undefined : ctx.svelteFileStatus(file);
+		// a component with a virtual ends the walk at its default or namespace;
+		// a `<script module>` name walks on into the virtual, which may itself
+		// re-export from a component that has none
+		if (status === 'virtual' && (importedName === 'default' || importedName === '*')) {
+			return undefined;
+		}
+		if (file === undefined || status === 'virtual' || importedName === undefined || !declaring) {
+			hop =
+				(hop.flags & ts.SymbolFlags.Alias) !== 0
+					? ctx.checker.getImmediateAliasedSymbol(hop)
+					: undefined;
+			continue;
+		}
+		return {
+			file: status === 'virtualless' && !isExternalPath(file) ? file : undefined,
+			importedName,
+			declaring: {
+				file: declaring.file,
+				node: declaring.node,
+				declaredName: declaring.slot ? getComponentName(file) : declaring.name
+			}
+		};
+	}
+	return undefined;
+};
+
+/** Whether `symbol` is what `sourceFile` exports as `default`, through any alias. */
+const isDefaultExportOf = (
+	symbol: ts.Symbol,
+	sourceFile: ts.SourceFile,
+	checker: ts.TypeChecker
+): boolean => {
+	const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+	const defaultExport =
+		moduleSymbol && checker.tryGetMemberInModuleExports('default', moduleSymbol);
+	if (!defaultExport) return false;
+	const resolved =
+		defaultExport.flags & ts.SymbolFlags.Alias
+			? checker.getAliasedSymbol(defaultExport)
+			: defaultExport;
+	return resolved === symbol || defaultExport === symbol;
+};
+
+/**
  * Synthesize a cross-file alias declaration for a renamed or documented
  * same-name re-export.
  *
- * Svelte canonicals get a `kind: 'component'` placeholder — running
- * `analyzeDeclaration` on svelte2tsx's `__SvelteComponent_` type alias would
- * leak internal names; phase-2 `resolveComponentAliases` copies
- * props/acceptsChildren/lang/etc. from the canonical (fill-gaps-only, so
- * local JSDoc applied by the caller sticks). Everything else is analyzed in
- * its own source file so the alias inherits `typeSignature`, `reactivity`,
- * `docComment`, `parameters`, etc.
+ * A Svelte component — the default export of a svelte2tsx virtual — gets a
+ * `kind: 'component'` placeholder: running `analyzeDeclaration` on
+ * svelte2tsx's `__SvelteComponent_` type alias would leak internal names;
+ * phase-2 `resolveComponentAliases` copies props/acceptsChildren/lang/etc.
+ * from the canonical (fill-gaps-only, so local JSDoc applied by the caller
+ * sticks). Everything else, a component's `<script module>` exports included,
+ * is analyzed in its own source file so the alias inherits `typeSignature`,
+ * `reactivity`, `docComment`, `parameters`, etc.
  *
  * `aliasOf.name` is the canonical's own symbol name — `'default'` for
  * default-slot canonicals (renames into and out of the slot flow through
@@ -339,7 +578,10 @@ const synthesizeCrossFileAlias = (
 	specifierLine: number | undefined,
 	ctx: ExtractContext
 ): DeclarationJsonBuild => {
-	if (isSvelteVirtualPath(originalSource.fileName)) {
+	if (
+		isSvelteVirtualPath(originalSource.fileName) &&
+		isDefaultExportOf(aliasedSymbol, originalSource, ctx.checker)
+	) {
 		return {
 			name: publicName,
 			kind: 'component',
@@ -355,6 +597,176 @@ const synthesizeCrossFileAlias = (
 	return analyzed;
 };
 
+/** The symbol an export binding ultimately names: an alias's target, else the symbol itself. */
+const resolveAlias = (symbol: ts.Symbol, checker: ts.TypeChecker): ts.Symbol =>
+	symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+
+/** A star-projected binding to document, as `collectMaterializedStars` resolved it. */
+interface MaterializedStar {
+	/** The `export * from` statement the binding is documented under. */
+	statement: ts.ExportDeclaration;
+	/** The binding the name resolves to through that star. */
+	resolved: ts.Symbol;
+}
+
+/**
+ * The bindings a module publishes only through `export * from` a project file
+ * that emits no module (gated, or outside the analyzed inputs), keyed by name
+ * with the star statement that projects each.
+ *
+ * `starExports` can't carry these: the target isn't in the output, so the
+ * names would be documented nowhere. The caller instead treats each as the
+ * named same-name re-export the star stands for, which routes it through the
+ * ordinary re-export arms — a link when its canonical does emit, a
+ * synthesized alias when it doesn't.
+ *
+ * ES star semantics decide membership, not TypeScript's export table (which
+ * keeps the first of two conflicting stars): `default` never projects, a
+ * local export of the same name shadows, and a name two stars resolve to
+ * different bindings is ambiguous and excluded. A name an emitted star target
+ * also provides is left to that target's `starExports` entry.
+ * svelte2tsx-generated names are skipped, and a statement-level `@nodocs`
+ * suppresses the whole star, as it does for an emitted target — its bindings
+ * still count toward ambiguity, since the module exports them all the same.
+ *
+ * Each entry carries the binding the star resolves the name to; the caller
+ * checks the export table's symbol against it, so a symbol the table took
+ * from some other star is never documented under this one.
+ *
+ * Not reconciled: a name an emitted star and a non-emitted star resolve
+ * differently is ambiguous under ES, but stays with the emitted star's
+ * `starExports` entry, which can't exclude a single name.
+ */
+const collectMaterializedStars = (
+	sourceFile: ts.SourceFile,
+	localExports: ReadonlyArray<ts.Symbol>,
+	currentFileName: string,
+	checker: ts.TypeChecker,
+	isExternalPath: (file: string) => boolean,
+	isEmittedFile: IsEmittedFile
+): Map<string, MaterializedStar> => {
+	// every star's projected bindings, by name, with whether its target emits
+	// and whether the statement is `@nodocs`
+	interface Provider extends MaterializedStar {
+		emitted: boolean;
+		suppressed: boolean;
+	}
+	const providers = new Map<string, Array<Provider>>();
+	let anyMaterialized = false;
+	for (const statement of sourceFile.statements) {
+		if (
+			!ts.isExportDeclaration(statement) ||
+			statement.exportClause ||
+			!statement.moduleSpecifier ||
+			!ts.isStringLiteral(statement.moduleSpecifier)
+		) {
+			continue;
+		}
+		const suppressed = !!parseComment(statement, sourceFile)?.nodocs;
+		const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
+		const targetFile = moduleSymbol && getPrimaryDeclarationFile(moduleSymbol);
+		if (!moduleSymbol || !targetFile || isExternalPath(targetFile)) continue;
+		const emitted = isEmittedFile(targetFile);
+		if (!emitted && !suppressed) anyMaterialized = true;
+		for (const projected of checker.getExportsOfModule(moduleSymbol)) {
+			if (projected.name === 'default' || isSvelte2tsxGeneratedExport(projected.name)) continue;
+			let list = providers.get(projected.name);
+			if (!list) providers.set(projected.name, (list = []));
+			list.push({
+				statement,
+				resolved: resolveAlias(projected, checker),
+				emitted,
+				suppressed
+			});
+		}
+	}
+
+	const materialized = new Map<string, MaterializedStar>();
+	if (!anyMaterialized) return materialized;
+	const shadowed = new Set<string>();
+	for (const symbol of localExports) {
+		if (isDeclaredInFile(symbol, currentFileName)) shadowed.add(symbol.name);
+	}
+	for (const [name, list] of providers) {
+		if (shadowed.has(name)) continue;
+		if (list.some((p) => p.emitted)) continue;
+		if (list.some((p) => p.resolved !== list[0]!.resolved)) continue;
+		const provider = list.find((p) => !p.suppressed);
+		if (provider) {
+			materialized.set(name, { statement: provider.statement, resolved: provider.resolved });
+		}
+	}
+	return materialized;
+};
+
+/**
+ * The first CommonJS export assignment in a JS file with no module symbol
+ * (no ES `import`/`export`; with one, TypeScript reads the assignments as
+ * ordinary code) — its left side, a top-level `module.exports = …`,
+ * `module.exports.x = …`, or `exports.x = …` (bracket access included) — or
+ * `undefined`, always for TypeScript. Syntactic, like TypeScript's own
+ * CommonJS detection, and narrower: assignments nested in blocks or functions
+ * (a UMD wrapper) and `Object.defineProperty(exports, …)` aren't looked for.
+ * A script whose own top-level declaration binds `exports` or `module`
+ * (`const exports = {}`, `var module = {exports: {}}`) assigns to its own
+ * object, so it has none.
+ */
+const findCommonjsExport = (sourceFile: ts.SourceFile): ts.Expression | undefined => {
+	if (!isJavaScriptNode(sourceFile)) return undefined;
+	for (const statement of sourceFile.statements) {
+		if (!ts.isExpressionStatement(statement)) continue;
+		const expression = statement.expression;
+		if (
+			ts.isBinaryExpression(expression) &&
+			expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+			isCommonjsExportTarget(expression.left)
+		) {
+			// checked only on a hit: a file's own `exports` or `module` makes it ordinary code
+			return bindsCommonjsName(sourceFile) ? undefined : expression.left;
+		}
+	}
+	return undefined;
+};
+
+const COMMONJS_NAMES = new Set(['exports', 'module']);
+
+/**
+ * Whether a top-level variable, function, or class declaration binds
+ * `exports` or `module`, destructuring included. Import bindings never reach
+ * here, since an `import` makes the file an ES module.
+ */
+const bindsCommonjsName = (sourceFile: ts.SourceFile): boolean => {
+	const bindsName = (name: ts.BindingName): boolean =>
+		ts.isIdentifier(name)
+			? COMMONJS_NAMES.has(name.text)
+			: name.elements.some(
+					(element) => !ts.isOmittedExpression(element) && bindsName(element.name)
+				);
+	return sourceFile.statements.some((statement) => {
+		if (ts.isVariableStatement(statement)) {
+			return statement.declarationList.declarations.some((d) => bindsName(d.name));
+		}
+		if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) {
+			return statement.name !== undefined && COMMONJS_NAMES.has(statement.name.text);
+		}
+		return false;
+	});
+};
+
+/** `module.exports`, or a property of it or of `exports`, in dot or bracket form. */
+const isCommonjsExportTarget = (node: ts.Expression): boolean => {
+	if (isModuleExports(node)) return true;
+	if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+	const object = node.expression;
+	return isModuleExports(object) || (ts.isIdentifier(object) && object.text === 'exports');
+};
+
+const isModuleExports = (node: ts.Expression): boolean =>
+	ts.isPropertyAccessExpression(node) &&
+	ts.isIdentifier(node.expression) &&
+	node.expression.text === 'module' &&
+	node.name.text === 'exports';
+
 /**
  * Analyze all exports from a TypeScript source file.
  *
@@ -364,6 +776,8 @@ const synthesizeCrossFileAlias = (
  * Handles re-exports by:
  * - Same-name re-exports: tracked in `reExports` for `alsoExportedFrom` building
  * - Renamed re-exports: included as new declarations with `aliasOf` metadata
+ * - Import-then-export (`import {foo as bar} from './x'; export {bar}`): encoded as its
+ *   export-from twin, since rename detection steps through import bindings (`nextExportHop`)
  * - Star exports (`export * from`): tracked in `starExports` for namespace-level info
  * - Direct external re-exports: tracked in `externalReExports`/`externalStarExports`
  *   (specifier as written; import-then-export and source-chained forms stay silent)
@@ -373,7 +787,10 @@ const synthesizeCrossFileAlias = (
  * For standard SvelteKit library layouts, use `createSourceOptions(process.cwd())`.
  *
  * @param sourceFile - the TypeScript source file to analyze
- * @param ctx - the extraction pass's context (see `ExtractContext`) — `analyzeModule` and `analyzeSvelteModule` construct it via `createExtractContext`; a direct caller owns the construction, deciding every field explicitly (tests use `mockExtractContext`). Its `isExternalFile` must be derived from the same `options` passed here: this function derives its own path-keyed twin (`createIsExternalPath`) from `options`, and the two externality axes are expected to agree
+ * @param ctx - the extraction pass's context (see `createExtractContext`); its
+ *   `isExternalFile` must derive from the same `options` passed here, since this
+ *   function derives its path-keyed twin (`createIsExternalPath`) from `options`
+ *   and the two must agree
  * @param options - module source options for path extraction in re-exports
  * @returns module comment, declarations, re-exports (source + external), and star exports (source + external)
  */
@@ -397,7 +814,7 @@ export const analyzeExports = (
 	// Extract star exports (export * from './module' / 'pkg')
 	const { starExports, externalStarExports } = extractStarExports(
 		sourceFile,
-		checker,
+		ctx,
 		options,
 		isExternalPath
 	);
@@ -409,26 +826,54 @@ export const analyzeExports = (
 	// Extract module-level comment — skipped for svelte2tsx virtuals, where
 	// hoisted instance-script comments would read as module comments;
 	// `analyzeSvelteModule` extracts the `<script module>` comment from the
-	// original source instead (and owns its `@nodocs` warning)
+	// original source instead (and owns its `misplaced_tag` warnings)
 	const isVirtual = currentFileName !== sourceFile.fileName;
-	const moduleComment = isVirtual ? undefined : extractModuleComment(sourceFile);
+	const moduleDoc = isVirtual ? undefined : extractModuleComment(sourceFile);
 
-	warnModuleCommentNodocs(moduleComment, currentFileName, diagnostics);
+	warnModuleCommentTags(moduleDoc, currentFileName, diagnostics);
 
 	// 1-based line of a node in this file. Virtual coordinates for Svelte
 	// `<script module>` sources — remapped in `analyzeSvelteModule`.
 	const lineOf = (node: ts.Node): number =>
 		sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
 
-	// Get all exported symbols
+	// Get all exported symbols. A file with no ES syntax has no module symbol,
+	// so a CommonJS module documents nothing, with a warning saying why.
 	const symbol = checker.getSymbolAtLocation(sourceFile);
+	const commonjsExport = symbol || isVirtual ? undefined : findCommonjsExport(sourceFile);
+	if (commonjsExport) {
+		diagnostics.push({
+			kind: 'commonjs_unsupported',
+			...getNodeLocation(commonjsExport),
+			message: `CommonJS module (unsupported): \`${commonjsExport.getText(sourceFile)}\` and any other CommonJS exports document nothing`,
+			severity: 'warning'
+		});
+	}
 	if (symbol) {
 		const exports = checker.getExportsOfModule(symbol);
+		const materializedStars = collectMaterializedStars(
+			sourceFile,
+			exports,
+			currentFileName,
+			checker,
+			isExternalPath,
+			ctx.isEmittedFile
+		);
 		for (const exportSymbol of exports) {
 			// Check if this is an alias (potential re-export) using the Alias flag
 			const isAlias = (exportSymbol.flags & ts.SymbolFlags.Alias) !== 0;
+			// The star statement to treat this binding as a named re-export
+			// of, when it arrives only through a star over a module that
+			// emits nothing (see `collectMaterializedStars`).
+			const materialized = isDeclaredInFile(exportSymbol, currentFileName)
+				? undefined
+				: materializedStars.get(exportSymbol.name);
+			const star =
+				materialized && materialized.resolved === resolveAlias(exportSymbol, checker)
+					? materialized.statement
+					: undefined;
 
-			if (isAlias) {
+			if (isAlias || star) {
 				// Star-projected alias bindings: `export * from './b'` projects
 				// b.ts's own re-export bindings into this module's export table,
 				// sharing the foreign declaration node (an `ExportSpecifier` or,
@@ -439,8 +884,98 @@ export const analyzeExports = (
 				// contain and read the foreign statement's JSDoc as if local
 				// (synthesizing duplicate declarations with mis-attributed docs).
 				// Runs before namespace classification so star-projected
-				// namespace bindings are silenced uniformly.
-				if (!isDeclaredInFile(exportSymbol, currentFileName)) continue;
+				// namespace bindings are silenced uniformly. The exception is a
+				// star over a module that emits nothing: there is no
+				// `starExports` entry to carry the binding, so it is processed
+				// as the named re-export the star stands for, positioned at the
+				// star statement and never reading a foreign statement's JSDoc
+				// (`getLocalExportStatement` finds none in this file).
+				if (!star && !isDeclaredInFile(exportSymbol, currentFileName)) continue;
+				const starLine = star ? lineOf(star) : undefined;
+
+				// A component the program has no virtual for (see
+				// `virtuallessSvelteReExport`): nothing can be read off it, but
+				// the statement still publishes a name, so its default documents
+				// as a `partial` component and a namespace over it as a `partial`
+				// namespace, in the shapes a valid component's re-exports take. A
+				// missing file publishes nothing to document. A `<script module>`
+				// name falls through to the arms below.
+				const virtualless = star
+					? undefined
+					: virtuallessSvelteReExport(exportSymbol, ctx, isExternalPath);
+				if (virtualless) {
+					const { file, importedName, declaring } = virtualless;
+					if (file === undefined) continue;
+					if (importedName === 'default' || importedName === '*') {
+						const localNode = exportSymbol.declarations![0] as ExportNode;
+						const localStatement = exportStatementOf(localNode);
+						const localTsdoc = parseComment(localStatement, sourceFile);
+						const sourceLine = lineOf(localNode);
+						const module = extractPath(file, options);
+						const direct = declaring.file === currentFileName;
+						// Through another module, a same-name re-export links to the
+						// module that declares the name when it emits, like any chain;
+						// the walk ends at the declaring hop, since what the checker
+						// resolves past it turns on unrelated files
+						const immediate = nextExportHop(exportSymbol, checker);
+						let name = direct ? declaring.declaredName : exportSymbol.name;
+						let link: string | undefined;
+						if (!direct && immediate?.name === exportSymbol.name) {
+							const canonicalDecl = walkSameNameCanonical(exportSymbol, checker, declaring.node)
+								.declarations?.[0];
+							const canonicalFile =
+								canonicalDecl && stripVirtualSuffix(canonicalDecl.getSourceFile().fileName);
+							if (canonicalFile === declaring.file) name = declaring.declaredName;
+							if (
+								canonicalFile &&
+								canonicalFile !== currentFileName &&
+								ctx.isEmittedFile(canonicalFile)
+							) {
+								link = canonicalFile;
+							}
+						}
+						if (link && !localTsdoc?.nodocs) {
+							const typeOnly =
+								ts.isExportDeclaration(localStatement) &&
+								(localStatement.isTypeOnly ||
+									(ts.isExportSpecifier(localNode) && localNode.isTypeOnly));
+							reExports.push({
+								name,
+								module: extractPath(link, options),
+								...(typeOnly ? { typeOnly: true } : {}),
+								sourceLine
+							});
+						}
+						if (link && !localTsdoc) continue;
+						const decl: DeclarationJsonBuild =
+							importedName === '*'
+								? {
+										name,
+										kind: 'namespace',
+										module,
+										partial: true,
+										...(direct
+											? {}
+											: {
+													aliasOf: {
+														module: extractPath(declaring.file, options),
+														name: declaring.declaredName
+													}
+												}),
+										sourceLine
+									}
+								: {
+										name,
+										kind: 'component',
+										partial: true,
+										aliasOf: { module, name: getComponentName(file) },
+										sourceLine
+									};
+						if (localTsdoc) applyToDeclaration(decl, localTsdoc);
+						declarations.push({ declaration: decl, nodocs: !!localTsdoc?.nodocs });
+						continue;
+					}
+				}
 
 				// Namespace re-exports (`export * as ns from './x'` and re-exports
 				// of such bindings) need special handling: their deeply-resolved
@@ -451,13 +986,17 @@ export const analyzeExports = (
 				// is robust to arbitrary re-export chain depth (the immediate-alias
 				// shape is fragile — intermediate hops are `ExportSpecifier` nodes,
 				// not `NamespaceExport`).
-				const nsClass = classifyNamespaceReExport(
-					exportSymbol,
-					checker,
-					currentFileName,
-					options,
-					isExternalPath
-				);
+				const nsClass = isAlias
+					? classifyNamespaceReExport(
+							exportSymbol,
+							checker,
+							currentFileName,
+							options,
+							isExternalPath,
+							ctx.isEmittedFile,
+							star !== undefined
+						)
+					: null;
 				if (nsClass) {
 					// The locality skip above filters star-projected bindings before
 					// classification, so origination/renamed/same-name statements are
@@ -466,7 +1005,7 @@ export const analyzeExports = (
 					// a foreign node.
 					const local = getLocalExportStatement(exportSymbol, sourceFile);
 					const localTsdoc = local ? parseComment(local.statement, sourceFile) : undefined;
-					const nsSpecifierLine = local ? lineOf(local.node) : undefined;
+					const nsSpecifierLine = local ? lineOf(local.node) : starLine;
 
 					if (nsClass.kind === 'origination') {
 						const decl: DeclarationJsonBuild = {
@@ -536,7 +1075,8 @@ export const analyzeExports = (
 				}
 
 				// This might be a re-export - use getAliasedSymbol to find the original
-				const aliasedSymbol = checker.getAliasedSymbol(exportSymbol);
+				// (a star-projected binding declared in its target is its own original)
+				const aliasedSymbol = isAlias ? checker.getAliasedSymbol(exportSymbol) : exportSymbol;
 				const originalSource = getPrimaryDeclarationSourceFile(aliasedSymbol);
 
 				if (originalSource) {
@@ -549,8 +1089,8 @@ export const analyzeExports = (
 						// lives on the ExportDeclaration, not on the canonical's
 						// declaration in the foreign file.
 						const local = getLocalExportStatement(exportSymbol, sourceFile);
-						const specifierTypeOnly = local ? isTypeOnlyLocalExport(local) : false;
-						const specifierLine = local ? lineOf(local.node) : undefined;
+						const specifierTypeOnly = local ? isTypeOnlyLocalExport(local) : !!star?.isTypeOnly;
+						const specifierLine = local ? lineOf(local.node) : starLine;
 						const localTsdoc = local ? parseComment(local.statement, sourceFile) : undefined;
 
 						// Synthesize a full alias declaration under `publicName`
@@ -574,14 +1114,17 @@ export const analyzeExports = (
 							declarations.push({ declaration: decl, nodocs: !!localTsdoc?.nodocs });
 						};
 
-						// Only track if the original is from a source module (not node_modules)
-						if (isSource(originalFileName, options)) {
+						// Only link when the original's module is in the output; one
+						// that emits nothing (gated, or a source file outside the
+						// analyzed inputs) takes the synthesizing arm below
+						if (ctx.isEmittedFile(originalFileName)) {
 							const originalModule = extractPath(originalFileName, options);
-							// Use the IMMEDIATE alias (one hop) for rename detection so a
-							// same-name re-export of an intermediate alias is not mistaken
-							// for a rename relative to the deeply-resolved canonical (whose
-							// name may differ from this hop's name).
-							const immediateAlias = checker.getImmediateAliasedSymbol(exportSymbol);
+							// Use the NEXT HOP (one export hop, through any import binding
+							// — see `nextExportHop`) for rename detection so a same-name
+							// re-export of an intermediate alias is not mistaken for a
+							// rename relative to the deeply-resolved canonical (whose name
+							// may differ from this hop's name).
+							const immediateAlias = isAlias ? nextExportHop(exportSymbol, checker) : undefined;
 							const immediateName = immediateAlias?.name ?? aliasedSymbol.name;
 							const isRenamed = exportSymbol.name !== immediateName;
 
@@ -596,7 +1139,7 @@ export const analyzeExports = (
 								// alias points at that alias's module, not the deeply-resolved
 								// canonical (whose declaration uses the pre-rename name and
 								// wouldn't match in `mergeReExports`).
-								const canonical = walkSameNameCanonical(exportSymbol, immediateAlias, checker);
+								const canonical = walkSameNameCanonical(exportSymbol, checker);
 								const canonicalSource = getPrimaryDeclarationSourceFile(canonical);
 								const canonicalFile = canonicalSource
 									? stripVirtualSuffix(canonicalSource.fileName)
@@ -620,7 +1163,7 @@ export const analyzeExports = (
 								// namespace classifier's `canonicalGated`). `aliasOf` points at
 								// the deep canonical — a real declaration.
 								const canonicalGated =
-									!isExternalPath(canonicalFile) && !isSource(canonicalFile, options);
+									!isExternalPath(canonicalFile) && !ctx.isEmittedFile(canonicalFile);
 
 								// Position 3 (content-conditional synthesis): if the local export
 								// statement carries JSDoc or @nodocs, synthesize an alias declaration
@@ -637,7 +1180,7 @@ export const analyzeExports = (
 								if (
 									!localTsdoc?.nodocs &&
 									canonicalFile !== currentFileName &&
-									isSource(canonicalFile, options)
+									ctx.isEmittedFile(canonicalFile)
 								) {
 									reExports.push({
 										name: reExportName,
@@ -650,10 +1193,11 @@ export const analyzeExports = (
 							continue;
 						}
 
-						// Re-export whose canonical is project-local but gated from
-						// output (the `internal/` convention, user excludes): the
-						// statement publishes the symbol *here*, and the canonical
-						// module emits nothing — so this module owns the docs. A full
+						// Re-export whose canonical is project-local but emits no
+						// module (the `internal/` convention, user excludes, a source
+						// file outside the analyzed inputs): the statement publishes the
+						// symbol *here*, and the canonical module emits nothing — so
+						// this module owns the docs. A full
 						// alias declaration is synthesized (same-name and renamed
 						// alike; there is no canonical to link an `alsoExportedFrom`
 						// edge to), inheriting the canonical's analyzed shape, with
@@ -682,11 +1226,14 @@ export const analyzeExports = (
 						// through a project-local *gated* module also stays silent
 						// (nothing owns the entry, a documented margin) rather than
 						// recording a relative path as a package specifier.
-						const immediateExternal = checker.getImmediateAliasedSymbol(exportSymbol);
+						const immediateExternal = isAlias
+							? checker.getImmediateAliasedSymbol(exportSymbol)
+							: undefined;
 						const immediateExternalFile =
 							immediateExternal && getPrimaryDeclarationFile(immediateExternal);
 						if (!immediateExternalFile || !isExternalPath(immediateExternalFile)) continue;
-						if (!local?.statement.moduleSpecifier) continue;
+						if (!local || !ts.isExportDeclaration(local.statement)) continue;
+						if (!local.statement.moduleSpecifier) continue;
 						if (!ts.isStringLiteral(local.statement.moduleSpecifier)) continue;
 						if (localTsdoc?.nodocs) continue;
 						const originalName = ts.isExportSpecifier(local.node)
@@ -711,15 +1258,27 @@ export const analyzeExports = (
 			// encoding is `starExports`; analyzing them here would duplicate the
 			// canonical declaration into this module (triggering spurious
 			// duplicate_declaration diagnostics, with sourceLine pointing into
-			// the foreign file).
-			if (!isAlias && !isDeclaredInFile(exportSymbol, currentFileName)) continue;
+			// the foreign file). A materialized star binding was handled by the
+			// arms above, or has nothing resolvable to describe.
+			if (star || (!isAlias && !isDeclaredInFile(exportSymbol, currentFileName))) continue;
 
 			// Normal export or within-file alias - declared in this file.
 			// For within-file aliases (export { x } or export { x as y }), resolve to
 			// the aliased symbol so that inferDeclarationKind sees the actual declaration
 			// node (e.g., VariableDeclaration with ArrowFunction) instead of the ExportSpecifier.
 			const symbolToAnalyze = isAlias ? checker.getAliasedSymbol(exportSymbol) : exportSymbol;
-			const analysisResult = analyzeDeclaration(symbolToAnalyze, sourceFile, ctx);
+			const analysisResult = analyzeDeclaration(
+				symbolToAnalyze,
+				sourceFile,
+				ctx,
+				// the component svelte2tsx generates carries the HTML `@component`
+				// comment, whose `@cssprop` tags are the component's
+				!(
+					isSvelteVirtualPath(sourceFile.fileName) &&
+					(isSvelte2tsxGeneratedExport(exportSymbol.name) ||
+						isSvelte2tsxGeneratedExport(symbolToAnalyze.name))
+				)
+			);
 			const { declaration } = analysisResult;
 			let { nodocs } = analysisResult;
 			// Preserve the export name for within-file renames (export { x as y }).
@@ -749,7 +1308,7 @@ export const analyzeExports = (
 	}
 
 	return {
-		moduleComment,
+		moduleDoc,
 		declarations,
 		reExports,
 		starExports,
@@ -768,12 +1327,17 @@ export const analyzeExports = (
  * @param symbol - the TypeScript symbol to analyze
  * @param sourceFile - the source file containing the symbol
  * @param ctx - the extraction pass's context (checker, diagnostics, externality predicate, alias registry)
+ * @param warnMisplacedCssprop - whether a `@cssprop` tag in the declaration's
+ *   JSDoc warns `misplaced_tag` (it documents only a component): set by the
+ *   declaring module's own pass, so an alias re-analyzing the canonical
+ *   doesn't repeat the warning
  * @returns complete declaration metadata including docs, types, and parameters, plus nodocs flag
  */
 export const analyzeDeclaration = (
 	symbol: ts.Symbol,
 	sourceFile: ts.SourceFile,
-	ctx: ExtractContext
+	ctx: ExtractContext,
+	warnMisplacedCssprop = false
 ): DeclarationAnalysis => {
 	const declNode = selectDeclarationNode(symbol);
 	// Pass the symbol's name through verbatim. Default-slot symbols
@@ -816,8 +1380,25 @@ export const analyzeDeclaration = (
 		}
 	}
 	applyToDeclaration(result, tsdoc);
+	if (
+		warnMisplacedCssprop &&
+		(tsdoc?.cssProperties?.length || tsdoc?.cssPropertyProblems?.length)
+	) {
+		const loc = getNodeLocation(declNode);
+		ctx.diagnostics.push({
+			kind: 'misplaced_tag',
+			file: loc.file,
+			line: loc.line,
+			column: loc.column,
+			message: `@cssprop on "${name}" has no effect — it documents a Svelte component's CSS custom properties, in the component's doc comment`,
+			severity: 'warning',
+			tagName: 'cssprop',
+			functionName: name
+		});
+	}
 
-	// Extract source line
+	// Extract source line — from the selected node, so a merged value+type
+	// symbol points at its type-space declaration
 	const start = declNode.getStart(sourceFile);
 	const startPos = sourceFile.getLineAndCharacterOfPosition(start);
 	result.sourceLine = startPos.line + 1;
@@ -833,7 +1414,7 @@ export const analyzeDeclaration = (
 		extractTypeInfo(declNode, result, ctx);
 		// the nodocs gate is explicit because extraction runs before the nodocs
 		// filter in analyze-core — an excluded alias must not warn
-		if (!nodocs && ts.isTypeAliasDeclaration(declNode)) {
+		if (!nodocs && isTypeAliasLike(declNode)) {
 			warnAliasLost(declNode, name, ctx);
 		}
 	} else if (result.kind === 'enum') {
@@ -887,11 +1468,12 @@ const ALIAS_LOST_RHS_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
  * analyzing site. Two non-recoverable aliases over one lost type still warn
  * separately (each names its own declaration site).
  */
-const warnAliasLost = (node: ts.TypeAliasDeclaration, name: string, ctx: ExtractContext): void => {
+const warnAliasLost = (node: TypeAliasLike, name: string, ctx: ExtractContext): void => {
 	const registry = ctx.aliasRegistry;
 	if (!registry) return;
 	if (registry.warnedAliasLost.has(node)) return;
-	if (!ALIAS_LOST_RHS_KINDS.has(node.type.kind)) return;
+	const rhs = typeAliasTypeNode(node);
+	if (!rhs || !ALIAS_LOST_RHS_KINDS.has(rhs.kind)) return;
 	// The svelte2tsx-synthesized component alias (`<Name>__SvelteComponent_`,
 	// alias-lost by construction for generic components) is not an author-side
 	// type — the svelte layer filters it from declarations after the walk, so
@@ -923,20 +1505,25 @@ const warnAliasLost = (node: ts.TypeAliasDeclaration, name: string, ctx: Extract
 };
 
 /**
- * Extract module-level comment.
+ * Extract and parse the module-level comment.
  *
  * @internal Used by `analyzeTypescriptModule` and `analyzeSvelteModule`'s
- * `<script module>` handling. Exposed via the `svelte-docinfo/typescript-exports.js`
+ * script handling. Exposed via the `svelte-docinfo/typescript-exports.js`
  * subpath so the Svelte analyzer can reuse it without circular imports, but
  * **not part of the stable barrel export**.
  *
- * Requires `@module` tag to identify module comments. The tag line is stripped
- * from the output. Supports optional module renaming: `@module custom-name`.
+ * The module comment is the first `/**` comment with a line starting with
+ * `@module`; later ones are ignored. It parses through `parseModuleComment`,
+ * so its tags read as a declaration's do and `@module` lines (with any
+ * `@module custom-name` rename) are dropped. `toModuleDocFields` projects the
+ * result onto `ModuleJson`, and `warnModuleCommentTags` reports the tags it
+ * drops.
  *
- * @returns cleaned module comment text (with `@module` line removed), or `undefined` if no `@module` comment found
+ * @returns the parsed comment, or `undefined` if no `@module` comment is found
+ *   or it holds nothing but `@module`
  * @see {@link https://typedoc.org/documents/Tags._module.html|TypeDoc @module documentation}
  */
-export const extractModuleComment = (sourceFile: ts.SourceFile): string | undefined => {
+export const extractModuleComment = (sourceFile: ts.SourceFile): TsdocParsedComment | undefined => {
 	const fullText = sourceFile.getFullText();
 
 	// Collect all JSDoc comments in the file
@@ -961,89 +1548,106 @@ export const extractModuleComment = (sourceFile: ts.SourceFile): string | undefi
 		const commentText = fullText.substring(comment.pos, comment.end);
 		if (!commentText.trimStart().startsWith('/**')) continue;
 
-		// Clean the comment first, then check for tag at start of line
+		// Clean the comment first, then check for the tag at the start of a line
 		const cleaned = cleanComment(commentText);
-		if (!cleaned) continue;
-
-		// Check for `@module` as a proper tag (at start of line, not mentioned in prose)
-		if (/(?:^|\n)@module\b/.test(cleaned)) {
-			const stripped = stripModuleTag(cleaned);
-			return stripped || undefined;
-		}
+		if (cleaned && hasModuleTag(cleaned)) return parseModuleComment(cleaned);
 	}
 
 	return undefined;
 };
 
 /**
- * Warn when a module comment carries `@nodocs`.
+ * Warn `misplaced_tag` for each tag a module comment carries that only
+ * describes a declaration: `@param`, `@returns`, `@mutates`, `@throws`,
+ * `@default`, `@nodocs`, and `@cssprop` (a component's). `toModuleDocFields`
+ * drops them, so in a module comment they do nothing. `@nodocs` applies to
+ * declarations and export statements; to omit a module, use exclude patterns.
  *
- * The tag has no module-level meaning — it applies to declarations and export
- * statements — so its presence in a `@module` comment is always author
- * confusion: it does nothing except remain verbatim in `moduleComment` text.
- * Same line-start detection as `extractModuleComment`'s `@module` test, so a
- * backticked or mid-prose mention doesn't trigger.
+ * Reads the parsed comment, so a tag counts when `parseComment` extracted it:
+ * a bare `@returns` or `@throws` with no text is dropped without a warning, as
+ * on an overload. Unknown tags drop silently, as on declarations.
  *
+ * @param moduleDoc - the module comment as `extractModuleComment` (or a Svelte
+ *   extractor) returns it
  * @param diagnosticFile - absolute source id, the form
  *   `normalizeDiagnosticPaths` rewrites to the project-root-relative
  *   `Diagnostic.file` contract. Not a module path — those are relative to
  *   `sourceRoot`, and normalization passes an already-relative path through
  *   untouched, so a module path here ships as a second base for the same file.
+ * @mutates diagnostics - appends one `misplaced_tag` per misplaced tag name
  *
  * @internal Split by source, not by file type: `analyzeExports` covers TS
- * files only — it passes `undefined` for a svelte2tsx virtual, where hoisted
- * instance-script comments would read as module comments — so
- * `analyzeSvelteModule` owns all three Svelte sources (instance script,
- * `<script module>`, HTML comment), reading each from the original file.
- * Those are the two callers this parameter's base once disagreed across.
+ * files only — it skips a svelte2tsx virtual, where hoisted instance-script
+ * comments would read as module comments — so `analyzeSvelteModule` owns all
+ * three Svelte sources (instance script, `<script module>`, HTML comment),
+ * reading each from the original file.
  */
-export const warnModuleCommentNodocs = (
-	moduleComment: string | undefined,
+export const warnModuleCommentTags = (
+	moduleDoc: TsdocParsedComment | undefined,
 	diagnosticFile: string,
 	diagnostics: Array<Diagnostic>
 ): void => {
-	if (!moduleComment || !/(?:^|\n)@nodocs\b/.test(moduleComment)) return;
-	diagnostics.push({
-		kind: 'misplaced_tag',
-		file: diagnosticFile,
-		message:
-			'@nodocs in a module comment has no effect — it applies to declarations and export statements; to omit a module from analysis, use exclude patterns',
-		severity: 'warning',
-		tagName: 'nodocs'
-	});
+	if (!moduleDoc) return;
+	for (const tagName of collectDeclarationOnlyTags(moduleDoc)) {
+		diagnostics.push({
+			kind: 'misplaced_tag',
+			file: diagnosticFile,
+			message:
+				tagName === 'nodocs'
+					? '@nodocs in a module comment has no effect — it applies to declarations and export statements; to omit a module from analysis, use exclude patterns'
+					: tagName === 'cssprop'
+						? "@cssprop in a module comment has no effect — it documents a Svelte component's CSS custom properties, in the component's doc comment"
+						: `@${tagName} in a module comment has no effect — it documents a declaration, not a module`,
+			severity: 'warning',
+			tagName
+		});
+	}
 };
 
-/**
- * Strip `@module` tag line from comment text.
- *
- * Handles formats:
- * - `@module` (standalone)
- * - `@module module-name` (with rename)
- */
-const stripModuleTag = (text: string): string => {
-	// Remove lines that START with `@module` (not mentioned in prose)
-	const lines = text.split('\n');
-	const filtered = lines.filter((line) => !/^\s*@module\b/.test(line));
-	return filtered.join('\n').trim();
+/** The declaration-only tags a parsed module comment carries, in tag order. */
+const collectDeclarationOnlyTags = (
+	tsdoc: TsdocParsedComment
+): Array<MisplacedTagDiagnostic['tagName']> => {
+	const found: Array<MisplacedTagDiagnostic['tagName']> = [];
+	if (Object.keys(tsdoc.params).length > 0) found.push('param');
+	if (tsdoc.returns !== undefined) found.push('returns');
+	if (tsdoc.mutates && Object.keys(tsdoc.mutates).length > 0) found.push('mutates');
+	if (tsdoc.throws?.length) found.push('throws');
+	if (tsdoc.defaultValue !== undefined) found.push('default');
+	if (tsdoc.nodocs) found.push('nodocs');
+	if (tsdoc.cssProperties?.length || tsdoc.cssPropertyProblems?.length) found.push('cssprop');
+	return found;
 };
 
 /**
  * Extract star exports (`export * from './module'` / `'pkg'`) from a source file.
  *
- * Uses the type checker to resolve module specifiers: source modules land in
- * `starExports` (as `sourceRoot`-relative paths), external modules in
- * `externalStarExports` (specifier as written). Unresolvable specifiers
- * (missing package, typo) are silently skipped.
+ * Uses the type checker to resolve module specifiers. Project-local targets that
+ * emit a module land in `starExports` as `sourceRoot`-relative paths; ones that
+ * emit nothing are omitted, their bindings materialized by the caller
+ * (`collectMaterializedStars`). External targets land in `externalStarExports`
+ * as written. Each target appears once, at its first statement, so
+ * `export *` plus `export type *` over one module is one entry. Unresolvable
+ * specifiers (missing package, typo) are silently skipped.
+ *
+ * A relative `.svelte` target the program has no virtual for is read by path
+ * (`ExtractContext.svelteFileStatus`), never through what the checker
+ * resolves it to: when it emits a module (the `partial` placeholder of a
+ * failed transform) it is a `starExports` entry, which `resolveExportSurface`
+ * reports as unresolved; otherwise (gated, never supplied, missing) it is
+ * dropped. Such a star is never an `externalStarExports` entry.
  *
  * Statement-level `@nodocs` suppresses the entry — the same rule as the other
  * re-export encodings (same-name edges and renamed aliases).
  */
 const extractStarExports = (
 	sourceFile: ts.SourceFile,
-	checker: ts.TypeChecker,
+	ctx: ExtractContext,
 	options: ModuleSourceOptions,
 	isExternalPath: (file: string) => boolean
 ): { starExports: Array<string>; externalStarExports: Array<string> } => {
+	const { checker, isEmittedFile } = ctx;
+	const currentFileName = stripVirtualSuffix(sourceFile.fileName);
 	const starExports: Array<string> = [];
 	const externalStarExports: Array<string> = [];
 
@@ -1055,6 +1659,24 @@ const extractStarExports = (
 			ts.isStringLiteral(statement.moduleSpecifier)
 		) {
 			if (parseComment(statement, sourceFile)?.nodocs) continue;
+			// A `.svelte` target with no virtual is read by path (see
+			// `SvelteFileStatus`): recorded when it emits a module (the
+			// `partial` placeholder of a failed transform), else dropped
+			const svelteFile = relativeSvelteSpecifierFile(statement.moduleSpecifier, currentFileName);
+			if (svelteFile !== undefined) {
+				const status = ctx.svelteFileStatus(svelteFile);
+				if (status !== 'virtual') {
+					if (
+						status === 'virtualless' &&
+						!isExternalPath(svelteFile) &&
+						ctx.isEmittedFile(svelteFile)
+					) {
+						const path = extractPath(svelteFile, options);
+						if (!starExports.includes(path)) starExports.push(path);
+					}
+					continue;
+				}
+			}
 			// Use the type checker to resolve the module - it has already resolved all imports
 			// during program creation, so this leverages TypeScript's full module resolution
 			const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
@@ -1062,15 +1684,20 @@ const extractStarExports = (
 			const resolvedPath = moduleSymbol && getPrimaryDeclarationFile(moduleSymbol);
 			if (resolvedPath) {
 				if (!isExternalPath(resolvedPath)) {
-					// Project-local target — source or gated (`internal/`
-					// convention, user excludes). A gated target's path isn't in
-					// the analyzed set, so `resolveExportSurface` reports it via
-					// `unresolvedStarExports` — truthful incompleteness, instead
-					// of recording a relative path as an external package.
-					starExports.push(extractPath(resolvedPath, options));
+					// Project-local target. One that emits a module is recorded
+					// here and its bindings stay with it. One that emits nothing
+					// (gated, or outside the analyzed inputs) is left out: its
+					// bindings are materialized in this module instead (see
+					// `collectMaterializedStars`), so no entry points at a module
+					// the output lacks.
+					if (isEmittedFile(resolvedPath)) {
+						const path = extractPath(resolvedPath, options);
+						if (!starExports.includes(path)) starExports.push(path);
+					}
 				} else {
 					// External package — record the specifier as written
-					externalStarExports.push(statement.moduleSpecifier.text);
+					const specifier = statement.moduleSpecifier.text;
+					if (!externalStarExports.includes(specifier)) externalStarExports.push(specifier);
 				}
 			}
 			// If the module couldn't be resolved (missing package, typo), skip it

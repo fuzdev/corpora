@@ -12,14 +12,14 @@
 		summary = null,
 		warnings = []
 	}: {
-		results: Array<BenchmarkResult>;
-		summary: Record<ImplementationName, SummaryStats> | null;
-		warnings: Array<string>;
+		results?: Array<BenchmarkResult>;
+		summary?: Record<ImplementationName, SummaryStats> | null;
+		warnings?: Array<string>;
 	} = $props();
 </script>
 
 {#if warnings.length > 0}
-	<section class="panel p_md warning">
+	<section class="panel p_md caution_60">
 		<h3 class="mt_0">⚠️ Warnings</h3>
 		<ul>
 			{#each warnings as warning (warning)}
@@ -38,12 +38,12 @@
 				<div>
 					<h3>{impl}</h3>
 					<div>
-						<strong>{fmt(stats.avg_mean)}ms</strong>
-						<span>avg time</span>
+						<strong>{fmt(stats.geomean_ms)}ms</strong>
+						<span>geomean time</span>
 					</div>
 					<div>
-						<strong>{fmt(stats.avg_ops, 0)}</strong>
-						<span>ops/sec</span>
+						<strong>{fmt(stats.geomean_ops, 0)}</strong>
+						<span>geomean ops/sec</span>
 					</div>
 					<div>
 						<strong>{fmt(stats.avg_cv * 100, 1)}%</strong>
@@ -51,7 +51,10 @@
 					</div>
 					{#if impl !== 'html' && stats.improvement !== undefined}
 						<div>
-							<strong class:positive={stats.improvement > 0} class:negative={stats.improvement < 0}>
+							<strong
+								class:positive_60={stats.improvement > 0}
+								class:negative_60={stats.improvement < 0}
+							>
 								{stats.improvement > 0 ? '+' : ''}{fmt(stats.improvement, 1)}%
 							</strong>
 							<span>vs baseline</span>
@@ -106,7 +109,7 @@
 			<ul>
 				<li>
 					<strong>Mean / Median / percentiles</strong>: work time — stylize + DOM commit + layout,
-					the highlighter's compute cost
+					the styler's compute cost
 				</li>
 				<li>
 					<strong>Paint</strong>: mean time until pixels settle (work plus ~1–2 animation frames)

@@ -1,5 +1,5 @@
 import { test, assert, describe } from 'vitest';
-import { z } from 'zod';
+import * as v from 'valibot';
 
 import {
 	byKind,
@@ -8,16 +8,16 @@ import {
 	formatDiagnostic,
 	hasErrors,
 	hasWarnings,
+	parseDiagnostics,
 	warningsOf,
 	type ClassMemberDiagnostic,
-	type LegacyPropsDiagnostic,
 	type MisplacedTagDiagnostic,
 	type ModuleSkippedDiagnostic,
 	type SignatureAnalysisDiagnostic,
 	type SveltePropDiagnostic,
 	type TypeExtractionDiagnostic,
 	type UnknownParamDiagnostic
-} from '$lib/diagnostics.ts';
+} from '#lib/diagnostics.ts';
 
 /**
  * Create a type extraction diagnostic for testing.
@@ -82,22 +82,6 @@ const createSveltePropDiagnostic = (
 	severity: 'warning',
 	componentName: 'Button',
 	propName: 'variant',
-	...overrides
-});
-
-/**
- * Create a legacy_props diagnostic for testing.
- */
-const createLegacyPropsDiagnostic = (
-	overrides: Partial<LegacyPropsDiagnostic> = {}
-): LegacyPropsDiagnostic => ({
-	kind: 'legacy_props',
-	file: 'Button.svelte',
-	line: 3,
-	message: 'Component "Button" declares props with legacy export let syntax (variant)',
-	severity: 'warning',
-	componentName: 'Button',
-	propNames: ['variant'],
 	...overrides
 });
 
@@ -433,19 +417,18 @@ describe('diagnostics array', () => {
 		});
 	});
 
-	describe('Zod schema round-trip', () => {
+	describe('schema round-trip', () => {
 		// The schema must match every variant emitted by analysis code. Each
-		// factory produces a populated diagnostic; `Diagnostic.parse` must
+		// factory produces a populated diagnostic; parsing through `Diagnostic` must
 		// accept it without error and return a deep-equal object. Catches
 		// schema/interface drift — e.g., adding a variant without updating
 		// the discriminated union.
-		test('every variant survives Diagnostic.parse → JSON.stringify → JSON.parse → Diagnostic.parse', () => {
+		test('every variant survives parse → JSON.stringify → JSON.parse → parse', () => {
 			const variants: Array<Diagnostic> = [
 				createTypeDiagnostic(),
 				createSignatureDiagnostic(),
 				createClassMemberDiagnostic(),
 				createSveltePropDiagnostic(),
-				createLegacyPropsDiagnostic(),
 				createModuleSkippedDiagnostic(),
 				createMisplacedTagDiagnostic(),
 				createUnknownParamDiagnostic(),
@@ -467,16 +450,16 @@ describe('diagnostics array', () => {
 				}
 			];
 			for (const d of variants) {
-				const validated = Diagnostic.parse(d);
-				const reparsed = Diagnostic.parse(JSON.parse(JSON.stringify(validated)));
+				const validated = v.parse(Diagnostic, d);
+				const reparsed = v.parse(Diagnostic, JSON.parse(JSON.stringify(validated)));
 				assert.deepEqual(reparsed, validated);
 			}
 		});
 
-		test('z.array(Diagnostic).parse accepts an empty array', () => {
+		test('parseDiagnostics accepts an empty array', () => {
 			// Diagnostics is a bare `Array<Diagnostic>` on the wire — no wrapper.
 			// CLI emits `[]` when no diagnostics are collected, and parse round-trips it.
-			const parsed = z.array(Diagnostic).parse([]);
+			const parsed = parseDiagnostics([]);
 			assert.deepEqual(parsed, []);
 		});
 
@@ -485,25 +468,25 @@ describe('diagnostics array', () => {
 			diagnostics.push(createModuleSkippedDiagnostic());
 
 			const json = JSON.stringify(diagnostics);
-			// No `line`/`column` keys in the JSON (per the optional() schema)
+			// no `line`/`column` keys in the JSON (they're optional in the schema)
 			assert.notInclude(json, 'line');
 			assert.notInclude(json, 'column');
 			assert.notInclude(json, 'null');
 
 			// Re-parse via schema
-			const reparsed = z.array(Diagnostic).parse(JSON.parse(json));
+			const reparsed = parseDiagnostics(JSON.parse(json));
 			assert.strictEqual(reparsed.length, 1);
 			assert.strictEqual(reparsed[0]!.line, undefined);
 			assert.strictEqual(reparsed[0]!.column, undefined);
 		});
 
-		test('populated diagnostics survive JSON.stringify → z.array(Diagnostic).parse', () => {
+		test('populated diagnostics survive JSON.stringify → parseDiagnostics', () => {
 			const diagnostics: Array<Diagnostic> = [];
 			diagnostics.push(createTypeDiagnostic({ line: 42, column: 7 }));
 			diagnostics.push(createModuleSkippedDiagnostic());
 			diagnostics.push(createMisplacedTagDiagnostic({ tagName: 'deprecated' }));
 
-			const reparsed = z.array(Diagnostic).parse(JSON.parse(JSON.stringify(diagnostics)));
+			const reparsed = parseDiagnostics(JSON.parse(JSON.stringify(diagnostics)));
 			assert.deepEqual(reparsed, diagnostics);
 			// Helpers behave identically against schema-parsed diagnostics
 			assert.strictEqual(hasErrors(reparsed), hasErrors(diagnostics));
@@ -703,7 +686,6 @@ describe('diagnostic type discrimination', () => {
 			createSignatureDiagnostic(),
 			createClassMemberDiagnostic(),
 			createSveltePropDiagnostic(),
-			createLegacyPropsDiagnostic(),
 			createModuleSkippedDiagnostic(),
 			createMisplacedTagDiagnostic(),
 			createUnknownParamDiagnostic()
@@ -725,10 +707,6 @@ describe('diagnostic type discrimination', () => {
 					assert.strictEqual(d.componentName, 'Button');
 					assert.strictEqual(d.propName, 'variant');
 					break;
-				case 'legacy_props':
-					assert.strictEqual(d.componentName, 'Button');
-					assert.deepEqual(d.propNames, ['variant']);
-					break;
 				case 'module_skipped':
 					assert.strictEqual(d.reason, 'no_analyzer');
 					break;
@@ -743,11 +721,20 @@ describe('diagnostic type discrimination', () => {
 				case 'module_unreadable':
 				case 'import_parse_failed':
 				case 'duplicate_comment':
+				case 'component_comment_mismatch':
 				case 'source_map_failed':
 				case 'duplicate_declaration':
 				case 'transform_failed':
 				case 'resolver_failed':
 				case 'alias_lost':
+				case 'commonjs_unsupported':
+				case 'css_parse_failed':
+				case 'css_lang_unsupported':
+				case 'unknown_cssprop':
+				case 'malformed_tag':
+				case 'duplicate_tag':
+				case 'cssprop_default_mismatch':
+				case 'implementation_doc_hidden':
 					assert.fail('unreachable');
 			}
 		}

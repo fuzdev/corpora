@@ -5,7 +5,7 @@ import type { BlogFeed } from '@fuzdev/fuz_blog/blog.ts';
 export const feed: BlogFeed = {
 	title: "Ryan Atkinson's blog",
 	id: 'https://www.ryanatkn.com/',
-	home_page_url: 'https://www.ryanatkn.com/',
+	home_page_url: 'https://www.ryanatkn.com/blog',
 	description: 'blog of a software developer building free and open source tools and toys',
 	icon: 'https://www.ryanatkn.com/favicon.png',
 	favicon: 'https://www.ryanatkn.com/favicon.png',
@@ -15,6 +15,7 @@ export const feed: BlogFeed = {
 		{
 			id: 'https://www.ryanatkn.com/blog/1',
 			url: 'https://www.ryanatkn.com/blog/modeling-virtual-social-spaces-in-this-house-we-post-cat-pics-on-saturday',
+			pathname: '/blog/modeling-virtual-social-spaces-in-this-house-we-post-cat-pics-on-saturday',
 			blog_post_id: 1,
 			title: 'Modeling virtual social spaces: in this house we post cat pics on Saturday',
 			slug: 'modeling-virtual-social-spaces-in-this-house-we-post-cat-pics-on-saturday',
@@ -22,8 +23,7 @@ export const feed: BlogFeed = {
 			date_modified: '2023-01-28T17:20:51.259Z',
 			summary:
 				'Proposing a model for one of the central aspects of online communities: the virtual social space.',
-			tags: ['web', 'community', 'social media', 'design', 'technology', 'software'],
-			comments: { url: 'https://hci.social/@ryanatkn/109768104377997044', type: 'mastodon' }
+			tags: ['web', 'community', 'social media', 'design', 'technology', 'software']
 		}
 	]
 };

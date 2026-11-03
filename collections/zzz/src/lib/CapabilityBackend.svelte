@@ -5,7 +5,7 @@
 
 	import { frontend_context } from './frontend.svelte.ts';
 	import { icon_arrow_right } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import ErrorMessage from './ErrorMessage.svelte';
 	import { SERVER_URL } from './constants.ts';
 	import PingForm from './PingForm.svelte';
@@ -23,8 +23,8 @@
 	<div class="display:flex">
 		<div
 			class="chip px_xl plain font-weight:400 width_atmost_sm"
-			style:padding="0 var(--space_xl) !important"
-			style:font-weight="400 !important"
+			style:padding="0 var(--space_xl)"
+			style:font-weight="400"
 			class:palette_b={capabilities.backend.status === 'success'}
 			class:palette_c={capabilities.backend.status === 'failure'}
 			class:palette_d={capabilities.backend.status === 'pending'}
@@ -48,7 +48,7 @@
 					{SERVER_URL}
 					{#if capabilities.latest_ping_time !== null}
 						<span>
-							<Svg data={icon_arrow_right} />
+							<Icon data={icon_arrow_right} />
 							{Math.round(capabilities.latest_ping_time)}ms
 						</span>
 					{/if}

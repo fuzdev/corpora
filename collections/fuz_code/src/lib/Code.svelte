@@ -19,15 +19,15 @@
 	}: SvelteHTMLElements['code'] &
 		(
 			| {
-					/** The source code to syntax highlight. */
+					/** The source code to style. */
 					content: string;
 					dangerous_raw_html?: undefined;
 			  }
 			| {
 					content?: undefined;
 					/**
-					 * Pre-highlighted HTML from the `svelte_preprocess_fuz_code` preprocessor.
-					 * When provided, skips runtime syntax highlighting entirely.
+					 * Pre-styled HTML from the `svelte_preprocess_fuz_code` preprocessor.
+					 * When provided, skips runtime syntax styling entirely.
 					 *
 					 * Named `dangerous_raw_html` to signal that it bypasses sanitization,
 					 * matching the `{@html}` pattern already used by this component.
@@ -38,8 +38,9 @@
 			/**
 			 * Language identifier (e.g. 'ts', 'css', 'html', 'json', 'svelte', 'md').
 			 * Selects the registered lexer and sets the `data-lang` attribute. `null`
-			 * disables highlighting (content renders as plain text); `undefined`
-			 * falls back to the default ('svelte').
+			 * or an unregistered id disables styling (content renders as plain text,
+			 * and an unregistered id logs an error in DEV); `undefined` falls back to
+			 * the default ('svelte').
 			 *
 			 * @default 'svelte'
 			 */
@@ -72,7 +73,7 @@
 			 */
 			syntax_styler?: SyntaxStyler;
 			/**
-			 * Optional snippet to customize how the highlighted markup is rendered.
+			 * Optional snippet to customize how the styled markup is rendered.
 			 * Receives the generated HTML string as a parameter.
 			 */
 			children?: Snippet<[markup: string]>;
@@ -80,7 +81,7 @@
 
 	const language_supported = $derived(lang !== null && syntax_styler.has_lang(lang));
 
-	const highlighting_disabled = $derived(lang === null || !language_supported);
+	const styling_disabled = $derived(lang === null || !language_supported);
 
 	// DEV-only validation warnings
 	if (DEV) {
@@ -91,28 +92,31 @@
 				const langs = [...syntax_styler.langs.keys()].join(', ');
 				// eslint-disable-next-line no-console
 				console.error(
-					`[Code] Language "${lang}" is not supported. ` +
-						`Highlighting disabled. Supported: ${langs}`
+					`[Code] Language "${lang}" is not supported. ` + `Styling disabled. Supported: ${langs}`
 				);
 			}
 		});
 	}
 
-	// Generate HTML markup for syntax highlighting
+	// Generate HTML markup for syntax styling
 	const html_content = $derived.by(() => {
 		if (dangerous_raw_html != null) return dangerous_raw_html;
-		if (!content || highlighting_disabled) return '';
-		return syntax_styler.stylize(content, lang!); // ! is safe bc of the `highlighting_disabled` calculation
+		if (!content || styling_disabled) return '';
+		return syntax_styler.stylize(content, lang!); // ! is safe bc of the `styling_disabled` calculation
 	});
 </script>
 
 <!-- eslint-disable svelte/no-at-html-tags -->
 
-<code {...rest} class:inline class:wrap class:nomargin data-lang={lang}
-	>{#if highlighting_disabled && dangerous_raw_html == null}{content}{:else if children}{@render children(
-			html_content
-		)}{:else}{@html html_content}{/if}</code
->
+<code {...rest} class:inline class:wrap class:nomargin data-lang={lang}>
+	{#if styling_disabled && dangerous_raw_html == null}
+		{content}
+	{:else if children}
+		{@render children(html_content)}
+	{:else}
+		{@html html_content}
+	{/if}
+</code>
 
 <style>
 	/* inline code inherits fuz_css defaults: pre-wrap, inline-block, baseline alignment */

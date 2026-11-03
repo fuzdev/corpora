@@ -470,7 +470,9 @@ function calcBaseRange(
     max = 100;
   } else {
     min = s === 'r' ? 1 : 0;
-    max = s === 'y' ? height : s === 'r' ? 25 : width;
+    // `z` is a height off an `isometric` floor — half the plot's shorter side reads as tall
+    // without towering over it
+    max = s === 'y' ? height : s === 'r' ? 25 : s === 'z' ? Math.min(width, height) / 2 : width;
   }
 
   return reverse === true ? [max, min] : [min, max];
@@ -593,10 +595,18 @@ function getPadFunctions(scale: ScaleWithProps): TransformFunctions {
   }
 }
 
-export function createGetter<TData>(accessor: (d: TData) => any, scale: AnyScale | null) {
+export function createGetter<TData>(
+  accessor: ((d: TData) => any) | null | undefined,
+  scale: AnyScale | null
+) {
   return (d: TData) => {
+    // An axis can go unconfigured — `<Chart x="distance">` with no `y` leaves `ctx.y` null — and
+    // the getter is still read for it, ex. when a tooltip resolves a row's coordinates.  Both
+    // halves are checked up front, since calling a missing accessor throws before the scale is
+    // ever consulted.
+    if (!accessor || !scale) return undefined;
+
     const val = accessor(d);
-    if (!scale) return undefined;
     if (Array.isArray(val)) {
       return val.map((v) => scale(v));
     }

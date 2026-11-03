@@ -7,8 +7,8 @@
 	import Breadcrumb from '@fuzdev/fuz_ui/Breadcrumb.svelte';
 	import { Library, library_context } from '@fuzdev/fuz_ui/library.svelte.ts';
 
-	import { MAIN_HEADER_MARGIN_TOP } from '$routes/constants.ts';
-	import { library_json } from '$routes/library.ts';
+	import { MAIN_HEADER_MARGIN_TOP } from '#routes/constants.ts';
+	import { library_json } from '#routes/library.ts';
 
 	const library = new Library(library_json);
 	library_context.set(() => library);
@@ -20,7 +20,7 @@
 <main class="width_atmost_md">
 	<section>
 		<header class="box width_atmost_sm">
-			<h1 class="mb_xl5" style:margin-top={MAIN_HEADER_MARGIN_TOP}>
+			<h1 style:margin-top={MAIN_HEADER_MARGIN_TOP}>
 				{library.repo_name}
 			</h1>
 		</header>

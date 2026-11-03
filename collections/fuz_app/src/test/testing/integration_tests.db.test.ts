@@ -11,31 +11,33 @@ import { test, assert, describe, beforeAll, beforeEach, afterAll } from 'vitest'
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import { fuz_session_config } from '$lib/auth/session_cookie.ts';
-import { create_health_route_spec } from '$lib/http/common_routes.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
-import { account_verify_action_spec } from '$lib/auth/account_action_specs.ts';
-import { prefix_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RpcEndpointSpec } from '$lib/http/surface.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
+import { fuz_session_config } from '#lib/auth/session_cookie.ts';
+import { create_health_route_spec } from '#lib/http/common_routes.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
+import { account_verify_action_spec } from '#lib/auth/account_action_specs.ts';
+import { prefix_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RpcEndpointSpec } from '#lib/http/surface.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_test_request_headers } from '#lib/testing/test_origin.ts';
+import { create_rate_limiter } from '#lib/rate_limiter.ts';
 import {
 	find_route_spec,
 	find_auth_route,
 	assert_response_matches_spec
-} from '$lib/testing/integration_helpers.ts';
-import { rpc_call, rpc_call_non_browser } from '$lib/testing/rpc_helpers.ts';
+} from '#lib/testing/integration_helpers.ts';
+import { rpc_call, rpc_call_non_browser } from '#lib/testing/rpc_helpers.ts';
 
 /** Duck-type of `Hono.request`; matches `RpcCallArgs.app`. */
 interface TestApp {
 	request: (input: string, init: RequestInit) => Promise<Response> | Response;
 }
-import { describe_standard_integration_tests } from '$lib/testing/integration.ts';
-import { auth_integration_truncate_tables } from '$lib/testing/db.ts';
-import { default_in_process_suite_options } from '$lib/testing/cross_backend/in_process_setup.ts';
+import { describe_standard_integration_tests } from '#lib/testing/integration.ts';
+import { auth_integration_truncate_tables } from '#lib/testing/db.ts';
+import { default_in_process_suite_options } from '#lib/testing/cross_backend/in_process_setup.ts';
 
-import { pglite_factory } from '../db_fixture.ts';
+import { default_db_factory } from '../db_fixture.ts';
 
 const RPC_PATH = '/api/rpc';
 const rpc_log = new Logger('integration-tests-rpc', { level: 'off' });
@@ -60,7 +62,8 @@ const test_rpc_endpoints = (ctx: AppServerContext): Array<RpcEndpointSpec> => [
 		path: RPC_PATH,
 		actions: create_account_actions({
 			log: rpc_log,
-			audit: ctx.deps.audit
+			audit: ctx.deps.audit,
+			connection_closer: ctx.deps.connection_closer
 		})
 	}
 ];
@@ -109,10 +112,10 @@ describe_standard_integration_tests(
 // --- Standalone tests for the helpers ---
 
 describe('create_test_app', () => {
-	let db: Awaited<ReturnType<typeof pglite_factory.create>>;
+	let db: Awaited<ReturnType<typeof default_db_factory.create>>;
 
 	beforeAll(async () => {
-		db = await pglite_factory.create();
+		db = await default_db_factory.create();
 	});
 
 	beforeEach(async () => {
@@ -122,7 +125,7 @@ describe('create_test_app', () => {
 	});
 
 	afterAll(async () => {
-		await pglite_factory.close(db);
+		await default_db_factory.close(db);
 	});
 
 	test('health route returns 200', async () => {
@@ -235,9 +238,51 @@ describe('create_test_app', () => {
 
 		const res = await test_app.app.request('/api/account/verify', {
 			method: 'GET',
-			headers: { host: 'localhost', origin: 'http://localhost:5173' }
+			headers: create_test_request_headers()
 		});
 		assert.strictEqual(res.status, 401);
+	});
+
+	/** The seven limiter fields of `AppServerContext`. */
+	const LIMITER_NAMES = [
+		'login_ip_rate_limiter',
+		'signup_ip_rate_limiter',
+		'bootstrap_ip_rate_limiter',
+		'login_account_rate_limiter',
+		'signup_account_rate_limiter',
+		'action_ip_rate_limiter',
+		'action_account_rate_limiter'
+	] as const;
+
+	test('disables every rate limiter, the action limiters included', async () => {
+		let ctx: AppServerContext | null = null;
+		const test_app = await create_test_app({
+			session_options: fuz_session_config,
+			create_route_specs: (context) => {
+				ctx = context;
+				return test_route_factory(context);
+			},
+			db
+		});
+		for (const name of LIMITER_NAMES) assert.strictEqual(ctx![name], null, name);
+		await test_app.cleanup();
+	});
+
+	test('a limiter passed through app_options wins over the disabled mode', async () => {
+		const action_account_rate_limiter = create_rate_limiter({ cleanup_interval_ms: 0 });
+		let ctx: AppServerContext | null = null;
+		const test_app = await create_test_app({
+			session_options: fuz_session_config,
+			create_route_specs: (context) => {
+				ctx = context;
+				return test_route_factory(context);
+			},
+			db,
+			app_options: { action_account_rate_limiter }
+		});
+		assert.strictEqual(ctx!.action_account_rate_limiter, action_account_rate_limiter);
+		assert.strictEqual(ctx!.action_ip_rate_limiter, null);
+		await test_app.cleanup();
 	});
 });
 
@@ -309,10 +354,10 @@ describe('find_auth_route', () => {
 });
 
 describe('assert_response_matches_spec', () => {
-	let db: Awaited<ReturnType<typeof pglite_factory.create>>;
+	let db: Awaited<ReturnType<typeof default_db_factory.create>>;
 
 	beforeAll(async () => {
-		db = await pglite_factory.create();
+		db = await default_db_factory.create();
 	});
 
 	beforeEach(async () => {
@@ -322,7 +367,7 @@ describe('assert_response_matches_spec', () => {
 	});
 
 	afterAll(async () => {
-		await pglite_factory.close(db);
+		await default_db_factory.close(db);
 	});
 
 	test('validates correct 200 response', async () => {
@@ -353,11 +398,9 @@ describe('assert_response_matches_spec', () => {
 
 		const res = await test_app.app.request('/api/account/logout', {
 			method: 'POST',
-			headers: {
-				host: 'localhost',
-				origin: 'http://localhost:5173',
+			headers: create_test_request_headers({
 				'content-type': 'application/json'
-			},
+			}),
 			body: JSON.stringify({})
 		});
 		assert.strictEqual(res.status, 401);

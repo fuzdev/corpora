@@ -11,31 +11,25 @@
 
 import { describe, test, assert, vi, afterEach } from 'vitest';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_signup_route_specs } from '$lib/auth/signup_routes.ts';
-import { create_admin_actions } from '$lib/auth/admin_actions.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
-import { query_create_invite } from '$lib/auth/invite_queries.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_signup_route_specs } from '#lib/auth/signup_routes.ts';
+import { create_admin_actions } from '#lib/auth/admin_actions.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
+import { query_create_invite } from '#lib/auth/invite_queries.ts';
 import {
 	app_settings_update_action_spec,
 	invite_create_action_spec,
 	invite_delete_action_spec,
 	invite_list_action_spec
-} from '$lib/auth/admin_action_specs.ts';
-import { account_verify_action_spec } from '$lib/auth/account_action_specs.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { rpc_call_for_spec, type RpcCallResult } from '$lib/testing/rpc_helpers.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { account_verify_action_spec } from '#lib/auth/account_action_specs.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_test_request_headers } from '#lib/testing/test_origin.ts';
+import { rpc_call_for_spec, type RpcCallResult } from '#lib/testing/rpc_helpers.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
 import {
 	ERROR_NO_MATCHING_INVITE,
 	ERROR_SIGNUP_CONFLICT,
@@ -43,22 +37,17 @@ import {
 	ERROR_INVITE_DUPLICATE,
 	ERROR_INVITE_ACCOUNT_EXISTS_USERNAME,
 	ERROR_INVITE_ACCOUNT_EXISTS_EMAIL
-} from '$lib/http/error_schemas.ts';
-import { prefix_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+} from '#lib/http/error_schemas.ts';
+import { prefix_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const { cookie_name } = session_options;
 
 const RPC_PATH = '/api/rpc';
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 	...prefix_route_specs('/api/account', [
@@ -79,6 +68,8 @@ const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 		})
 	]),
 	...create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: [...create_admin_actions(ctx.deps), ...create_account_actions(ctx.deps)],
 		log: ctx.deps.log
@@ -480,7 +471,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'newuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 200);
 			const body = await res.json();
@@ -509,7 +500,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'emailuser', password: 'securepassword123', email: 'signup@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 200);
 		});
@@ -524,7 +515,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'noinvite', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 403);
 			const body = await res.json();
@@ -550,7 +541,7 @@ describe_db('invite + signup integration', (get_db) => {
 					username: test_app.backend.account.username,
 					password: 'securepassword123'
 				},
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 409);
 			const body = await res.json();
@@ -580,7 +571,7 @@ describe_db('invite + signup integration', (get_db) => {
 					password: 'securepassword123',
 					email: 'taken@example.com'
 				},
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 409);
 			const body = await res.json();
@@ -607,7 +598,7 @@ describe_db('invite + signup integration', (get_db) => {
 					username: test_app.backend.account.username,
 					password: 'securepassword123'
 				},
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			const body_username = await res_username.json();
 
@@ -627,7 +618,7 @@ describe_db('invite + signup integration', (get_db) => {
 					password: 'securepassword123',
 					email: 'conflict@example.com'
 				},
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			const body_email = await res_email.json();
 
@@ -657,7 +648,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'claimcheck', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			// Check invite list
 			const list_r = await rpc_call_for_spec({
@@ -691,7 +682,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'verifyuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			// Extract session cookie from signup response
 			const set_cookie = signup_res.headers.get('set-cookie');
@@ -733,7 +724,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'alice', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 403);
 			const body = await res.json();
@@ -760,7 +751,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'wronguser', password: 'securepassword123', email: 'both@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res1.status, 403);
 
@@ -769,7 +760,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'bothuser', password: 'securepassword123', email: 'wrong@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res2.status, 403);
 
@@ -778,7 +769,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'bothuser', password: 'securepassword123', email: 'both@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res3.status, 200);
 		});
@@ -803,7 +794,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'aliceuser', password: 'securepassword123', email: 'alice@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 200);
 		});
@@ -828,7 +819,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'caseuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 200);
 		});
@@ -843,7 +834,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: '123invalid', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 400);
 		});
@@ -858,7 +849,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'validuser', password: 'short' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 400);
 		});
@@ -873,7 +864,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'a'.repeat(40), password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 400);
 		});
@@ -897,7 +888,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'raceuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res1.status, 200);
 
@@ -908,7 +899,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'raceuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res2.status, 409);
 			const body = await res2.json();
@@ -935,7 +926,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'claimedel', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			// Try to delete the now-claimed invite
 			const del_r = await rpc_call_for_spec({
@@ -971,7 +962,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'openuser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 200);
 			const body = await res.json();
@@ -993,7 +984,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'closeduser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 403);
 			const body = await res.json();
@@ -1024,7 +1015,7 @@ describe_db('invite + signup integration', (get_db) => {
 					username: test_app.backend.account.username,
 					password: 'securepassword123'
 				},
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 409);
 			const body = await res.json();
@@ -1061,7 +1052,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'toggleduser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 403);
 			const body = await res.json();
@@ -1089,7 +1080,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'audituser', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			// Check audit log
 			const rows = await get_db().query<{ event_type: string; metadata: unknown }>(
@@ -1123,7 +1114,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'nomatch', password: 'securepassword123', email: 'nomatch@example.com' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 403);
 			const rows = await get_db().query<{
@@ -1166,7 +1157,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: test_app.backend.account.username, password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 409);
 			const rows = await get_db().query<{
@@ -1213,7 +1204,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: test_app.backend.account.username, password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			assert.strictEqual(res.status, 409);
 			const rows = await get_db().query<{ outcome: string; metadata: unknown }>(
@@ -1253,6 +1244,8 @@ describe_db('invite + signup integration', (get_db) => {
 				})
 			]),
 			...create_rpc_endpoint({
+				action_ip_rate_limiter: null,
+				action_account_rate_limiter: null,
 				path: RPC_PATH,
 				actions: [...create_admin_actions(ctx.deps), ...create_account_actions(ctx.deps)],
 				log: ctx.deps.log
@@ -1270,7 +1263,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'nomatchfloor', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			const elapsed = performance.now() - t0;
 			assert.strictEqual(res.status, 403);
@@ -1301,7 +1294,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: test_app.backend.account.username, password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 			const elapsed = performance.now() - t0;
 			assert.strictEqual(res.status, 409);
@@ -1347,7 +1340,7 @@ describe_db('invite + signup integration', (get_db) => {
 				test_app.app,
 				'/api/account/signup',
 				{ username: 'internalerr', password: 'securepassword123' },
-				{ host: 'localhost', origin: 'http://localhost:5173' }
+				create_test_request_headers()
 			);
 
 			// Status is not 200 — the rethrow propagates. Hono's default
@@ -1376,6 +1369,61 @@ describe_db('invite + signup integration', (get_db) => {
 			// (we mocked `transaction` to throw before invoking the callback),
 			// so no invite_id is recorded.
 			assert.strictEqual(metadata.invite_id, undefined);
+		});
+
+		test('an invite claim that misses rolls the signup back as internal_error', async () => {
+			const test_app = await create_test_app({
+				session_options,
+				create_route_specs,
+				db: get_db(),
+				roles: [ROLE_ADMIN]
+			});
+			const invite = await query_create_invite(
+				{ db: get_db() },
+				{ username: 'claimmiss', created_by: null }
+			);
+
+			// The claim UPDATE matches no row inside the signup tx — the state a
+			// broken FOR UPDATE invariant would leave.
+			const db = get_db();
+			const transaction = db.transaction.bind(db);
+			vi.spyOn(db, 'transaction').mockImplementation((fn) =>
+				transaction(async (tx) => {
+					const query = tx.query.bind(tx);
+					vi.spyOn(tx, 'query').mockImplementation((sql: string, params?: Array<unknown>) =>
+						sql.startsWith('UPDATE invite SET claimed_by')
+							? Promise.resolve([])
+							: query(sql, params)
+					);
+					return fn(tx);
+				})
+			);
+			vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			const res = await json_request(
+				test_app.app,
+				'/api/account/signup',
+				{ username: 'claimmiss', password: 'securepassword123' },
+				create_test_request_headers()
+			);
+			vi.restoreAllMocks();
+
+			assert.strictEqual(res.status, 500);
+			const body = await res.json();
+			assert.strictEqual(body.error, 'internal_error');
+			const accounts = await db.query(`SELECT id FROM account WHERE username = 'claimmiss'`);
+			assert.strictEqual(accounts.length, 0, 'the account rolled back');
+			const invites = await db.query<{ claimed_at: string | null }>(
+				`SELECT claimed_at FROM invite WHERE id = $1`,
+				[invite.id]
+			);
+			assert.strictEqual(invites[0]!.claimed_at, null);
+			const rows = await db.query<{ outcome: string; metadata: any }>(
+				`SELECT outcome, metadata FROM audit_log WHERE event_type = 'signup' ORDER BY seq DESC LIMIT 1`
+			);
+			assert.strictEqual(rows[0]!.outcome, 'failure');
+			assert.strictEqual(rows[0]!.metadata.reason, 'internal_error');
+			assert.strictEqual(rows[0]!.metadata.invite_id, invite.id);
 		});
 	});
 });

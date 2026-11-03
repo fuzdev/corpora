@@ -1,4 +1,5 @@
 import { map_concurrent } from '@fuzdev/fuz_util/async.ts';
+import { ensure_end } from '@fuzdev/fuz_util/string.ts';
 import { fs_search } from '@fuzdev/fuz_util/fs.ts';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 import type { PathFilter } from '@fuzdev/fuz_util/path.ts';
@@ -6,13 +7,9 @@ import { globSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import {
-	GRO_CONFIG_FILENAME,
-	SVELTE_CONFIG_FILENAMES,
-	VITE_CONFIG_FILENAMES
-} from './constants.ts';
+import { GRO_CONFIG_FILENAME, VITE_CONFIG_FILENAMES } from './constants.ts';
 import { format_file } from './format_file.ts';
-import { paths } from './paths.ts';
+import { paths, to_search_filters_relative } from './paths.ts';
 
 /**
  * File extensions the format sweep collects. `json` is intentionally omitted
@@ -23,19 +20,15 @@ import { paths } from './paths.ts';
 const FORMATTABLE_MATCHER = /\.(ts|mts|cts|js|mjs|cjs|svelte|css)$/;
 
 /**
- * Root-level files formatted alongside `paths.source`.
- * Every Svelte and Vite config filename is listed rather than just the `.js`/`.ts` one,
- * since which extension a project uses is SvelteKit's and Vite's call; the ones a project
+ * Root-level files formatted alongside the root's `src/`.
+ * Every Vite config filename is listed rather than just the `.js`/`.ts` one,
+ * since which extension a project uses is Vite's call; the ones a project
  * doesn't have are skipped when read, the same as any other default root file it lacks.
  * `package.json` is intentionally omitted — `gro sync` owns its serialization
  * via `package_json_serialize` (2-space, matching the npm convention).
  * `tsconfig.json` is omitted because the sweep no longer formats json.
  */
-const ROOT_FILES_DEFAULT = [
-	GRO_CONFIG_FILENAME,
-	...SVELTE_CONFIG_FILENAMES,
-	...VITE_CONFIG_FILENAMES
-];
+const ROOT_FILES_DEFAULT = [GRO_CONFIG_FILENAME, ...VITE_CONFIG_FILENAMES];
 
 /**
  * Root-level ignore files for the format sweep (gitignore-style patterns).
@@ -54,37 +47,61 @@ export interface FormatDirectoryResult {
 	errored: Array<{ id: string; error: unknown }>;
 }
 
+export interface FormatDirectoryOptions {
+	log: Logger;
+	/**
+	 * The directory swept when `patterns` is empty.
+	 */
+	dir: string;
+	/**
+	 * When `true`, reports unformatted files instead of writing them.
+	 * @default false
+	 */
+	check?: boolean;
+	/**
+	 * Directory filters (e.g. `config.search_filters`) to skip, tested relative to the project root,
+	 * or outside it to the searched directory or a glob's leading literal directory; also prunes
+	 * `patterns` results, so a glob within the root can't reach `node_modules`, while a glob whose
+	 * literal base is outside the root (`../other/node_modules/x/*.js`) is taken as given.
+	 */
+	filter?: PathFilter | Array<PathFilter>;
+	/**
+	 * Globs to format instead of sweeping `dir`, relative to the cwd or absolute.
+	 */
+	patterns?: Array<string>;
+	/**
+	 * The project root `filter` tests paths relative to, and where the ignore files are read.
+	 * @default `paths.root`
+	 */
+	root?: string;
+}
+
 /**
  * Formats files on the filesystem in-process via `format_file`.
  * When `patterns` is provided, formats those specific files/globs.
  * Otherwise formats `dir` (recursively, respecting `filter`) plus the root
- * files when `dir` is `paths.source`. In both modes, files matched by the
+ * files when `dir` is the root's `src/`. In both modes, files matched by the
  * project root's `.formatignore` or `.prettierignore` are skipped.
  *
  * Files the formatter rejects (e.g. a syntax error) are reported and fail the
  * run in both modes rather than being silently skipped.
  *
  * This is separated from `./format_file` so modules that only need directory
- * traversal don't pull in the formatter (which loads the `tsv` WASM module).
- *
- * @param check - when `true`, reports unformatted files instead of writing them
- * @param filter - directory filters (e.g. `config.search_filters`) to skip;
- * also prunes `patterns` results so an explicit glob can't reach `node_modules`
+ * traversal don't pull in the formatter (which loads the `tsv` native addon).
  */
-export const format_directory = async (
-	log: Logger,
-	dir: string,
+export const format_directory = async ({
+	log,
+	dir,
 	check = false,
-	filter?: PathFilter | Array<PathFilter>,
-	patterns?: Array<string>
-): Promise<FormatDirectoryResult> => {
+	filter,
+	patterns,
+	root = paths.root
+}: FormatDirectoryOptions): Promise<FormatDirectoryResult> => {
 	const collected = patterns?.length
-		? globSync(patterns, to_glob_options(filter))
-				.filter((p) => FORMATTABLE_MATCHER.test(p))
-				.map((p) => (isAbsolute(p) ? p : resolve(p)))
-		: await collect_source_files(dir, filter);
+		? collect_glob_files(patterns, filter, root)
+		: await collect_source_files(dir, filter, root);
 
-	const ignored = read_format_ignore(paths.root);
+	const ignored = read_format_ignore(root);
 	const file_ids = ignored.size ? collected.filter((id) => !ignored.has(id)) : collected;
 
 	const formatted: Array<string> = [];
@@ -153,27 +170,77 @@ export const read_format_ignore = (root: string): Set<string> => {
 	return new Set(globSync(patterns, { cwd: root }).map((p) => resolve(root, p)));
 };
 
-/** Builds `globSync` options that prune the same paths `filter` would exclude. */
+/**
+ * Builds `globSync` options that prune the same paths `filter` would exclude,
+ * testing each path relative to the project root like the sweep,
+ * or, outside the root, relative to `base_dir`,
+ * and never pruning the root, a `base_dir` outside it, or the directories above them
+ * that an absolute or `../` pattern walks through.
+ * Node's glob calls `exclude` with each directory's path, relative to the cwd or absolute
+ * like the pattern, and with each entry's bare name under a `**`,
+ * so a name is tested as itself, never resolved against a cwd that may be elsewhere.
+ */
 const to_glob_options = (
-	filter?: PathFilter | Array<PathFilter>
+	filter: PathFilter | Array<PathFilter> | undefined,
+	root: string,
+	base_dir: string
 ): { exclude: (path: string) => boolean } => {
-	const filters = filter && (Array.isArray(filter) ? filter : [filter]);
-	if (!filters?.length) return { exclude: () => false };
-	return { exclude: (path) => filters.some((f) => !f(path, false)) };
+	const filters = to_search_filters_relative(filter, root, base_dir);
+	if (!filters.length) return { exclude: () => false };
+	const root_dir = ensure_end(resolve(root), '/');
+	const base = ensure_end(resolve(base_dir), '/');
+	const base_outside_root = !base.startsWith(root_dir);
+	return {
+		exclude: (path) => {
+			if (!path.includes('/')) return filters.some((f) => !f(path, false));
+			const id = resolve(path);
+			const dir = ensure_end(id, '/');
+			if (root_dir.startsWith(dir) || (base_outside_root && base.startsWith(dir))) return false;
+			return filters.some((f) => !f(id, false));
+		}
+	};
+};
+
+const GLOB_MAGIC_MATCHER = /[*?[\]{}()!]/;
+
+/**
+ * The directory a glob pattern searches, its leading segments before the first with glob syntax.
+ */
+const to_glob_base_dir = (pattern: string): string => {
+	const segments = pattern.split('/');
+	segments.pop(); // the last segment names files, magic or not
+	const magic_index = segments.findIndex((segment) => GLOB_MAGIC_MATCHER.test(segment));
+	const base = (magic_index === -1 ? segments : segments.slice(0, magic_index)).join('/');
+	return resolve(base || (pattern.startsWith('/') ? '/' : '.'));
+};
+
+const collect_glob_files = (
+	patterns: Array<string>,
+	filter: PathFilter | Array<PathFilter> | undefined,
+	root: string
+): Array<string> => {
+	const file_ids: Set<string> = new Set();
+	for (const pattern of patterns) {
+		for (const p of globSync(pattern, to_glob_options(filter, root, to_glob_base_dir(pattern)))) {
+			if (FORMATTABLE_MATCHER.test(p)) file_ids.add(isAbsolute(p) ? p : resolve(p));
+		}
+	}
+	return Array.from(file_ids);
 };
 
 const collect_source_files = async (
 	dir: string,
-	filter?: PathFilter | Array<PathFilter>
+	filter: PathFilter | Array<PathFilter> | undefined,
+	root: string
 ): Promise<Array<string>> => {
 	const found = await fs_search(dir, {
-		filter,
+		filter: to_search_filters_relative(filter, root, dir),
 		file_filter: (path) => FORMATTABLE_MATCHER.test(path)
 	});
 	const file_ids = found.map((f) => f.id);
-	if (dir === paths.source) {
+	if (dir === join(root, 'src/')) {
 		for (const name of ROOT_FILES_DEFAULT) {
-			file_ids.push(join(paths.root, name));
+			file_ids.push(join(root, name));
 		}
 	}
 	return file_ids;

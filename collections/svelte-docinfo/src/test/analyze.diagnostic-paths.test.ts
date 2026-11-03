@@ -26,12 +26,12 @@ import { test, assert, describe } from 'vitest';
 
 import ts from 'typescript';
 
-import { analyze, analyzeFromFiles } from '$lib/analyze.ts';
-import { analyzeCore } from '$lib/analyze-core.ts';
-import { byKind } from '$lib/diagnostics.ts';
-import { createSourceOptions } from '$lib/source-config.ts';
-import { SVELTE_VIRTUAL_SUFFIX } from '$lib/source.ts';
-import type { SvelteVirtualFile } from '$lib/svelte.ts';
+import { analyze, analyzeFromFiles } from '#lib/analyze.ts';
+import { analyzeCore, finalizeDiagnostics } from '#lib/analyze-core.ts';
+import { byKind, type Diagnostic } from '#lib/diagnostics.ts';
+import { createSourceOptions } from '#lib/source-config.ts';
+import { SVELTE_VIRTUAL_SUFFIX } from '#lib/source.ts';
+import type { SvelteVirtualFile } from '#lib/svelte.ts';
 
 import { withTestProject } from './test-helpers.ts';
 import {
@@ -67,6 +67,17 @@ const NODOCS_MODULE_COMMENT_SVELTE = `<!--
 </script>
 `;
 
+/** A component documented twice, which warns `duplicate_comment` from the Svelte layer. */
+const DUPLICATE_COMMENT_SVELTE = `<!--
+	@component
+	Description.
+-->
+<script lang="ts">
+	/** Description 1 */
+	let {a}: {a: string} = $props();
+</script>
+`;
+
 /** Analyze every file already written under the project's `src/lib`. */
 const analyzeProject = async (projectRoot: string) => {
 	const dir = join(projectRoot, 'src/lib');
@@ -78,7 +89,8 @@ const analyzeProject = async (projectRoot: string) => {
 				content: await readFile(join(dir, name), 'utf8')
 			}))
 		),
-		sourceOptions: createSourceOptions(projectRoot)
+		sourceOptions: createSourceOptions(projectRoot),
+		onDuplicates: 'diagnostic'
 	});
 };
 
@@ -104,8 +116,6 @@ describe('Diagnostic.file rejoins with projectRoot', () => {
 	let {a}: {a: string} = $props();
 </script>
 `,
-				// legacy_props (Svelte layer)
-				'src/lib/Legacy.svelte': `<script lang="ts">\n\texport let prop1: string;\n</script>\n`,
 				// misplaced_tag from a module comment (Svelte layer)
 				'src/lib/Nodocs.svelte': NODOCS_MODULE_COMMENT_SVELTE,
 				// misplaced_tag from a module comment (TypeScript path)
@@ -122,7 +132,6 @@ describe('Diagnostic.file rejoins with projectRoot', () => {
 				const kinds = new Set(diagnostics.map((d) => d.kind));
 				for (const kind of [
 					'duplicate_comment',
-					'legacy_props',
 					'misplaced_tag',
 					'unknown_param',
 					'duplicate_declaration'
@@ -146,7 +155,7 @@ describe('Diagnostic.file rejoins with projectRoot', () => {
 		// into `file` collides. Catches a future kind without naming it.
 		await withTestProject(
 			{
-				'src/lib/Legacy.svelte': `<script lang="ts">\n\texport let prop1: string;\n</script>\n`,
+				'src/lib/Dup.svelte': DUPLICATE_COMMENT_SVELTE,
 				'src/lib/nodocs.ts': NODOCS_MODULE_COMMENT_TS,
 				'src/lib/a.ts': `export const dup = 1;`,
 				'src/lib/b.ts': `export const dup = 2;`
@@ -172,13 +181,17 @@ describe('Diagnostic.file rejoins with projectRoot', () => {
 		// its own (`analyze.ts`) rather than through `analyzeCore`.
 		await withTestProject(
 			{
-				'src/lib/Legacy.svelte': `<script lang="ts">\n\texport let prop1: string;\n</script>\n`,
+				'src/lib/Dup.svelte': DUPLICATE_COMMENT_SVELTE,
 				'src/lib/nodocs.ts': NODOCS_MODULE_COMMENT_TS,
 				'src/lib/a.ts': `export const dup = 1;`,
 				'src/lib/b.ts': `export const dup = 2;`
 			},
 			async (projectRoot) => {
-				const { modules, diagnostics } = await analyzeFromFiles({ projectRoot, discovery: 'glob' });
+				const { modules, diagnostics } = await analyzeFromFiles({
+					projectRoot,
+					discovery: 'glob',
+					onDuplicates: 'diagnostic'
+				});
 				assert.isAtLeast(diagnostics.length, 3);
 				const modulePaths = new Set(modules.map((m) => m.path));
 				for (const d of diagnostics) {
@@ -232,15 +245,6 @@ describe('producers agree on one base', () => {
 		assert.strictEqual(byKind(diagnostics, 'unknown_param').length, 1);
 	});
 
-	test('legacy_props reports project-root-relative', async () => {
-		const { diagnostics } = await analyzeTestProject({
-			'src/lib/Legacy.svelte': `<script lang="ts">\n\texport let prop1: string;\n</script>\n`
-		});
-		const [legacy] = byKind(diagnostics, 'legacy_props');
-		assert.ok(legacy);
-		assert.strictEqual(legacy.file, 'src/lib/Legacy.svelte');
-	});
-
 	test('duplicate_comment reports project-root-relative', async () => {
 		const { diagnostics } = await analyzeTestProject({
 			'src/lib/Widget.svelte': DUPLICATE_COMMENT_COMPONENT
@@ -253,10 +257,13 @@ describe('producers agree on one base', () => {
 	test('duplicate_declaration keeps module paths in `modules` and the message', async () => {
 		// The two bases coexist inside one record by design: `file` is a file
 		// path, `modules` names modules.
-		const { diagnostics } = await analyzeTestProject({
-			'src/lib/a.ts': `export const dup = 1;`,
-			'src/lib/b.ts': `export const dup = 2;`
-		});
+		const { diagnostics } = await analyzeTestProject(
+			{
+				'src/lib/a.ts': `export const dup = 1;`,
+				'src/lib/b.ts': `export const dup = 2;`
+			},
+			{ onDuplicates: 'diagnostic' }
+		);
 		const [duplicate] = byKind(diagnostics, 'duplicate_declaration');
 		assert.ok(duplicate);
 		assert.strictEqual(duplicate.file, 'src/lib/a.ts');
@@ -268,20 +275,19 @@ describe('producers agree on one base', () => {
 describe('the base does not track sourceRoot', () => {
 	test('a wider sourceRoot shifts module paths but not diagnostic files', async () => {
 		// `sourcePaths: ['src']` makes `sourceRoot` `src`, so module paths gain
-		// the `lib/` segment. Diagnostics must not move with them — this is the
-		// divergence the old behavior encoded, and it is invisible whenever
-		// `sourceRoot` happens to be empty.
+		// the `lib/` segment. Diagnostics must not move with them — a divergence
+		// that's invisible whenever `sourceRoot` happens to be empty.
 		await withTestProject(
 			{
-				'src/lib/Legacy.svelte': `<script lang="ts">\n\texport let prop1: string;\n</script>\n`,
+				'src/lib/Dup.svelte': DUPLICATE_COMMENT_SVELTE,
 				'src/lib/nodocs.ts': NODOCS_MODULE_COMMENT_TS
 			},
 			async (projectRoot) => {
 				const { modules, diagnostics } = await analyze({
 					sourceFiles: [
 						{
-							id: join(projectRoot, 'src/lib/Legacy.svelte'),
-							content: `<script lang="ts">\n\texport let prop1: string;\n</script>\n`
+							id: join(projectRoot, 'src/lib/Dup.svelte'),
+							content: DUPLICATE_COMMENT_SVELTE
 						},
 						{ id: join(projectRoot, 'src/lib/nodocs.ts'), content: NODOCS_MODULE_COMMENT_TS }
 					],
@@ -290,12 +296,12 @@ describe('the base does not track sourceRoot', () => {
 
 				// module paths took the wider root
 				assert.deepStrictEqual(modules.map((m) => m.path).sort(), [
-					'lib/Legacy.svelte',
+					'lib/Dup.svelte',
 					'lib/nodocs.ts'
 				]);
 				// diagnostics did not
 				assert.deepStrictEqual(diagnostics.map((d) => d.file).sort(), [
-					'src/lib/Legacy.svelte',
+					'src/lib/Dup.svelte',
 					'src/lib/nodocs.ts'
 				]);
 				for (const d of diagnostics) {
@@ -394,5 +400,49 @@ describe('module_skipped, the sites no pipeline test reaches', () => {
 		for (const d of diagnostics) {
 			assert.notInclude(d.message, root, `${d.kind} leaked the project root`);
 		}
+	});
+});
+
+describe('identical diagnostics collapse', () => {
+	const warning = (line: number): Diagnostic => ({
+		kind: 'unknown_param',
+		file: '/p/src/lib/a.ts',
+		line,
+		column: 1,
+		message: 'm',
+		severity: 'warning',
+		paramName: 'b',
+		functionName: 'fn'
+	});
+
+	test('finalizeDiagnostics keeps the first of identical entries, in order', () => {
+		const diagnostics = [warning(1), warning(2), warning(1), warning(3), warning(2)];
+		finalizeDiagnostics(diagnostics, { projectRoot: '/p' });
+		assert.deepStrictEqual(
+			diagnostics.map((d) => d.line),
+			[1, 2, 3]
+		);
+	});
+
+	test('a symbol analyzed again through a renamed re-export warns once', async () => {
+		const root = '/virtual/dedupe';
+		const { diagnostics } = await analyze({
+			sourceFiles: [
+				{
+					id: `${root}/src/lib/a.ts`,
+					content: `export function fn(a: string): string;
+export function fn(a: number): number;
+/** Hidden. */
+export function fn(a: string | number): string | number {
+	return a;
+}
+export {fn as fn2};
+`
+				}
+			],
+			sourceOptions: createSourceOptions(root),
+			tsconfig: false
+		});
+		assert.strictEqual(byKind(diagnostics, 'implementation_doc_hidden').length, 1);
 	});
 });

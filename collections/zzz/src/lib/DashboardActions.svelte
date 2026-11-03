@@ -3,25 +3,29 @@
 	import ActionDetail from './ActionDetail.svelte';
 	import DashboardHeader from './DashboardHeader.svelte';
 	import { icon_log } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import type { Action } from './action.svelte.ts';
 	import { app_context } from './app.svelte.ts';
 	import TimeWidget from './TimeWidget.svelte';
 	import { random_item } from '@fuzdev/fuz_util/random.ts';
+	import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 	const app = app_context.get();
 
 	const { actions } = $derived(app);
 
-	// TODO could potentially be removed from the collection by some external process,
-	// so having this state be component-local solves some problems but not all
-	let selected_action: Action | null = $state.raw(null);
+	// looked up by id, so an action deleted from history or trimmed past the
+	// history limit deselects instead of lingering disposed
+	let selected_action_id: Uuid | null = $state.raw(null);
+	const selected_action: Action | null = $derived(
+		selected_action_id === null ? null : (actions.items.by_id.get(selected_action_id) ?? null)
+	);
 </script>
 
 <div class="column p_lg height:100%">
 	<DashboardHeader>
 		{#snippet header()}
-			<h1><Svg data={icon_log} /> system actions</h1>
+			<h1><Icon data={icon_log} /> system actions</h1>
 		{/snippet}
 		<TimeWidget value={app.time.now} />
 	</DashboardHeader>
@@ -32,16 +36,15 @@
 	<p class="row gap_sm">
 		<button
 			type="button"
-			class="sm"
+			class="sized_sm"
 			onclick={() => {
 				actions.items.clear();
-				selected_action = null;
 			}}
 			disabled={!actions.items.size}
 		>
 			clear action history
 		</button>
-		<button type="button" class="sm" onclick={() => app.api.ping()}>ping</button>
+		<button type="button" class="sized_sm" onclick={() => app.api.ping()}>ping</button>
 	</p>
 
 	<div
@@ -55,9 +58,9 @@
 		>
 			<ActionList
 				limit={100}
-				selected_action_id={selected_action?.id}
+				{selected_action_id}
 				onselect={(action) => {
-					selected_action = action;
+					selected_action_id = action.id;
 				}}
 			/>
 		</div>
@@ -73,7 +76,7 @@
 							type="button"
 							class="inline palette_f"
 							onclick={() => {
-								selected_action = random_item(actions.items.values);
+								selected_action_id = random_item(actions.items.values).id;
 							}}
 						>
 							go fish

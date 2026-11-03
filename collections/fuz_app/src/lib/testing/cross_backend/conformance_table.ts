@@ -15,7 +15,7 @@ import '../assert_dev_env.ts';
  * `output` schema from the live spec registry (RPC) or `RouteSpec` (the 6
  * REST auth routes) — the row never carries a schema. The principal the
  * row runs `as` resolves to a `TestFixture` accessor via
- * `resolve_principal` — no inline credential minting.
+ * `resolve_conformance_principal` — no inline credential minting.
  *
  * Every response also passes an always-on **no-fingerprint** invariant
  * (`assert_no_fingerprint_headers` over `FINGERPRINT_HEADERS` — `Server` /
@@ -23,13 +23,30 @@ import '../assert_dev_env.ts';
  * a row may pin further header expectations via `expect.headers`. Headers are
  * deliberately kept out of the equivalence-group `{status, body}` comparison.
  *
+ * Given `ws`, the runner sends each case as a frame on a WebSocket instead:
+ * the principal opens an admitted socket and the frame meets the per-message
+ * gates. The frame carries the same JSON-RPC envelope the HTTP body does, so
+ * the same rows hold, read through the status the HTTP binding maps the
+ * frame's error code to; the cases a socket can't carry are left out
+ * (`is_ws_conformance_case`).
+ *
+ * A case binding `request.acting` gets `params.acting` filled with a real
+ * actor id at run time (`ConformanceActingBinding`), so rows can act as a
+ * named actor of a multi-actor keeper without knowing its id.
+ *
+ * A case's RPC method resolves from the declared `rpc_endpoints` first, then
+ * from `live_rpc_endpoints` when given — the methods a backend live-mounts
+ * off the declared surface (cell verbs, opt-in resolvers, `_testing_*`
+ * backdoors), so rows can reach them too.
+ *
  * @module
  */
 
 import { assert, describe, test } from 'vitest';
 
-import type { AppSurfaceSpec } from '../../http/surface.ts';
-import type { RouteMethod } from '../../http/route_spec.ts';
+import type { AppSurfaceSpec, RpcEndpointSpec } from '../../http/surface.ts';
+import type { RouteMethod, RouteSpec } from '../../http/route_spec.ts';
+import type { RpcAction } from '../../actions/action_types.ts';
 import type { SessionOptions } from '../../auth/session_cookie.ts';
 import { DAEMON_TOKEN_HEADER } from '../../auth/daemon_token.ts';
 import {
@@ -40,21 +57,29 @@ import {
 import {
 	find_rpc_action,
 	headers_to_record,
-	rpc_call,
-	rpc_call_for_spec,
+	parse_rpc_call_result,
+	rpc_call_raw,
+	create_rpc_request_text,
 	resolve_rpc_endpoints_for_setup,
 	type RpcEndpointsSuiteOption
 } from '../rpc_helpers.ts';
 import { account_token_create_action_spec } from '../../auth/account_action_specs.ts';
+import { jsonrpc_error_code_to_http_status } from '../../http/jsonrpc_errors.ts';
+import type { JsonrpcErrorCode } from '../../http/jsonrpc.ts';
 import type { FetchTransport } from '../transports/fetch_transport.ts';
+import { create_admitted_ws_transport } from '../transports/ws_transport.ts';
+import { is_response_for } from '../transports/ws_client.ts';
 import {
 	SCOPED_TOKEN_ADMITTED_METHOD,
+	type ConformanceActingBinding,
 	type ConformanceCase,
 	type ConformancePrincipal
 } from './conformance_case.ts';
 import type { BackendCapabilities } from './capabilities.ts';
 import type { SetupTest, TestFixture } from './setup.ts';
+import { mint_narrowed_api_token } from './narrowed_api_token.ts';
 import { xfail_until } from './xfail.ts';
+import type { WsEndpointTarget } from './ws_endpoint.ts';
 
 /**
  * Names a seeded `extra_accounts` username for the `role_holder` /
@@ -81,16 +106,90 @@ export interface ConformanceTableOptions {
 	readonly capabilities: BackendCapabilities;
 	/** RPC endpoints — resolved to find each method's action spec. */
 	readonly rpc_endpoints: RpcEndpointsSuiteOption;
+	/**
+	 * The RPC endpoints the backend live-mounts, for methods kept off the
+	 * declared `rpc_endpoints` (cell verbs, opt-in resolvers, `_testing_*`
+	 * backdoors). A method resolves from `rpc_endpoints` first and from here
+	 * only when the declared surface lacks it, so passing a backend's whole
+	 * live mount is fine. Omitted, only declared methods resolve.
+	 */
+	readonly live_rpc_endpoints?: RpcEndpointsSuiteOption;
 	/** Session options — needed to resolve the `rpc_endpoints` factory form. */
 	readonly session_options: SessionOptions<string>;
 	/** Maps the `role_holder` / `wrong_role` principals to seeded usernames. */
 	readonly principals?: ConformancePrincipalConfig;
+	/**
+	 * Run the cases over a WebSocket at this endpoint instead of HTTP: each RPC
+	 * case's principal opens an admitted socket and sends its request as a
+	 * frame. Only the cases `is_ws_conformance_case` admits run; the rest are
+	 * left out, and so is an equivalence group left with fewer than two members.
+	 */
+	readonly ws?: WsEndpointTarget;
 	/** `describe` block label. Defaults to `'conformance table'`. */
 	readonly suite_name?: string;
 }
 
+/** What `resolve_conformance_rpc_endpoints` reads. */
+export interface ConformanceRpcEndpointsOptions {
+	/** The declared RPC endpoints. */
+	readonly rpc_endpoints: RpcEndpointsSuiteOption;
+	/** The live-mounted RPC endpoints, for methods off the declared surface. */
+	readonly live_rpc_endpoints?: RpcEndpointsSuiteOption;
+	/** Session options — needed to resolve the factory forms. */
+	readonly session_options: SessionOptions<string>;
+}
+
+/**
+ * Resolve the endpoints a conformance case's RPC method is looked up in: the
+ * declared `rpc_endpoints`, then `live_rpc_endpoints`. `find_rpc_action`
+ * takes the first match, so a declared method resolves from the declared
+ * surface even when the live mount repeats it.
+ *
+ * @param options - the declared and live endpoints, and the session options
+ * @returns the endpoints in lookup order
+ */
+export const resolve_conformance_rpc_endpoints = (
+	options: ConformanceRpcEndpointsOptions
+): Array<RpcEndpointSpec> => [
+	...resolve_rpc_endpoints_for_setup(options.rpc_endpoints, options.session_options),
+	...(options.live_rpc_endpoints
+		? resolve_rpc_endpoints_for_setup(options.live_rpc_endpoints, options.session_options)
+		: [])
+];
+
+/**
+ * Principals that cannot hold a socket: each presents no usable credential
+ * (`anonymous`, the browser-discarded and malformed bearers, the expired
+ * session) or one the upgrade refuses (`scoped_token` — a narrowed token is
+ * refused `surface:ws_upgrade`), so the upgrade answers before any frame.
+ * The front-door table (`describe_transport_composition_cross_tests`) pins
+ * those upgrade refusals.
+ */
+const WS_UNAVAILABLE_PRINCIPALS: ReadonlySet<ConformancePrincipal> = new Set([
+	'anonymous',
+	'bearer_browser',
+	'malformed_bearer',
+	'expired_session',
+	'scoped_token'
+] satisfies Array<ConformancePrincipal>);
+
+/**
+ * Whether a case can run over a WebSocket: an RPC method (not a REST auth
+ * route), sent as `POST` (a `GET` row pins the HTTP query path), pinning no
+ * header value (a frame has no headers; an absence pin holds vacuously), as
+ * a principal that can hold a socket.
+ *
+ * @param c - the case
+ * @returns whether the WS leg runs it
+ */
+export const is_ws_conformance_case = (c: ConformanceCase): boolean =>
+	!c.request.method.startsWith('/') &&
+	(c.request.verb ?? 'POST') === 'POST' &&
+	!Object.values(c.expect.headers ?? {}).some((value) => value !== null) &&
+	!WS_UNAVAILABLE_PRINCIPALS.has(c.request.as);
+
 /** A resolved principal: the transport + headers a case fires through. */
-interface ResolvedPrincipal {
+export interface ResolvedConformancePrincipal {
 	readonly transport: FetchTransport;
 	readonly headers: Record<string, string>;
 	/**
@@ -99,6 +198,11 @@ interface ResolvedPrincipal {
 	 * discards the token when `Origin` / `Referer` is present.
 	 */
 	readonly suppress_default_origin?: boolean;
+	/**
+	 * The actor of the account the credential names — what the `principal`
+	 * acting binding writes. Absent for principals that present no account.
+	 */
+	readonly actor_id?: string;
 }
 
 /**
@@ -137,28 +241,13 @@ const mint_scoped_token = async (
 				`rpc_endpoints.`
 		);
 	}
-	// Spec-bound rather than a loose `rpc_call`: `params` type-checks against
-	// `TokenCreateInput` (so dropping `scope` is a compile error, not a runtime
-	// 400 in every test at once), and `result.token` comes back typed and
-	// output-validated — no cast, no hand-rolled presence check.
-	const res = await rpc_call_for_spec({
+	return mint_narrowed_api_token({
 		app: fixture.transport,
-		path: found.path,
-		spec: account_token_create_action_spec,
-		params: {
-			name: 'conformance scoped token',
-			scope: { kind: 'methods', methods: [SCOPED_TOKEN_ADMITTED_METHOD] },
-			lifetime: { kind: 'eternal' }
-		},
-		headers: fixture.create_session_headers()
+		rpc_path: found.path,
+		session_headers: fixture.create_session_headers(),
+		methods: [SCOPED_TOKEN_ADMITTED_METHOD],
+		name: 'conformance scoped token'
 	});
-	if (!res.ok) {
-		throw new Error(
-			`conformance: minting the 'scoped_token' principal failed with ${res.status}: ` +
-				JSON.stringify(res.error)
-		);
-	}
-	return res.result.token;
 };
 
 /**
@@ -169,25 +258,38 @@ const mint_scoped_token = async (
  * `role_holder` / `wrong_role` read a seeded `extra_accounts` entry named
  * via `options.principals` (throws a clear setup error when unconfigured);
  * `scoped_token` mints its narrowed credential over the production path.
+ * Also used outside the table by suites that send a principal's requests
+ * themselves (`describe_rpc_adversarial_cross_tests`).
+ *
+ * @param fixture - the per-test fixture
+ * @param as - the principal
+ * @param principals - usernames for `role_holder` / `wrong_role`
+ * @param resolved_rpc_endpoints - the endpoints `scoped_token` mints through
+ * @returns the transport and headers the principal sends with
  */
-const resolve_principal = async (
+export const resolve_conformance_principal = async (
 	fixture: TestFixture,
 	as: ConformancePrincipal,
-	principals: ConformancePrincipalConfig | undefined,
-	resolved_rpc_endpoints: ReturnType<typeof resolve_rpc_endpoints_for_setup>
-): Promise<ResolvedPrincipal> => {
+	principals?: ConformancePrincipalConfig,
+	resolved_rpc_endpoints: ReturnType<typeof resolve_rpc_endpoints_for_setup> = []
+): Promise<ResolvedConformancePrincipal> => {
 	switch (as) {
 		case 'keeper':
 			// Keeper carries its session cookie via `create_session_headers`
 			// (in-process the transport is stateless; cross-process the jar
 			// also holds it — the explicit header is the same value).
-			return { transport: fixture.transport, headers: fixture.create_session_headers() };
+			return {
+				transport: fixture.transport,
+				headers: fixture.create_session_headers(),
+				actor_id: fixture.actor.id
+			};
 		case 'daemon':
 			// Daemon-token is a non-browser credential — empty jar + no Origin.
 			return {
 				transport: fixture.fresh_transport({ origin: null }),
 				headers: fixture.create_daemon_token_headers(),
-				suppress_default_origin: true
+				suppress_default_origin: true,
+				actor_id: fixture.actor.id
 			};
 		case 'invalid_daemon':
 			// A malformed `X-Daemon-Token` carried ALONGSIDE the keeper's session
@@ -205,7 +307,8 @@ const resolve_principal = async (
 				headers: fixture.create_session_headers({
 					[DAEMON_TOKEN_HEADER]: INVALID_DAEMON_TOKEN_VALUE
 				}),
-				suppress_default_origin: true
+				suppress_default_origin: true,
+				actor_id: fixture.actor.id
 			};
 		case 'daemon_browser':
 			// A VALID `X-Daemon-Token` carried in a browser context (default Origin
@@ -220,14 +323,16 @@ const resolve_principal = async (
 			// guard), the 403 here proves the valid token was discarded, not honored.
 			return {
 				transport: fixture.transport,
-				headers: fixture.create_session_headers(fixture.create_daemon_token_headers())
+				headers: fixture.create_session_headers(fixture.create_daemon_token_headers()),
+				actor_id: fixture.actor.id
 			};
 		case 'token':
 			// Bearer is discarded in a browser context — empty jar + no Origin.
 			return {
 				transport: fixture.fresh_transport({ origin: null }),
 				headers: fixture.create_bearer_headers(),
-				suppress_default_origin: true
+				suppress_default_origin: true,
+				actor_id: fixture.actor.id
 			};
 		case 'bearer_browser':
 			// A VALID bearer api-token in a browser context (default Origin
@@ -243,6 +348,19 @@ const resolve_principal = async (
 				transport: fixture.fresh_transport(),
 				headers: fixture.create_bearer_headers()
 			};
+		case 'malformed_bearer': {
+			// The keeper's valid token minus its last character — prefixed, one char
+			// short — over the same no-Origin, empty-jar transport as `token`, so the
+			// shape precheck (not the browser-context discard) is what refuses it.
+			const valid = fixture.create_bearer_headers().authorization;
+			if (!valid)
+				throw new Error(`conformance: principal 'malformed_bearer' found no bearer header`);
+			return {
+				transport: fixture.fresh_transport({ origin: null }),
+				headers: { authorization: valid.slice(0, -1) },
+				suppress_default_origin: true
+			};
+		}
 		case 'scoped_token': {
 			// A narrowed bearer, otherwise identical to `token` — empty jar + no
 			// Origin, so the credential is honored rather than browser-discarded
@@ -251,7 +369,8 @@ const resolve_principal = async (
 			return {
 				transport: fixture.fresh_transport({ origin: null }),
 				headers: { authorization: `Bearer ${token}` },
-				suppress_default_origin: true
+				suppress_default_origin: true,
+				actor_id: fixture.actor.id
 			};
 		}
 		case 'anonymous':
@@ -259,7 +378,11 @@ const resolve_principal = async (
 			return { transport: fixture.fresh_transport(), headers: {} };
 		case 'fresh_non_admin': {
 			const account = await fixture.create_account();
-			return { transport: fixture.fresh_transport(), headers: account.create_session_headers() };
+			return {
+				transport: fixture.fresh_transport(),
+				headers: account.create_session_headers(),
+				actor_id: account.actor.id
+			};
 		}
 		case 'expired_session': {
 			// The keeper presented via an expired server-side session — fresh
@@ -267,7 +390,11 @@ const resolve_principal = async (
 			// minted cookie payload is valid; the backdated `auth_session` row
 			// is what the DB-row expiry gate refuses.
 			const cookie = await fixture.mint_expired_session();
-			return { transport: fixture.fresh_transport(), headers: { cookie } };
+			return {
+				transport: fixture.fresh_transport(),
+				headers: { cookie },
+				actor_id: fixture.actor.id
+			};
 		}
 		case 'role_holder':
 		case 'wrong_role': {
@@ -285,7 +412,11 @@ const resolve_principal = async (
 						`declare it in the suite's extra_accounts option.`
 				);
 			}
-			return { transport: fixture.fresh_transport(), headers: extra.create_session_headers() };
+			return {
+				transport: fixture.fresh_transport(),
+				headers: extra.create_session_headers(),
+				actor_id: extra.actor.id
+			};
 		}
 	}
 };
@@ -411,6 +542,277 @@ interface NormalizedResponse {
 	readonly body: unknown;
 }
 
+/** What `send_conformance_case` needs besides the case. */
+export interface SendConformanceCaseOptions {
+	/** The per-test fixture the principal resolves from. */
+	readonly fixture: TestFixture;
+	/** Surface spec — supplies the `RouteSpec`s for the REST branch. */
+	readonly surface_source: AppSurfaceSpec;
+	/** Usernames for the `role_holder` / `wrong_role` principals. */
+	readonly principals?: ConformancePrincipalConfig;
+	/**
+	 * The endpoints RPC methods (and the `scoped_token` mint) resolve against —
+	 * `resolve_conformance_rpc_endpoints` of the declared and live endpoints.
+	 */
+	readonly resolved_rpc_endpoints: ReturnType<typeof resolve_rpc_endpoints_for_setup>;
+	/** Send the request as a frame on a socket at this endpoint instead of over HTTP. */
+	readonly ws?: WsEndpointTarget;
+	/**
+	 * Headers added to the HTTP request beneath the principal's, which win on
+	 * a name clash. Not sent on the WS leg (a frame carries no headers).
+	 */
+	readonly request_headers?: Readonly<Record<string, string>>;
+}
+
+/** The spec a sent case resolved to — the RPC action, or the REST route. */
+export type ConformanceCaseTarget =
+	| { readonly kind: 'rpc'; readonly path: string; readonly action: RpcAction }
+	| { readonly kind: 'rest'; readonly route: RouteSpec };
+
+/**
+ * One case's request as sent and its response unparsed: the HTTP status, the
+ * response-headers snapshot (lowercased keys), and the JSON body exactly as
+ * the server sent it — the whole JSON-RPC envelope for an RPC method,
+ * `undefined` for a REST body that is not JSON.
+ *
+ * Over a WebSocket the body is the response frame, the headers are empty (a
+ * frame carries none), and the status is the one the HTTP binding answers
+ * for the frame's outcome: `200` for a result, else
+ * `jsonrpc_error_code_to_http_status` of its error code — so a row's
+ * `expect.status` reads as the error code on both transports.
+ */
+export interface ConformanceCaseResponse {
+	readonly target: ConformanceCaseTarget;
+	readonly status: number;
+	readonly headers: Record<string, string>;
+	readonly body: unknown;
+}
+
+/**
+ * Resolve a case's principal on `fixture` and send its request, asserting
+ * nothing about the response.
+ *
+ * The send half of the table runner, shared with the cross-backend
+ * differential (`describe_differential_conformance_tests`), which sends one
+ * case to two backends and compares what came back.
+ *
+ * @param c - the case
+ * @param options - the fixture, surface and endpoints to send through
+ * @returns the resolved target and the raw response
+ * @throws Error when the method is on neither the RPC surface nor the REST
+ *   auth routes
+ */
+export const send_conformance_case = async (
+	c: ConformanceCase,
+	options: SendConformanceCaseOptions
+): Promise<ConformanceCaseResponse> => {
+	const { fixture, surface_source, principals, resolved_rpc_endpoints, ws, request_headers } =
+		options;
+	if (ws && !is_ws_conformance_case(c)) {
+		throw new Error(
+			`conformance: case '${c.name}' cannot run over a WebSocket (is_ws_conformance_case) — ` +
+				`filter the cases before sending them on the WS leg.`
+		);
+	}
+	const principal = await resolve_conformance_principal(
+		fixture,
+		c.request.as,
+		principals,
+		resolved_rpc_endpoints
+	);
+	const { transport, suppress_default_origin } = principal;
+	const headers = request_headers
+		? { ...request_headers, ...principal.headers }
+		: principal.headers;
+	const { params_json } = c.request;
+	if (params_json !== undefined && (c.request.params !== undefined || c.request.acting)) {
+		throw new Error(
+			`conformance: case '${c.name}' sets params_json, so it can't also set params or acting.`
+		);
+	}
+	const params = c.request.acting
+		? bind_acting(c, resolve_acting_binding(c, c.request.acting, fixture, principal))
+		: c.request.params;
+
+	if (c.request.method.startsWith('/')) {
+		if (params_json !== undefined) {
+			throw new Error(
+				`conformance: case '${c.name}' sets params_json, which only RPC methods take.`
+			);
+		}
+		const suffix = c.request.method as RestAuthRouteSuffix;
+		if (!rest_auth_route_suffixes.includes(suffix)) {
+			throw new Error(
+				`conformance: REST method '${c.request.method}' is not a known auth-route suffix ` +
+					`(${rest_auth_route_suffixes.join(', ')}). Use an RPC method name for RPC actions.`
+			);
+		}
+		const verb: RouteMethod = c.request.verb ?? 'POST';
+		const route = find_auth_route(surface_source.route_specs, suffix, verb);
+		if (!route) {
+			throw new Error(`conformance: no REST route spec for ${verb} ${suffix} on the surface.`);
+		}
+		const init: RequestInit = {
+			method: verb,
+			headers: { 'Content-Type': 'application/json', ...headers },
+			...(verb !== 'GET' && params !== undefined && { body: JSON.stringify(params) })
+		};
+		const response = await transport(route.path, init);
+		const body: unknown = await response.json().catch(() => undefined);
+		return {
+			target: { kind: 'rest', route },
+			status: response.status,
+			headers: headers_to_record(response.headers),
+			body
+		};
+	}
+
+	const found = find_rpc_action(resolved_rpc_endpoints, c.request.method);
+	if (!found) {
+		throw new Error(
+			`conformance: RPC method '${c.request.method}' not found on the surface — ` +
+				`check the method name or that the action is registered on rpc_endpoints ` +
+				`(or, for a method off the declared surface, on live_rpc_endpoints).`
+		);
+	}
+	if (ws) {
+		return {
+			target: { kind: 'rpc', ...found },
+			...(await send_ws_frame(c.request.method, params, params_json, principal, ws))
+		};
+	}
+	const raw = await rpc_call_raw({
+		app: transport,
+		path: found.path,
+		method: c.request.method,
+		params,
+		...(params_json !== undefined && { params_json }),
+		headers,
+		...(c.request.verb && { verb: c.request.verb }),
+		...(suppress_default_origin && { suppress_default_origin: true })
+	});
+	return { target: { kind: 'rpc', ...found }, ...raw };
+};
+
+/**
+ * The request id the WS leg sends under — the id the HTTP leg's
+ * `rpc_call_raw` sends by default, so the two envelopes read alike.
+ */
+const CONFORMANCE_REQUEST_ID = 'test';
+
+/**
+ * Open an admitted socket as the principal, send one request frame, and read
+ * its response frame — the WS leg of `send_conformance_case`.
+ *
+ * The upgrade carries the principal's headers (its cookie, bearer or daemon
+ * token) and the `Origin` the HTTP leg would send: none for a principal that
+ * suppresses it, the target's otherwise. It also names the principal's own
+ * actor as `?acting=`, which both spines resolve at the upgrade (a
+ * multi-actor account's upgrade without one is refused 400
+ * `actor_required`). Per-frame dispatch resolves the actor from each frame's
+ * own `acting` on both. Because the leg always sends `?acting=`, it does not
+ * cover the upgrade's own refusal — the front-door table's multi-actor row
+ * does. The socket closes afterwards; a close error is not the case's subject
+ * (a request that revokes its own credential closes the socket after its
+ * reply).
+ */
+const send_ws_frame = async (
+	method: string,
+	params: unknown,
+	params_json: string | undefined,
+	principal: ResolvedConformancePrincipal,
+	ws: WsEndpointTarget
+): Promise<Omit<ConformanceCaseResponse, 'target'>> => {
+	const client = await create_admitted_ws_transport({
+		base_url: ws.base_url,
+		ws_path:
+			principal.actor_id === undefined
+				? ws.ws_path
+				: `${ws.ws_path}?acting=${encodeURIComponent(principal.actor_id)}`,
+		cookies: [],
+		headers: principal.headers,
+		origin: principal.suppress_default_origin ? null : (ws.origin ?? ws.base_url)
+	});
+	try {
+		if (params_json === undefined) {
+			const frame: Record<string, unknown> = {
+				jsonrpc: '2.0',
+				id: CONFORMANCE_REQUEST_ID,
+				method
+			};
+			if (params !== undefined && params !== null) frame.params = params;
+			await client.send(frame);
+		} else {
+			await client.send_text(create_rpc_request_text(method, params_json, CONFORMANCE_REQUEST_ID));
+		}
+		const body = await client.wait_for<{ error?: { code?: unknown } }>(
+			is_response_for(CONFORMANCE_REQUEST_ID)
+		);
+		const code = body.error?.code;
+		const status =
+			body.error === undefined
+				? 200
+				: typeof code === 'number'
+					? jsonrpc_error_code_to_http_status(code as JsonrpcErrorCode)
+					: 500;
+		return { status, headers: {}, body };
+	} finally {
+		await client.close().catch(() => {});
+	}
+};
+
+/**
+ * The actor id a case's `acting` binding names on this fixture.
+ *
+ * @throws Error when the binding names an actor the fixture or principal lacks
+ */
+const resolve_acting_binding = (
+	c: ConformanceCase,
+	binding: ConformanceActingBinding,
+	fixture: TestFixture,
+	principal: ResolvedConformancePrincipal
+): string => {
+	switch (binding) {
+		case 'principal':
+			if (principal.actor_id === undefined) {
+				throw new Error(
+					`conformance: case '${c.name}' binds acting to its principal, but '${c.request.as}' ` +
+						`presents no account to take an actor from.`
+				);
+			}
+			return principal.actor_id;
+		case 'extra_actor': {
+			const extra = fixture.extra_actors[0];
+			if (!extra) {
+				throw new Error(
+					`conformance: case '${c.name}' binds acting to the keeper's extra actor, but the ` +
+						`fixture seeds none — declare extra_actors at setup.`
+				);
+			}
+			return extra.id;
+		}
+		case 'keeper_actor':
+			return fixture.actor.id;
+	}
+};
+
+/** A case's params with `acting` set to `actor_id`. */
+const bind_acting = (c: ConformanceCase, actor_id: string): Record<string, unknown> => {
+	const { params } = c.request;
+	if (params === undefined) return { acting: actor_id };
+	if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+		throw new Error(
+			`conformance: case '${c.name}' binds acting, so its params must be an object or omitted.`
+		);
+	}
+	if ('acting' in params) {
+		throw new Error(
+			`conformance: case '${c.name}' binds acting and also sets params.acting — pick one.`
+		);
+	}
+	return { ...params, acting: actor_id };
+};
+
 /**
  * Run one conformance case end-to-end: resolve the principal, dispatch the
  * request, and assert the expected status / reason / fields. Returns the
@@ -421,17 +823,19 @@ const run_case = async (
 	options: ConformanceTableOptions,
 	resolved_rpc_endpoints: ReturnType<typeof resolve_rpc_endpoints_for_setup>
 ): Promise<NormalizedResponse> => {
-	const fixture = await options.setup_test();
-	const { transport, headers, suppress_default_origin } = await resolve_principal(
-		fixture,
-		c.request.as,
-		options.principals,
-		resolved_rpc_endpoints
-	);
+	const sent = await send_conformance_case(c, {
+		fixture: await options.setup_test(),
+		surface_source: options.surface_source,
+		...(options.principals && { principals: options.principals }),
+		resolved_rpc_endpoints,
+		...(options.ws && { ws: options.ws })
+	});
+	assert_response_headers(sent.headers, c);
 
-	const normalized = c.request.method.startsWith('/')
-		? await run_rest_case(c, options, transport, headers)
-		: await run_rpc_case(c, transport, headers, suppress_default_origin, resolved_rpc_endpoints);
+	const normalized =
+		sent.target.kind === 'rest'
+			? assert_rest_case(c, sent.target.route, sent)
+			: assert_rpc_case(c, sent.target.action, sent);
 
 	// Negative-space field check, uniform across REST + RPC and success + error
 	// bodies: a sensitive column (`password_hash`, `token_hash`) must not appear
@@ -442,33 +846,13 @@ const run_case = async (
 	return normalized;
 };
 
-/** Dispatch + assert a case targeting an RPC method. */
-const run_rpc_case = async (
+/** Assert a case targeting an RPC method. */
+const assert_rpc_case = (
 	c: ConformanceCase,
-	transport: FetchTransport,
-	headers: Record<string, string>,
-	suppress_default_origin: boolean | undefined,
-	resolved_rpc_endpoints: ReturnType<typeof resolve_rpc_endpoints_for_setup>
-): Promise<NormalizedResponse> => {
-	const found = find_rpc_action(resolved_rpc_endpoints, c.request.method);
-	if (!found) {
-		throw new Error(
-			`conformance: RPC method '${c.request.method}' not found on the surface — ` +
-				`check the method name or that the action is registered on rpc_endpoints.`
-		);
-	}
-
-	const res = await rpc_call({
-		app: transport,
-		path: found.path,
-		method: c.request.method,
-		params: c.request.params,
-		headers,
-		...(c.request.verb && { verb: c.request.verb }),
-		...(suppress_default_origin && { suppress_default_origin: true })
-	});
-
-	assert_response_headers(res.headers, c);
+	action: RpcAction,
+	sent: ConformanceCaseResponse
+): NormalizedResponse => {
+	const res = parse_rpc_call_result(sent, c.request.method);
 
 	if (is_success_status(c.expect.status)) {
 		assert.ok(
@@ -478,7 +862,7 @@ const run_rpc_case = async (
 			)}`
 		);
 		assert.strictEqual(res.status, c.expect.status, `${c.name}: status`);
-		const parsed = found.action.spec.output.safeParse(res.result);
+		const parsed = action.spec.output.safeParse(res.result);
 		assert.ok(
 			parsed.success,
 			`${c.name}: result does not match spec.output: ${JSON.stringify(
@@ -506,37 +890,14 @@ const run_rpc_case = async (
 	return { status: res.status, body: res.error };
 };
 
-/** Dispatch + assert a case targeting one of the 6 REST auth routes. */
-const run_rest_case = async (
+/** Assert a case targeting one of the 6 REST auth routes. */
+const assert_rest_case = (
 	c: ConformanceCase,
-	options: ConformanceTableOptions,
-	transport: FetchTransport,
-	headers: Record<string, string>
-): Promise<NormalizedResponse> => {
-	const suffix = c.request.method as RestAuthRouteSuffix;
-	if (!rest_auth_route_suffixes.includes(suffix)) {
-		throw new Error(
-			`conformance: REST method '${c.request.method}' is not a known auth-route suffix ` +
-				`(${rest_auth_route_suffixes.join(', ')}). Use an RPC method name for RPC actions.`
-		);
-	}
-	const verb: RouteMethod = c.request.verb ?? 'POST';
-	const route = find_auth_route(options.surface_source.route_specs, suffix, verb);
-	if (!route) {
-		throw new Error(`conformance: no REST route spec for ${verb} ${suffix} on the surface.`);
-	}
-
-	const init: RequestInit = {
-		method: verb,
-		headers: { 'Content-Type': 'application/json', ...headers },
-		...(verb !== 'GET' &&
-			c.request.params !== undefined && { body: JSON.stringify(c.request.params) })
-	};
-	const response = await transport(route.path, init);
-	assert_response_headers(headers_to_record(response.headers), c);
-	assert.strictEqual(response.status, c.expect.status, `${c.name}: status`);
-
-	const body: unknown = await response.json().catch(() => undefined);
+	route: RouteSpec,
+	sent: ConformanceCaseResponse
+): NormalizedResponse => {
+	const { status, body } = sent;
+	assert.strictEqual(status, c.expect.status, `${c.name}: status`);
 	if (is_success_status(c.expect.status)) {
 		const parsed = route.output.safeParse(body);
 		assert.ok(
@@ -550,7 +911,7 @@ const run_rest_case = async (
 		assert.strictEqual(error, c.expect.error_reason, `${c.name}: body.error`);
 	}
 	if (c.expect.fields) assert_fields(body, c.expect.fields, c.name);
-	return { status: response.status, body };
+	return { status, body };
 };
 
 /**
@@ -560,10 +921,7 @@ const run_rest_case = async (
  * capabilities}` protocol.
  */
 export const describe_conformance_table_tests = (options: ConformanceTableOptions): void => {
-	const resolved_rpc_endpoints = resolve_rpc_endpoints_for_setup(
-		options.rpc_endpoints,
-		options.session_options
-	);
+	const resolved_rpc_endpoints = resolve_conformance_rpc_endpoints(options);
 	// Per-group normalized responses, populated as the member case tests run
 	// and consulted by the per-group byte-identity assertions registered after
 	// the case loop — vitest runs a describe's tests in registration order, so
@@ -572,17 +930,25 @@ export const describe_conformance_table_tests = (options: ConformanceTableOption
 		string,
 		Array<{ name: string; normalized: NormalizedResponse }>
 	>();
-	const group_names = new Set<string>();
-	for (const c of options.cases) {
-		if (c.expect.equivalence_group) group_names.add(c.expect.equivalence_group);
+	const cases = options.ws ? options.cases.filter(is_ws_conformance_case) : options.cases;
+	const group_sizes = new Map<string, number>();
+	for (const c of cases) {
+		const group = c.expect.equivalence_group;
+		if (group) group_sizes.set(group, (group_sizes.get(group) ?? 0) + 1);
 	}
+	// a group the WS filter left a single member of has nothing to compare;
+	// on HTTP every group runs, so an undersized one still fails loud
+	const group_names = new Set(
+		[...group_sizes].filter(([, size]) => !options.ws || size >= 2).map(([group]) => group)
+	);
 	describe(options.suite_name ?? 'conformance table', () => {
-		for (const c of options.cases) {
+		for (const c of cases) {
 			const label = c.note ? `${c.name} — ${c.note}` : c.name;
 			const group = c.expect.equivalence_group;
+			const recorded = group !== undefined && group_names.has(group);
 			const body = async (): Promise<void> => {
 				const normalized = await run_case(c, options, resolved_rpc_endpoints);
-				if (group) {
+				if (recorded && group) {
 					const members = equivalence_groups.get(group) ?? [];
 					members.push({ name: c.name, normalized });
 					equivalence_groups.set(group, members);

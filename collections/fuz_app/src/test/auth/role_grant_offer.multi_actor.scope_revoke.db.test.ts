@@ -11,20 +11,17 @@
  */
 
 import { assert, describe, test } from 'vitest';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
 import {
 	query_role_grant_revoke_for_scope,
 	query_create_role_grant
-} from '$lib/auth/role_grant_queries.ts';
+} from '#lib/auth/role_grant_queries.ts';
 
-import {
-	create_route_specs,
-	describe_db,
-	session_options
-} from './role_grant_offer_test_helpers.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { create_route_specs, session_options } from './role_grant_offer_test_helpers.ts';
 
 describe_db('role_grant_offer.multi_actor — scope_revoke', (get_db) => {
 	describe('query_role_grant_revoke_for_scope returns actor + account per revoked role_grant', () => {

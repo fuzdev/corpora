@@ -3,13 +3,14 @@
 
 	import HueInput from '@fuzdev/fuz_ui/HueInput.svelte';
 
-	import { HUE_BINDING_MATCHER, type ThemeKnob } from '$lib/knobs.ts';
-	import { PALETTE_HUES } from '$lib/ramps.ts';
+	import { HUE_BINDING_MATCHER, type ThemeKnob } from '#lib/knobs.ts';
+	import { PALETTE_HUES } from '#lib/ramps.ts';
+	import { parse_css_number } from '#lib/theme_resolver.ts';
 	import {
 		palette_variants,
 		format_palette_gloss,
 		type PaletteVariant
-	} from '$lib/variable_data.ts';
+	} from '#lib/variable_data.ts';
 
 	const {
 		knob,
@@ -63,11 +64,19 @@
 		if (v === undefined) return null;
 		const m = HUE_BINDING_MATCHER.exec(v);
 		if (m) return resolve_hue(m[1] as PaletteVariant);
-		let s = v;
-		if (knob.kind === 'percent') s = s.replace(/%$/u, '');
-		else if (knob.kind === 'time') s = s.replace(/(?<=\d)s$/u, '');
-		const n = Number(s);
-		return Number.isNaN(n) ? null : n;
+		// the CSS `<number>` grammar the resolver reads, so a value the theme
+		// can't hold (`''`, `0x10`, `Infinity`) has no slider position
+		const text = v.trim();
+		if (knob.kind === 'percent') return parse_css_number(text.replace(/%$/u, ''));
+		if (knob.kind === 'time') {
+			const ms = /^(.+)ms$/u.exec(text);
+			if (ms) {
+				const n = parse_css_number(ms[1]!);
+				return n === null ? null : n / 1000;
+			}
+			return parse_css_number(text.replace(/s$/u, ''));
+		}
+		return parse_css_number(text);
 	};
 
 	const numeric_value = $derived(resolve_numeric(value));
@@ -95,24 +104,38 @@
 	};
 
 	const emit_numeric = (raw: string): void => {
-		if (raw.trim() === '') return; // `Number('')` is 0 - don't slam the knob mid-edit
-		const n = Number(raw);
-		if (Number.isNaN(n)) return;
+		// mid-edit text that isn't a number yet (`''`, `-`) leaves the knob alone
+		const n = parse_css_number(raw.trim());
+		if (n === null) return;
 		onchange(knob.kind === 'percent' ? `${n}%` : knob.kind === 'time' ? `${n}s` : String(n));
+	};
+
+	// a cleared text field resets the knob - a blank slot isn't a value a theme can hold
+	const emit_text = (input: HTMLInputElement): void => {
+		if (input.value.trim() !== '') {
+			onchange(input.value);
+			return;
+		}
+		onreset();
+		// a knob already at its base value doesn't change on reset, so the
+		// field is restored by hand rather than left showing blank
+		input.value = value ?? '';
 	};
 
 	const gloss_title = (letter: PaletteVariant): string =>
 		`${letter} - ${format_palette_gloss(letter)}`;
 </script>
 
-<!-- @fuz-classes sm md lg -->
-<div class="knob {compact ? 'sm' : knob.leverage}" class:compact>
+<!-- @fuz-classes sized_sm sized_md sized_lg -->
+<div class="knob sized_{compact ? 'sm' : knob.leverage}" class:compact>
 	{#if knob.bindable}
 		<!-- intent/neutral hues: a palette-letter binding picker with a
 			custom-angle escape; chips write `var(--hue_x)`, custom detaches to a
 			literal angle -->
-		<div class="title"><code class="knob_name">--{knob.name}</code></div>
-		<div class="letter_chips" role="radiogroup" aria-label="--{knob.name} binding">
+		<div class="title">
+			<code class="p_0 font_size_sm background-color:transparent">--{knob.name}</code>
+		</div>
+		<div class="letter-chips" role="radiogroup" aria-label="--{knob.name} binding">
 			{#each palette_variants as letter (letter)}
 				<button
 					type="button"
@@ -151,7 +174,7 @@
 				type="text"
 				aria-label={knob.name}
 				value={value ?? ''}
-				onchange={(e) => onchange(e.currentTarget.value)}
+				onchange={(e) => emit_text(e.currentTarget)}
 			/>
 		{/if}
 	{:else if knob.kind === 'hue' && (numeric_value ?? derived_numeric) !== null}
@@ -159,11 +182,13 @@
 		<HueInput
 			bind:value={() => numeric_value ?? derived_numeric ?? 0, (v) => emit_numeric(String(v))}
 		>
-			<code class="knob_name">--{knob.name}</code>
+			<code class="p_0 font_size_sm background-color:transparent">--{knob.name}</code>
 		</HueInput>
 	{:else}
 		<label>
-			<div class="title"><code class="knob_name">--{knob.name}</code></div>
+			<div class="title">
+				<code class="p_0 font_size_sm background-color:transparent">--{knob.name}</code>
+			</div>
 			{#if knob.kind === 'enum'}
 				<select value={value ?? ''} onchange={(e) => onchange(e.currentTarget.value)}>
 					{#if value === undefined}
@@ -205,7 +230,7 @@
 					type="text"
 					value={value ?? ''}
 					placeholder={knob.hook ? 'unset (falls back in style.css)' : ''}
-					onchange={(e) => onchange(e.currentTarget.value)}
+					onchange={(e) => emit_text(e.currentTarget)}
 				/>
 			{/if}
 		</label>
@@ -215,7 +240,7 @@
 			would become the label's implicit control -->
 		<button
 			type="button"
-			class="plain icon_button sm knob_reset"
+			class="plain icon_button sized_sm knob-reset"
 			title="reset to base"
 			aria-label="reset to base"
 			onclick={onreset}
@@ -230,7 +255,7 @@
 		/* control-column sizing; no distance token sits near these */
 		--knob_basis: 260px;
 		--knob_max_width: 420px;
-		position: relative; /* for the .knob_reset button */
+		position: relative; /* for the .knob-reset button */
 		flex: 1 1 var(--knob_basis);
 		max-width: var(--knob_max_width);
 	}
@@ -238,26 +263,22 @@
 		--knob_basis: 190px;
 		--knob_max_width: 300px;
 	}
-	.knob:has(.knob_reset) .title {
-		/* keep long names clear of the reset button (an sm icon_button,
-			--input_height under sm = --space_xl4) */
+	.knob:has(.knob-reset) .title {
+		/* keep long names clear of the reset button (a sized_sm icon_button,
+			--input_height under sized_sm = --space_xl4) */
 		padding-right: var(--space_xl4);
 	}
-	.knob_reset {
+	.knob-reset {
 		position: absolute;
 		top: 0;
 		right: 0;
 	}
-	.knob_name {
-		background: transparent;
-		padding: 0;
-		font-size: var(--font_size_sm);
-	}
 	.knob_number {
+		/* room for a signed decimal like -0.025 at the input font size */
 		width: 90px;
 		flex-shrink: 0;
 	}
-	.letter_chips {
+	.letter-chips {
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--space_xs2);

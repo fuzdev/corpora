@@ -1,43 +1,43 @@
-import type { Args } from '@fuzdev/fuz_util/args.ts';
 import { UnreachableError } from '@fuzdev/fuz_util/error.ts';
 import { EMPTY_OBJECT } from '@fuzdev/fuz_util/object.ts';
 import { throttle } from '@fuzdev/fuz_util/throttle.ts';
 
 import type { Plugin } from './plugin.ts';
+import type { ModuleGraph } from './module_graph.ts';
 import { paths } from './paths.ts';
 import { find_genfiles, is_gen_path } from './gen.ts';
-import { filter_dependents } from './filer.ts';
 import { should_trigger_gen } from './gen_helpers.ts';
 import { spawn_cli } from './cli.ts';
 
 const FLUSH_DEBOUNCE_DELAY = 500;
 
-// TODO is cache busting a good idea here to speed up and run in-process?
-// 	await invoke_task('gen', {_: files, bust_cache: true});
 const gen = (files: Array<string> = []) => spawn_cli('gro', ['gen', ...files]);
 
-export interface TaskArgs extends Args {
-	watch?: boolean;
-}
-
+/**
+ * Options for `gro_plugin_gen`.
+ */
 export interface GroPluginGenOptions {
-	input_paths?: Array<string>;
-	root_dirs?: Array<string>;
+	/**
+	 * How long to wait after a change before running `gro gen`, batching the changes in between.
+	 */
 	flush_debounce_delay?: number;
 }
 
+/**
+ * Runs `gro gen` in development: with no watch, once if there are genfiles under `src/`,
+ * and with watch, for each genfile in the module graph (`watch.dir`, default `src/`)
+ * that a change affects.
+ */
 export const gro_plugin_gen = ({
-	input_paths = [paths.source],
-	root_dirs = [paths.source],
 	flush_debounce_delay = FLUSH_DEBOUNCE_DELAY
 }: GroPluginGenOptions = EMPTY_OBJECT): Plugin => {
 	const queued_files: Set<string> = new Set();
 
-	let cleanup_watch: (() => void) | undefined;
+	let cleanup_watch: (() => Promise<void>) | undefined;
 
 	return {
 		name: 'gro_plugin_gen',
-		setup: async ({ watch, dev, log, config, filer, invoke_task, timings }) => {
+		setup: async ({ watch, dev, log, config, graph }) => {
 			// For production builds, we assume `gen` is already fresh,
 			// which should be checked by CI via `gro check` which calls `gro gen --check`.
 			if (!dev) return;
@@ -48,7 +48,7 @@ export const gro_plugin_gen = ({
 				// Some parts of the build may have already happened,
 				// making us miss `build` events for gen dependencies,
 				// so we run a full `gen` here even if it's usually wasteful.
-				const found = await find_genfiles(input_paths, root_dirs, config);
+				const found = await find_genfiles([paths.source], [paths.source], config);
 				if (found.ok && found.value.resolved_input_files.length > 0) {
 					await gen();
 				}
@@ -69,65 +69,30 @@ export const gro_plugin_gen = ({
 							: `[gen] generating ${files.length} file${files.length === 1 ? '' : 's'}`
 					);
 					queued_files.clear();
+					// a file queued while this runs opens the throttle's next window, which takes it
 					await gen(files);
-
-					// run again?
-					if (queued_files.size > 0) {
-						log.info(
-							`[gen] re-running for ${queued_files.size} more queued file${
-								queued_files.size === 1 ? '' : 's'
-							}`
-						);
-						setTimeout(flush_gen_queue); // setTimeout is needed bc of throttle behavior
-					} else {
-						log.info('[gen] queue empty, done');
-					}
 				},
 				{ delay: flush_debounce_delay, when: 'trailing' }
 			);
 
-			// When a file builds, check it and its tree of dependents
-			// for any `.gen.` files that need to run.
-			cleanup_watch = await filer.watch(async (change, source_file) => {
-				if (source_file.external) return;
+			// When a file changes, check every `.gen.` file for whether it needs to run.
+			cleanup_watch = await graph.watch(async (change) => {
 				switch (change.type) {
 					case 'add':
 					case 'update': {
-						// Queue the gen file itself if it changed
-						if (is_gen_path(source_file.id)) {
-							queue_gen(source_file.id);
-						}
-
-						// Find all current gen files and check their dependencies
-						const gen_files = filer.filter((d) => !d.external && is_gen_path(d.id));
-						if (gen_files) {
-							for (const gen_file of gen_files) {
-								const should_trigger = await should_trigger_gen(
-									gen_file.id,
-									source_file.id,
-									config,
-									filer,
-									log,
-									timings,
-									invoke_task
-								);
-								if (should_trigger) {
-									queue_gen(gen_file.id);
+						try {
+							// queue each gen file that changed, imports the changed file, or declares it an input
+							const gen_file_ids = await graph.modules(is_gen_path);
+							for (const gen_file_id of gen_file_ids) {
+								if (await should_trigger_gen(gen_file_id, change.id, graph, log)) {
+									queue_gen(gen_file_id);
 								}
 							}
-						}
-
-						// Check import-based dependents
-						const dependent_gen_file_ids = filter_dependents(
-							source_file,
-							filer.get_by_id,
-							is_gen_path,
-							undefined,
-							undefined,
-							log
-						);
-						for (const dependent_gen_file_id of dependent_gen_file_ids) {
-							queue_gen(dependent_gen_file_id);
+						} catch (error) {
+							// a query on a closed graph rejects, so a check in flight when it closed,
+							// like when a later plugin's setup fails, ends quietly
+							if (await graph_is_closed(graph)) return;
+							log.error('[gen] failed to check for genfiles to run for', change.id, error);
 						}
 						break;
 					}
@@ -140,11 +105,25 @@ export const gro_plugin_gen = ({
 				}
 			});
 		},
-		teardown: () => {
+		teardown: async () => {
 			if (cleanup_watch) {
-				cleanup_watch();
+				const c = cleanup_watch;
 				cleanup_watch = undefined;
+				await c();
 			}
 		}
 	};
 };
+
+/**
+ * Whether `graph` is closed, which every query on a closed graph rejects to say.
+ * Only called after a query failed, once the graph had loaded,
+ * since a graph that loaded stays loaded until it closes.
+ */
+const graph_is_closed = (graph: ModuleGraph): Promise<boolean> =>
+	graph
+		.modules(() => false)
+		.then(
+			() => false,
+			() => true
+		);

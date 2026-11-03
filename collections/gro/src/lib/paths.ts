@@ -1,17 +1,10 @@
-import { join, extname, relative } from 'node:path';
+import { join, extname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ensure_end, strip_end } from '@fuzdev/fuz_util/string.ts';
+import { ensure_end } from '@fuzdev/fuz_util/string.ts';
 import { styleText as st } from 'node:util';
-import type { PathId } from '@fuzdev/fuz_util/path.ts';
+import type { PathFilter, PathId } from '@fuzdev/fuz_util/path.ts';
 
-import {
-	GRO_CONFIG_FILENAME,
-	GRO_DEV_DIR,
-	GRO_DIR,
-	LIB_DIR,
-	SOURCE_DIR,
-	SVELTEKIT_DIST_DIRNAME
-} from './constants.ts';
+import { GRO_CONFIG_FILENAME, GRO_DEV_DIR, GRO_DIR, LIB_DIR, SOURCE_DIR } from './constants.ts';
 
 /*
 
@@ -64,21 +57,14 @@ export const is_gro_id = (id: PathId): boolean =>
 export const to_root_path = (id: PathId, p = infer_paths(id)): string =>
 	relative(p.root, id) || './';
 
-// '/home/me/app/src/foo/bar/baz.ts' → 'foo/bar/baz.ts'
-export const path_id_to_base_path = (path_id: PathId, p = infer_paths(path_id)): string =>
-	relative(p.source, path_id);
-
 // TODO base_path is an obsolete concept, it was a remnant from forcing `src/`
 // 'foo/bar/baz.ts' → '/home/me/app/src/foo/bar/baz.ts'
 export const base_path_to_path_id = (base_path: string, p = infer_paths(base_path)): PathId =>
 	join(p.source, base_path);
 
 export const print_path = (path: string, p = infer_paths(path)): string => {
-	let final_path =
-		strip_end(path, '/') === strip_end(GRO_DIST_DIR, '/') ? 'gro' : to_root_path(path, p);
-	final_path =
-		final_path === 'gro' ? final_path : final_path[0] === '.' ? final_path : './' + final_path;
-	return st('gray', final_path);
+	const root_path = to_root_path(path, p);
+	return st('gray', root_path[0] === '.' ? root_path : './' + root_path);
 };
 
 export const replace_extension = (path: string, new_extension: string): string => {
@@ -91,23 +77,58 @@ export const replace_extension = (path: string, new_extension: string): string =
  */
 export const paths = create_paths(process.cwd());
 
-/** @trailing_slash */
-export const GRO_PACKAGE_DIR = 'gro/';
-// TODO document these conditions with comments
-// TODO there's probably a more robust way to do this
-const filename = fileURLToPath(import.meta.url);
-const gro_package_dir_path = join(
-	filename,
-	filename.includes('/gro/src/lib/')
-		? '../../../'
-		: filename.includes('/gro/dist/')
-			? '../../'
-			: '../'
-);
+/**
+ * Finds the Gro package directory from the path of Gro's own `paths` module,
+ * by its location in the package (`src/lib/paths.ts` from source, `dist/paths.js` built),
+ * so a checkout or worktree of any name works.
+ * @param module_path - the absolute path of Gro's `paths` module
+ * @returns the package directory with a trailing slash
+ * @internal
+ */
+export const to_gro_package_dir = (module_path: PathId): string =>
+	join(
+		module_path,
+		module_path.endsWith('/src/lib/paths.ts')
+			? '../../../'
+			: module_path.endsWith('/dist/paths.js')
+				? '../../'
+				: '../'
+	);
+
+const gro_package_dir_path = to_gro_package_dir(fileURLToPath(import.meta.url));
 export const IS_THIS_GRO = gro_package_dir_path === paths.root;
 /**
  * `Paths` for the Gro package being used by the user repo.
  */
 export const gro_paths = IS_THIS_GRO ? paths : create_paths(gro_package_dir_path);
-/** @trailing_slash */
-export const GRO_DIST_DIR = gro_paths.root + SVELTEKIT_DIST_DIRNAME + '/';
+
+/**
+ * Binds `search_filters` to the project root,
+ * so each filter tests the path relative to `root` rather than the absolute id,
+ * the same path whichever directory a search starts in,
+ * and a project under a `.`-prefixed directory like `~/.cache/` still finds its files.
+ * A path outside `root` but under `search_dir` is tested relative to `search_dir`,
+ * so a search of a directory outside the project, like `~/.cache/other/src`, finds its files too,
+ * and any other path is tested as its absolute id.
+ * @param search_filters - the filters each file and directory must pass, usually `config.search_filters`
+ * @param root - the project root the paths are relative to, usually `paths.root`
+ * @param search_dir - the directory being searched, the base for the paths outside `root`
+ * @returns filters for `fs_search`, which passes them absolute ids
+ */
+export const to_search_filters_relative = (
+	search_filters: PathFilter | Array<PathFilter> | null | undefined,
+	root: string,
+	search_dir?: string
+): Array<PathFilter> => {
+	if (!search_filters) return [];
+	const filters = Array.isArray(search_filters) ? search_filters : [search_filters];
+	const root_prefix = ensure_end(resolve(root), '/');
+	const dir_prefix = search_dir === undefined ? null : ensure_end(resolve(search_dir), '/');
+	const to_path = (id: string): string =>
+		id.startsWith(root_prefix)
+			? id.slice(root_prefix.length)
+			: dir_prefix !== null && id.startsWith(dir_prefix)
+				? id.slice(dir_prefix.length)
+				: id;
+	return filters.map((filter) => (id, is_directory) => filter(to_path(id), is_directory));
+};

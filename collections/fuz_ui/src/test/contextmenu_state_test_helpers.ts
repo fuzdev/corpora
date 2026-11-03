@@ -13,7 +13,7 @@ import {
 	SubmenuState,
 	type ContextmenuRun,
 	type RootMenuState
-} from '$lib/contextmenu_state.svelte.ts';
+} from '#lib/contextmenu_state.svelte.ts';
 
 /**
  * Creates an `EntryState` and registers it via `menu.add_item`.

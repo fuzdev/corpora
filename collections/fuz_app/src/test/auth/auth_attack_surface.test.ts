@@ -12,38 +12,43 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import { apply_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
+import { apply_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
 import {
 	ActingActor,
 	is_keeper_auth,
 	is_plain_authenticated_auth,
 	is_public_auth,
 	is_role_auth
-} from '$lib/http/auth_shape.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import type { MiddlewareSpec } from '$lib/http/middleware_spec.ts';
-import { generate_app_surface } from '$lib/http/surface.ts';
+} from '#lib/http/auth_shape.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import type { MiddlewareSpec } from '#lib/http/middleware_spec.ts';
+import { generate_app_surface } from '#lib/http/surface.ts';
 import {
 	REQUEST_CONTEXT_KEY,
 	require_auth,
 	require_role,
 	type RequestContext
-} from '$lib/auth/request_context.ts';
+} from '#lib/auth/request_context.ts';
 import {
-	ACCOUNT_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TEST_CONTEXT_PRESET_KEY,
-	type CredentialType
-} from '$lib/hono_context.ts';
-import { session_cookie_options } from '$lib/auth/session_cookie.ts';
-import { API_TOKEN_PREFIX } from '$lib/auth/api_token.ts';
-import { PASSWORD_LENGTH_MIN } from '$lib/auth/password.ts';
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import type { BuiltinCredentialType } from '#lib/auth/credential_type_schema.ts';
+import { session_cookie_options } from '#lib/auth/session_cookie.ts';
+import { API_TOKEN_PREFIX } from '#lib/auth/api_token.ts';
+import { PASSWORD_LENGTH_MIN } from '#lib/auth/password.ts';
 import {
 	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_INSUFFICIENT_PERMISSIONS
-} from '$lib/http/error_schemas.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { create_stub_db } from '$lib/testing/stubs.ts';
+} from '#lib/http/error_schemas.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { create_stub_db } from '#lib/testing/stubs.ts';
+import { to_iso8601_seconds } from '#lib/timestamp.ts';
+
+/** The content type every non-`raw_body` POST route requires. */
+const JSON_HEADERS = { 'content-type': 'application/json' };
 
 const log = new Logger('test', { level: 'off' });
 const stub_db = create_stub_db();
@@ -54,8 +59,8 @@ const create_test_ctx_with_role_grants = (roles: ReadonlyArray<string>): Request
 		id: 'acc_1' as Uuid,
 		username: 'alice',
 		password_hash: 'hash',
-		created_at: new Date().toISOString(),
-		updated_at: new Date().toISOString(),
+		created_at: to_iso8601_seconds(new Date()),
+		updated_at: to_iso8601_seconds(new Date()),
 		created_by: null,
 		updated_by: null,
 		deleted_at: null,
@@ -67,7 +72,7 @@ const create_test_ctx_with_role_grants = (roles: ReadonlyArray<string>): Request
 		id: 'act_1' as Uuid,
 		account_id: 'acc_1' as Uuid,
 		name: 'alice',
-		created_at: new Date().toISOString(),
+		created_at: to_iso8601_seconds(new Date()),
 		updated_at: null,
 		updated_by: null,
 		deleted_at: null,
@@ -79,7 +84,7 @@ const create_test_ctx_with_role_grants = (roles: ReadonlyArray<string>): Request
 		role,
 		scope_kind: null,
 		scope_id: null,
-		created_at: new Date().toISOString(),
+		created_at: to_iso8601_seconds(new Date()),
 		expires_at: null,
 		revoked_at: null,
 		revoked_by: null,
@@ -97,16 +102,21 @@ const create_test_ctx = (role?: string): RequestContext =>
 const create_test_app = (
 	specs: Array<RouteSpec>,
 	auth_ctx?: RequestContext,
-	credential_type?: CredentialType
+	credential_type?: BuiltinCredentialType
 ): Hono => {
 	const app = new Hono();
 	// Simulate request context middleware — sets context if provided
 	if (auth_ctx) {
 		app.use('/*', async (c, next) => {
-			(c as any).set(ACCOUNT_ID_KEY, auth_ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({
+					credential_type: credential_type ?? 'session',
+					account_id: auth_ctx.account.id
+				})
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, auth_ctx);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
-			if (credential_type) (c as any).set(CREDENTIAL_TYPE_KEY, credential_type);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 	}
@@ -180,13 +190,13 @@ const test_route_specs: Array<RouteSpec> = [
  * Named credential variants for the auth matrix.
  *
  * `none` = no auth context at all (the fixture omits every auth key).
- * Other entries set `ACCOUNT_ID_KEY`, `REQUEST_CONTEXT_KEY` (with the named
- * role_grants), and `CREDENTIAL_TYPE_KEY`, simulating what each upstream
+ * Other entries set `RESOLVED_AUTH_KEY` (the named credential type) and
+ * `REQUEST_CONTEXT_KEY` (with the named role_grants), simulating what each upstream
  * authentication middleware would deposit before the dispatcher's
  * authorization phase.
  */
 interface CredentialDescriptor {
-	credential_type: CredentialType | null;
+	credential_type: BuiltinCredentialType | null;
 	role_grants: ReadonlyArray<string>;
 }
 
@@ -334,7 +344,7 @@ describe('auth matrix — credential × route', () => {
 				: undefined;
 			const credential_type = descriptor.credential_type ?? undefined;
 			const app = create_test_app(test_route_specs, auth_ctx, credential_type);
-			const res = await app.request(c.path, { method: c.method });
+			const res = await app.request(c.path, { method: c.method, headers: JSON_HEADERS });
 			assert.strictEqual(
 				res.status,
 				c.expected,
@@ -354,8 +364,8 @@ describe('targeted adversarial tests', () => {
 				role: 'admin',
 				scope_kind: null,
 				scope_id: null,
-				created_at: new Date().toISOString(),
-				expires_at: new Date(Date.now() - 86400_000).toISOString(), // expired yesterday
+				created_at: to_iso8601_seconds(new Date()),
+				expires_at: to_iso8601_seconds(new Date(Date.now() - 86400_000)), // expired yesterday
 				revoked_at: null,
 				revoked_by: null,
 				revoked_reason: null,
@@ -364,7 +374,7 @@ describe('targeted adversarial tests', () => {
 			}
 		];
 		const app = create_test_app(test_route_specs, ctx);
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', { method: 'POST', headers: JSON_HEADERS });
 		assert.strictEqual(res.status, 403);
 	});
 
@@ -377,9 +387,9 @@ describe('targeted adversarial tests', () => {
 				role: 'admin',
 				scope_kind: null,
 				scope_id: null,
-				created_at: new Date().toISOString(),
+				created_at: to_iso8601_seconds(new Date()),
 				expires_at: null,
-				revoked_at: new Date().toISOString(),
+				revoked_at: to_iso8601_seconds(new Date()),
 				revoked_by: 'someone' as Uuid,
 				revoked_reason: null,
 				granted_by: null,
@@ -387,19 +397,19 @@ describe('targeted adversarial tests', () => {
 			}
 		];
 		const app = create_test_app(test_route_specs, ctx);
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', { method: 'POST', headers: JSON_HEADERS });
 		assert.strictEqual(res.status, 403);
 	});
 
 	test('admin cannot access keeper routes', async () => {
 		const app = create_test_app(test_route_specs, create_test_ctx('admin'));
-		const res = await app.request('/keeper', { method: 'POST' });
+		const res = await app.request('/keeper', { method: 'POST', headers: JSON_HEADERS });
 		assert.strictEqual(res.status, 403);
 	});
 
 	test('keeper cannot access admin routes', async () => {
 		const app = create_test_app(test_route_specs, create_test_ctx('keeper'));
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', { method: 'POST', headers: JSON_HEADERS });
 		assert.strictEqual(res.status, 403);
 	});
 
@@ -417,9 +427,12 @@ describe('targeted adversarial tests', () => {
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
 			const ctx = create_test_ctx('viewer');
-			(c as any).set(ACCOUNT_ID_KEY, ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, ctx);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.get('/test', require_role(['admin']), (c) => c.json({ ok: true }));

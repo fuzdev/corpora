@@ -5,7 +5,7 @@
  * enabling zero-config file discovery without glob patterns.
  *
  * @see `source.ts` for `SourceFileInfo`
- * @see `analyze.ts` for `analyzeFromFiles` (primary consumer)
+ * @see `discovery.ts` for `discoverSourceFiles` (the consumer)
  *
  * @module
  */
@@ -17,9 +17,10 @@ import { glob } from 'tinyglobby';
 
 import type { SourceFileInfo } from './source.ts';
 import type { Diagnostic } from './diagnostics.ts';
-import { to_error_message } from './error.ts';
+import { toErrorMessage } from './error.ts';
 import { toPosixPath } from './paths.ts';
-import { MAX_FILE_CONCURRENCY, map_concurrent } from './concurrency.ts';
+import { compareStrings } from './postprocess.ts';
+import { MAX_FILE_CONCURRENCY, mapConcurrent } from './concurrency.ts';
 import { baselineExcludesForBase, hasBaselineExcludedSegment } from './source-config.ts';
 
 // Types
@@ -75,12 +76,12 @@ export interface ParsedExports {
 	entries: Array<ExportEntry>;
 	/**
 	 * Specifiers (exact or wildcard patterns) whose export target resolves
-	 * nothing — a literal `null`, or a conditions object with no usable
-	 * target. Node's explicit-exclusion form: `"./internal/*": null` blocks
-	 * the subpaths a broader wildcard would otherwise expose. Discovery
-	 * honors these with Node's best-match semantics: a subpath whose
-	 * most-specific matching key is blocked is not exported, so its source
-	 * file is not discovered.
+	 * nothing — a literal `null`, a conditions object with no usable target
+	 * (all-null or empty), or a fallback array with no usable element. Node's
+	 * explicit-exclusion form: `"./internal/*": null` blocks the subpaths a
+	 * broader wildcard would otherwise expose. Discovery honors these with
+	 * Node's best-match semantics: a subpath whose most-specific matching key
+	 * is blocked is not exported, so its source file is not discovered.
 	 *
 	 * Interpret via `createBlockedSpecifierChecker` — a naive membership
 	 * check (`blocked.includes(specifier)`) is wrong for wildcard keys and
@@ -342,9 +343,13 @@ export const mapDistToSource = (
 		return sourceBase;
 	}
 
-	// .js → .ts (primary), .js (fallback — handled by caller checking existence)
+	// .js → .ts and .mjs → .mts (primary); the caller falls back through
+	// `SOURCE_EXTENSION_VARIANTS` (.tsx, .js, .jsx; .mjs) by existence
 	if (sourceBase.endsWith('.js')) {
 		return sourceBase.replace(/\.js$/, '.ts');
+	}
+	if (sourceBase.endsWith('.mjs')) {
+		return sourceBase.replace(/\.mjs$/, '.mts');
 	}
 
 	return sourceBase;
@@ -452,8 +457,8 @@ export const discoverFromExports = async (
 	// Load file contents with bounded concurrency to keep FD pressure under
 	// the typical ulimit on large projects. See `concurrency.ts`.
 	const diagnostics: Array<Diagnostic> = [];
-	const absPaths = Array.from(discovered.keys());
-	const results = await map_concurrent(
+	const absPaths = Array.from(discovered.keys()).sort(compareStrings);
+	const results = await mapConcurrent(
 		absPaths,
 		MAX_FILE_CONCURRENCY,
 		async (absPath): Promise<SourceFileInfo | null> => {
@@ -465,7 +470,7 @@ export const discoverFromExports = async (
 					kind: 'module_unreadable',
 					severity: 'error',
 					file: toPosixPath(relative(projectRoot, absPath)),
-					message: `Could not read file discovered via package.json exports: ${to_error_message(err)}`
+					message: `Could not read file discovered via package.json exports: ${toErrorMessage(err)}`
 				});
 				return null;
 			}
@@ -496,8 +501,8 @@ const resolveConcreteExport = async (
 	const sourcePath = mapDistToSource(distPath, condition, mappingOptions);
 	if (!sourcePath) return;
 	// `mapDistToSource` prefixes `sourceDir/`, so the slice is the base-relative
-	// remainder; the `.js` fallback below differs only in the final segment,
-	// which the baseline never checks, so one check covers both.
+	// remainder; the extension fallbacks below differ only in the final segment,
+	// which the baseline never checks, so one check covers them all.
 	const { sourceDir } = mappingOptions;
 	const baseRelative = sourceDir ? sourcePath.slice(sourceDir.length + 1) : sourcePath;
 	if (hasBaselineExcludedSegment(baseRelative)) return;
@@ -506,15 +511,23 @@ const resolveConcreteExport = async (
 	const absPath = toPosixPath(resolve(projectRoot, sourcePath));
 	if (discovered.has(absPath)) return;
 
-	// Check existence — try .ts first, fall back to .js
+	// Check existence — the mapped path first, then its fallbacks in
+	// TypeScript's resolution order (`./x.js` → `x.ts`, `x.tsx`, `x.js`, `x.jsx`)
 	if (await fileExists(absPath)) {
 		discovered.set(absPath, sourcePath);
-	} else if (sourcePath.endsWith('.ts')) {
-		const jsPath = sourcePath.replace(/\.ts$/, '.js');
-		if (excludeMatcher?.(jsPath)) return;
-		const absJs = toPosixPath(resolve(projectRoot, jsPath));
-		if (await fileExists(absJs)) {
-			discovered.set(absJs, jsPath);
+		return;
+	}
+	const variant = sourceExtensionVariant(sourcePath);
+	if (!variant) return;
+	const stem = sourcePath.slice(0, -variant.extension.length);
+	for (const ext of variant.fallbacks) {
+		const fallbackPath = stem + ext;
+		if (excludeMatcher?.(fallbackPath)) continue;
+		const absFallback = toPosixPath(resolve(projectRoot, fallbackPath));
+		if (discovered.has(absFallback)) return;
+		if (await fileExists(absFallback)) {
+			discovered.set(absFallback, fallbackPath);
+			return;
 		}
 	}
 };
@@ -537,8 +550,7 @@ const resolveConcreteExport = async (
  *   project-root `**` that rakes in `node_modules`/`dist`. Empty `sourceDir`
  *   only arises from the multi-`sourcePaths` no-common-prefix layout (which
  *   `discoverSourceFiles` short-circuits before reaching here) or an explicit
- *   `sourceRoot: ''`; leaving it non-recursive matches the prior behavior
- *   without the explosion risk.
+ *   `sourceRoot: ''`; it stays non-recursive, avoiding the explosion risk.
  *
  * Both fall through to matching same-directory files only.
  */
@@ -550,24 +562,46 @@ const toRecursiveExportGlob = (pattern: string): string => {
 };
 
 /**
- * Extensions a `.ts`-mapped exports pattern also matches — `mapDistToSource`
- * maps `.js` dist entries to `.ts` sources, but the same entry serves
- * Svelte/JS/CSS files too.
+ * The source extensions a mapped extension also stands for, in lookup order.
+ * `mapDistToSource` maps a `.js` dist entry to `.ts` and a `.mjs` one to
+ * `.mts`, but a `.js` file in `dist` also compiles from `.tsx`, `.js`, and
+ * `.jsx` sources, and a `.mjs` one from `.mjs`. `fallbacks` is TypeScript's
+ * resolution order after the mapped extension, for a concrete entry's
+ * existence check; `globbed` adds the `.svelte` and `.css` sources a
+ * wildcard entry also serves.
  */
-const TS_VARIANT_EXTENSIONS = ['.svelte', '.js', '.css'];
+const SOURCE_EXTENSION_VARIANTS: ReadonlyArray<{
+	extension: string;
+	fallbacks: ReadonlyArray<string>;
+	globbed: ReadonlyArray<string>;
+}> = [
+	{
+		extension: '.ts',
+		fallbacks: ['.tsx', '.js', '.jsx'],
+		globbed: ['.tsx', '.svelte', '.js', '.jsx', '.css']
+	},
+	{ extension: '.mts', fallbacks: ['.mjs'], globbed: ['.mjs'] }
+];
+
+const sourceExtensionVariant = (
+	path: string
+): (typeof SOURCE_EXTENSION_VARIANTS)[number] | undefined =>
+	SOURCE_EXTENSION_VARIANTS.find((v) => path.endsWith(v.extension));
 
 /**
- * Expand a `.ts`-suffixed pattern (or pattern trailer) into every
+ * Expand a `.ts`- or `.mts`-suffixed pattern (or pattern trailer) into every
  * source-extension variant it matches, itself first. The one variant table:
  * the glob expansion and the specifier inversion
  * (`createSpecifierForSourcePath`) both consume it, so they can't drift — a
  * divergence would make blocked-key checking silently fail open for the
  * missed extension.
  */
-const tsExtensionVariants = (pattern: string): Array<string> =>
-	pattern.endsWith('.ts')
-		? [pattern, ...TS_VARIANT_EXTENSIONS.map((ext) => pattern.slice(0, -3) + ext)]
-		: [pattern];
+const tsExtensionVariants = (pattern: string): Array<string> => {
+	const variant = sourceExtensionVariant(pattern);
+	if (!variant) return [pattern];
+	const stem = pattern.slice(0, -variant.extension.length);
+	return [pattern, ...variant.globbed.map((ext) => stem + ext)];
+};
 
 /**
  * Expand a wildcard export pattern to matching source files.
@@ -584,7 +618,8 @@ const expandWildcardExport = async (
 
 	// The exports `*` crosses directory separators; a glob `*` does not — widen
 	// it so nested modules aren't silently dropped. A `.ts`-mapped pattern also
-	// matches Svelte/JS/CSS sources (`tsExtensionVariants`).
+	// matches TSX/Svelte/JS/JSX/CSS sources, a `.mts` one `.mjs`
+	// (`tsExtensionVariants`).
 	const patterns = tsExtensionVariants(toRecursiveExportGlob(mappedPattern));
 
 	// Blocked-key checking: reconstruct the specifier this entry would resolve
@@ -630,8 +665,8 @@ const expandWildcardExport = async (
  * pattern's `*` captured, substituted into the entry's specifier, is the
  * specifier Node would resolve that file under (`src/lib/internal/foo.ts` →
  * capture `internal/foo` → `./internal/foo.js`). Extension variants come from
- * `tsExtensionVariants`, the same table the glob used, so `.svelte`/`.js`/
- * `.css` files map too — their specifier keeps this entry's extension
+ * `tsExtensionVariants`, the same table the glob used, so `.tsx`/`.svelte`/
+ * `.js`/`.jsx`/`.css` files map too — their specifier keeps this entry's extension
  * (`./X.js` for an `X.svelte` match), which is exact for prefix-shaped
  * blocked keys (`./internal/*`) and only approximate for a blocked key
  * targeting a specific foreign extension.

@@ -15,12 +15,14 @@ import { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import type { AppDeps } from '../auth/deps.ts';
 import { create_audit_emitter, type AuditEmitter } from '../auth/audit_emitter.ts';
+import { create_realtime_closer, type RealtimeCloser } from '../actions/connection_closer.ts';
 import type { DbType, Db } from '../db/db.ts';
 import type { Keyring } from '../auth/keyring.ts';
 import type { PasswordHashDeps } from '../auth/password.ts';
 import { run_migrations, type MigrationNamespace, type MigrationResult } from '../db/migrate.ts';
-import { auth_migration_ns, reserved_migration_namespaces } from '../auth/migrations.ts';
-import { create_db } from '../db/create_db.ts';
+import { AUTH_MIGRATION_NS } from '../auth/migrations.ts';
+import { create_db, is_pg_database_url } from '../db/create_db.ts';
+import { DEFAULT_DB_AUDIT_CHECKOUT_TIMEOUT_MS } from '../db/db_pg.ts';
 
 /**
  * Result of `create_app_backend()` — database metadata + deps bundle.
@@ -40,7 +42,10 @@ export interface AppBackend {
 
 /**
  * Callback that builds the bound `AuditEmitter` after the backend's pool
- * `Db` and `Logger` exist. Required on `CreateAppBackendOptions` so the
+ * `Db` and `Logger` exist. The `db` it is handed is the backend's pool with
+ * the audit checkout bound (`db_audit_checkout_timeout_ms`,
+ * `Db.with_checkout_timeout`), so the emitter's pool writes wait longer than a
+ * request's checkout. Required on `CreateAppBackendOptions` so the
  * consumer owns subscriber-chain composition and `AuditLogConfig`
  * selection without the factory holding a default.
  *
@@ -91,7 +96,7 @@ export interface CreateAppBackendOptions {
 	/**
 	 * Hardened secret-file read for the bootstrap token — pass the runtime's
 	 * `read_secure_file` (see `FsSecureReadDeps`). Rejects symlinks,
-	 * group/other-accessible modes, and oversized files.
+	 * non-regular files, group/other-accessible modes, and oversized files.
 	 */
 	read_secure_file: (path: string) => Promise<Uint8Array>;
 	/** Delete a file. */
@@ -119,23 +124,55 @@ export interface CreateAppBackendOptions {
 	 * })
 	 * ```
 	 *
-	 * Additional listeners (factory-managed audit SSE, per-endpoint WS
-	 * auth guards) are registered at `create_app_server` time via
+	 * Additional listeners (factory-managed audit SSE, the revocation guard)
+	 * are registered at `create_app_server` time via
 	 * `audit.add_listener(...)`.
 	 */
 	audit_factory: AuditFactory;
+	/**
+	 * The closer to put on `AppDeps.connection_closer`. Omit for a fresh one
+	 * — the usual case, since `create_app_server` adds the transports it
+	 * mounts. Pass one built up front (`create_realtime_closer()`) when a
+	 * transport is constructed before the backend and has to be added to the
+	 * same closer the handlers will hold — e.g. an audit stream from
+	 * `create_audit_log_sse` whose listener `audit_factory` registers.
+	 */
+	connection_closer?: RealtimeCloser;
 	/**
 	 * Additional migration namespaces to run after the builtin auth namespace.
 	 * The shared `schema_version` table records one row per applied migration
 	 * (`namespace`, `name`, `sequence`); order is append-only so forward-only
 	 * guarantees hold per-namespace.
 	 *
-	 * Names in `reserved_migration_namespaces` (currently `['fuz_auth']`) are
-	 * rejected at startup. Omit for no extra namespaces. This is the only
+	 * A name in `reserved_migration_namespaces` is rejected at startup
+	 * (`run_migrations` refuses it before touching the database) unless the
+	 * entry is the spine's own `CELL_MIGRATION_NS` / `FACT_MIGRATION_NS`
+	 * object; auth always runs first, so it is never passed here.
+	 * Omit for no extra namespaces. This is the only
 	 * place to splice consumer migrations — DB init belongs to the backend
 	 * lifecycle, not server assembly.
 	 */
 	migration_namespaces?: ReadonlyArray<MigrationNamespace>;
+	/**
+	 * Bound on the pool checkouts a request makes, in ms — the server env's
+	 * `FUZ_DB_CHECKOUT_TIMEOUT_MS`. Default `DEFAULT_DB_CHECKOUT_TIMEOUT_MS`
+	 * (5 s). A failed checkout answers 503 on every surface. Audit writes use
+	 * `db_audit_checkout_timeout_ms` instead — the failed-login row a request
+	 * waits on included. A checkout that waits and then connects can take about
+	 * twice the bound (`db/db_pg.ts`, "Checkout timeout"). Postgres only:
+	 * PGlite and pglet have no pool, and a value passed with one is warned of
+	 * at boot. Twin of the Rust `BaseServerEnv::db_checkout_timeout`.
+	 */
+	db_checkout_timeout_ms?: number;
+	/**
+	 * Bound on the checkout behind each audit pool write, in ms — the server
+	 * env's `FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS`. Default
+	 * `DEFAULT_DB_AUDIT_CHECKOUT_TIMEOUT_MS` (30 s). A failed login awaits its
+	 * row, so it can wait up to this bound. Postgres only, like
+	 * `db_checkout_timeout_ms`. Twin of the Rust
+	 * `BaseServerEnv::db_audit_checkout_timeout`.
+	 */
+	db_audit_checkout_timeout_ms?: number;
 }
 
 /**
@@ -143,38 +180,47 @@ export interface CreateAppBackendOptions {
  *
  * Calls `create_db` → `run_migrations` (auth namespace, then any
  * `migration_namespaces` from options in order) → `audit_factory({db, log})`
- * and bundles the result with the provided keyring and password deps.
+ * (`db` with the audit checkout bound)
+ * and bundles the result with the provided keyring and password deps and a
+ * `connection_closer` (empty until `create_app_server` adds its transports).
  *
  * @param options - keyring, password deps, `audit_factory`, optional database URL, and optional `migration_namespaces`
  * @returns app backend with deps, database metadata, and combined migration results
- * @throws Error if `migration_namespaces` contains a namespace in `reserved_migration_namespaces`
+ * @throws MigrationError `namespace-reserved` if a `migration_namespaces` entry bears a `reserved_migration_namespaces` name and is not the spine's own namespace
  */
 export const create_app_backend = async (options: CreateAppBackendOptions): Promise<AppBackend> => {
 	const { database_url, keyring, password, read_secure_file, delete_file, audit_factory } = options;
 	const log = options.log ?? new Logger('server');
-	const { db, close, db_type, db_name } = await create_db(database_url);
-	// Everything after `create_db` can throw — reserved-namespace check,
-	// `run_migrations` (seven MigrationError kinds), `audit_factory`.
+	const { db, close, db_type, db_name } = await create_db(database_url, {
+		checkout_timeout_ms: options.db_checkout_timeout_ms
+	});
+	// set but inert: fail loud rather than let an operator believe it applies
+	if (
+		!is_pg_database_url(database_url) &&
+		(options.db_checkout_timeout_ms !== undefined ||
+			options.db_audit_checkout_timeout_ms !== undefined)
+	) {
+		log.warn(
+			`${db_type} has no connection pool; FUZ_DB_CHECKOUT_TIMEOUT_MS and FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS have no effect`
+		);
+	}
+	// Everything after `create_db` can throw — `run_migrations` (its
+	// `MigrationError` kinds include the reserved-namespace refusal),
+	// `audit_factory`.
 	// Without this guard the pool leaks because `close` is only returned
 	// on the success path. Cleanup errors are logged and swallowed so the
 	// caller sees the original failure, not a teardown-shaped one.
 	try {
-		if (options.migration_namespaces?.length) {
-			for (const ns of options.migration_namespaces) {
-				if (reserved_migration_namespaces.includes(ns.namespace)) {
-					throw new Error(
-						`Migration namespace "${
-							ns.namespace
-						}" is reserved by fuz_app — choose a different namespace`
-					);
-				}
-			}
-		}
 		const migration_results = await run_migrations(db, [
-			auth_migration_ns,
+			AUTH_MIGRATION_NS,
 			...(options.migration_namespaces ?? [])
 		]);
-		const audit = audit_factory({ db, log });
+		const audit = audit_factory({
+			db: db.with_checkout_timeout(
+				options.db_audit_checkout_timeout_ms ?? DEFAULT_DB_AUDIT_CHECKOUT_TIMEOUT_MS
+			),
+			log
+		});
 		return {
 			db_type,
 			db_name,
@@ -187,7 +233,8 @@ export const create_app_backend = async (options: CreateAppBackendOptions): Prom
 				read_secure_file,
 				delete_file,
 				log,
-				audit
+				audit,
+				connection_closer: options.connection_closer ?? create_realtime_closer()
 			}
 		};
 	} catch (err) {

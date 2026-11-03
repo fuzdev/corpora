@@ -7,11 +7,16 @@
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import { assert_row } from '../db/assert_row.ts';
-import { columns_sql, omit_columns } from '../db/sql_columns.ts';
+import {
+	columns_sql,
+	iso8601_timestamp_column,
+	iso8601_timestamp_expr,
+	omit_columns
+} from '../db/sql_columns.ts';
 import {
 	to_admin_account,
 	type Account,
@@ -21,6 +26,7 @@ import {
 } from './account_schema.ts';
 import { ADMIN_ACCOUNT_LIST_DEFAULT_LIMIT } from './admin_action_specs.ts';
 import { ROLE_GRANT_COLUMNS } from './role_grant_queries.ts';
+import { offer_pending_predicate, role_grant_active_sql } from './role_grant_sql.ts';
 
 /**
  * The full `account` column set, named explicitly so a row read fails loud
@@ -68,6 +74,19 @@ export const ACTOR_COLUMNS = [
 ] as const satisfies ReadonlyArray<keyof Actor>;
 
 /**
+ * The timestamp override both tables this module owns share (`ACTOR_COLUMNS`
+ * carries the same triple); every read here is on the bare table. Actor
+ * timestamps never reach the wire (the summaries carry `{id, name}` only —
+ * see `actor_lookup_action_specs.ts` on timing-oracle avoidance), but `Actor`
+ * declares them as strings, so the projection makes the row honest there too.
+ */
+const account_actor_expr = iso8601_timestamp_expr(ACCOUNT_COLUMNS, [
+	'created_at',
+	'updated_at',
+	'deleted_at'
+])('');
+
+/**
  * Create a new account.
  *
  * @param deps - query dependencies
@@ -82,7 +101,7 @@ export const query_create_account = async (
 	const row = await deps.db.query_one<Account>(
 		`INSERT INTO account (username, password_hash, email)
 		 VALUES ($1, $2, $3)
-		 RETURNING ${columns_sql(ACCOUNT_COLUMNS)}`,
+		 RETURNING ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)}`,
 		[input.username, input.password_hash, input.email ?? null]
 	);
 	return assert_row(row, 'INSERT INTO account');
@@ -102,7 +121,7 @@ export const query_account_by_id = async (
 	id: string
 ): Promise<Account | undefined> => {
 	return deps.db.query_one<Account>(
-		`SELECT ${columns_sql(ACCOUNT_COLUMNS)} FROM account WHERE id = $1 AND deleted_at IS NULL`,
+		`SELECT ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)} FROM account WHERE id = $1 AND deleted_at IS NULL`,
 		[id]
 	);
 };
@@ -115,7 +134,7 @@ export const query_account_by_username = async (
 	username: string
 ): Promise<Account | undefined> => {
 	return deps.db.query_one<Account>(
-		`SELECT ${columns_sql(ACCOUNT_COLUMNS)} FROM account WHERE LOWER(username) = LOWER($1)`,
+		`SELECT ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)} FROM account WHERE LOWER(username) = LOWER($1)`,
 		[username]
 	);
 };
@@ -128,7 +147,7 @@ export const query_account_by_email = async (
 	email: string
 ): Promise<Account | undefined> => {
 	return deps.db.query_one<Account>(
-		`SELECT ${columns_sql(ACCOUNT_COLUMNS)} FROM account WHERE LOWER(email) = LOWER($1)`,
+		`SELECT ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)} FROM account WHERE LOWER(email) = LOWER($1)`,
 		[email]
 	);
 };
@@ -350,7 +369,7 @@ export const query_create_actor = async (
 	name: string
 ): Promise<Actor> => {
 	const row = await deps.db.query_one<Actor>(
-		`INSERT INTO actor (account_id, name) VALUES ($1, $2) RETURNING ${columns_sql(ACTOR_COLUMNS)}`,
+		`INSERT INTO actor (account_id, name) VALUES ($1, $2) RETURNING ${columns_sql(ACTOR_COLUMNS, account_actor_expr)}`,
 		[account_id, name]
 	);
 	return assert_row(row, 'INSERT INTO actor');
@@ -372,7 +391,7 @@ export const query_actors_by_account = async (
 	account_id: string
 ): Promise<Array<Actor>> => {
 	return deps.db.query<Actor>(
-		`SELECT ${columns_sql(ACTOR_COLUMNS)} FROM actor WHERE account_id = $1 ORDER BY created_at ASC, id ASC`,
+		`SELECT ${columns_sql(ACTOR_COLUMNS, account_actor_expr)} FROM actor WHERE account_id = $1 ORDER BY actor.created_at ASC, actor.id ASC`,
 		[account_id]
 	);
 };
@@ -393,7 +412,7 @@ export const query_active_actors_by_account = async (
 	account_id: string
 ): Promise<Array<Actor>> => {
 	return deps.db.query<Actor>(
-		`SELECT ${columns_sql(ACTOR_COLUMNS)} FROM actor WHERE account_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC`,
+		`SELECT ${columns_sql(ACTOR_COLUMNS, account_actor_expr)} FROM actor WHERE account_id = $1 AND deleted_at IS NULL ORDER BY actor.created_at ASC, actor.id ASC`,
 		[account_id]
 	);
 };
@@ -405,9 +424,10 @@ export const query_actor_by_id = async (
 	deps: QueryDeps,
 	id: string
 ): Promise<Actor | undefined> => {
-	return deps.db.query_one<Actor>(`SELECT ${columns_sql(ACTOR_COLUMNS)} FROM actor WHERE id = $1`, [
-		id
-	]);
+	return deps.db.query_one<Actor>(
+		`SELECT ${columns_sql(ACTOR_COLUMNS, account_actor_expr)} FROM actor WHERE id = $1`,
+		[id]
+	);
 };
 
 /**
@@ -440,6 +460,15 @@ const ADMIN_ROLE_GRANT_COLUMNS = omit_columns(
 	'revoked_reason',
 	'source_offer_id'
 );
+
+/**
+ * The admin listing's active-grant summary timestamps — twin of the spine's
+ * `role_grant_summary_columns`. The read is on the bare `role_grant` table.
+ */
+const admin_role_grant_expr = iso8601_timestamp_expr(ADMIN_ROLE_GRANT_COLUMNS, [
+	'created_at',
+	'expires_at'
+])('');
 
 /** Row shape for the active role_grants batch query — `ADMIN_ROLE_GRANT_COLUMNS`. */
 interface RoleGrantWithActorId {
@@ -499,6 +528,16 @@ export interface AdminAccountListOptions {
  * visibility of grantor notes would expand beyond what the audit log
  * discloses).
  *
+ * Every list is ordered as the Rust spine orders it, on data keys rather than
+ * the random `id` alone: accounts by `created_at, username`, each entry's
+ * role_grants by `created_at, role, scope_id`, its pending offers by
+ * `expires_at, role, scope_id` (`id` last, for a tie no data key breaks). The
+ * order is deterministic on each engine, so rows written in one transaction
+ * (one `created_at`) list stably. Two backends holding the same rows list
+ * them alike only under the same text collation: a bytewise compare (pglet)
+ * and a locale one (Postgres `en_US.UTF-8`, which passes over `_` and `-` at
+ * first) can order the text keys differently.
+ *
  * @param deps - query dependencies
  * @param options - optional `{limit, offset}`. Default limit is
  *   `ADMIN_ACCOUNT_LIST_DEFAULT_LIMIT`; pass `limit: null` to disable.
@@ -517,11 +556,11 @@ export const query_admin_account_list = async (
 	const account_query =
 		limit == null
 			? deps.db.query<Account>(
-					`SELECT ${columns_sql(ACCOUNT_COLUMNS)} FROM account ${where} ORDER BY created_at OFFSET $1`,
+					`SELECT ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)} FROM account ${where} ORDER BY account.created_at, account.username OFFSET $1`,
 					[offset]
 				)
 			: deps.db.query<Account>(
-					`SELECT ${columns_sql(ACCOUNT_COLUMNS)} FROM account ${where} ORDER BY created_at LIMIT $1 OFFSET $2`,
+					`SELECT ${columns_sql(ACCOUNT_COLUMNS, account_actor_expr)} FROM account ${where} ORDER BY account.created_at, account.username LIMIT $1 OFFSET $2`,
 					[limit, offset]
 				);
 	const accounts = await account_query;
@@ -531,44 +570,44 @@ export const query_admin_account_list = async (
 
 	const [actors, role_grants, pending_offers] = await Promise.all([
 		deps.db.query<Actor>(
-			`SELECT ${columns_sql(ACTOR_COLUMNS)} FROM actor WHERE account_id = ANY($1::uuid[])`,
+			`SELECT ${columns_sql(ACTOR_COLUMNS, account_actor_expr)} FROM actor WHERE account_id = ANY($1::uuid[]) ORDER BY actor.created_at, actor.name, actor.id`,
 			[account_ids]
 		),
 		deps.db.query<RoleGrantWithActorId>(
-			`SELECT ${columns_sql(ADMIN_ROLE_GRANT_COLUMNS)}
+			`SELECT ${columns_sql(ADMIN_ROLE_GRANT_COLUMNS, admin_role_grant_expr)}
 			 FROM role_grant
 			 WHERE actor_id IN (SELECT id FROM actor WHERE account_id = ANY($1::uuid[]))
-			   AND revoked_at IS NULL
-			   AND (expires_at IS NULL OR expires_at > NOW())`,
+			   AND ${role_grant_active_sql('')}
+			 ORDER BY role_grant.created_at, role_grant.role, role_grant.scope_id, role_grant.id`,
 			[account_ids]
 		),
 		deps.db.query<PendingOfferRow>(
 			`SELECT po.id, po.to_account_id, po.from_actor_id, po.role, po.scope_kind, po.scope_id,
-			        po.created_at, po.expires_at, a.username AS from_username
+			        ${iso8601_timestamp_column('po', 'created_at')} AS created_at,
+			        ${iso8601_timestamp_column('po', 'expires_at')} AS expires_at,
+			        a.username AS from_username
 			 FROM role_grant_offer po
 			 JOIN actor act ON act.id = po.from_actor_id
 			 JOIN account a ON a.id = act.account_id
 			 WHERE po.to_account_id = ANY($1::uuid[])
-			   AND po.accepted_at IS NULL
-			   AND po.declined_at IS NULL
-			   AND po.retracted_at IS NULL
-			   AND po.superseded_at IS NULL
+			   AND ${offer_pending_predicate('po')}
 			   AND po.expires_at > NOW()
-			 ORDER BY po.expires_at ASC`,
+			 ORDER BY po.expires_at ASC, po.role ASC, po.scope_id ASC, po.id ASC`,
 			[account_ids]
 		)
 	]);
 
-	// Index actors by account_id. Multi-actor TODO: this Map keyed by
-	// account_id silently overwrites earlier actors when an account
-	// hosts more than one — when multi-actor lands, the admin row shape
-	// must change from "account → one actor" to "account → Array<Actor>"
-	// (or split into a separate per-actor row). The JSON shape change
-	// will ripple into the admin UI; bundle that with the multi-actor
+	// Index actors by account_id, the first one winning: actors arrive in
+	// `created_at, name, id` order, so an account's row carries its oldest actor
+	// (and that actor's grants). Multi-actor TODO: an account hosting more
+	// than one actor shows only that one — when multi-actor lands, the admin
+	// row shape must change from "account → one actor" to "account →
+	// Array<Actor>" (or split into a separate per-actor row). The JSON shape
+	// change will ripple into the admin UI; bundle that with the multi-actor
 	// session-actor-selector work.
 	const actor_by_account = new Map<Uuid, Actor>();
 	for (const actor of actors) {
-		actor_by_account.set(actor.account_id, actor);
+		if (!actor_by_account.has(actor.account_id)) actor_by_account.set(actor.account_id, actor);
 	}
 
 	// Group role_grants by actor_id

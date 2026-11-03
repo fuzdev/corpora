@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { color_schemes, type ColorScheme } from '@fuzdev/fuz_css/theme.ts';
+	import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
 	import { theme_state_context } from './theme_state.svelte.ts';
@@ -10,14 +11,13 @@
 	const {
 		value = get_theme_state(),
 		...rest
-	}: SvelteHTMLElements['menu'] & {
+	}: OmitStrict<SvelteHTMLElements['menu'], 'title' | 'children' | 'onselect'> & {
 		value?: { color_scheme: ColorScheme };
 	} = $props();
 </script>
 
 <RadioMenu
 	{...rest}
-	class={['color-scheme-control', rest.class]}
 	options={color_schemes}
 	bind:value={value.color_scheme}
 	label={(color_scheme) => color_scheme}

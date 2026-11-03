@@ -1,6 +1,5 @@
 import { resolve } from '$app/paths';
 import type { Component } from 'svelte';
-import { z } from 'zod';
 import { ensure_start } from '@fuzdev/fuz_util/string.ts';
 
 import { create_context } from './context_helpers.ts';
@@ -10,28 +9,30 @@ export const tomes_context = create_context<() => Map<string, Tome>>();
 
 export const tome_context = create_context<() => Tome>();
 
-export const Tome = z.object({
+/**
+ * A documentation page registered with `Docs` and looked up through `tomes_context`.
+ */
+export interface Tome {
 	/**
 	 * Stable identifier and URL path segment — must be a URL-safe slug
 	 * (used directly as the route segment, the lookup key, and in
 	 * `related_tomes` cross-references). Set `title` for the display label.
 	 */
-	slug: z.string(),
+	slug: string;
 	/**
 	 * Human-readable display label shown in menus, headings, and links.
 	 * Falls back to `slug` when omitted, so set `title` to give multi-word or
 	 * specially cased tomes a readable label (e.g. `slug: 'vite-plugin'` →
 	 * `title: 'vite plugin'`).
 	 */
-	title: z.string().optional(),
-	// TODO maybe now this makes sense with mdz? summary: z.string(),
-	category: z.string(),
-	Component: z.custom<Component<any, any>>(),
-	related_tomes: z.array(z.string()),
-	related_modules: z.array(z.string()),
-	related_declarations: z.array(z.string())
-});
-export type Tome = z.infer<typeof Tome>;
+	title?: string;
+	// TODO maybe now this makes sense with mdz? summary: string;
+	category: string;
+	Component: Component<any, any>;
+	related_tomes: Array<string>;
+	related_modules: Array<string>;
+	related_declarations: Array<string>;
+}
 
 /**
  * @param hash - URL fragment to append, with or without the `#`

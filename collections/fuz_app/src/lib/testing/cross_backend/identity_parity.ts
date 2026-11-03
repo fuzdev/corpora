@@ -26,7 +26,9 @@ import '../assert_dev_env.ts';
  *   all-uppercase submission (proves the *lookup* folds case, not merely that
  *   the stored form was lowercased).
  * - **whitespace-trim login** — the same shape logs in with surrounding
- *   whitespace (proves `.trim()` on the lookup path).
+ *   whitespace (proves `.trim()` on the lookup path). The trimmed set is JS
+ *   `String.prototype.trim`'s on every spine: U+FEFF padding is trimmed (→
+ *   200, and alone → 400 empty), U+0085 is not (→ 401 lookup miss).
  * - **no Unicode case-fold collision (negative)** — a Turkish-`İ` (U+0130)
  *   variant of an existing ASCII username must NOT match. Both JS
  *   `.toLowerCase()` and Rust `str::to_lowercase()` map `İ` → `i` + U+0307
@@ -68,6 +70,10 @@ import '../assert_dev_env.ts';
  * with mid-string `_`/`-` accepted siblings as the don't-over-reject control.
  * Signup is also strict-object on both spines (TS `z.strictObject`, Rust
  * `#[serde(deny_unknown_fields)]`), so an unknown signup body key → 400.
+ * Nothing trims a creation username: a padded one is refused 400 at signup and
+ * at bootstrap, never trimmed into a legal name. Bootstrap validates its body
+ * before its window check, so the padded bootstrap answers 400 even after
+ * bootstrap completed.
  *
  * **Email format (creation):** the optional signup `email` is validated to a
  * loose `local@domain.tld` shape on both spines — TS `Email`
@@ -79,14 +85,20 @@ import '../assert_dev_env.ts';
  * share. This closed a real divergence: the Rust spine previously
  * length-checked the email only, accepting any non-empty string TS rejected.
  *
+ * **Malformed JSON body:** a body typed `application/json` that doesn't parse
+ * (`{`) or parses to anything but an object (`[]`) is 400 `{error:
+ * "invalid_json_body"}`, with no other field, on login, signup, bootstrap
+ * (`bootstrap_path`, parsed ahead of the window check), and the password change
+ * (`password_path`, default `/api/account/password`, `null` to skip) — parsed
+ * only after its credential and session-only gates, so the case sends the
+ * keeper's session, and an anonymous unparseable body is still 401.
+ *
  * Both surfaces are flat REST on every spine, so this is an imperative suite
  * (not a `conformance_table` row) and ungated. Runs both legs via the shared
  * `{setup_test}` protocol: the in-process leg
  * (`cross_backend/identity_parity.db.test.ts`, plain `gro test`) and the
- * cross-process leg (`cross_backend/identity_parity.cross.test.ts`, the TS spine
+ * cross-process leg (`cross_backend/spine_suites.cross.test.ts`, the TS spine
  * binaries + Rust `testing_spine_stub` over real HTTP).
- *
- * `$lib`-free by contract (relative specifiers only).
  *
  * @module
  */
@@ -94,12 +106,22 @@ import '../assert_dev_env.ts';
 import { describe, test, assert } from 'vitest';
 
 import {
+	ERROR_ALREADY_BOOTSTRAPPED,
+	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_INVALID_CREDENTIALS,
+	ERROR_INVALID_JSON_BODY,
 	ERROR_INVALID_REQUEST_BODY,
 	ERROR_NO_MATCHING_INVITE
 } from '../../http/error_schemas.ts';
 import { DEFAULT_TEST_PASSWORD } from '../test_credentials.ts';
 import type { SetupTest } from './setup.ts';
+import { test_if } from './capabilities.ts';
+import {
+	SPINE_ACCOUNT_BOOTSTRAP_PATH,
+	SPINE_ACCOUNT_LOGIN_PATH,
+	SPINE_ACCOUNT_PASSWORD_PATH,
+	SPINE_ACCOUNT_SIGNUP_PATH
+} from './spine_surface_constants.ts';
 
 /**
  * The flat-REST `{error}` reason each terminal login/signup status carries on
@@ -125,6 +147,17 @@ export interface IdentityParityCrossTestOptions {
 	readonly login_path?: string;
 	/** REST signup route path. Default `/api/account/signup` (the spine convention). */
 	readonly signup_path?: string;
+	/**
+	 * REST bootstrap route path. Default `/api/account/bootstrap` (the spine
+	 * convention); `null` skips the bootstrap case, for a surface that mounts no
+	 * bootstrap route.
+	 */
+	readonly bootstrap_path?: string | null;
+	/**
+	 * REST password-change route path, for the malformed-body case. Default
+	 * `/api/account/password` (the spine convention); `null` skips that case.
+	 */
+	readonly password_path?: string | null;
 }
 
 /**
@@ -287,8 +320,12 @@ export const describe_identity_parity_cross_tests = (
 	options: IdentityParityCrossTestOptions
 ): void => {
 	const { setup_test } = options;
-	const login_path = options.login_path ?? '/api/account/login';
-	const signup_path = options.signup_path ?? '/api/account/signup';
+	const login_path = options.login_path ?? SPINE_ACCOUNT_LOGIN_PATH;
+	const signup_path = options.signup_path ?? SPINE_ACCOUNT_SIGNUP_PATH;
+	const bootstrap_path =
+		options.bootstrap_path === undefined ? SPINE_ACCOUNT_BOOTSTRAP_PATH : options.bootstrap_path;
+	const password_path =
+		options.password_path === undefined ? SPINE_ACCOUNT_PASSWORD_PATH : options.password_path;
 
 	type Fixture = Awaited<ReturnType<typeof setup_test>>;
 	/** The status + flat-REST `error` reason an attempt settled to. */
@@ -298,21 +335,36 @@ export const describe_identity_parity_cross_tests = (
 	}
 
 	/**
+	 * POST a raw body typed `application/json` on a fresh (cookie-jar-free)
+	 * transport, with the transport's allowed `Origin`; return the status and
+	 * the body text. Always reads the body so the cross-process socket releases.
+	 */
+	const post_raw = async (
+		fixture: Fixture,
+		path: string,
+		body: string,
+		headers?: Record<string, string>
+	): Promise<{ status: number; text: string }> => {
+		const res = await fixture.fresh_transport()(path, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', ...headers },
+			body
+		});
+		return { status: res.status, text: await res.text().catch(() => '') };
+	};
+
+	/**
 	 * POST JSON on a fresh (cookie-jar-free) transport; return the status and the
 	 * parsed flat-REST `{error}` reason (`undefined` for success / non-JSON
-	 * bodies). Always reads the body so the cross-process socket releases.
+	 * bodies).
 	 */
 	const post_json = async (
 		fixture: Fixture,
 		path: string,
 		body: Record<string, unknown>
 	): Promise<Attempt> => {
-		const res = await fixture.fresh_transport()(path, {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		const text = await res.text().catch(() => '');
+		const res = await post_raw(fixture, path, JSON.stringify(body));
+		const text = res.text;
 		let error: string | undefined;
 		try {
 			const parsed: unknown = text ? JSON.parse(text) : undefined;
@@ -345,7 +397,7 @@ export const describe_identity_parity_cross_tests = (
 
 	/**
 	 * Assert an attempt settled to `status` **and** carried the flat-REST error
-	 * reason that status implies on every spine (see {@link REASON_BY_STATUS}) —
+	 * reason that status implies on every spine (see `REASON_BY_STATUS`) —
 	 * a body-shape check, not just a status check, so a backend can't pass by
 	 * returning the right status with the wrong/leaky body.
 	 */
@@ -398,6 +450,34 @@ export const describe_identity_parity_cross_tests = (
 			const fixture = await setup_test();
 			await fixture.create_account({ username: 'Canon_Trim_User' });
 			assert_attempt(await login(fixture, '  canon_trim_user  '), 200, 'whitespace-trim login');
+		});
+
+		// JS `trim` and Rust `str::trim` disagree on two code points: U+FEFF is JS
+		// whitespace but not Unicode `White_Space`, U+0085 the reverse. Every
+		// spine trims the JS set (TS is the oracle).
+		test('U+FEFF padding is trimmed on lookup → 200', async () => {
+			const fixture = await setup_test();
+			await fixture.create_account({ username: 'canon_bom_user' });
+			assert_attempt(
+				await login(fixture, '\ufeffcanon_bom_user\ufeff'),
+				200,
+				'U+FEFF-padded login'
+			);
+		});
+
+		test('U+FEFF alone is empty after the trim → 400', async () => {
+			const fixture = await setup_test();
+			assert_attempt(await login(fixture, '\ufeff'), 400, 'U+FEFF-only login');
+		});
+
+		test('U+0085 padding is not trimmed → 401 lookup miss', async () => {
+			const fixture = await setup_test();
+			await fixture.create_account({ username: 'canon_nel_user' });
+			assert_attempt(
+				await login(fixture, '\u0085canon_nel_user\u0085'),
+				401,
+				'U+0085-padded login'
+			);
 		});
 
 		test('no Unicode case-fold collision — Turkish İ variant of an ASCII username → 401', async () => {
@@ -601,5 +681,122 @@ export const describe_identity_parity_cross_tests = (
 				'signup unknown body key'
 			);
 		});
+
+		// `Username` validates the raw value — nothing trims a creation username,
+		// so padding is refused, never repaired into a legal name (which would
+		// reach the invite gate → 403, or create the account under open signup).
+		for (const [username, label] of [
+			[' padded_signup_user ', 'space padding'],
+			['padded_signup_user\t', 'trailing tab'],
+			['\u0085padded_signup_user', 'leading U+0085']
+		] as const) {
+			test(`padded username (${label}) → 400, not trimmed`, async () => {
+				const fixture = await setup_test();
+				assert_attempt(await signup(fixture, username), 400, `signup ${label}`);
+			});
+		}
+	});
+
+	describe('bootstrap input validation parity', () => {
+		// The body is validated before the bootstrap window is consulted on every
+		// spine (the TS route schema runs ahead of the handler), so a padded
+		// username answers 400 `invalid_request_body` even after bootstrap
+		// completed — not the closed window's refusal. The unpadded control, the
+		// same body otherwise, reaches the closed window, so the 400 can only be
+		// the username's.
+		test_if(
+			bootstrap_path !== null,
+			'padded username → 400, not trimmed, ahead of the window check',
+			async () => {
+				const fixture = await setup_test();
+				const body = {
+					token: 'identity-parity-not-the-token',
+					username: ' padded_keeper ',
+					password: DEFAULT_TEST_PASSWORD
+				};
+				assert_attempt(
+					await post_json(fixture, bootstrap_path!, body),
+					400,
+					'bootstrap padded username'
+				);
+				const control = await post_json(fixture, bootstrap_path!, {
+					...body,
+					username: 'padded_keeper'
+				});
+				assert.deepStrictEqual(
+					control,
+					{ status: 403, error: ERROR_ALREADY_BOOTSTRAPPED },
+					'bootstrap unpadded control'
+				);
+			}
+		);
+	});
+
+	describe('malformed JSON body parity', () => {
+		// A body typed `application/json` that doesn't parse, or parses to
+		// anything but an object, is 400 `invalid_json_body` on every spine —
+		// never the schema's `invalid_request_body`, and with no other field.
+		// Bootstrap parses ahead of its window check (so the 400 holds after
+		// bootstrap completed); the password change parses only after its
+		// credential and session-only gates, so it needs a session, and an
+		// anonymous caller still hears 401.
+		const MALFORMED_BODIES = [
+			['{', 'unparseable'],
+			['[]', 'a non-object array']
+		] as const;
+
+		const assert_invalid_json_body = (
+			got: { status: number; text: string },
+			label: string
+		): void => {
+			assert.strictEqual(got.status, 400, `${label} — status: ${got.text}`);
+			assert.deepStrictEqual(
+				JSON.parse(got.text),
+				{ error: ERROR_INVALID_JSON_BODY },
+				`${label} — body`
+			);
+		};
+
+		const routes: ReadonlyArray<{
+			readonly name: string;
+			readonly path: string | null;
+			readonly session: boolean;
+		}> = [
+			{ name: 'login', path: login_path, session: false },
+			{ name: 'signup', path: signup_path, session: false },
+			{ name: 'bootstrap', path: bootstrap_path, session: false },
+			{ name: 'password', path: password_path, session: true }
+		];
+
+		for (const { name, path, session } of routes) {
+			for (const [body, label] of MALFORMED_BODIES) {
+				test_if(path !== null, `${name}: ${label} body → 400 invalid_json_body`, async () => {
+					const fixture = await setup_test();
+					assert_invalid_json_body(
+						await post_raw(
+							fixture,
+							path!,
+							body,
+							session ? fixture.create_session_headers() : undefined
+						),
+						`${name} ${label} body`
+					);
+				});
+			}
+		}
+
+		test_if(
+			password_path !== null,
+			'password: an unparseable body without a session → 401, the gates ahead of the parse',
+			async () => {
+				const fixture = await setup_test();
+				const got = await post_raw(fixture, password_path!, '{');
+				assert.strictEqual(got.status, 401, `anonymous unparseable password body: ${got.text}`);
+				assert.strictEqual(
+					(JSON.parse(got.text) as { error?: unknown }).error,
+					ERROR_AUTHENTICATION_REQUIRED
+				);
+			}
+		);
 	});
 };

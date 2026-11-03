@@ -2,10 +2,12 @@ import { test, describe, assert } from 'vitest';
 
 import {
 	generate_classes_css,
-	extract_primary_property,
+	to_property_rank,
 	type CssClassDefinitionInterpreter
-} from '$lib/css_class_generation.ts';
-import { css_class_composites } from '$lib/css_class_composites.ts';
+} from '#lib/css_class_generation.ts';
+import { css_class_composites } from '#lib/css_class_composites.ts';
+import { css_class_definitions } from '#lib/css_class_definitions.ts';
+import { css_class_interpreters } from '#lib/css_class_interpreters.ts';
 import {
 	assert_css_contains,
 	assert_css_not_contains,
@@ -35,7 +37,7 @@ const SIMPLE_LITERAL_INTERPRETER: CssClassDefinitionInterpreter = {
 	pattern: /^.+:.+$/,
 	interpret: (matched) => {
 		const [prop, val] = matched[0].split(':');
-		return `${prop}: ${val};`;
+		return { declaration: `${prop}: ${val};` };
 	}
 };
 
@@ -80,7 +82,7 @@ describe('generate_classes_css', () => {
 		test('uses interpreter for unknown classes', () => {
 			const interpreter: CssClassDefinitionInterpreter = {
 				pattern: /^test-(\w+)$/,
-				interpret: (matched) => `test-prop: ${matched[1]};`
+				interpret: (matched) => ({ declaration: `test-prop: ${matched[1]};` })
 			};
 
 			const result = generate_classes_css({
@@ -96,8 +98,9 @@ describe('generate_classes_css', () => {
 		test('interpreter can return full ruleset', () => {
 			const interpreter: CssClassDefinitionInterpreter = {
 				pattern: /^media-(\w+)$/,
-				interpret: (matched) =>
-					`@media (min-width: 800px) { .media-${matched[1]} { display: ${matched[1]}; } }`
+				interpret: (matched) => ({
+					ruleset: `@media (min-width: 800px) { .media-${matched[1]} { display: ${matched[1]}; } }`
+				})
 			};
 
 			const result = generate_classes_css({
@@ -120,7 +123,7 @@ describe('generate_classes_css', () => {
 						identifier: matched[0],
 						suggestion: null
 					});
-					return `color: ${matched[1]};`;
+					return { declaration: `color: ${matched[1]};` };
 				}
 			};
 
@@ -384,21 +387,48 @@ describe('generate_classes_css', () => {
 	});
 
 	describe('sorting', () => {
-		test('maintains definition order for known classes', () => {
+		test('orders single-purpose classes by property rank, then definition order', () => {
 			const class_definitions = {
-				aaa: { declaration: 'a: a;' },
-				zzz: { declaration: 'z: z;' },
-				mmm: { declaration: 'm: m;' }
+				zzz: { declaration: 'padding: 0;' },
+				aaa: { declaration: 'padding-left: 0;' },
+				mmm: { declaration: 'margin: 0;' }
 			};
 
 			const result = generate_classes_css({
-				class_names: ['mmm', 'aaa', 'zzz'],
+				class_names: ['aaa', 'mmm', 'zzz'],
 				class_definitions,
 				interpreters: [],
 				css_properties: null
 			});
 
-			assert_css_order(result.css, '.aaa', '.zzz', '.mmm');
+			assert_css_order(result.css, '.zzz', '.mmm', '.aaa');
+		});
+
+		test('orders interpreted classes of equal rank by name, after static ones', () => {
+			const result = generate_classes_css({
+				class_names: ['margin:0', 'padding:0', 'mmm'],
+				class_definitions: { mmm: { declaration: 'margin: 1px;' } },
+				interpreters: css_class_interpreters,
+				css_properties: null
+			});
+
+			assert_css_order(result.css, '.mmm', '.margin\\:0', '.padding\\:0');
+		});
+
+		test('keeps definition order among composites', () => {
+			const class_definitions = {
+				zzz: { composite: true, declaration: 'display: flex; gap: 0;' },
+				aaa: { composite: true, declaration: 'display: grid; gap: 0;' }
+			};
+
+			const result = generate_classes_css({
+				class_names: ['aaa', 'zzz'],
+				class_definitions,
+				interpreters: [],
+				css_properties: null
+			});
+
+			assert_css_order(result.css, '.zzz', '.aaa');
 		});
 
 		test('sorts unknown classes alphabetically at end', () => {
@@ -419,7 +449,7 @@ describe('generate_classes_css', () => {
 		test('sorts interpreted classes alphabetically', () => {
 			const interpreter: CssClassDefinitionInterpreter = {
 				pattern: /^int-(\w+)$/,
-				interpret: (matched) => `prop: ${matched[1]};`
+				interpret: (matched) => ({ declaration: `prop: ${matched[1]};` })
 			};
 
 			const result = generate_classes_css({
@@ -466,33 +496,20 @@ describe('generate_classes_css', () => {
 		});
 
 		test('modified literal shorthand sorts before token longhand', () => {
-			const modified_literal_interpreter: CssClassDefinitionInterpreter = {
-				pattern: /^.+:.+$/,
-				interpret: (matched) => {
-					const parts = matched[0].split(':');
-					const prop = parts.at(-2);
-					const val = parts.at(-1);
-					return `${prop}: ${val};`;
-				}
-			};
-
 			const result = generate_classes_css({
 				class_names: ['border_top_right_radius_sm', 'hover:border-radius:0'],
 				class_definitions: BORDER_RADIUS_DEFS,
-				interpreters: [modified_literal_interpreter],
+				interpreters: [SIMPLE_LITERAL_INTERPRETER],
 				css_properties: null
 			});
 
 			assert_css_order(result.css, 'hover\\:border-radius\\:0', 'border_top_right_radius_sm');
 		});
 
-		test('modified token class sorts alphabetically, not by property', () => {
-			// hover:p_md: segments ['hover', 'p_md'] - the loop runs i < 1 (i.e. only i=0),
-			// 'hover' is skipped as a modifier, loop ends, returns MAX_VALUE.
-			// p_md has a finite index, so it sorts before hover:p_md.
+		test('a state-modified class sorts after its unmodified form', () => {
 			const catch_all_interpreter: CssClassDefinitionInterpreter = {
 				pattern: /./,
-				interpret: (matched) => `content: "${matched[0]}";`
+				interpret: (matched) => ({ declaration: `content: "${matched[0]}";` })
 			};
 
 			const result = generate_classes_css({
@@ -806,10 +823,43 @@ describe('generate_classes_css', () => {
 		});
 	});
 
-	describe('xs composite', () => {
-		test('generates xs class two steps down', () => {
+	describe('surface shadows', () => {
+		test('pane and panel read their surface variables', () => {
 			const result = generate_classes_css({
-				class_names: ['xs'],
+				class_names: ['pane', 'panel'],
+				class_definitions: css_class_composites,
+				interpreters: [],
+				css_properties: null
+			});
+			assert_css_contains(
+				result.css,
+				'box-shadow: var(--pane_shadow);',
+				'box-shadow: var(--panel_shadow);',
+				'background-color: var(--panel_fill);'
+			);
+			assert.isTrue(result.variables_used.has('pane_shadow'));
+			assert.isTrue(result.variables_used.has('panel_shadow'));
+			assert.isTrue(result.variables_used.has('panel_fill'));
+		});
+
+		test('a shadow class on a panel or pane lands after the composite and wins', () => {
+			// both sit in the utilities layer at one specificity, so source order
+			// is what lets `class="panel shadow_inset_xs"` keep its shadow
+			const result = generate_classes_css({
+				class_names: ['shadow_inset_xs', 'shadow_md', 'panel', 'pane'],
+				class_definitions: css_class_definitions,
+				interpreters: [],
+				css_properties: null
+			});
+			assert_css_order(result.css, '.pane {', '.shadow_md {');
+			assert_css_order(result.css, '.panel {', '.shadow_inset_xs {');
+		});
+	});
+
+	describe('sized_xs composite', () => {
+		test('generates sized_xs class two steps down', () => {
+			const result = generate_classes_css({
+				class_names: ['sized_xs'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -817,7 +867,7 @@ describe('generate_classes_css', () => {
 
 			assert_css_contains(
 				result.css,
-				'.xs {',
+				'.sized_xs {',
 				'--font_size: var(--font_size_xs);',
 				'--input_height: var(--space_xl3);',
 				'--input_height_compact: var(--space_xl2);',
@@ -829,9 +879,9 @@ describe('generate_classes_css', () => {
 			assert.lengthOf(result.diagnostics, 0);
 		});
 
-		test('xs tracks used variables', () => {
+		test('sized_xs tracks used variables', () => {
 			const result = generate_classes_css({
-				class_names: ['xs'],
+				class_names: ['sized_xs'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -847,10 +897,10 @@ describe('generate_classes_css', () => {
 		});
 	});
 
-	describe('sm composite', () => {
-		test('generates sm class with density overrides', () => {
+	describe('sized_sm composite', () => {
+		test('generates sized_sm class with density overrides', () => {
 			const result = generate_classes_css({
-				class_names: ['sm'],
+				class_names: ['sized_sm'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -858,7 +908,7 @@ describe('generate_classes_css', () => {
 
 			assert_css_contains(
 				result.css,
-				'.sm {',
+				'.sized_sm {',
 				'--font_size: var(--font_size_sm);',
 				'--input_height: var(--space_xl4);',
 				'--input_height_compact: var(--space_xl3);',
@@ -870,9 +920,9 @@ describe('generate_classes_css', () => {
 			assert.lengthOf(result.diagnostics, 0);
 		});
 
-		test('sm tracks used variables', () => {
+		test('sized_sm tracks used variables', () => {
 			const result = generate_classes_css({
-				class_names: ['sm'],
+				class_names: ['sized_sm'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -888,10 +938,10 @@ describe('generate_classes_css', () => {
 		});
 	});
 
-	describe('md composite', () => {
-		test('generates md class with default sizing', () => {
+	describe('sized_md composite', () => {
+		test('generates sized_md class with default sizing', () => {
 			const result = generate_classes_css({
-				class_names: ['md'],
+				class_names: ['sized_md'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -899,7 +949,7 @@ describe('generate_classes_css', () => {
 
 			assert_css_contains(
 				result.css,
-				'.md {',
+				'.sized_md {',
 				'--font_size: var(--font_size_md);',
 				'--input_height: var(--space_xl5);',
 				'--input_height_compact: var(--space_xl4);',
@@ -911,9 +961,9 @@ describe('generate_classes_css', () => {
 			assert.lengthOf(result.diagnostics, 0);
 		});
 
-		test('md tracks used variables', () => {
+		test('sized_md tracks used variables', () => {
 			const result = generate_classes_css({
-				class_names: ['md'],
+				class_names: ['sized_md'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -929,10 +979,10 @@ describe('generate_classes_css', () => {
 		});
 	});
 
-	describe('lg composite', () => {
-		test('generates lg class one step up', () => {
+	describe('sized_lg composite', () => {
+		test('generates sized_lg class one step up', () => {
 			const result = generate_classes_css({
-				class_names: ['lg'],
+				class_names: ['sized_lg'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -940,7 +990,7 @@ describe('generate_classes_css', () => {
 
 			assert_css_contains(
 				result.css,
-				'.lg {',
+				'.sized_lg {',
 				'--font_size: var(--font_size_lg);',
 				'--input_height: var(--space_xl6);',
 				'--input_height_compact: var(--space_xl5);',
@@ -952,9 +1002,9 @@ describe('generate_classes_css', () => {
 			assert.lengthOf(result.diagnostics, 0);
 		});
 
-		test('lg tracks used variables', () => {
+		test('sized_lg tracks used variables', () => {
 			const result = generate_classes_css({
-				class_names: ['lg'],
+				class_names: ['sized_lg'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -970,10 +1020,10 @@ describe('generate_classes_css', () => {
 		});
 	});
 
-	describe('xl composite', () => {
-		test('generates xl class two steps up', () => {
+	describe('sized_xl composite', () => {
+		test('generates sized_xl class two steps up', () => {
 			const result = generate_classes_css({
-				class_names: ['xl'],
+				class_names: ['sized_xl'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -981,7 +1031,7 @@ describe('generate_classes_css', () => {
 
 			assert_css_contains(
 				result.css,
-				'.xl {',
+				'.sized_xl {',
 				'--font_size: var(--font_size_xl);',
 				'--input_height: var(--space_xl7);',
 				'--input_height_compact: var(--space_xl6);',
@@ -993,9 +1043,9 @@ describe('generate_classes_css', () => {
 			assert.lengthOf(result.diagnostics, 0);
 		});
 
-		test('xl tracks used variables', () => {
+		test('sized_xl tracks used variables', () => {
 			const result = generate_classes_css({
-				class_names: ['xl'],
+				class_names: ['sized_xl'],
 				class_definitions: css_class_composites,
 				interpreters: [],
 				css_properties: null
@@ -1056,6 +1106,29 @@ describe('generate_classes_css', () => {
 		});
 	});
 
+	describe('plain composite', () => {
+		test('strips chrome from unselected elements only', () => {
+			const result = generate_classes_css({
+				class_names: ['plain'],
+				class_definitions: css_class_composites,
+				interpreters: [],
+				css_properties: null
+			});
+
+			// a selected button's inverse text needs its fill, so no rule may
+			// reach a selected element
+			const selectors = Array.from(result.css.matchAll(/^\s*(\.plain[^{]*)\{/gm), (m) =>
+				m[1]!.trim()
+			);
+			assert.isAbove(selectors.length, 0);
+			for (const selector of selectors) {
+				assert.match(selector, /^\.plain:not\(\.selected[,)]/, selector);
+			}
+			assert_css_contains(result.css, '--button_fill: transparent;', 'box-shadow: none;');
+			assert.lengthOf(result.diagnostics, 0);
+		});
+	});
+
 	describe('composite fallback patterns', () => {
 		test.each(['chip', 'pane', 'panel'])(
 			'%s uses var(--border_radius, var(--border_radius_xs))',
@@ -1071,7 +1144,7 @@ describe('generate_classes_css', () => {
 			}
 		);
 
-		test('chip uses var(--font_size, inherit)', () => {
+		test('chip falls back to revert-layer for font-size', () => {
 			const result = generate_classes_css({
 				class_names: ['chip'],
 				class_definitions: css_class_composites,
@@ -1079,7 +1152,7 @@ describe('generate_classes_css', () => {
 				css_properties: null
 			});
 
-			assert_css_contains(result.css, 'font-size: var(--font_size, inherit)');
+			assert_css_contains(result.css, 'font-size: var(--font_size, revert-layer)');
 		});
 	});
 
@@ -1087,7 +1160,7 @@ describe('generate_classes_css', () => {
 		test('static definition takes priority over interpreter', () => {
 			const interpreter: CssClassDefinitionInterpreter = {
 				pattern: /^box$/,
-				interpret: () => 'from-interpreter: true;'
+				interpret: () => ({ declaration: 'from-interpreter: true;' })
 			};
 
 			const result = generate_classes_css({
@@ -1104,11 +1177,11 @@ describe('generate_classes_css', () => {
 		test('first matching interpreter wins', () => {
 			const interpreter1: CssClassDefinitionInterpreter = {
 				pattern: /^test-(.+)$/,
-				interpret: () => 'first: true;'
+				interpret: () => ({ declaration: 'first: true;' })
 			};
 			const interpreter2: CssClassDefinitionInterpreter = {
 				pattern: /^test-(.+)$/,
-				interpret: () => 'second: true;'
+				interpret: () => ({ declaration: 'second: true;' })
 			};
 
 			const result = generate_classes_css({
@@ -1129,7 +1202,7 @@ describe('generate_classes_css', () => {
 			};
 			const interpreter2: CssClassDefinitionInterpreter = {
 				pattern: /^test-(.+)$/,
-				interpret: () => 'second: true;'
+				interpret: () => ({ declaration: 'second: true;' })
 			};
 
 			const result = generate_classes_css({
@@ -1144,32 +1217,27 @@ describe('generate_classes_css', () => {
 	});
 });
 
-describe('extract_primary_property', () => {
-	test('returns property name for single-property declaration', () => {
-		assert.strictEqual(
-			extract_primary_property('border-radius: var(--border_radius_sm);'),
-			'border-radius'
-		);
+describe('to_property_rank', () => {
+	test('ranks a property by its name depth', () => {
+		assert.strictEqual(to_property_rank('padding'), 0);
+		assert.strictEqual(to_property_rank('padding-left'), 1);
+		assert.strictEqual(to_property_rank('border-top-color'), 2);
+		assert.strictEqual(to_property_rank('border-top-left-radius'), 3);
 	});
 
-	test('returns null for multi-property declaration', () => {
-		assert.strictEqual(extract_primary_property('display: flex; align-items: center;'), null);
+	test('ranks the shorthands whose longhands do not extend their name below them', () => {
+		assert.isBelow(to_property_rank('inset'), to_property_rank('top'));
+		assert.isBelow(to_property_rank('place-items'), to_property_rank('align-items'));
+		assert.isBelow(to_property_rank('flex-flow'), to_property_rank('flex-direction'));
+		assert.isBelow(to_property_rank('grid-area'), to_property_rank('grid-row'));
+		assert.isBelow(to_property_rank('gap'), to_property_rank('row-gap'));
 	});
 
-	test('works without trailing semicolon', () => {
-		assert.strictEqual(extract_primary_property('border-radius: 0'), 'border-radius');
+	test('ignores a vendor prefix', () => {
+		assert.strictEqual(to_property_rank('-webkit-text-size-adjust'), 2);
 	});
 
-	test('lowercases the property name', () => {
-		assert.strictEqual(extract_primary_property('Border-Radius: 0;'), 'border-radius');
-	});
-
-	test('returns null for CSS custom property declaration', () => {
-		// Custom properties (--foo) start with two dashes; the regex requires [a-zA-Z] after optional single `-`
-		assert.strictEqual(extract_primary_property('--foo: 1;'), null);
-	});
-
-	test('handles trailing whitespace as single-property', () => {
-		assert.strictEqual(extract_primary_property('padding: var(--space_md);\n'), 'padding');
+	test('ranks custom properties at 0', () => {
+		assert.strictEqual(to_property_rank('--font_size'), 0);
 	});
 });

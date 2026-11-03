@@ -1,13 +1,14 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resolve } from 'node:path';
 
-import { task as deploy_task } from '$lib/deploy.task.ts';
+import { task as deploy_task } from '#lib/deploy.task.ts';
 
 import {
 	create_mock_deploy_task_context,
 	setup_successful_git_mocks,
 	setup_successful_fs_mocks,
-	setup_successful_spawn_mock
+	setup_successful_spawn_mock,
+	FIRST_COMMIT_HASH
 } from './deploy_task_test_helpers.ts';
 
 // Mock dependencies
@@ -26,12 +27,13 @@ vi.mock('@fuzdev/fuz_util/git.js', async (import_original) => {
 		git_current_branch_name: vi.fn(),
 		git_delete_local_branch: vi.fn(),
 		git_push_to_create: vi.fn(),
-		git_reset_branch_to_first_commit: vi.fn()
+		git_current_branch_first_commit_hash: vi.fn()
 	};
 });
 
 vi.mock('@fuzdev/fuz_util/process.js', () => ({
-	spawn: vi.fn()
+	spawn: vi.fn(),
+	spawn_out: vi.fn()
 }));
 
 vi.mock('node:fs/promises', () => ({
@@ -88,7 +90,7 @@ describe('deploy_task dry mode', () => {
 			expect(cp).toHaveBeenCalled();
 
 			// Should NOT commit or push
-			expect(spawn).not.toHaveBeenCalledWith('git', ['add', '.', '-f'], expect.anything());
+			expect(spawn).not.toHaveBeenCalledWith('git', ['add', '.'], expect.anything());
 			expect(spawn).not.toHaveBeenCalledWith(
 				'git',
 				['commit', '-m', 'deployment'],
@@ -151,7 +153,7 @@ describe('deploy_task dry mode', () => {
 			expect(result).toBeUndefined();
 
 			// Should NOT proceed to commit/push
-			expect(spawn).not.toHaveBeenCalledWith('git', ['add', '.', '-f'], expect.anything());
+			expect(spawn).not.toHaveBeenCalledWith('git', ['add', '.'], expect.anything());
 		});
 	});
 
@@ -259,9 +261,7 @@ describe('deploy_task dry mode', () => {
 		});
 
 		test('dry mode works with reset flag', async () => {
-			const { git_reset_branch_to_first_commit } = vi.mocked(
-				await import('@fuzdev/fuz_util/git.ts')
-			);
+			const { spawn } = vi.mocked(await import('@fuzdev/fuz_util/process.ts'));
 			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
 			vi.mocked(fs_exists).mockResolvedValue(true);
 
@@ -272,13 +272,36 @@ describe('deploy_task dry mode', () => {
 
 			await deploy_task.run(ctx);
 
-			// Should still reset in dry mode
-			expect(git_reset_branch_to_first_commit).toHaveBeenCalled();
+			// resets locally in dry mode, pushing nothing
+			expect(spawn).toHaveBeenCalledWith('git', ['reset', '--hard', FIRST_COMMIT_HASH], {
+				cwd: resolve('.gro/deploy')
+			});
+			expect(spawn.mock.calls.some((call) => call[1]?.[0] === 'push')).toBe(false);
 			expect(ctx.log.info).toHaveBeenCalledWith(
 				expect.stringContaining('dry deploy complete'),
 				expect.anything(),
 				expect.anything()
 			);
+		});
+
+		test('a first dry deploy creates the target branch locally, pushing nothing', async () => {
+			const { spawn } = vi.mocked(await import('@fuzdev/fuz_util/process.ts'));
+			const { git_remote_branch_exists, git_push_to_create } = vi.mocked(
+				await import('@fuzdev/fuz_util/git.ts')
+			);
+			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
+			vi.mocked(git_remote_branch_exists).mockResolvedValue(false);
+			vi.mocked(fs_exists).mockImplementation(async (path: any) => String(path).includes('build'));
+
+			const ctx = create_mock_deploy_task_context({ dry: true });
+
+			await deploy_task.run(ctx);
+
+			expect(spawn).toHaveBeenCalledWith('git', ['checkout', '--orphan', 'deploy'], {
+				cwd: resolve('.gro/deploy')
+			});
+			expect(git_push_to_create).not.toHaveBeenCalled();
+			expect(spawn.mock.calls.some((call) => call[1]?.[0] === 'push')).toBe(false);
 		});
 	});
 
@@ -293,7 +316,7 @@ describe('deploy_task dry mode', () => {
 			await deploy_task.run(ctx);
 
 			// Should commit and push
-			expect(spawn).toHaveBeenCalledWith('git', ['add', '.', '-f'], {
+			expect(spawn).toHaveBeenCalledWith('git', ['add', '.'], {
 				cwd: resolve('.gro/deploy')
 			});
 			expect(spawn).toHaveBeenCalledWith('git', ['commit', '-m', 'deployment'], {

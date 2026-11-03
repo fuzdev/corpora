@@ -4,7 +4,8 @@
 Renders the full detail view for an exported declaration.
 Handles all svelte-docinfo declaration kinds (function, class, interface,
 type, variable, enum, component, snippet) and their kind-specific fields
-including parameters, props, members, overloads, external types, and more.
+including parameters, props, CSS custom properties, members, overloads,
+external types, and more.
 
 @see `declaration.svelte.ts` for the `Declaration` wrapper class
 @see {@link https://github.com/fuzdev/svelte-docinfo svelte-docinfo} for the analysis library
@@ -25,6 +26,7 @@ including parameters, props, members, overloads, external types, and more.
 	import TypeJsonView from './TypeJsonView.svelte';
 	import ModuleLink from './ModuleLink.svelte';
 	import DocsLink from './DocsLink.svelte';
+	import { dedent_css_fallback } from './helpers.ts';
 
 	const { declaration }: { declaration: Declaration } = $props();
 
@@ -39,6 +41,20 @@ including parameters, props, members, overloads, external types, and more.
 		const filtered = external_types.filter((t) => !heritage.includes(t));
 		return filtered.length ? filtered : undefined;
 	});
+
+	// the "inferred" chip marks entries found by a `var()` fallback or an
+	// `@property` rule, which only distinguishes anything when the list also
+	// has `@cssprop`-documented ones
+	const css_property_chips_shown = $derived.by(() => {
+		const css_properties = declaration.css_custom_properties;
+		if (!css_properties) return false;
+		return css_properties.some((p) => p.documented) && css_properties.some((p) => !p.documented);
+	});
+
+	// a documented `default` (the tag's claim) and the style's `fallback` are
+	// shown as one row when they agree, as the analyzer compares them
+	const css_values_agree = (a: string, b: string): boolean =>
+		a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim();
 
 	// render mdz inline `code` as API-linking `DocsLink` and fenced blocks as syntax-highlighted
 	// `Code`, matching the rest of the docs — the injection mdz core leaves open
@@ -55,6 +71,7 @@ including parameters, props, members, overloads, external types, and more.
 		examples?: Array<string>;
 		seeAlso?: Array<string>;
 		throws?: Array<{ type?: string; description: string }>;
+		mutates?: Record<string, string>;
 	}
 </script>
 
@@ -97,7 +114,7 @@ including parameters, props, members, overloads, external types, and more.
 	</div>
 {/snippet}
 
-<!-- Compact prose metadata for props and members (deprecated, internal, since, examples, see also, throws). -->
+<!-- Compact prose metadata for props and members (deprecated, internal, since, examples, see also, throws, mutates). -->
 {#snippet doc_extras(item: DocExtras)}
 	<!-- eslint-disable-next-line @typescript-eslint/no-deprecated -->
 	{#if item.deprecatedMessage !== undefined}
@@ -139,6 +156,16 @@ including parameters, props, members, overloads, external types, and more.
 					{:else}
 						{thrown.description}
 					{/if}
+				</li>
+			{/each}
+		</ul>
+	{/if}
+	{#if item.mutates && Object.keys(item.mutates).length}
+		<p><strong>mutates</strong></p>
+		<ul>
+			{#each Object.entries(item.mutates) as [target, description] (target)}
+				<li>
+					<code>{target}</code>{#if description}{' '}— {description}{/if}
 				</li>
 			{/each}
 		</ul>
@@ -307,6 +334,62 @@ including parameters, props, members, overloads, external types, and more.
 	</section>
 {/if}
 
+<!-- CSS custom properties (for Svelte components): the styling API a
+	consumer sets on the component or an ancestor; `documented` entries come
+	from `@cssprop` tags and arrive first, the rest are inferred from `var()`
+	fallbacks and `@property` rules in the component's styles, marked only when
+	the list mixes both -->
+{#if declaration.css_custom_properties?.length}
+	<section>
+		<h4>CSS custom properties</h4>
+		{#if css_property_chips_shown}
+			<p>
+				Properties marked <span class="chip">inferred</span> are found by their <code>var()</code>
+				fallback or <code>@property</code> rule, not documented with <code>@cssprop</code>.
+			</p>
+		{/if}
+		{#each declaration.css_custom_properties as css_property (css_property.name)}
+			<section>
+				<div class="row gap_md">
+					<h5><code>{css_property.name}</code></h5>
+					{#if css_property_chips_shown && !css_property.documented}
+						<span class="chip">inferred</span>
+					{/if}
+				</div>
+				{#if css_property.description}
+					<Mdz content={css_property.description} />
+				{/if}
+				{#if css_property.syntax}
+					<div class="row gap_md mb_sm">
+						<strong>syntax</strong>
+						<code>{css_property.syntax}</code>
+					</div>
+				{/if}
+				{#if css_property.default !== undefined}
+					<div class="row gap_md">
+						<strong>default</strong>
+						<Code lang="css" content={dedent_css_fallback(css_property.default)} wrap />
+					</div>
+				{/if}
+				{#if css_property.fallback !== undefined &&
+					(css_property.default === undefined ||
+						!css_values_agree(css_property.default, css_property.fallback))
+				}
+					<div class="row gap_md">
+						<strong>fallback</strong>
+						{#if css_property.fallback}
+							<Code lang="css" content={dedent_css_fallback(css_property.fallback)} wrap />
+						{:else}
+							<!-- `var(--a,)`, a fallback of nothing -->
+							<span>empty</span>
+						{/if}
+					</div>
+				{/if}
+			</section>
+		{/each}
+	</section>
+{/if}
+
 <!-- overloads -->
 {#if declaration.overloads?.length}
 	<section>
@@ -337,7 +420,8 @@ including parameters, props, members, overloads, external types, and more.
 {/if}
 
 <!-- external types whose contributions are filtered out of (or, on
-	interfaces/classes, never enumerated in) props/members -->
+	interfaces/classes, never enumerated in) props/members; a component prop
+	its `$props()` destructuring names is documented anyway -->
 {#if external_types_not_inherited}
 	<section>
 		<h4>external types</h4>
@@ -435,7 +519,9 @@ including parameters, props, members, overloads, external types, and more.
 		<h4>mutates</h4>
 		<ul>
 			{#each Object.entries(declaration.mutates) as [param, description] (param)}
-				<li><code>{param}</code> — {description}</li>
+				<li>
+					<code>{param}</code>{#if description}{' '}— {description}{/if}
+				</li>
 			{/each}
 		</ul>
 	</section>

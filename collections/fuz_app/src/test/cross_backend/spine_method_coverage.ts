@@ -20,7 +20,7 @@
  * @module
  */
 
-import type { MethodCoverageEntry } from '$lib/testing/cross_backend/method_coverage.ts';
+import type { MethodCoverageEntry } from '#lib/testing/cross_backend/method_coverage.ts';
 
 export const SPINE_METHOD_COVERAGE: ReadonlyArray<MethodCoverageEntry> = [
 	// --- Declared surface — the `create_standard_rpc_actions` bundle ---
@@ -184,12 +184,24 @@ export const SPINE_METHOD_COVERAGE: ReadonlyArray<MethodCoverageEntry> = [
 		capability: 'cell_gated_create',
 		suite: 'describe_cell_moderate_cross_tests'
 	},
+	// A root's contribution policy. Its validation runs through the mounted
+	// create authorizer, so its behavioral coverage rides the same
+	// `cell_gated_create` capability as the authorizer itself.
+	{
+		method: 'cell_policy_set',
+		tier: 'off_surface',
+		capability: 'cell_gated_create',
+		suite: 'describe_cell_gated_create_cross_tests'
+	},
 
 	// --- Off-surface: opt-in actor resolvers (ungated) ---
 	// Not in `create_standard_rpc_actions`; always mounted on the spine, their
-	// cross suites run unconditionally (no capability flag).
+	// coverage runs unconditionally (no capability flag). `actor_search` is
+	// table rows alone (`conformance_actor_cases.ts`, resolved through the
+	// runner's `live_rpc_endpoints`); `actor_lookup` keeps an imperative suite for
+	// the round trip that names the fixture's actor, beside its table rows.
 	{ method: 'actor_lookup', tier: 'off_surface', suite: 'describe_actor_lookup_cross_tests' },
-	{ method: 'actor_search', tier: 'off_surface', suite: 'describe_actor_search_cross_tests' },
+	{ method: 'actor_search', tier: 'off_surface', suite: 'conformance_actor_cases.ts' },
 
 	// --- Off-surface: peer/ping protocol action (capability `peer_request`) ---
 	// A protocol action (filtered from the action manifest), but live-mounted on
@@ -206,8 +218,7 @@ export const SPINE_METHOD_COVERAGE: ReadonlyArray<MethodCoverageEntry> = [
 	// --- Backdoor: `_testing_*` daemon-token actions ---
 	// Live-mounted on the test binary only, never on the declared surface
 	// (`assert_no_testing_methods` guards that). The negative-credential gate is
-	// `describe_testing_backdoor_cross_tests`; `_testing_drain_effects` is the
-	// audit barrier the suites call, not itself credential-probed.
+	// `describe_testing_backdoor_cross_tests`.
 	{ method: '_testing_reset', tier: 'backdoor', suite: 'describe_testing_backdoor_cross_tests' },
 	{
 		method: '_testing_mint_session',
@@ -215,6 +226,11 @@ export const SPINE_METHOD_COVERAGE: ReadonlyArray<MethodCoverageEntry> = [
 		suite: 'describe_testing_backdoor_cross_tests'
 	},
 	{ method: '_testing_put_fact', tier: 'backdoor', suite: 'describe_testing_backdoor_cross_tests' },
+	{
+		method: '_testing_flood_notifications',
+		tier: 'backdoor',
+		suite: 'describe_testing_backdoor_cross_tests'
+	},
 	{
 		method: '_testing_schema_snapshot',
 		tier: 'backdoor',
@@ -231,8 +247,19 @@ export const SPINE_METHOD_COVERAGE: ReadonlyArray<MethodCoverageEntry> = [
 		suite: 'describe_testing_backdoor_cross_tests'
 	},
 	{
+		method: '_testing_origin_check',
+		tier: 'backdoor',
+		suite: 'describe_testing_backdoor_cross_tests'
+	},
+	{
+		method: '_testing_shorten_credential_expiry',
+		tier: 'backdoor',
+		suite: 'describe_testing_backdoor_cross_tests'
+	},
+	{
 		method: '_testing_drain_effects',
 		tier: 'backdoor',
-		note: 'audit barrier; not credential-probed'
+		suite: 'describe_testing_backdoor_cross_tests',
+		note: 'the audit barrier the suites call'
 	}
 ];

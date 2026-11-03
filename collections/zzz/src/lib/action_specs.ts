@@ -10,7 +10,7 @@ import { heartbeat_action_spec } from '@fuzdev/fuz_app/actions/heartbeat.ts';
 import { cancel_action_spec } from '@fuzdev/fuz_app/actions/cancel.ts';
 import { peer_ping_action_spec } from '@fuzdev/fuz_app/actions/peer_ping.ts';
 import { protocol_action_specs } from '@fuzdev/fuz_app/actions/protocol.ts';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 // Re-export so codegen (which builds `import * as specs from './action_specs'`)
 // resolves `specs.heartbeat_action_spec` / `specs.cancel_action_spec` /
@@ -24,13 +24,19 @@ export { heartbeat_action_spec, cancel_action_spec, peer_ping_action_spec };
 
 import {
 	DiskfileChange,
+	DiskfileChangeType,
 	DiskfileDirectoryPath,
 	DiskfilePath,
+	DisknodeMetadata,
 	SerializableDisknode
 } from './diskfile_types.ts';
+import { ERROR_INVALID_PATH, is_path_absolute } from './diskfile_helpers.ts';
+import { ERROR_TERMINAL_COMMAND_NOT_FOUND } from './terminal_helpers.ts';
 import { ProviderStatus, ProviderName } from './provider_types.ts';
+import { JobSnapshot } from './job_types.ts';
+import { TranscriptSegment } from './transcript_types.ts';
 import { CompletionMessage, CompletionRequest, CompletionResponse } from './completion_types.ts';
-import { WorkspaceInfoJson } from './workspace.svelte.ts';
+import { WorkspaceInfoJson, WorkspaceWatchStatus } from './workspace.svelte.ts';
 
 // -- Shared sub-schemas -----------------------------------------------------
 
@@ -53,7 +59,10 @@ export type PingOutput = z.infer<typeof PingOutput>;
 
 /**
  * Inner payload of `session_load`. The fields here are the actual session
- * snapshot — files, scoped dirs, provider status, workspaces.
+ * snapshot — files and the roots they cover, scoped dirs, provider status,
+ * workspaces, the caller's terminals, and the server instance. The frontend
+ * loads it at boot and again after every reconnect, reconciling its state to
+ * it (see `Frontend.load_session`).
  *
  * TODO extract to `diskfile_types.ts` (or a session-specific module) once
  * the Rust backend grows its own typed session response and we can move
@@ -63,8 +72,23 @@ export const SessionLoadData = z.strictObject({
 	zzz_dir: DiskfileDirectoryPath,
 	scoped_dirs: z.readonly(z.array(DiskfileDirectoryPath)),
 	files: z.array(SerializableDisknode),
+	/**
+	 * The directories whose complete file trees `files` holds (the backend's
+	 * watched roots) — a known file under one of them that's missing from
+	 * `files` is gone from disk.
+	 */
+	file_roots: z.array(DiskfileDirectoryPath),
 	provider_status: z.array(ProviderStatus),
-	workspaces: z.array(WorkspaceInfoJson)
+	workspaces: z.array(WorkspaceInfoJson),
+	/** Backend ids of the caller's live terminals. */
+	terminal_ids: z.array(Uuid),
+	/** The caller's jobs, oldest first — running, queued, and recent finished ones. */
+	jobs: z.array(JobSnapshot),
+	/**
+	 * Minted each time the backend starts — a different id than the last
+	 * snapshot's means it restarted, losing its terminals and runtime workspaces.
+	 */
+	server_instance_id: Uuid
 });
 export type SessionLoadData = z.infer<typeof SessionLoadData>;
 
@@ -79,11 +103,20 @@ export const SessionLoadOutput = z.strictObject({
 });
 export type SessionLoadOutput = z.infer<typeof SessionLoadOutput>;
 
-/** Input for `filer_change`. */
-export const FilerChangeInput = z.strictObject({
-	change: DiskfileChange,
-	disknode: SerializableDisknode
-});
+/**
+ * Input for `filer_change`: the file's whole disknode — or, for a `touch`,
+ * its metadata without the contents (`DisknodeMetadata`).
+ */
+export const FilerChangeInput = z.union([
+	z.strictObject({
+		change: DiskfileChange.extend({ type: DiskfileChangeType.exclude(['touch']) }),
+		disknode: SerializableDisknode
+	}),
+	z.strictObject({
+		change: DiskfileChange.extend({ type: z.literal('touch') }),
+		disknode: DisknodeMetadata
+	})
+]);
 export type FilerChangeInput = z.infer<typeof FilerChangeInput>;
 
 /** Input for `diskfile_update`. */
@@ -92,6 +125,59 @@ export const DiskfileUpdateInput = z.strictObject({
 	content: z.string()
 });
 export type DiskfileUpdateInput = z.infer<typeof DiskfileUpdateInput>;
+
+/** Input for `diskfile_create`. */
+export const DiskfileCreateInput = z.strictObject({
+	path: DiskfilePath,
+	content: z.string()
+});
+export type DiskfileCreateInput = z.infer<typeof DiskfileCreateInput>;
+
+/** Input for `media_finalize`. */
+export const MediaFinalizeInput = z.strictObject({
+	path: DiskfilePath
+});
+export type MediaFinalizeInput = z.infer<typeof MediaFinalizeInput>;
+
+/** Output for `media_finalize`: the rewritten file's size in bytes. */
+export const MediaFinalizeOutput = z.strictObject({
+	size: z.number()
+});
+export type MediaFinalizeOutput = z.infer<typeof MediaFinalizeOutput>;
+
+/** Input for `transcription_create`. */
+export const TranscriptionCreateInput = z.strictObject({
+	path: DiskfilePath,
+	/** A language code like `en`, or `auto` (the default) to detect it. */
+	language: z.string().optional()
+});
+export type TranscriptionCreateInput = z.infer<typeof TranscriptionCreateInput>;
+
+/** Output for `transcription_create`: the job that will do it. */
+export const TranscriptionCreateOutput = z.strictObject({
+	job_id: Uuid
+});
+export type TranscriptionCreateOutput = z.infer<typeof TranscriptionCreateOutput>;
+
+/** Input for the `transcription_progress` notification. */
+export const TranscriptionProgressInput = z.strictObject({
+	job_id: Uuid,
+	/** The segments decoded since the last notification. */
+	segments: z.array(TranscriptSegment)
+});
+export type TranscriptionProgressInput = z.infer<typeof TranscriptionProgressInput>;
+
+/** Input for `job_cancel`. */
+export const JobCancelInput = z.strictObject({
+	job_id: Uuid
+});
+export type JobCancelInput = z.infer<typeof JobCancelInput>;
+
+/** Input for the `job_changed` notification. */
+export const JobChangedInput = z.strictObject({
+	job: JobSnapshot
+});
+export type JobChangedInput = z.infer<typeof JobChangedInput>;
 
 /** Input for `diskfile_delete`. */
 export const DiskfileDeleteInput = z.strictObject({
@@ -166,7 +252,8 @@ export type ProviderLoadStatusOutput = z.infer<typeof ProviderLoadStatusOutput>;
 export const TerminalCreateInput = z.strictObject({
 	command: z.string(),
 	args: z.array(z.string()).default(() => []),
-	cwd: z.string().optional(),
+	/** The working directory — absolute, never resolved against the daemon's own. */
+	cwd: z.string().refine(is_path_absolute, { message: 'cwd must be an absolute path' }).optional(),
 	preset_id: Uuid.optional()
 });
 export type TerminalCreateInput = z.infer<typeof TerminalCreateInput>;
@@ -187,22 +274,49 @@ export type TerminalDataSendInput = z.infer<typeof TerminalDataSendInput>;
 /** Input for `terminal_data` (backend → frontend stdout/stderr stream). */
 export const TerminalDataInput = z.strictObject({
 	terminal_id: Uuid,
-	data: z.string()
+	data: z.string(),
+	/**
+	 * Bytes of output (`data` as UTF-8) the terminal has sent in total, this
+	 * chunk included — the backend's count, echoed back by `terminal_ack`.
+	 */
+	sent_bytes: z.number().int().nonnegative()
 });
 export type TerminalDataInput = z.infer<typeof TerminalDataInput>;
+
+/** Input for `terminal_ack`. */
+export const TerminalAckInput = z.strictObject({
+	terminal_id: Uuid,
+	/**
+	 * The `sent_bytes` of the last `terminal_data` the client finished with.
+	 * Cumulative: the backend keeps the highest it has seen from a connection.
+	 */
+	bytes: z.number().int().nonnegative()
+});
+export type TerminalAckInput = z.infer<typeof TerminalAckInput>;
+
+/**
+ * A terminal dimension (`cols` / `rows`) — the `u16` range of a PTY
+ * `winsize`, minus zero.
+ */
+export const TerminalDimension = z.number().int().min(1).max(65_535);
+export type TerminalDimension = z.infer<typeof TerminalDimension>;
 
 /** Input for `terminal_resize`. */
 export const TerminalResizeInput = z.strictObject({
 	terminal_id: Uuid,
-	cols: z.number().int(),
-	rows: z.number().int()
+	cols: TerminalDimension,
+	rows: TerminalDimension
 });
 export type TerminalResizeInput = z.infer<typeof TerminalResizeInput>;
+
+/** A signal `terminal_close` can send. */
+export const TerminalCloseSignal = z.enum(['SIGTERM', 'SIGKILL']);
+export type TerminalCloseSignal = z.infer<typeof TerminalCloseSignal>;
 
 /** Input for `terminal_close`. */
 export const TerminalCloseInput = z.strictObject({
 	terminal_id: Uuid,
-	signal: z.string().default('SIGTERM').optional()
+	signal: TerminalCloseSignal.default('SIGTERM').optional()
 });
 export type TerminalCloseInput = z.infer<typeof TerminalCloseInput>;
 
@@ -228,7 +342,8 @@ export type WorkspaceOpenInput = z.infer<typeof WorkspaceOpenInput>;
 /** Output for `workspace_open`. */
 export const WorkspaceOpenOutput = z.strictObject({
 	workspace: WorkspaceInfoJson,
-	files: z.array(SerializableDisknode)
+	files: z.array(SerializableDisknode),
+	watch_status: WorkspaceWatchStatus
 });
 export type WorkspaceOpenOutput = z.infer<typeof WorkspaceOpenOutput>;
 
@@ -276,7 +391,8 @@ export const session_load_action_spec = {
 	input: z.void(),
 	output: SessionLoadOutput,
 	async: true,
-	description: 'Load initial session data including filesystem state and provider status.'
+	description:
+		'Load the session snapshot (files, workspaces, terminals, jobs, provider status) — at boot and after each reconnect, to resync.'
 } satisfies RequestResponseActionSpec;
 
 export const filer_change_action_spec = {
@@ -288,7 +404,8 @@ export const filer_change_action_spec = {
 	input: FilerChangeInput,
 	output: z.void(),
 	async: true,
-	description: 'Notifies the frontend of a file system change detected by the watcher.'
+	description:
+		"Notifies the frontend of a file system change detected by the watcher. Carries the file's contents unless the ones the backend holds for it are unchanged (a `touch`)."
 } satisfies RemoteNotificationActionSpec;
 
 export const diskfile_update_action_spec = {
@@ -301,6 +418,19 @@ export const diskfile_update_action_spec = {
 	output: z.null(),
 	async: true,
 	description: 'Write new content to a file on disk.'
+} satisfies RequestResponseActionSpec;
+
+export const diskfile_create_action_spec = {
+	method: 'diskfile_create',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: { account: 'required', actor: 'none' },
+	side_effects: true,
+	input: DiskfileCreateInput,
+	output: z.null(),
+	async: true,
+	description:
+		'Create a new file on disk, failing with `conflict` (`already_exists`) if the path is taken — never overwrites.'
 } satisfies RequestResponseActionSpec;
 
 export const diskfile_delete_action_spec = {
@@ -324,8 +454,73 @@ export const directory_create_action_spec = {
 	input: DirectoryCreateInput,
 	output: z.null(),
 	async: true,
-	description: 'Create a new directory on disk.'
+	description:
+		'Create a new directory on disk, and any missing parents, failing with `conflict` (`already_exists`) if the path is taken — never reuses an existing one.'
 } satisfies RequestResponseActionSpec;
+
+export const media_finalize_action_spec = {
+	method: 'media_finalize',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: { account: 'required', actor: 'none' },
+	side_effects: true,
+	input: MediaFinalizeInput,
+	output: MediaFinalizeOutput,
+	async: true,
+	description:
+		'Rewrite a recorded media file in place so its header has a duration and a seek index (an `ffmpeg` stream copy, nothing re-encoded). The container comes from the extension: WebM, Matroska, Ogg, MP4, MP3, WAV, FLAC, or AAC.'
+} satisfies RequestResponseActionSpec;
+
+export const transcription_create_action_spec = {
+	method: 'transcription_create',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: { account: 'required', actor: 'none' },
+	side_effects: true,
+	input: TranscriptionCreateInput,
+	output: TranscriptionCreateOutput,
+	async: true,
+	description:
+		"Queue a transcription of an audio file by the local speech model, and return its job. The transcript is written beside the file as `<name>.<model>.transcript.json`; fails with `conflict` (`already_exists`) if that model's transcript is already there."
+} satisfies RequestResponseActionSpec;
+
+export const transcription_progress_action_spec = {
+	method: 'transcription_progress',
+	kind: 'remote_notification',
+	initiator: 'backend',
+	auth: null,
+	side_effects: true,
+	input: TranscriptionProgressInput,
+	output: z.void(),
+	async: true,
+	description:
+		'Segments a running transcription just decoded — a preview; the transcript file is written when the job succeeds.'
+} satisfies RemoteNotificationActionSpec;
+
+export const job_cancel_action_spec = {
+	method: 'job_cancel',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: { account: 'required', actor: 'none' },
+	side_effects: true,
+	input: JobCancelInput,
+	output: z.null(),
+	async: true,
+	description:
+		'Cancel a job: a queued one never starts, the running one is stopped. A job that is already over is left as it is.'
+} satisfies RequestResponseActionSpec;
+
+export const job_changed_action_spec = {
+	method: 'job_changed',
+	kind: 'remote_notification',
+	initiator: 'backend',
+	auth: null,
+	side_effects: true,
+	input: JobChangedInput,
+	output: z.void(),
+	async: true,
+	description: 'A job was queued, started, progressed, or finished — its full current state.'
+} satisfies RemoteNotificationActionSpec;
 
 export const completion_create_action_spec = {
 	method: 'completion_create',
@@ -385,7 +580,9 @@ export const terminal_create_action_spec = {
 	input: TerminalCreateInput,
 	output: TerminalCreateOutput,
 	async: true,
-	description: 'Spawn a PTY process and return the terminal ID.'
+	error_reasons: [ERROR_INVALID_PATH, ERROR_TERMINAL_COMMAND_NOT_FOUND],
+	description:
+		'Spawn a PTY process and return the terminal ID. A `cwd` must be absolute (`invalid_params` otherwise); a `command` that does not exist is `invalid_params` with `terminal_command_not_found`.'
 } satisfies RequestResponseActionSpec;
 
 export const terminal_data_send_action_spec = {
@@ -397,7 +594,8 @@ export const terminal_data_send_action_spec = {
 	input: TerminalDataSendInput,
 	output: z.null(),
 	async: true,
-	description: 'Send stdin bytes to a terminal.'
+	description:
+		'Send stdin bytes to a terminal. Fails with `not_found` when the caller has no live terminal with the id.'
 } satisfies RequestResponseActionSpec;
 
 export const terminal_data_action_spec = {
@@ -412,6 +610,19 @@ export const terminal_data_action_spec = {
 	description: 'Stream stdout/stderr bytes from a terminal to the frontend.'
 } satisfies RemoteNotificationActionSpec;
 
+export const terminal_ack_action_spec = {
+	method: 'terminal_ack',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: { account: 'required', actor: 'none' },
+	side_effects: true,
+	input: TerminalAckInput,
+	output: z.null(),
+	async: true,
+	description:
+		"Acknowledge a terminal's output up to a `terminal_data`'s `sent_bytes`. The backend stops reading a terminal whose output runs too far ahead of what an acknowledging WebSocket connection has taken, and resumes as acks arrive; connections that never acknowledge aren't waited for, and over HTTP the call does nothing. Fails with `not_found` when the caller has no live terminal with the id."
+} satisfies RequestResponseActionSpec;
+
 export const terminal_resize_action_spec = {
 	method: 'terminal_resize',
 	kind: 'request_response',
@@ -421,7 +632,8 @@ export const terminal_resize_action_spec = {
 	input: TerminalResizeInput,
 	output: z.null(),
 	async: true,
-	description: 'Update PTY dimensions for a terminal.'
+	description:
+		'Update PTY dimensions for a terminal. Fails with `not_found` when the caller has no live terminal with the id.'
 } satisfies RequestResponseActionSpec;
 
 export const terminal_close_action_spec = {
@@ -433,7 +645,8 @@ export const terminal_close_action_spec = {
 	input: TerminalCloseInput,
 	output: TerminalCloseOutput,
 	async: true,
-	description: 'Kill a terminal process and return the exit code.'
+	description:
+		'Kill a terminal process and return the exit code. Fails with `not_found` when the caller has no live terminal with the id.'
 } satisfies RequestResponseActionSpec;
 
 export const terminal_exited_action_spec = {
@@ -515,8 +728,14 @@ export const all_action_specs: Array<ActionSpecUnion> = [
 	session_load_action_spec,
 	filer_change_action_spec,
 	diskfile_update_action_spec,
+	diskfile_create_action_spec,
 	diskfile_delete_action_spec,
 	directory_create_action_spec,
+	media_finalize_action_spec,
+	transcription_create_action_spec,
+	transcription_progress_action_spec,
+	job_cancel_action_spec,
+	job_changed_action_spec,
 	completion_create_action_spec,
 	completion_progress_action_spec,
 	toggle_main_menu_action_spec,
@@ -524,6 +743,7 @@ export const all_action_specs: Array<ActionSpecUnion> = [
 	terminal_create_action_spec,
 	terminal_data_send_action_spec,
 	terminal_data_action_spec,
+	terminal_ack_action_spec,
 	terminal_resize_action_spec,
 	terminal_close_action_spec,
 	terminal_exited_action_spec,

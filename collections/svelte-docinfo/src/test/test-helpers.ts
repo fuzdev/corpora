@@ -10,15 +10,15 @@ import { tmpdir } from 'node:os';
 import type ts from 'typescript';
 import { assert } from 'vitest';
 
-import { compareStrings } from '$lib/postprocess.ts';
-import type { AnalysisLog } from '$lib/log.ts';
-import type { ExtractContext } from '$lib/typescript-extract-shared.ts';
+import { compareStrings } from '#lib/postprocess.ts';
+import type { AnalysisLog } from '#lib/log.ts';
+import type { ExtractContext } from '#lib/typescript-extract-shared.ts';
 import type {
 	DeclarationJson,
 	FunctionDeclarationJson,
 	ComponentDeclarationJson,
 	ModuleJson
-} from '$lib/types.ts';
+} from '#lib/types.ts';
 
 /**
  * Create an `AnalysisLog` that collects info messages for assertions.
@@ -35,7 +35,8 @@ export const collectingLog = (): { infos: Array<string>; log: AnalysisLog } => {
  * A minimal `ExtractContext` for tests driving extraction seams directly
  * (extractors, `analyzeExports`, `analyzeTypescriptModule`): fresh
  * diagnostics array, nothing external, no alias registry (written-name
- * recovery only), widening-mode optionals. Override per test via `overrides`.
+ * recovery only), widening-mode optionals, every `.svelte` target read as
+ * having a virtual. Override per test via `overrides`.
  */
 export const mockExtractContext = (
 	checker: ts.TypeChecker,
@@ -46,6 +47,8 @@ export const mockExtractContext = (
 	isExternalFile: () => false,
 	aliasRegistry: undefined,
 	exactOptionalPropertyTypes: false,
+	isEmittedFile: () => true,
+	svelteFileStatus: () => 'virtual',
 	...overrides
 });
 
@@ -241,7 +244,7 @@ export const normalizeJson = (obj: any): any => {
 		const normalized: any = {};
 		for (const [key, value] of Object.entries(obj)) {
 			if (value === undefined) continue;
-			if (value === false) continue; // Strip boolean defaults (restored by Zod .default(false))
+			if (value === false) continue; // Strip boolean defaults (restored by the schema)
 			if (Array.isArray(value) && value.length === 0) continue;
 			normalized[key] = normalizeJson(value);
 		}
@@ -394,6 +397,32 @@ export const findModule = (modules: Array<ModuleJson>, path: string): ModuleJson
 };
 
 /**
+ * Find a component's declaration in an analyze result, by the name its
+ * `<Name>.svelte` module carries.
+ *
+ * @param modules - Array of modules to search
+ * @param name - The component name, `Comp` for the usual single-component project
+ * @returns The found component declaration
+ */
+export const findComponent = (
+	modules: Array<ModuleJson>,
+	name = 'Comp'
+): ComponentDeclarationJson =>
+	assertHasComponentDeclaration(findModule(modules, `${name}.svelte`), name);
+
+/**
+ * The 1-based line of the first occurrence of `needle` in `source`, for
+ * asserting a diagnostic or `sourceLine` against the text it should point at.
+ *
+ * @throws If `needle` isn't in `source`
+ */
+export const lineOf = (source: string, needle: string): number => {
+	const index = source.indexOf(needle);
+	assert.notStrictEqual(index, -1, `expected source to contain "${needle}"`);
+	return source.slice(0, index).split('\n').length;
+};
+
+/**
  * A sibling source file loaded from a multi-file fixture directory.
  *
  * `path` is fixture-dir-relative POSIX form (`dep.ts`, `internal/helper.ts`,
@@ -411,6 +440,8 @@ export interface FixtureExtraFile {
 export interface GenericFixture<T> {
 	name: string;
 	input: string;
+	/** The extension of the fixture's input file, one of the loader's `inputExtension`. */
+	inputExtension: string;
 	expected: T;
 	/**
 	 * Sibling source files beside the input (multi-file fixtures). Present
@@ -426,8 +457,12 @@ export interface GenericFixture<T> {
 export interface FixtureLoaderConfig {
 	/** Directory containing fixture subdirectories */
 	fixturesDir: string;
-	/** Input file extension (e.g., '.mdz', '.ts', '.svelte') */
-	inputExtension: string;
+	/**
+	 * Input file extension (e.g., '.mdz', '.ts', '.svelte'), or several when a
+	 * set takes more than one input language (the ts set's `.ts` and `.js`);
+	 * a directory holding more than one matching input throws.
+	 */
+	inputExtension: string | ReadonlyArray<string>;
 	/**
 	 * Collect sibling source files (recursive) beside the input file, for
 	 * multi-file fixtures. Default `false`.
@@ -488,27 +523,30 @@ const loadFixtureExtraFiles = async (
  * A fixture directory is one that contains an `input${extension}` file.
  *
  * @param baseDir - The base directory to search
- * @param inputExtension - The file extension to look for (e.g., '.svelte', '.ts')
- * @returns Array of {path: absolutePath, name: relativePath}
+ * @param inputExtension - The file extension(s) to look for (e.g., '.svelte', '.ts')
+ * @returns Array of {path: absolutePath, name: relativePath, inputExtension: the matched one}
  */
 const discoverFixtureDirs = async (
 	baseDir: string,
-	inputExtension: string
-): Promise<Array<{ path: string; name: string }>> => {
-	const results: Array<{ path: string; name: string }> = [];
+	inputExtension: string | ReadonlyArray<string>
+): Promise<Array<{ path: string; name: string; inputExtension: string }>> => {
+	const extensions = typeof inputExtension === 'string' ? [inputExtension] : inputExtension;
+	const results: Array<{ path: string; name: string; inputExtension: string }> = [];
 
 	const scan = async (dir: string): Promise<void> => {
 		const entries = await readdir(dir, { withFileTypes: true });
 
 		// Check if this directory contains an input file
-		const hasInputFile = entries.some(
-			(entry) => entry.isFile() && entry.name === `input${inputExtension}`
+		const matched = extensions.filter((ext) =>
+			entries.some((entry) => entry.isFile() && entry.name === `input${ext}`)
 		);
 
-		if (hasInputFile) {
+		if (matched.length > 1) {
+			throw new Error(`fixture ${dir} has more than one input: ${matched.join(', ')}`);
+		} else if (matched[0] !== undefined) {
 			// This is a fixture directory
 			const name = relative(baseDir, dir);
-			results.push({ path: dir, name });
+			results.push({ path: dir, name, inputExtension: matched[0] });
 		} else {
 			// Recurse into subdirectories
 			for (const entry of entries) {
@@ -546,19 +584,24 @@ export const loadFixturesGeneric = async <T>(
 ): Promise<Array<GenericFixture<T>>> => {
 	const {
 		fixturesDir,
-		inputExtension,
+		inputExtension: inputExtensions,
 		loadExtraFiles,
 		extraFileExtensions = DEFAULT_EXTRA_FILE_EXTENSIONS
 	} = config;
 
 	// Recursively discover all fixture directories
-	const fixtureDirs = await discoverFixtureDirs(fixturesDir, inputExtension);
+	const fixtureDirs = await discoverFixtureDirs(fixturesDir, inputExtensions);
 
 	return await Promise.all(
-		fixtureDirs.map(async ({ path: fixtureDir, name }) => {
+		fixtureDirs.map(async ({ path: fixtureDir, name, inputExtension }) => {
 			const input = await readFile(join(fixtureDir, `input${inputExtension}`), 'utf-8');
 			const expectedText = await readFile(join(fixtureDir, 'expected.json'), 'utf-8');
-			const fixture: GenericFixture<T> = { name, input, expected: JSON.parse(expectedText) };
+			const fixture: GenericFixture<T> = {
+				name,
+				input,
+				inputExtension,
+				expected: JSON.parse(expectedText)
+			};
 			if (loadExtraFiles) {
 				const extraFiles = await loadFixtureExtraFiles(
 					fixtureDir,
@@ -578,8 +621,8 @@ export const loadFixturesGeneric = async <T>(
 export interface UpdateTaskConfig<TInput, TOutput> {
 	/** Directory containing fixture subdirectories */
 	fixturesDir: string;
-	/** Input file extension */
-	inputExtension: string;
+	/** Input file extension(s) — see `FixtureLoaderConfig`. */
+	inputExtension: string | ReadonlyArray<string>;
 	/**
 	 * Collect sibling source files per fixture and pass them to `process` /
 	 * `processAll` (multi-file fixtures). Default `false`.
@@ -591,11 +634,13 @@ export interface UpdateTaskConfig<TInput, TOutput> {
 	 * Process one input to generate its output. Exactly one of `process` /
 	 * `processAll` must be supplied. `extraFiles` is populated only under
 	 * `loadExtraFiles`, and only for fixtures that carry sibling files.
+	 * `inputExtension` is the one the fixture's input matched.
 	 */
 	process?: (
 		input: TInput,
 		name: string,
-		extraFiles?: Array<FixtureExtraFile>
+		extraFiles: Array<FixtureExtraFile> | undefined,
+		inputExtension: string
 	) => Promise<TOutput> | TOutput;
 	/**
 	 * Batch form of `process`: receives every fixture at once (one discovery
@@ -604,7 +649,12 @@ export interface UpdateTaskConfig<TInput, TOutput> {
 	 * shared program. `extraFiles` follows the same rule as `process`.
 	 */
 	processAll?: (
-		fixtures: Array<{ name: string; input: TInput; extraFiles?: Array<FixtureExtraFile> }>
+		fixtures: Array<{
+			name: string;
+			input: TInput;
+			inputExtension: string;
+			extraFiles?: Array<FixtureExtraFile>;
+		}>
 	) => Promise<Array<TOutput>> | Array<TOutput>;
 	/**
 	 * Custom JSON replacer for serialization.
@@ -641,7 +691,7 @@ export const runUpdateTask = async <TInput = string, TOutput = any>(
 ): Promise<{ generatedCount: number; skippedCount: number }> => {
 	const {
 		fixturesDir,
-		inputExtension,
+		inputExtension: inputExtensions,
 		loadExtraFiles,
 		extraFileExtensions = DEFAULT_EXTRA_FILE_EXTENSIONS,
 		process,
@@ -653,17 +703,18 @@ export const runUpdateTask = async <TInput = string, TOutput = any>(
 	}
 
 	// Recursively discover all fixture directories
-	const fixtureDirs = await discoverFixtureDirs(fixturesDir, inputExtension);
+	const fixtureDirs = await discoverFixtureDirs(fixturesDir, inputExtensions);
 
 	log.info(`found ${fixtureDirs.length} fixtures`);
 
 	const fixtures = await Promise.all(
-		fixtureDirs.map(async ({ path: fixtureDir, name }) => {
+		fixtureDirs.map(async ({ path: fixtureDir, name, inputExtension }) => {
 			const extraFiles = loadExtraFiles
 				? await loadFixtureExtraFiles(fixtureDir, inputExtension, extraFileExtensions)
 				: [];
 			return {
 				name,
+				inputExtension,
 				expectedPath: join(fixtureDir, 'expected.json'),
 				input: (await readFile(join(fixtureDir, `input${inputExtension}`), 'utf-8')) as TInput,
 				extraFiles: extraFiles.length > 0 ? extraFiles : undefined
@@ -672,9 +723,18 @@ export const runUpdateTask = async <TInput = string, TOutput = any>(
 	);
 
 	const outputs = processAll
-		? await processAll(fixtures.map(({ name, input, extraFiles }) => ({ name, input, extraFiles })))
+		? await processAll(
+				fixtures.map(({ name, input, inputExtension, extraFiles }) => ({
+					name,
+					input,
+					inputExtension,
+					extraFiles
+				}))
+			)
 		: await Promise.all(
-				fixtures.map(({ input, name, extraFiles }) => process!(input, name, extraFiles))
+				fixtures.map(({ input, name, extraFiles, inputExtension }) =>
+					process!(input, name, extraFiles, inputExtension)
+				)
 			);
 
 	let generatedCount = 0;

@@ -3,6 +3,9 @@
 > task runner for
 > [Gro](https://github.com/fuzdev/gro)
 
+> Where it's going: on the [runtime](runtime.md), `gro task <path>` and the builtin subcommands stay,
+> and `gro check` infers each task's grants from its imports and diffs them against a committed policy file.
+
 ## contents
 
 - [what](#what)
@@ -22,27 +25,26 @@ and defers composition to the user in regular TypeScript modules.
 > but uses the Gro loader to support `.ts`.
 
 - tasks are defined by naming files with the `.task.ts` and `.task.js` suffixes
-- tasks can be run from the CLI via a name (`gro foo`),
-  which uses Gro's task resolution (see more below),
-  or via paths that are absolute (`gro /path/to/foo`) or explicitly relative (`gro ./foo`)
-- Gro automatically discovers all `*.task.ts|js` files
-  in its configurable directory, so creating a new task
+- [Gro's builtin tasks](./tasks.md) run by name (`gro check`),
+  and a name always means a builtin
+- project tasks run by path (`gro task src/lib/foo.task.ts`),
+  relative to the cwd (the project root) or absolute, `./` optional,
+  with the `.task.ts` or `.task.js` suffix required, naming a regular file;
+  nothing is searched for, so creating a new task
   is as simple as [creating a new file](#define-a-task), no config needed
-  (defaults to `src/lib`, see the config option [`task_root_dirs`](./config.md#task_root_dirs))
-- to view [the available tasks](https://github.com/fuzdev/gro/blob/main/src/docs/tasks.md)
-  run `gro` with no arguments
+- `gro` with no arguments lists the builtins,
+  and `gro task` lists the project's tasks under `src/`
 - task definitions are just objects with an async `run` function and some optional properties,
   so composing tasks is explicit in your code, just like any other module
   (but there's also the helper `invoke_task`, see more below)
 - the task object's `run` function has access to CLI args
-- tasks optionally use [zod](https://github.com/colinhacks/zod) schemas
+- tasks optionally use [fuz_schema](https://schema.fuz.dev/) schemas
   for `args` types, runtime parsing with helpful validation errors,
-  and generated help docs (`gro foo --help`), with DRY co-located definitions
-- it's easy to call into or override any of Gro's builtin tasks,
-  like [`gro test`](/src/lib/test.task.ts) and [`gro gen`](/src/lib/gen.task.ts) -
-  your own versions with the same name take precedence, and you can invoke the base
-  tasks using the `gro/` prefix, e.g. `gro gro/test`
-  (tasks are also copy-paste friendly! just update the imports)
+  and generated help docs (`gro check --help`), with DRY co-located definitions
+- a project task can wrap any of Gro's builtins,
+  like [`gro test`](/src/lib/test.task.ts) and [`gro gen`](/src/lib/gen.task.ts),
+  by invoking it by name (see [wrap a builtin](#wrap-one-of-gros-builtin-tasks));
+  tasks are also copy-paste friendly, just update the imports
 - it's fast because it imports only the modules imported by your invoked tasks, not every task's
 
 The task runner's purpose is to provide an ergonomic interface
@@ -51,50 +53,46 @@ As a developer, it's nice to be able to reuse TypeScript modules in every contex
 
 ## usage
 
-### show all available tasks
+### list tasks
 
 ```bash
-# This looks through `src/lib` in both the current working directory and Gro's source
-# for all files matching `*.task.ts|js` and logs them out with their args docs.
+# Lists Gro's builtins and the CLI usage, importing no task module.
 $ gro
+
+# Lists the project's `*.task.ts|js` files under `src/` with their summaries.
+$ gro task
+
+# Lists the tasks under a directory.
+$ gro task src/lib/some/
 ```
 
-The [config](./config.md) option [task_root_dirs](./config.md#task_root_dirs)
-tells Gro where to search for tasks.
-
-> Currently, only the first directory specified in `task_root_dirs` that's found on the filesystem
-> will be used to automatically discover tasks, like when running `gro` without args.
-> Please open an issue if you would like to see Gro be able to discover
-> tasks in more than one directory - it will take some reworking of internals
-> but it seems like the right design.
-
-### show tasks in a directory
-
-```bash
-# Logs all `*.task.ts|js` files in `src/lib/some/dir` and `gro/src/lib/some/dir`.
-# If no tasks are found, it displays an error.
-$ gro some/dir
-```
-
-> To learn more about the Gro CLI path conventions,
-> see [the `input_paths` comments](../lib/input_path.ts)
+The [config](./config.md) option [`search_filters`](./config.md#search_filters)
+excludes paths from the listing.
 
 ### run a task
 
 ```bash
-# This runs `src/lib/some/file.task.ts`,
-# or if it doesn't exist, `gro/src/lib/some/file.task.ts`.
-# If neither exists, it displays an error.
-$ gro some/file arg1 arg2 --arg3 example
+# Runs a builtin by name.
+$ gro check
 
-# This runs `gro/src/lib/some/file.task.ts` directly
-# without checking the current working directory,
-# and displays an error if it doesn't exist.
-$ gro gro/some/file
+# Runs the project task at `src/lib/some/file.task.ts`.
+$ gro task src/lib/some/file.task.ts arg1 arg2 --arg3 example
 
 # Without colors:
-$ NO_COLOR=1 gro
+$ NO_COLOR=1 gro check
 ```
+
+A name that's no builtin is an error listing the builtins,
+with the hint `gro task src/lib/foo.task.ts`, saying whether that file exists.
+A path without `gro task`, like `gro src/lib/foo.task.ts`,
+is an error naming the `gro task` form;
+for a path without a task suffix, like `gro src/lib/foo`,
+the error names what's there: `src/lib/foo.task.ts` or `.task.js` to run,
+the directory to list, or nothing.
+`gro task src/lib/foo` listing no tasks beside `src/lib/foo.task.ts` hints running it.
+A `gro/` prefix, like `gro gro/check`, is an error naming the plain builtin.
+Flags go after the path: `gro task --a src/lib/foo.task.ts` is an error,
+since `--a` would take the path as its value.
 
 ### define a task
 
@@ -124,14 +122,15 @@ Minimum with [`Args`](#task-args):
 ```ts
 // src/lib/some/withargs.task.ts
 import type {Task} from '@fuzdev/gro';
-import {z} from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import {meta} from '@fuzdev/fuz_schema/meta.ts';
 
-export const Args = z.strictObject({
-	arg: z.number().meta({description: 'example number arg'}).default(2),
+export const Args = s.object({
+	arg: s.with_default(meta(s.number, {description: 'example number arg'}), 2),
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
-export const task: Task = {
+export const task: Task<Args> = {
 	Args,
 	run: async ({args}) => {
 		args.arg; // `number` that defaults to `2`
@@ -145,11 +144,11 @@ export const task: Task = {
 import type {Task} from '@fuzdev/gro';
 
 export interface Task<
-	TArgs = Args, // same as `z.infer<typeof Args>`
-	TArgsSchema extends z.ZodType = z.ZodType,
+	TArgs = Args, // same as `s.Infer<typeof Args>`
+	TArgsSchema extends Schema<Args, Args> = Schema<Args, Args>,
 	TReturn = unknown,
 > {
-	run: (ctx: TaskContext<TArgs>) => Promise<TReturn>;
+	run: (ctx: TaskContext<TArgs>) => TReturn | Promise<TReturn>;
 	summary?: string;
 	Args?: TArgsSchema;
 }
@@ -164,32 +163,34 @@ export interface TaskContext<TArgs = object> {
 	args: TArgs;
 	config: GroConfig;
 	svelte_config: Promise<ParsedSvelteConfig>;
+	graph: ModuleGraph;
+	watcher: Watcher;
 	log: Logger;
 	timings: Timings;
 	invoke_task: InvokeTask;
 }
 ```
 
+`graph` is the project's module graph (the modules under `src/`, which imports which,
+and their changes) and `watcher` a plain file watch over the same directory.
+Both load on first use, so a task that never touches them never starts a watch;
+`config.watch` sets what they watch.
+A task invoked with `invoke_task` shares its invoker's `graph` and `watcher`.
+
 ### run a task inside another task with `invoke_task`
 
 Because Gro tasks are just functions,
 you can directly import them from within other tasks and run them.
 However, we recommend using the `invoke_task` helper
-for its ergonomics and automatic logging and diagnostics.
+for its ergonomics, automatic logging and diagnostics,
+and [forwarded args](#task-args-forwarding).
 
-The `invoke_task` helper uses Gro's task resolution rules
-to allow user code to override builtin tasks.
-For example, Gro's `check.task.ts` calls `invoke_task('test')`
-so that it calls your `src/lib/test.task.ts` if it exists
-and falls back to `gro/src/lib/test.task.ts` if not.
-
-It's less important to use `invoke_task` over explicit imports in user code
-because you don't need to rely on the task override rules to get desired behavior,
-but the logging and diagnostics it provides are nice to have.
-
-```bash
-gro some/file
-```
+`invoke_task` takes a builtin name or a task path by the same rule as the CLI:
+an input containing a `/` or ending in `.task.ts` or `.task.js` is a path,
+relative to the cwd (the project root, not the invoking task's directory) or absolute,
+and anything else is a builtin name.
+A name always reaches the builtin, so Gro's `check.task.ts` calling `invoke_task('test')`
+runs the builtin `test` whatever tasks the project defines.
 
 ```ts
 // src/lib/some/file.task.ts
@@ -197,65 +198,110 @@ import type {Task} from '@fuzdev/gro';
 
 export const task: Task = {
 	run: async ({args, invoke_task}) => {
-		// runs `src/lib/some/file.task.ts`, automatically forwarding `args`
-		await invoke_task('some/file');
-		// as documented above, the following is similar but lacks nice features:
-		// await (await import('./some/file.task.js')).run(ctx);
+		// runs the builtin `gen`
+		await invoke_task('gen', {check: true});
 
-		// runs `src/lib/other/file.task.ts` and falls back to `gro/src/other/file.task.ts`,
-		// forwarding both custom args and a different event emitter (warning: spaghetti)
+		// runs `src/lib/other/file.task.ts`,
+		// passing custom args and optionally a different config
 		await invoke_task(
-			'other/file',
+			'src/lib/other/file.task.ts',
 			{...args, optionally: 'extended'},
-			optionalEventEmitterForSubtree,
-			optionalDevFlagForSubtree,
-			optionalFsForSubtree,
+			{config: optional_config},
 		);
 
-		// runs `gro/src/lib/other/file.task.ts` directly, bypassing any local version
-		await invoke_task('gro/other/file');
+		// similar, but lacks the logging, diagnostics, and forwarded args:
+		// await (await import('../other/file.task.ts')).task.run(ctx);
 	},
 };
 ```
 
-### hook into one of [Gro's builtin tasks](./tasks.md)
+### types for `invoke_task`
 
-```bash
-# This normally loads Gro's version of the test task at `gro/src/lib/test.task.ts`,
-# but projects can define `src/lib/test.task.ts` to extend or replace it.
-$ gro test
+`invoke_task` checks task names and args at the type level.
+A literal name must be a builtin,
+and args are checked against the input type of the task's exported `Args` schema,
+so args with defaults are optional and args without defaults are required.
+
+Gro's builtins are typed out of the box.
+To type your project's tasks, add a genfile that exports `gen_task_registry`:
+
+```ts
+// src/gro_tasks.gen.ts
+import {gen_task_registry} from '@fuzdev/gro/task_registry.ts';
+
+export const gen = gen_task_registry;
 ```
+
+`gro gen` then writes `src/gro_tasks.ts`, which augments the `ProjectTasks` interface
+with every task file under `src/`, keyed by its path relative to the project root
+(`'src/lib/foo.task.ts'`), so `invoke_task('src/lib/foo.task.ts', ...)`
+and `invoke_task('./src/lib/foo.task.ts', ...)` check against that task's args.
+A literal task path missing from the registry accepts any args.
+The file regenerates in `gro dev` when a task file is added or changed,
+but `gro dev` ignores deletes, so run `gro gen` after removing a task
+(`gro check` catches a stale file with `gro gen --check`).
+Args are read from the task module's `Args` export, so export the schema:
+
+```ts
+export const Args = s.object({name: s.with_default(s.string, 'world')});
+export type Args = s.Infer<typeof Args>;
+```
+
+A task module without an `Args` export accepts any args.
+
+To invoke a task by a name that isn't a literal, like one computed at runtime,
+widen it to `string`, which opts out of checking:
+
+```ts
+const task_name: string = to_task_name_somehow();
+await invoke_task(task_name, {anything: 'goes'});
+```
+
+### wrap one of [Gro's builtin tasks](./tasks.md)
+
+A project task never shadows a builtin: `gro test` always runs Gro's `test`.
+To extend a builtin, write a project task that invokes it by name,
+and point the project's `package.json` script at the task's path:
 
 ```ts
 // src/lib/test.task.ts
 import type {Task} from '@fuzdev/gro';
+import {Args} from '@fuzdev/gro/test.task.ts';
 
-export const task: Task = {
+// shares the builtin's `Args`, so `--help` and arg validation are unchanged
+// and the args passed through below type-check against the builtin
+export const task: Task<Args> = {
+	Args,
 	run: async ({args, invoke_task}) => {
-		await doSomethingFirst();
-		// As discussed in the `invoke_task` section above,
-		// it's possible to `import {task as groBuiltinTestTask} from '@fuzdev/gro/test.task.ts'`
-		// and then call `groBuiltinTestTask.run` directly,
-		// but that loses some important benefits.
-		// Still, the task is available to import if you want it for any reason!
-		await invoke_task('gro/test', {...args, optionally: 'extended'}, newEventEmitterForSubtree);
-		await emailEveryoneWithTestResults();
+		await do_something_first();
+		await invoke_task('test', args); // always the builtin
+		await email_everyone_with_test_results();
 	},
 };
 ```
 
-Note that when hooking into [Gro's builtin tasks](./tasks.md),
-like `test.task.ts` above, you don't have to call its version.
-You can copy/paste an existing task and customize it,
-rewrite a task from scratch, compose them together, or whatever is needed for each project.
+```json
+{
+	"scripts": {
+		"test": "gro task src/lib/test.task.ts"
+	}
+}
+```
+
+Builtins that invoke other builtins reach the builtins,
+so `gro check` runs Gro's `test`, not the wrapper.
+A wrapper doesn't have to call the builtin at all:
+copy an existing task and customize it,
+rewrite it from scratch, compose several, or whatever each project needs.
 
 ### task `Args`
 
 The **`Args` property** of each `Task` (not the task context **`args` param** described above!)
-is an optional [zod](https://github.com/colinhacks/zod) schema.
-Using zod has some benefits:
+is an optional [fuz_schema](https://schema.fuz.dev/) object schema,
+one entry per arg, with `s.object` refusing unknown args.
+Using a schema has some benefits:
 
-- automatically print helpful text on the CLI with `gro` and `gro taskname --help`
+- automatically print helpful text on the CLI with `--help`
 - automated args parsing/validation using the schema with initialized defaults
 - type safety using args in tasks
 - concise source of truth
@@ -263,14 +309,16 @@ Using zod has some benefits:
 ```ts
 // src/lib/dosomething.task.ts
 import type {Task} from '@fuzdev/gro';
-import type {z} from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import {meta} from '@fuzdev/fuz_schema/meta.ts';
 
-export const Args = z.strictObject({
-	_: z.array(z.string()).meta({description: 'rest args'}).default([]),
-	yepyep: z.string().meta({description: 'helpful info'}).default('ya'),
-	okcool: z.number().meta({description: 'that prints to the CLI'}).default(1234),
-	maybee: z.boolean().meta({description: 'and optional args work too'}),
+export const Args = s.object({
+	_: s.with_default_fn(meta(s.array(s.string), {description: 'rest args'}), () => []),
+	yepyep: s.with_default(meta(s.string, {description: 'helpful info'}), 'ya'),
+	okcool: s.with_default(meta(s.number, {description: 'that prints to the CLI'}), 1234),
+	maybee: s.optional(meta(s.boolean, {description: 'and optional args work too'})),
 });
+export type Args = s.Infer<typeof Args>;
 
 export const task: Task<Args> = {
 	Args,
@@ -283,35 +331,68 @@ export const task: Task<Args> = {
 };
 ```
 
-Running `gro dosomething --help` prints the schema information in a friendly format.
+Running `gro task src/lib/dosomething.task.ts --help` prints the schema information in a friendly format.
+
+A `with_default` value is the same object on every parse,
+so an array or object arg takes its default from `with_default_fn`,
+which makes a new one each time, as `_` does above.
 
 ### task args forwarding
 
 Some builtin Gro tasks call external commands like
-[`svelte-kit`](https://github.com/sveltejs/kit),
+[`eslint`](https://github.com/eslint/eslint),
 [`vite`](https://github.com/vitejs/vite),
 [`vitest`](https://github.com/vitest-dev/vitest),
 and [`tsc`](https://github.com/microsoft/typescript).
 Gro supports generic agnostic args forwarding to these tasks via the `--` pattern:
-for example, to forward args to `svelte-kit` and `vitest`, no matter which task invokes them,
-use `gro taskname --taskname-arg -- vitest --arg1 neat --arg2 22 -- svelte-kit --arg3`.
+for example, to forward args to `eslint` and `vitest`, no matter which task invokes them,
+use `gro check -- vitest --arg1 neat --arg2 22 -- eslint --arg3`.
 
 Any number of sections separated by `--` may be defined, and the first arg
 that appears after each `--` is assumed to be the CLI command.
-If `gro taskname` or its invoked tasks don't call `vitest` or `svelte-kit`,
+If `gro check` or its invoked tasks don't call `vitest` or `eslint`,
 the `--` args will be ignored.
+An outside command gets its section's text verbatim, never parsed and reserialized,
+so `-- eslint --max-warnings -1 --no-cache` reaches `eslint` exactly as written.
+When a task passes a flag of its own, like `lint`'s `--max-warnings 0`
+or `typecheck`'s `--noEmit` to `tsc`, a forwarded flag of the same name
+(`--name`, `--name=value`, or `--no-name`) replaces it.
+The forwarded text follows Gro's own args, except that `--noEmit` follows it,
+as `tsc --build` must come first.
+A literal `--` can't be forwarded, because it separates the sections
+(except to [`gro run`](#gro-run)'s script).
+
+`gro test` also forwards to `vitest` the first section, unless it starts with `gro`
+or the tool's own name (`vitest`), only up to the next `--`,
+and only when the CLI invoked `gro test` directly:
+`gro test -- --watch` passes `--watch` to `vitest`,
+but `gro check -- --watch` passes nothing to the `test` that `check` invokes.
 
 There's one special case for task args forwarding: running Gro tasks.
-If `gro` is the command following a `--`, e.g. the second `gro` of
-`gro taskname -- gro taskname2 --a --b`,
-then `--a` and `--b` will be forwarded to `taskname2`.
+If `gro` is the command following a `--`, the args after the task are parsed and forwarded to it:
+in `gro check -- gro test --a --b`, `--a` and `--b` go to the builtin `test`,
+and in `gro check -- gro task src/lib/foo.task.ts --a`, `--a` goes to that project task,
+its path normalized like `gro task` normalizes it (`./` optional).
+A path without `task`, like `-- gro src/lib/foo.task.ts`, is an error, as it is on the CLI.
 Forwarded args to Gro tasks override direct args, including args to `invoke_task`,
-so `gro taskname --a 1 -- gro taskname --a 2` will invoke `taskname` with `{a: 2}`.
+so `gro test --a 1 -- gro test --a 2` invokes `test` with `{a: 2}`.
 
 The `invoke_task` helper in the task context forwards the CLI args for the specified task.
 CLI args take precedence over args passed directly to `invoke_task`.
 This may not always be the desired behavior, but it gives the user more control,
 because you can't change args in code you don't control.
+
+### gro run
+
+`gro run <path> ...rest` runs a TypeScript or JS file with Gro's loader, like `node`.
+Everything after the path goes to the script verbatim, including any `--`,
+so `gro run foo.ts --help` passes `--help` to the script, not to Gro.
+Before the path, `gro run` takes only `--help`, and any other flag is an error
+saying to put the script's flags after the path.
+Also like `node`, it prints no timings, and Gro exits with the script's exit code,
+or for a script killed by a signal, `128` plus the signal's number, like a shell (`143` for `SIGTERM`).
+`invoke_task('run', {_: [path, ...positionals], ...named})` serializes the named args
+after the positionals, as code has no raw text to pass.
 
 ### throwing errors
 
@@ -324,7 +405,7 @@ To suppress logging the stack trace for an error,
 throw a `TaskError`.
 
 ```ts
-import {Task, TaskError} from '@fuzdev/gro';
+import {type Task, TaskError} from '@fuzdev/gro';
 
 export const task: Task = {
 	run: async () => {
@@ -335,47 +416,47 @@ export const task: Task = {
 };
 ```
 
+A failed task is reported once, where it fails:
+`invoke_task` logs the error and throws a `SilentError` with the original error as its `cause`,
+so an invoking task reports only that it failed.
+The CLI exits with `1`, or with the `exit_code` of a `TaskError` thrown by the task it invoked,
+an integer 1–255, like `throw new TaskError('failed', {exit_code: 3})`.
+
+To test a caught error, use `is_task_error` and `is_silent_error` from `@fuzdev/gro/task.ts`
+rather than `instanceof`: they match subclasses and errors from other copies of Gro,
+like a project's own install beside a global one.
+
 ## why?
 
-Gro usage on the command line (`gro <task_name_or_directory> [...flags]`)
+Gro usage on the command line (`gro <builtin> [...flags]`, `gro task <path> [...flags]`)
 looks a lot like using `node`.
 What makes Gro different?
 
 - The `*.task.ts` file name convention signals to Gro that your application
   contains task modules that conform to some interface.
   This allows them to be discoverable by convention,
-  so running `gro` displays them all without any config, and it puts generic handles on them,
+  so running `gro task` displays them all without any config, and it puts generic handles on them,
   enabling various verbs (e.g. `run`) and
   structured metadata (e.g. `summary` and args schemas for docs and validation).
 - Tasks aren't just a script on the filesystem, they can be composed and inspected in code.
   Task modules do not have any side effects when imported,
   while Node scripts just execute when imported -
   their primary purpose is to cause side effects, and they're limited to the filesystem API.
-  This is useful in many cases - for example `gro taskname --help`
+  This is useful in many cases - for example `gro check --help`
   inspects the args schema and other metadata to print help to the console,
-  and `gro` prints the `summary` property of each task it discovers.
+  and `gro task` prints the `summary` property of each task it lists.
   There's lots more to explore here, like task composition
   and improved DX with new capabilities.
 - Tasks support CLI args that are validated and typesafe
-  via colocated Zod schemas with minimal boilerplate.
+  via colocated fuz_schema schemas with minimal boilerplate.
 - Tasks are forwarded CLI args when called via `invoke_task` in other tasks,
-  so running `gro foo -- gro bar --a b` passes `{a: 'b'}` automatically to the `bar` task.
-- Module resolution differs and leverages discoverability:
-  - When a task name is given to Gro,
-    it first searches `src/lib/` in the current working directory and
-    falls back to searching the Gro directory.
-    This allows your code and CLI commands to compose Gro's builtin tasks
-    or override them without changing how you invoke them.
-    Gro reserves no special behavior for its own commands -
-    `gro test`, `gro gen`, and all the rest are just tasks that all follow the same rules.
-    (see its task at [`src/lib/test.task.ts`](/src/lib/test.task.ts)).
-  - When a directory is given to Gro,
-    it prints all of the tasks found inside it,
-    both relative to the current working directory and Gro's directory.
-    So when you run `gro` by itself,
-    it prints all tasks available both in your project and Gro.
-  - The trailing `.task.ts` in the file path provided to `gro` is optional,
-    so for example, `gro foo/bar` is the same as `gro foo/bar.task.ts`, a nice convenience.
+  so running `gro check -- gro test --a b` passes `{a: 'b'}` automatically to the `test` task.
+- Resolution is explicit, with no search:
+  - A name means one of Gro's builtins and nothing else,
+    so `gro test` and a builtin's `invoke_task('test')` mean the same task in every project.
+  - A path means exactly one task file, relative to the project root or absolute,
+    so `gro task src/lib/foo.task.ts` names the file it runs,
+    and a project task is displayed and its forwarded args keyed by that path.
 
 ## :turtle:<sub>:turtle:</sub><sub><sub>:turtle:</sub></sub>
 

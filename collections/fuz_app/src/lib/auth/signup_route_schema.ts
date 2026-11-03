@@ -13,9 +13,8 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, Username, Email } from '../primitive_schemas.ts';
 
-import { Username, Email } from '../primitive_schemas.ts';
 import { Password } from './password.ts';
 import type { RouteSpec } from '../http/route_spec.ts';
 import {
@@ -65,6 +64,7 @@ export const create_signup_route_shape = (
 	method: 'POST',
 	path: '/signup',
 	auth: { account: 'none', actor: 'none' },
+	mints_credential: true,
 	description: 'Create account (invite-gated or open signup)',
 	transaction: false, // manages its own transaction for TOCTOU safety
 	input: SignupInput,

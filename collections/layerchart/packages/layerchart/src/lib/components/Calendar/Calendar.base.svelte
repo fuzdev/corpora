@@ -13,13 +13,15 @@
 <script lang="ts">
   import { timeDays, timeMonths, timeWeek } from 'd3-time';
   import { index } from 'd3-array';
-  import { format } from '@layerstack/utils';
+  import { endOfInterval, format } from '@layerstack/utils';
 
   // MonthPath isn't split — only used here when `monthPath` is set.
   import MonthPath from '../MonthPath.svelte';
-  import { chartDataArray } from '$lib/utils/common.js';
+  import {} from '$lib/utils/common.js';
   import { getChartContext } from '$lib/contexts/chart.js';
+  import { getMarkData } from '$lib/contexts/facet.js';
   import { extractLayerProps } from '$lib/utils/attributes.js';
+  import { getLayerIsometric } from '$lib/contexts/isometric.js';
 
   let {
     Rect,
@@ -31,15 +33,31 @@
     monthLabel = true,
     tooltip,
     children,
+    z,
     ...restProps
   }: CalendarBaseProps = $props();
 
   const ctx = getChartContext();
+  // Its days are keyed, in depth order on an isometric floor
+  ctx.registerComponent({ name: 'Calendar', kind: 'mark', paintByDepth: true });
+  const layerIsometric = getLayerIsometric();
+  const markData = getMarkData();
 
   const yearDays = $derived(timeDays(start, end));
   const yearMonths = $derived(timeMonths(start, end));
   const yearWeeks = $derived(timeWeek.count(start, end));
-  const chartCellWidth = $derived(ctx.width / (yearWeeks + 1));
+
+  // `MonthPath` outlines the whole month, so the last month can extend past `end` when the range
+  // stops mid-month (ex. a trailing 90 days). Size cells against the widest thing drawn, otherwise
+  // the outline overflows the chart until the container shrinks past the last cell instead.
+  const monthPathWeeks = $derived(
+    monthPath && yearMonths.length
+      ? timeWeek.count(start, endOfInterval('month', yearMonths[yearMonths.length - 1]))
+      : 0
+  );
+  const weekColumns = $derived(Math.max(yearWeeks, monthPathWeeks) + 1);
+
+  const chartCellWidth = $derived(ctx.width / weekColumns);
   const chartCellHeight = $derived(ctx.height / 7);
   const chartCellSize = $derived(Math.min(chartCellWidth, chartCellHeight));
 
@@ -52,7 +70,7 @@
   );
 
   const dataByDate = $derived(
-    ctx.data && ctx.config.x ? index(chartDataArray(ctx.data), (d) => ctx.x(d)) : new Map()
+    ctx.data && ctx.config.x ? index(markData(), (d) => ctx.x(d)) : new Map()
   );
 
   const cells = $derived(
@@ -66,17 +84,34 @@
       };
     })
   ) satisfies CalendarCell[];
+
+  /** A day's height in pixels, from `z` or the chart's, or `undefined` */
+  function cellHeight(cell: CalendarCell) {
+    if (z == null && ctx.config.z == null) return undefined;
+    return ctx.heightOf(cell.data, z);
+  }
+
+  // Back to front on an isometric floor, each keyed by its day so a reorder doesn't hand one
+  // day's `Rect` (and its `motion`) another's
+  const paintedCells = $derived.by(() => {
+    const keyed = cells.map((cell, index) => ({ cell, index }));
+    const m = layerIsometric();
+    if (!m) return keyed;
+    const depth = ({ cell }: (typeof keyed)[number]) => m.b * cell.x + m.d * cell.y;
+    return keyed.sort((a, b) => depth(a) - depth(b));
+  });
 </script>
 
 {#if children}
   {@render children({ cells, cellSize })}
 {:else}
-  {#each cells as cell}
+  {#each paintedCells as { cell, index } (index)}
     <Rect
       x={cell.x}
       y={cell.y}
       width={cellSize[0]}
       height={cellSize[1]}
+      z={cellHeight(cell)}
       fill={cell.color}
       onpointermove={(e: PointerEvent) => tooltip && ctx.tooltip?.show(e, cell.data)}
       onpointerleave={() => tooltip && ctx.tooltip?.hide()}
@@ -102,7 +137,8 @@
     <Text
       x={timeWeek.count(start, timeWeek.ceil(date)) * cellSize[0]}
       value={format(date, 'month', { variant: 'short' })}
-      capHeight="7px"
+      verticalAnchor="end"
+      dy={-4}
       {...extractLayerProps(monthLabel, 'lc-calendar-month-label')}
     />
   {/each}

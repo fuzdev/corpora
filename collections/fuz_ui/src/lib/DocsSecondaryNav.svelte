@@ -1,15 +1,22 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
 	import DocsMenu from './DocsMenu.svelte';
-	import { Tome } from './tome.ts';
+	import type { Tome } from './tome.ts';
 
 	const {
 		tomes,
 		sidebar = true,
+		header,
+		footer,
 		...rest
 	}: SvelteHTMLElements['aside'] & {
 		tomes: Array<Tome>;
+		/** Rendered above the menu, e.g. links to the site's other sections. */
+		header?: Snippet;
+		/** Rendered below the menu. */
+		footer?: Snippet;
 		sidebar?: boolean; // TODO @many dialog navs (this shouldn't exist)
 	} = $props();
 
@@ -18,7 +25,9 @@
 
 <aside {...rest} class={['docs-secondary-nav unstyled', rest.class, { sidebar }]}>
 	<nav aria-label="Secondary nav">
+		{@render header?.()}
 		<DocsMenu {tomes} {expand_width} />
+		{@render footer?.()}
 	</nav>
 </aside>
 

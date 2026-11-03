@@ -8,7 +8,7 @@
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
 
-	import { palette_variants } from '$lib/variable_data.ts';
+	import { palette_variants } from '#lib/variable_data.ts';
 
 	const LIBRARY_ITEM_NAME = 'buttons';
 
@@ -20,8 +20,6 @@
 	let selected_deselectable_button = $state.raw(true);
 
 	// TODO probably want to put the buttons in a more consistent format so we can include `disabled` versions of each in a condensed format
-
-	const mb_xs = true;
 </script>
 
 <!-- eslint-disable svelte/no-useless-mustaches -->
@@ -35,71 +33,86 @@
 		</p>
 		<p>
 			Buttons have a <code>.selected</code> state that can be used for various UI purposes, like
-			showing a selected item in a menu or a styling button's <code>aria-pressed</code> state.
-			Instead of having two distinct styles of buttons with outlined and filled variants, fuz_css
-			makes outlined buttons the default, and selected buttons are filled. There's also the
-			<code>.deselectable</code>
-			modifier class for buttons that remain clickable when selected. Themes can customize this
-			behavior.
+			showing a selected item in a menu. Instead of having two distinct styles of buttons with
+			outlined and filled variants, fuz_css makes outlined buttons the default, and selected buttons
+			are filled. There's also the <code>.deselectable</code> modifier class for buttons that remain
+			clickable when selected. Themes can customize this behavior.
 		</p>
-		<div class:mb_xs>
+		<p>
+			A toggle button's <code>aria-pressed="true"</code> takes the same fill and stays clickable,
+			like <code>.deselectable</code>. <code>aria-disabled="true"</code> takes the disabled look but
+			keeps the button focusable. Focus shows as the outline ring alone, for keyboard focus
+			(<code>:focus-visible</code>), so a clicked button doesn't stay highlighted - a popover or
+			menu trigger wanting a held look while open can style its own
+			<code>[aria-expanded='true']</code>.
+		</p>
+		<div class="mb_xs">
 			<Code content={`<button>a button</button>`} />
 			<button type="button" onclick={() => (clicked_button = !clicked_button)}>a button</button>
 			{#if clicked_button}
 				<div transition:slide>clicked a button</div>
 			{/if}
 		</div>
-		<button type="button" disabled class:mb_xs>button:disabled</button>
-		<button type="button" class="plain" class:mb_xs>button.plain</button>
-		<button type="button" class="plain" disabled class:mb_xs>button.plain:disabled</button>
-		<button type="button" class="selected" class:mb_xs>button.selected</button>
-		<button type="button" class="selected" disabled class:mb_xs>button.selected:disabled</button>
-		<button type="button" class="selected deselectable" class:mb_xs>
-			button.selected.deselectable
-		</button>
-		<button type="button" class="selected deselectable" disabled class:mb_xs>
-			button.selected.deselectable:disabled
-		</button>
-		<button type="button" class="unstyled">with .unstyled</button>
+		<div class="column align-items:flex-start gap_xs">
+			<button type="button" disabled>button:disabled</button>
+			<button type="button" class="plain">button.plain</button>
+			<button type="button" class="plain" disabled>button.plain:disabled</button>
+			<button type="button" class="selected">button.selected</button>
+			<button type="button" class="selected" disabled>button.selected:disabled</button>
+			<button type="button" class="selected deselectable">button.selected.deselectable</button>
+			<button type="button" class="selected deselectable" disabled>
+				button.selected.deselectable:disabled
+			</button>
+			<button type="button" aria-pressed="true">button[aria-pressed="true"]</button>
+			<button type="button" aria-disabled="true">button[aria-disabled="true"]</button>
+			<button type="button" class="unstyled">with .unstyled</button>
+		</div>
 	</section>
 
 	<section>
-		<div class="box width:100% mb_lg">
+		<div class="box width:100%">
 			<ColorSchemeInput />
 		</div>
 	</section>
 
 	<TomeSection>
 		<TomeSectionHeader text="Colorful buttons" />
+		<p>
+			<code>.palette_a</code> through <code>.palette_j</code> color a button with a palette hue: its
+			border, focus ring, and fill tint take stop 60, and its label stop 70, which holds AA contrast
+			on the tint at rest, hovered, and pressed.
+		</p>
 		{#each palette_variants as c (c)}
 			{@const palette_name = `palette_${c}`}
 			<section>
 				<Code content={`<button class="${palette_name}">`} />
-				<button type="button" class={palette_name} class:mb_xs>.{palette_name}</button>
-				<button type="button" class={palette_name} disabled class:mb_xs>
-					.{palette_name}:disabled
-				</button>
-				<button type="button" class="{palette_name} plain" class:mb_xs>
-					.{palette_name}.plain
-				</button>
-				<button type="button" class="{palette_name} plain" disabled class:mb_xs>
-					.{palette_name}.plain:disabled
-				</button>
-				<button type="button" class="{palette_name} selected" class:mb_xs>
-					.{palette_name}.selected
-				</button>
-				<button type="button" class="{palette_name} selected" disabled class:mb_xs>
-					.{palette_name}.selected:disabled
-				</button>
-				<button type="button" class="{palette_name} selected deselectable" class:mb_xs>
-					.{palette_name}.selected.deselectable
-				</button>
-				<button type="button" class="{palette_name} selected deselectable" disabled class:mb_xs>
-					.{palette_name}.selected.deselectable:disabled
-				</button>
+				<div class="column align-items:flex-start gap_xs">
+					<button type="button" class={palette_name}>.{palette_name}</button>
+					<button type="button" class={palette_name} disabled>
+						.{palette_name}:disabled
+					</button>
+					<button type="button" class="{palette_name} plain">
+						.{palette_name}.plain
+					</button>
+					<button type="button" class="{palette_name} plain" disabled>
+						.{palette_name}.plain:disabled
+					</button>
+					<button type="button" class="{palette_name} selected">
+						.{palette_name}.selected
+					</button>
+					<button type="button" class="{palette_name} selected" disabled>
+						.{palette_name}.selected:disabled
+					</button>
+					<button type="button" class="{palette_name} selected deselectable">
+						.{palette_name}.selected.deselectable
+					</button>
+					<button type="button" class="{palette_name} selected deselectable" disabled>
+						.{palette_name}.selected.deselectable:disabled
+					</button>
+				</div>
 			</section>
 		{/each}
-		<div class="box width:100% mb_lg">
+		<div class="box width:100%">
 			<ColorSchemeInput />
 		</div>
 	</TomeSection>
@@ -107,20 +120,21 @@
 	<TomeSection>
 		<TomeSectionHeader text="With disabled attribute" />
 		<Code content={`<button disabled>\n\t:|\n</button>`} />
-		<button type="button" disabled class:mb_xs>:|</button>
-		<button type="button" disabled>a bigger disabled button</button>
+		<div class="column align-items:flex-start gap_xs">
+			<button type="button" disabled>:|</button>
+			<button type="button" disabled>a bigger disabled button</button>
+		</div>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="With .selected">
 			With <code>.selected</code>
 		</TomeSectionHeader>
-		<nav>
+		<nav class="column align-items:flex-start gap_xs">
 			<button
 				type="button"
 				class:selected={selected_button === 0}
 				onclick={() => (selected_button = 0)}
-				class:mb_xs
 			>
 				button 0
 			</button>
@@ -128,7 +142,6 @@
 				type="button"
 				class:selected={selected_button === 1}
 				onclick={() => (selected_button = 1)}
-				class:mb_xs
 			>
 				button 1
 			</button>
@@ -136,7 +149,6 @@
 				type="button"
 				class:selected={selected_button === 2}
 				onclick={() => (selected_button = 2)}
-				class:mb_xs
 			>
 				button 2
 			</button>
@@ -180,35 +192,46 @@
 	+
 </button>`}
 		/>
-		<button type="button" class="plain" class:mb_xs>+</button>
-		<button type="button" class="plain mb_lg" disabled>+</button>
+		<div class="column align-items:flex-start gap_xs mb_flow">
+			<button type="button" class="plain">+</button>
+			<button type="button" class="plain" disabled>+</button>
+		</div>
 		<Code
 			content={`<button class="icon_button">
 	+
 </button>`}
 		/>
-		<button type="button" class="icon_button" class:mb_xs>+</button>
-		<button type="button" class="icon_button mb_lg" disabled>+</button>
+		<div class="column align-items:flex-start gap_xs mb_flow">
+			<button type="button" class="icon_button">+</button>
+			<button type="button" class="icon_button" disabled>+</button>
+		</div>
 		<Code
 			content={`<button class="plain icon_button">
 	+
 </button>`}
 		/>
-		<button type="button" class="plain icon_button" class:mb_xs>+</button>
-		<button type="button" class="plain icon_button" disabled>+</button>
+		<div class="column align-items:flex-start gap_xs">
+			<button type="button" class="plain icon_button">+</button>
+			<button type="button" class="plain icon_button" disabled>+</button>
+		</div>
 		<h4><code>.selected</code> variants</h4>
+		<p>
+			<code>.plain</code> strips the fill, border, and shadow from buttons that are neither selected
+			nor pressed at rest (the fill and shadow return on hover), so a selected or pressed plain
+			button looks like any other selected button.
+		</p>
 		<Code
 			content={`<button class="plain selected">
 	+
 </button>`}
 		/>
-		<button type="button" class="plain selected mb_lg">+</button>
+		<button type="button" class="plain selected mb_flow">+</button>
 		<Code
 			content={`<button class="icon_button selected">
 	+
 </button>`}
 		/>
-		<button type="button" class="icon_button selected mb_lg">+</button>
+		<button type="button" class="icon_button selected mb_flow">+</button>
 		<Code
 			content={`<button class="plain icon_button selected">
 	+
@@ -221,13 +244,13 @@
 	+
 </button>`}
 		/>
-		<button type="button" class="plain selected deselectable mb_lg">+</button>
+		<button type="button" class="plain selected deselectable mb_flow">+</button>
 		<Code
 			content={`<button class="icon_button selected deselectable">
 	+
 </button>`}
 		/>
-		<button type="button" class="icon_button selected deselectable mb_lg">+</button>
+		<button type="button" class="icon_button selected deselectable mb_flow">+</button>
 		<Code
 			content={`<button class="plain icon_button selected deselectable">
 	+
@@ -240,30 +263,31 @@
 		<TomeSectionHeader text="Size composites" />
 		<p>
 			The <TomeLink slug="classes" hash="#Composite-classes">size composite classes</TomeLink>
-			<code>.xs</code>, <code>.sm</code>, <code>.md</code>, <code>.lg</code>, and <code>.xl</code>
-			scale buttons up and down by overriding custom properties for font, height, and padding.
+			<code>.sized_xs</code>, <code>.sized_sm</code>, <code>.sized_md</code>,
+			<code>.sized_lg</code>, and <code>.sized_xl</code> scale buttons up and down by overriding
+			custom properties for font, height, and padding.
 		</p>
 		<Code
-			content={`<button class="xs">xs</button>\n<button class="sm">sm</button>\n<button>md</button>\n<button class="lg">lg</button>\n<button class="xl">xl</button>`}
+			content={`<button class="sized_xs">sized_xs</button>\n<button class="sized_sm">sized_sm</button>\n<button class="sized_md">sized_md</button>\n<button class="sized_lg">sized_lg</button>\n<button class="sized_xl">sized_xl</button>`}
 		/>
-		<div class="row align-items:center flex-wrap:wrap gap_sm mb_lg">
-			<button type="button" class="xs">xs</button>
-			<button type="button" class="sm">sm</button>
-			<button type="button">md</button>
-			<button type="button" class="lg">lg</button>
-			<button type="button" class="xl">xl</button>
+		<div class="row align-items:center flex-wrap:wrap gap_sm mb_flow">
+			<button type="button" class="sized_xs">sized_xs</button>
+			<button type="button" class="sized_sm">sized_sm</button>
+			<button type="button" class="sized_md">sized_md</button>
+			<button type="button" class="sized_lg">sized_lg</button>
+			<button type="button" class="sized_xl">sized_xl</button>
 		</div>
 		<p>They compose with other classes like <code>.plain</code> and <code>.icon_button</code>:</p>
-		<div class="row align-items:center gap_sm mb_lg">
-			<button type="button" class="xs icon_button plain">+</button>
-			<button type="button" class="sm icon_button plain">+</button>
+		<div class="row align-items:center gap_sm mb_flow">
+			<button type="button" class="sized_xs icon_button plain">+</button>
+			<button type="button" class="sized_sm icon_button plain">+</button>
 			<button type="button" class="icon_button plain">+</button>
-			<button type="button" class="lg icon_button plain">+</button>
-			<button type="button" class="xl icon_button plain">+</button>
+			<button type="button" class="sized_lg icon_button plain">+</button>
+			<button type="button" class="sized_xl icon_button plain">+</button>
 		</div>
 		<p>Set on a container and children inherit the sizing:</p>
-		<Code content={`<div class="xs">...</div>`} />
-		<div class="xs row gap_sm">
+		<Code content={`<div class="sized_xs">...</div>`} />
+		<div class="sized_xs row gap_sm">
 			<button type="button">one</button>
 			<button type="button" class="plain">to</button>
 			<button type="button" class="palette_j">3</button>

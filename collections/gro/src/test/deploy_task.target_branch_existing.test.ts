@@ -1,13 +1,14 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resolve } from 'node:path';
 
-import { task as deploy_task } from '$lib/deploy.task.ts';
+import { task as deploy_task } from '#lib/deploy.task.ts';
 
 import {
 	create_mock_deploy_task_context,
 	setup_successful_git_mocks,
 	setup_successful_fs_mocks,
-	setup_successful_spawn_mock
+	setup_successful_spawn_mock,
+	FIRST_COMMIT_HASH
 } from './deploy_task_test_helpers.ts';
 
 // Mock dependencies
@@ -26,12 +27,13 @@ vi.mock('@fuzdev/fuz_util/git.js', async (import_original) => {
 		git_current_branch_name: vi.fn(),
 		git_delete_local_branch: vi.fn(),
 		git_push_to_create: vi.fn(),
-		git_reset_branch_to_first_commit: vi.fn()
+		git_current_branch_first_commit_hash: vi.fn()
 	};
 });
 
 vi.mock('@fuzdev/fuz_util/process.js', () => ({
-	spawn: vi.fn()
+	spawn: vi.fn(),
+	spawn_out: vi.fn()
 }));
 
 vi.mock('node:fs/promises', () => ({
@@ -319,9 +321,7 @@ describe('deploy_task target branch sync (remote exists)', () => {
 
 	describe('reset flag handling', () => {
 		test('resets to first commit when reset=true', async () => {
-			const { git_reset_branch_to_first_commit } = vi.mocked(
-				await import('@fuzdev/fuz_util/git.ts')
-			);
+			const { spawn } = vi.mocked(await import('@fuzdev/fuz_util/process.ts'));
 			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
 
 			vi.mocked(fs_exists).mockResolvedValue(true);
@@ -334,13 +334,13 @@ describe('deploy_task target branch sync (remote exists)', () => {
 			await deploy_task.run(ctx);
 
 			// Should reset to first commit
-			expect(git_reset_branch_to_first_commit).toHaveBeenCalledWith('origin', 'deploy', {
+			expect(spawn).toHaveBeenCalledWith('git', ['reset', '--hard', FIRST_COMMIT_HASH], {
 				cwd: resolve('.gro/deploy')
 			});
 		});
 
 		test('skips reset when reset=false', async () => {
-			const { git_reset_branch_to_first_commit } = vi.mocked(
+			const { git_current_branch_first_commit_hash } = vi.mocked(
 				await import('@fuzdev/fuz_util/git.ts')
 			);
 			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
@@ -355,13 +355,12 @@ describe('deploy_task target branch sync (remote exists)', () => {
 			await deploy_task.run(ctx);
 
 			// Should NOT reset
-			expect(git_reset_branch_to_first_commit).not.toHaveBeenCalled();
+			expect(git_current_branch_first_commit_hash).not.toHaveBeenCalled();
 		});
 
 		test('reset happens after sync', async () => {
-			const { git_reset_branch_to_first_commit, git_pull } = vi.mocked(
-				await import('@fuzdev/fuz_util/git.ts')
-			);
+			const { git_pull } = vi.mocked(await import('@fuzdev/fuz_util/git.ts'));
+			const { spawn } = vi.mocked(await import('@fuzdev/fuz_util/process.ts'));
 			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
 
 			vi.mocked(fs_exists).mockResolvedValue(true);
@@ -375,7 +374,10 @@ describe('deploy_task target branch sync (remote exists)', () => {
 
 			// Reset should happen after pull
 			const pull_order = git_pull.mock.invocationCallOrder[0]!;
-			const reset_order = git_reset_branch_to_first_commit.mock.invocationCallOrder[0]!;
+			const reset_order =
+				spawn.mock.invocationCallOrder[
+					spawn.mock.calls.findIndex((call) => call[1]?.[2] === FIRST_COMMIT_HASH)
+				]!;
 
 			expect(reset_order).toBeGreaterThan(pull_order);
 		});
@@ -392,25 +394,6 @@ describe('deploy_task target branch sync (remote exists)', () => {
 			const ctx = create_mock_deploy_task_context({ dry: true });
 
 			await expect(deploy_task.run(ctx)).rejects.toThrow('Git command failed');
-		});
-
-		test('propagates error when reset --hard fails', async () => {
-			const { spawn } = vi.mocked(await import('@fuzdev/fuz_util/process.ts'));
-			const { fs_exists } = vi.mocked(await import('@fuzdev/fuz_util/fs.ts'));
-
-			vi.mocked(fs_exists).mockResolvedValue(true);
-
-			// Make reset fail
-			vi.mocked(spawn).mockImplementation(async (cmd, args) => {
-				if (cmd === 'git' && args?.[0] === 'reset') {
-					throw new Error('Reset failed');
-				}
-				return { code: 0 } as any;
-			});
-
-			const ctx = create_mock_deploy_task_context({ dry: true });
-
-			await expect(deploy_task.run(ctx)).rejects.toThrow('Reset failed');
 		});
 
 		test('propagates error when git_pull fails', async () => {

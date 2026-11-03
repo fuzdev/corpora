@@ -3,7 +3,8 @@ const MIN_SAMPLES_FOR_JITTER = 5;
 const RECENT_SAMPLE_COUNT = 10;
 const MAX_ACCEPTABLE_LAG_MS = 5;
 const MAX_MEMORY_PRESSURE = 0.9;
-const MAX_JITTER_RATIO = 2;
+// the coefficient of variation of a test's recent timings
+const MAX_JITTER_RATIO = 0.25;
 
 const COOLDOWN_TIMES: Record<string, number> = {
 	high_lag: 200,
@@ -44,11 +45,11 @@ export const check_system_stability = async (
 
 	return { is_stable, lag, memory_pressure, jitter };
 };
+// the same thresholds as `check_system_stability`, inverted
 export const get_instability_reason = (stability: StabilityCheck): string => {
-	if (stability.lag > MAX_ACCEPTABLE_LAG_MS) return 'high_lag';
-	if (stability.jitter > MAX_JITTER_RATIO) return 'high_jitter';
-	if (stability.memory_pressure && stability.memory_pressure > MAX_MEMORY_PRESSURE)
-		return 'memory_pressure';
+	if (stability.lag >= MAX_ACCEPTABLE_LAG_MS) return 'high_lag';
+	if (stability.jitter >= MAX_JITTER_RATIO) return 'high_jitter';
+	if (stability.memory_pressure >= MAX_MEMORY_PRESSURE) return 'memory_pressure';
 	return 'unknown';
 };
 export const extended_cooldown = async (reason: string): Promise<void> => {

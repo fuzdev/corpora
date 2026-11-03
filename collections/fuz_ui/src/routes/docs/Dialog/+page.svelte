@@ -2,19 +2,19 @@
 	import { slide } from 'svelte/transition';
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import Alert from '$lib/Alert.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import Dialog from '$lib/Dialog.svelte';
-	import DialogContent from '$lib/DialogContent.svelte';
-	import TomeLink from '$lib/TomeLink.svelte';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
-	import { dialog_aligns, type DialogAlign } from '$lib/dialog.ts';
-	import { icon_remove } from '$lib/icons.ts';
-	import Svg from '$lib/Svg.svelte';
+	import Alert from '#lib/Alert.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import Dialog from '#lib/Dialog.svelte';
+	import DialogContent from '#lib/DialogContent.svelte';
+	import TomeLink from '#lib/TomeLink.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
+	import { dialog_aligns, type DialogAlign } from '#lib/dialog.ts';
+	import { icon_remove } from '#lib/icons.ts';
+	import Svg from '#lib/Svg.svelte';
 
 	const TOME_SLUG = 'Dialog';
 
@@ -54,7 +54,7 @@
 		content={`<Dialog show={opened} onclose={() => (opened = false)}>
 	<DialogContent>
 		{#snippet close_button(attrs)}
-			<button {...attrs} class="xs plain">close</button>
+			<button {...attrs} class="sized_xs plain">close</button>
 		{/snippet}
 		<Code content="..." />
 	</DialogContent>
@@ -66,13 +66,11 @@
 	<section>
 		<p>
 			A <DeclarationLink name="Dialog" /> is a modal that overlays the entire page. It uses the
-			native
-			<MdnLink path="Web/HTML/Element/dialog" /> element, so opening it with
-			<MdnLink path="Web/API/HTMLDialogElement/showModal">showModal()</MdnLink>
-			puts children in the browser's top layer, escaping ancestor stacking (avoiding bugs and
-			caveats, like unwanted overflow containment and cascading styles, without using
-			<TomeLink slug="Teleport" />). The native element also traps focus, makes the rest of the page
-			inert, closes on
+			native <MdnLink path="Web/HTML/Element/dialog" /> element, so opening it with
+			<MdnLink path="Web/API/HTMLDialogElement/showModal">showModal()</MdnLink> puts children in the
+			browser's top layer, escaping ancestor stacking (avoiding bugs and caveats, like unwanted
+			overflow containment and cascading styles, without using <TomeLink slug="Teleport" />). The
+			native element also traps focus, makes the rest of the page inert, closes on
 			<kbd>Escape</kbd>, and restores focus to the previously focused element on close.
 		</p>
 	</section>
@@ -144,15 +142,12 @@
 		/>
 		<p>
 			<DeclarationLink name="DialogContent" /> adds a close button in the top-right corner, rendered
-			after the content so it doesn't take initial focus. Pass
-			<code>close_button={'{false}'}</code> to remove it, or a snippet to render your own. The
-			snippet receives <code>attrs</code> with type
-			<DeclarationLink name="DialogCloseButtonAttrs" /> with the default button's placement,
+			after the content so it doesn't take initial focus. Pass <code>close_button={'{false}'}</code>
+			to remove it, or a snippet to render your own. The snippet receives <code>attrs</code> with
+			type <DeclarationLink name="DialogCloseButtonAttrs" /> with the default button's placement,
 			styling, a11y, and the <code>onclick</code> that closes the dialog, plus the
-			<DeclarationLink name="DialogContext" />. Spread
-			<code>attrs</code>
-			to inherit the corner-anchored button and override only the glyph, or ignore it to place the
-			button freely:
+			<DeclarationLink name="DialogContext" />. Spread <code>attrs</code> to inherit the
+			corner-anchored button and override only the glyph, or ignore it to place the button freely:
 		</p>
 		<button type="button" class="mb_lg" onclick={() => (dialog_custom_close_opened = true)}>
 			open a dialog with a custom close button
@@ -208,8 +203,7 @@
 		<p>
 			To intercept closing, pass <code>onbeforeclose</code> and return <code>false</code> to keep
 			the dialog open, which is useful for confirming unsaved changes. Closing programmatically via
-			<code>show={'{false}'}</code>
-			bypasses it:
+			<code>show={'{false}'}</code> bypasses it:
 		</p>
 		<button
 			type="button"
@@ -259,7 +253,7 @@
 	<Dialog onclose={() => (dialog_custom_close_opened = false)}>
 		<DialogContent>
 			{#snippet close_button(attrs)}
-				<button {...attrs} class="xs plain">close</button>
+				<button {...attrs} class="sized_xs plain">close</button>
 			{/snippet}
 			<p class="mt_lg">
 				The close button in the top-right is custom: it spreads <code>attrs</code> to extend the
@@ -333,7 +327,8 @@
 						<button type="button" onclick={() => remove_item(item)}>
 							<Svg data={icon_remove} />
 						</button>
-						new stuff appears {#if selected_align === 'top'}
+						new stuff appears
+						{#if selected_align === 'top'}
 							gracefully
 						{:else if selected_align === 'center'}
 							ungracefully
@@ -392,8 +387,7 @@
 					via <kbd>Escape</kbd>, click-outside, or the buttons asks for confirmation first.
 				</p>
 				<label class="row gap_sm">
-					<input type="checkbox" bind:checked={dirty} />
-					unsaved changes
+					<input type="checkbox" bind:checked={dirty} /> unsaved changes
 				</label>
 				<button type="button" onclick={close}>close</button>
 			{/snippet}

@@ -28,7 +28,10 @@
 	const url = $derived(host + path);
 
 	onMount(() => {
-		if (auto) void goto(url, { replaceState: true }); // eslint-disable-line svelte/no-navigation-without-resolve
+		if (!auto) return;
+		// `goto` rejects URLs that aren't routes of this app, like static files, other apps,
+		// and other hosts, which navigate the browser itself
+		goto(url, { replace: true }).catch(() => location.replace(url));
 	});
 </script>
 

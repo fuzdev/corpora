@@ -3,10 +3,11 @@
 	 * Recipient-side pending offer inbox.
 	 *
 	 * Renders `RoleGrantOffersState.incoming` (pending, soonest-expiry first)
-	 * with accept + decline-with-reason controls. Grantor and scope rendering
-	 * are delegated via optional callback props — consumers plug in display
-	 * names once they know what a `from_actor_id` / `scope_id` represents
-	 * in their domain (usernames, classroom names, etc.).
+	 * with per-row accept + decline-with-reason controls, each row showing its
+	 * own pending state and error. Grantor and scope rendering are delegated
+	 * via optional callback props — consumers plug in display names once they
+	 * know what a `from_actor_id` / `scope_id` represents in their domain
+	 * (usernames, classroom names, etc.).
 	 */
 
 	import PendingButton from '@fuzdev/fuz_ui/PendingButton.svelte';
@@ -46,14 +47,10 @@
 </script>
 
 <section class="role-grant-offer-inbox">
-	<h2>pending offers</h2>
+	<h2>Pending Offers</h2>
 
-	{#if role_grant_offers.list.error || role_grant_offers.accept.error || role_grant_offers.decline.error}
-		<p class="color_c_50">
-			{role_grant_offers.list.error ??
-				role_grant_offers.accept.error ??
-				role_grant_offers.decline.error}
-		</p>
+	{#if role_grant_offers.list.error}
+		<p class="color_c_50">{role_grant_offers.list.error}</p>
 	{/if}
 
 	{#if role_grant_offers.incoming.length === 0}
@@ -61,9 +58,13 @@
 	{:else}
 		<ul class="column gap_md">
 			{#each role_grant_offers.incoming as offer (offer.id)}
+				{@const accepting = role_grant_offers.accept.loading(offer.id)}
+				{@const declining = role_grant_offers.decline.loading(offer.id)}
+				{@const row_error =
+					role_grant_offers.accept.error(offer.id) ?? role_grant_offers.decline.error(offer.id)}
 				<li class="box p_md column gap_sm">
-					<div class="row gap_sm align_center">
-						<span class="chip color_a">{format_role(offer.role)}</span>
+					<div class="row gap_sm">
+						<span class="chip palette_a">{format_role(offer.role)}</span>
 						<span class="text_50 font_size_sm">{scope_label(offer.scope_id, offer.role)}</span>
 						<span class="text_50 font_size_sm">from {format_actor(offer.from_actor_id)}</span>
 						<span
@@ -80,10 +81,10 @@
 
 					<div class="row gap_sm">
 						<PendingButton
-							pending={role_grant_offers.accept.loading}
-							disabled={role_grant_offers.accept.loading}
+							pending={accepting}
+							disabled={accepting || declining}
 							onclick={() => role_grant_offers.submit_accept(offer.id)}
-							class="color_b"
+							class="palette_b"
 						>
 							accept
 						</PendingButton>
@@ -91,6 +92,8 @@
 						<ConfirmButton
 							title="decline offer"
 							position="bottom"
+							pending={declining}
+							disabled={accepting || declining}
 							onconfirm={() => {
 								const reason = decline_reasons.get(offer.id) ?? '';
 								void role_grant_offers.submit_decline(offer.id, reason || null);
@@ -114,7 +117,11 @@
 										></textarea>
 									</label>
 									<div class="row gap_sm">
-										<button type="button" class="color_c bg_100" onclick={confirm}>
+										<button
+											type="button"
+											class="palette_c background-color:var(--paper_100)"
+											onclick={confirm}
+										>
 											confirm decline
 										</button>
 										<button type="button" onclick={() => popover.hide()}>cancel</button>
@@ -123,6 +130,10 @@
 							{/snippet}
 						</ConfirmButton>
 					</div>
+
+					{#if row_error}
+						<p class="color_c_50 mb_0">{row_error}</p>
+					{/if}
 				</li>
 			{/each}
 		</ul>

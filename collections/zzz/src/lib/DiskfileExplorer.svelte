@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { slide } from 'svelte/transition';
+	import { resolve } from '$app/paths';
 	import type { Snippet } from 'svelte';
 	import PendingAnimation from '@fuzdev/fuz_ui/PendingAnimation.svelte';
 	import PendingButton from '@fuzdev/fuz_ui/PendingButton.svelte';
@@ -10,12 +10,14 @@
 	import {
 		icon_create_directory,
 		icon_create_file,
-		icon_directory,
-		icon_sort
+		icon_sort,
+		icon_workspace
 	} from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import SortableList from './SortableList.svelte';
 	import { sort_by_text, sort_by_numeric } from './sortable.svelte.ts';
+	import { prompt_create_diskfile } from './diskfile_helpers.ts';
+	import { icon_microphone } from './media_icons.ts';
 
 	const {
 		empty
@@ -24,94 +26,96 @@
 	} = $props();
 
 	const app = frontend_context.get();
-	const { diskfiles } = app;
+	const { diskfiles, recorder } = app;
 	const { editor } = diskfiles;
 
 	const { zzz_dir } = $derived(app);
+	const { new_files_dir } = $derived(diskfiles);
 
 	// TODO need awaitable websocket calls?
 	const TODO_create_file_pending = false;
 	const TODO_create_folder_pending = false;
-
-	// TODO @many this is very hacky and duplicated, refactor into cell methods
-	// TODO @many improve UX to not use alert/prompt
-	const create_file = async () => {
-		if (!zzz_dir) {
-			alert('cannot create file: filesystem is not available'); // eslint-disable-line no-alert
-			return;
-		}
-
-		const filename = prompt('new file name:'); // eslint-disable-line no-alert
-		if (!filename) return;
-
-		try {
-			await diskfiles.create_file(filename);
-		} catch (error) {
-			console.error('failed to create file:', error);
-			alert(`failed to create file: ${error}`); // eslint-disable-line no-alert
-		}
-	};
-
-	const create_folder = async () => {
-		if (!zzz_dir) {
-			alert('cannot create folder: filesystem is not available'); // eslint-disable-line no-alert
-			return;
-		}
-
-		const dirname = prompt('New folder name:'); // eslint-disable-line no-alert
-		if (!dirname) return;
-
-		try {
-			await diskfiles.create_directory(dirname);
-		} catch (error) {
-			console.error('failed to create folder:', error);
-			alert(`failed to create folder: ${error}`); // eslint-disable-line no-alert
-		}
-	};
 </script>
 
 <div class="height:100% overflow:auto scrollbar-width:thin">
 	{#if zzz_dir === undefined}
 		<div>&nbsp;</div>
+	{:else if zzz_dir === null && app.session_status === 'failure'}
+		<div class="row height-input-height px_xs">
+			<small class="ellipsis" title={app.session_error}>session failed to load, retrying</small>
+		</div>
 	{:else if zzz_dir === null}
 		<div class="row height-input-height"><PendingAnimation /></div>
 	{:else}
 		<div class="row height-input-height justify-content:space-between px_xs">
-			<small class="ellipsis"><Svg data={icon_directory} /> {zzz_dir}</small>
+			{#if new_files_dir}
+				<small class="ellipsis" title="new files and folders go in the active workspace">
+					<Icon data={icon_workspace} />
+					{new_files_dir}
+				</small>
+			{:else}
+				<small class="ellipsis">
+					<a href={resolve('/workspaces')}>open a workspace</a> to create files
+				</small>
+			{/if}
 			<div class="display:flex gap_xs2">
 				<PendingButton
 					pending={TODO_create_file_pending}
-					class="plain sm"
-					title="create file in {zzz_dir}"
-					onclick={create_file}
+					class="plain sized_sm"
+					title={new_files_dir
+						? `create file in ${new_files_dir}`
+						: 'open a workspace to create files'}
+					disabled={!new_files_dir}
+					onclick={() => prompt_create_diskfile(diskfiles, 'file')}
 				>
-					<Svg data={icon_create_file} />
+					<Icon data={icon_create_file} />
+				</PendingButton>
+				<PendingButton
+					pending={recorder.status === 'starting'}
+					class="plain sized_sm"
+					title={!new_files_dir
+						? 'open a workspace to record'
+						: recorder.active
+							? 'a recording is under way'
+							: `record audio to a new file in ${new_files_dir}`}
+					disabled={!new_files_dir || recorder.active}
+					onclick={() => {
+						// in the click itself: the microphone opens only on a user gesture —
+						// a failure shows in the recorder indicator
+						if (new_files_dir) recorder.start(new_files_dir).catch(() => undefined);
+					}}
+				>
+					<Icon data={icon_microphone} />
 				</PendingButton>
 				<PendingButton
 					pending={TODO_create_folder_pending}
-					class="plain sm"
-					title="create folder in {zzz_dir}"
-					onclick={create_folder}
+					class="plain sized_sm"
+					title={new_files_dir
+						? `create folder in ${new_files_dir}`
+						: 'open a workspace to create folders'}
+					disabled={!new_files_dir}
+					onclick={() => prompt_create_diskfile(diskfiles, 'folder')}
 				>
-					<Svg data={icon_create_directory} />
+					<Icon data={icon_create_directory} />
 				</PendingButton>
-				{#if app.diskfiles.items.size > 1}
+				{#if diskfiles.listed.length > 1}
 					<button
 						type="button"
-						class="plain sm selectable deselectable"
+						class="plain sized_sm selectable deselectable"
 						class:selected={editor.show_sort_controls}
 						title="toggle sort controls"
 						onclick={() => editor.toggle_sort_controls()}
 					>
-						<Svg data={icon_sort} />
+						<Icon data={icon_sort} />
 					</button>
 				{/if}
 			</div>
 		</div>
 
-		<!-- TODO @many improve efficiency - maybe add `all` back to the base IndexedCollection, or add an incremental index for this case? -->
+		<!-- windowed: only the rows near the viewport render, so a workspace of thousands of files stays cheap -->
 		<SortableList
-			items={diskfiles.items.values}
+			items={diskfiles.listed}
+			windowed
 			show_sort_controls={editor.show_sort_controls}
 			sorters={[
 				// TODO @many rework API to avoid casting
@@ -129,30 +133,19 @@
 			<!-- TODO bug with `selected` -->
 			{#snippet children(diskfile)}
 				{@const selected = diskfiles.selected_file_id === diskfile.id}
-				<div class="diskfile-listitem-wrapper" class:selected transition:slide>
-					<DiskfileListitem
-						{diskfile}
-						{selected}
-						onselect={(diskfile, open_not_preview) => {
-							// TODO this needs to navigate to the path of the file (so should be a link, not this onselect callback)
-							diskfiles.select(diskfile.id, open_not_preview);
-						}}
-					/>
-				</div>
+				<DiskfileListitem
+					{diskfile}
+					{selected}
+					onselect={(diskfile, open_not_preview) => {
+						// TODO this needs to navigate to the path of the file (so should be a link, not this onselect callback)
+						diskfiles.select(diskfile.id, open_not_preview);
+					}}
+				/>
 			{/snippet}
 		</SortableList>
 
-		{#if empty && diskfiles.items.size === 0}
+		{#if empty && diskfiles.listed.length === 0}
 			{@render empty()}
 		{/if}
 	{/if}
 </div>
-
-<style>
-	.diskfile-listitem-wrapper {
-		position: sticky;
-		top: 0;
-		bottom: 0;
-		background-color: var(--shade_00);
-	}
-</style>

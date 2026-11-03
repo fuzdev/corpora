@@ -11,12 +11,15 @@ import { Diskfiles } from './diskfiles.svelte.ts';
 import { DiskfilesEditor } from './diskfiles_editor.svelte.ts';
 import { Model } from './model.svelte.ts';
 import { Models } from './models.svelte.ts';
+import { Job } from './job.svelte.ts';
+import { Jobs } from './jobs.svelte.ts';
 import { Action } from './action.svelte.ts';
 import { Actions } from './actions.svelte.ts';
 import { Prompt } from './prompt.svelte.ts';
 import { Prompts } from './prompts.svelte.ts';
 import { Provider } from './provider.svelte.ts';
 import { Providers } from './providers.svelte.ts';
+import { Recorder } from './recorder.svelte.ts';
 import { Turn } from './turn.svelte.ts';
 import { Thread } from './thread.svelte.ts';
 import { Threads } from './threads.svelte.ts';
@@ -25,11 +28,18 @@ import { Space } from './space.svelte.ts';
 import { Spaces } from './spaces.svelte.ts';
 import { Terminal } from './terminal.svelte.ts';
 import { TerminalPreset } from './terminal_preset.svelte.ts';
+import { TerminalPresets } from './terminal_presets.svelte.ts';
+import { Terminals } from './terminals.svelte.ts';
 import { Ui } from './ui.svelte.ts';
 import { Workspace } from './workspace.svelte.ts';
 import { Workspaces } from './workspaces.svelte.ts';
 import type { Cell } from './cell.svelte.ts';
 
+/**
+ * The registered cell classes, keyed by the name schemas refer to them by
+ * (their `cell_class_name` meta) — the registry's key, never `constructor.name`,
+ * which a minified build mangles.
+ */
 export const cell_classes = {
 	Parts,
 	Capabilities,
@@ -42,6 +52,8 @@ export const cell_classes = {
 	DiskfileHistory,
 	Diskfiles,
 	DiskfilesEditor,
+	Job,
+	Jobs,
 	Model,
 	Models,
 	Action,
@@ -50,10 +62,13 @@ export const cell_classes = {
 	Prompts,
 	Provider,
 	Providers,
+	Recorder,
 	Space,
 	Spaces,
 	Terminal,
 	TerminalPreset,
+	TerminalPresets,
+	Terminals,
 	Turn,
 	Thread,
 	Threads,
@@ -78,10 +93,4 @@ export type CellRegistryMap = {
 export const is_cell_type = <K extends CellClassNames>(
 	cell: Cell<any> | null | undefined,
 	class_name: K
-): cell is CellRegistryMap[K] => cell?.constructor.name === class_name;
-
-/**
- * Get a list of all registered cell class names.
- */
-export const get_cell_class_names = (): Array<CellClassNames> =>
-	Object.keys(cell_classes) as Array<CellClassNames>;
+): cell is CellRegistryMap[K] => cell instanceof cell_classes[class_name];

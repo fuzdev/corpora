@@ -38,20 +38,25 @@
 </script>
 
 <section>
-	<h1>role_grant history</h1>
+	<h1>Role-Grant History</h1>
 
 	{#if audit_log.role_grant_history.loading}
-		<p class="text_50">loading role_grant history...</p>
+		<p class="text_50">loading role-grant history...</p>
 	{:else if audit_log.role_grant_history.error}
 		<p class="color_c_50">{audit_log.role_grant_history.error}</p>
 	{:else}
-		<Datatable {columns} rows={audit_log.role_grant_history_events} height="400px" row_key="id">
+		<Datatable
+			{columns}
+			rows={audit_log.role_grant_history_events}
+			row_key={(row) => row.id}
+			height="400px"
+		>
 			{#snippet cell(column, row)}
 				{#if column.key === 'event_type'}
 					<span
 						class="chip"
-						class:color_b={row.event_type === 'role_grant_create'}
-						class:color_c={row.event_type === 'role_grant_revoke'}
+						class:palette_b={row.event_type === 'role_grant_create'}
+						class:palette_c={row.event_type === 'role_grant_revoke'}
 					>
 						{row.event_type === 'role_grant_create' ? 'grant' : 'revoke'}
 					</span>
@@ -74,14 +79,14 @@
 				{:else if column.key === 'username'}
 					<!-- Prefer actor-grain id in the truncated fallback; account is
 					     the second fallback for events with no actor binding. -->
-					<span class="text_50"
-						>{row.username ?? truncate_uuid(row.actor_id ?? row.account_id ?? '?')}</span
-					>
+					<span class="text_50">
+						{row.username ?? truncate_uuid(row.actor_id ?? row.account_id ?? '?')}
+					</span>
 				{:else if column.key === 'target_username'}
-					<span class="text_50"
-						>{row.target_username ??
-							truncate_uuid(row.target_actor_id ?? row.target_account_id ?? '?')}</span
-					>
+					<span class="text_50">
+						{row.target_username ??
+							truncate_uuid(row.target_actor_id ?? row.target_account_id ?? '?')}
+					</span>
 				{:else if column.key === 'created_at'}
 					<span title={format_datetime_local(row.created_at)}>
 						{format_relative_time(row.created_at)}

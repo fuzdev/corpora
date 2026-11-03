@@ -20,17 +20,18 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			svelte-docinfo outputs JSON describing your project's exported API. The data format is a
-			hierarchy: modules contain declarations, and some declarations contain members or props. You
-			may want to skip the explanation and jump down to the <a href="#Examples">examples</a>.
+			svelte-docinfo outputs JSON describing your project's exported API. Modules contain
+			declarations, and some declarations contain members or props. To see it in practice, jump to
+			the <a href="#Examples">examples</a>.
 		</p>
 
 		<TomeSection>
 			<TomeSectionHeader text="Top-level structure" />
 			<p>
-				Programmatic entry points (<DeclarationLink name="analyze" />,
-				<DeclarationLink name="analyzeFromFiles" />) return both
-				<code>modules</code> and accumulated <TomeLink slug="diagnostics" />:
+				Every surface returns the same envelope, <DeclarationLink name="AnalyzeResultJson" />: the
+				<TomeLink slug="js-api">JS API</TomeLink> (<code>analyze</code>,
+				<code>analyzeFromFiles</code>, a session's <code>query()</code>), the CLI's JSON, and the
+				Vite plugin's virtual module.
 			</p>
 			<Code
 				lang="ts"
@@ -40,12 +41,9 @@
 }`}
 			/>
 			<p>
-				All surfaces emit this shape. The CLI's stdout JSON and the Vite plugin's virtual module
-				both expose <code>modules</code> and <code>diagnostics</code> (matching
-				<DeclarationLink name="AnalyzeResultJson" />). The CLI runs output through
-				<DeclarationLink name="compactReplacer" /> so empty arrays strip on the wire (an empty-project
-				run emits <code>{`{}`}</code>); parse JSON consumers through
-				<DeclarationLink name="AnalyzeResultJson" /> to restore Zod defaults.
+				<code>diagnostics</code> is covered in <TomeLink slug="diagnostics" />. The CLI emits
+				<a href="#Compact-JSON">compact JSON</a>, so an empty project prints <code>{`{}`}</code>;
+				parse it with <DeclarationLink name="parseAnalyzeResult" /> to restore the defaults.
 			</p>
 		</TomeSection>
 
@@ -56,31 +54,46 @@
 			</p>
 			<ul>
 				<li>
-					<code>path</code>: file path relative to the source root (e.g., <code>"math.ts"</code>)
+					<code>path</code>: file path relative to the source root (e.g.,
+					<Code lang="ts" inline content={'"math.ts"'} />)
 				</li>
 				<li><code>declarations</code>: exported items from this module</li>
-				<li><code>moduleComment</code>: file-level JSDoc comment, if present</li>
+				<li>
+					<code>moduleComment</code>: the prose of the file-level <code>@module</code> comment, if
+					it has any
+				</li>
+				<li>
+					<code>examples</code>, <code>deprecatedMessage</code>, <code>seeAlso</code>,
+					<code>since</code>, <code>internalMessage</code>: that comment's tags, as on a declaration
+					(see <TomeLink slug="tags" hash="module">@module</TomeLink>)
+				</li>
 				<li><code>dependencies</code>: paths of modules this file imports</li>
 				<li><code>dependents</code>: paths of modules that import this file</li>
-				<li><code>starExports</code>: <code>export * from './module'</code> patterns</li>
 				<li>
-					<code>reExports</code>: same-name re-export edges (<code
-						>{`{name, module, typeOnly, sourceLine}`}</code
-					>) in this module's source — the forward view of <code>alsoExportedFrom</code> (see Re-exports
-					below)
+					<code>starExports</code>: <Code lang="ts" inline content="export * from './module'" />
+					targets
 				</li>
 				<li>
-					<code>externalReExports</code>: direct re-exports from packages (<code
-						>{`{name, specifier, originalName?, typeOnly, sourceLine}`}</code
-					>)
+					<code>reExports</code>: same-name re-export edges
+					(<code>{`{name, module, typeOnly, sourceLine}`}</code>), the forward view of
+					<code>alsoExportedFrom</code> (see <TomeLink slug="re-exports" />)
 				</li>
 				<li>
-					<code>externalStarExports</code>: <code>export * from 'pkg'</code> specifiers as written
+					<code>externalReExports</code>: direct re-exports from packages
+					(<code>{`{name, specifier, originalName?, typeOnly, sourceLine}`}</code>)
+				</li>
+				<li>
+					<code>externalStarExports</code>: <Code lang="ts" inline content="export * from 'pkg'" />
+					specifiers as written
+				</li>
+				<li>
+					<code>partial</code>: <code>true</code> when the module is a placeholder for a
+					<code>.svelte</code> file that svelte2tsx failed to transform (see
+					<code>transform_failed</code>)
 				</li>
 			</ul>
 			<p>
-				Array fields (<code>declarations</code>, <code>dependencies</code>, etc.) are omitted from
-				JSON when empty and default to <code>[]</code> at runtime after parsing.
+				Array fields are omitted from JSON when empty and default to <code>[]</code> after parsing.
 			</p>
 		</TomeSection>
 
@@ -88,123 +101,81 @@
 			<TomeSectionHeader text="DeclarationJson" />
 			<p>
 				Each declaration is a <DeclarationLink name="DeclarationJson" />, a discriminated union on
-				the
-				<code>kind</code> field with nine variants:
+				<code>kind</code> with nine variants:
 			</p>
 			<ul>
 				<li>
-					<code>"function"</code>: adds <code>parameters</code>, <code>returnType</code>,
-					<code>returnTypeInfo</code>, <code>returnDescription</code>, <code>overloads</code>
+					<Code lang="ts" inline content={'"function"'} />: adds <code>parameters</code>,
+					<code>returnType</code>, <code>returnTypeInfo</code>, <code>returnDescription</code>,
+					<code>overloads</code>
 				</li>
 				<li>
-					<code>"variable"</code>: adds optional <code>defaultValue</code> (from
-					<code>@default</code>), plus <code>reactivity</code> when the initializer is a Svelte rune
-					(<code>$state</code>, <code>$state.raw</code>, <code>$derived</code>,
-					<code>$derived.by</code>)
+					<Code lang="ts" inline content={'"variable"'} />: adds <code>typeInfo</code>, optional
+					<code>defaultValue</code> (from <code>@default</code>), and <code>reactivity</code> (see
+					<a href="#Reactivity">Reactivity</a>)
 				</li>
 				<li>
-					<code>"class"</code>: adds <code>members</code>, <code>extends</code>,
-					<code>implements</code>, <code>externalTypes</code>
+					<Code lang="ts" inline content={'"class"'} />: adds <code>members</code>,
+					<code>extends</code>, <code>implements</code>, <code>externalTypes</code>
 				</li>
 				<li>
-					<code>"interface"</code>: adds <code>members</code>, <code>extends</code>,
-					<code>externalTypes</code>, <code>mergedValue</code>
+					<Code lang="ts" inline content={'"interface"'} />: adds <code>members</code>,
+					<code>extends</code>, <code>externalTypes</code>, <code>mergedValue</code>
 				</li>
 				<li>
-					<code>"type"</code>: adds <code>members</code>, <code>externalTypes</code>,
-					<code>mergedValue</code>
-				</li>
-				<li><code>"enum"</code>: adds <code>members</code> (enum values)</li>
-				<li>
-					<code>"component"</code>: adds <code>props</code>, <code>externalTypes</code>,
-					<code>acceptsChildren</code>, <code>lang</code> (Svelte components)
+					<Code lang="ts" inline content={'"type"'} />: adds <code>typeInfo</code>,
+					<code>members</code>, <code>externalTypes</code>, <code>mergedValue</code>
 				</li>
 				<li>
-					<code>"snippet"</code>: adds <code>parameters</code> (exported Svelte template snippets)
+					<Code lang="ts" inline content={'"enum"'} />: adds <code>members</code> (enum values)
 				</li>
 				<li>
-					<code>"namespace"</code>: adds <code>module</code> (the source module path projected under
-					this binding); synthesized for <code>export * as ns from './x'</code>
+					<Code lang="ts" inline content={'"component"'} />: adds <code>props</code>,
+					<code>externalTypes</code>, <code>acceptsChildren</code>,
+					<code>cssCustomProperties</code>, <code>lang</code> (Svelte components).
+					<code>acceptsChildren</code> is set by a <code>Snippet</code>-typed <code>children</code>
+					prop, template use of <code>children</code>, or a legacy component's default
+					<Code lang="svelte" inline content={'<slot />'} />
+				</li>
+				<li>
+					<Code lang="ts" inline content={'"snippet"'} />: adds <code>parameters</code> (exported
+					Svelte template snippets)
+				</li>
+				<li>
+					<Code lang="ts" inline content={'"namespace"'} />: adds <code>module</code>, the path of
+					the module projected by <Code lang="ts" inline content="export * as ns from './x'" />
 				</li>
 			</ul>
 			<p>
-				A merged value+type export — one name declared in both spaces, like the schema pattern
-				<code>{`export const Foo = z.strictObject({...})`}</code> +
-				<code>{`export type Foo = z.infer<typeof Foo>`}</code> — produces one declaration: the type
-				meaning wins the slot and documents like its un-merged equivalent (structure,
-				<code>members</code>, <code>typeInfo</code>), and <code>mergedValue: true</code> marks that
-				the name is also importable as a runtime value —
-				<DeclarationLink name="generateImport" /> reads it to emit <code>import</code> instead of
-				<code>import type</code>. JSDoc falls back to the value declaration's comment when the type
-				declaration has none, and <code>@nodocs</code> on either declaration excludes the pair.
+				A name declared as both a value and a type, like the schema pattern
+				<Code lang="ts" inline content={'export const Foo = z.strictObject({...})'} /> +
+				<Code lang="ts" inline content={'export type Foo = z.infer<typeof Foo>'} />, produces one
+				declaration. The type meaning documents like its un-merged equivalent (structure,
+				<code>members</code>, <code>typeInfo</code>), and
+				<Code lang="ts" inline content="mergedValue: true" /> marks that the name is also a runtime
+				value, so <DeclarationLink name="generateImport" /> emits <code>import</code> instead of
+				<Code lang="ts" inline content="import type" />. JSDoc falls back to the value declaration's
+				comment when the type has none, and <code>@nodocs</code> on either declaration excludes the
+				pair. In JS, a <Code lang="ts" inline content="const Foo" /> with a same-named
+				<code>@typedef</code> merges the same way.
 			</p>
 			<p>Shared fields on all variants:</p>
 			<ul>
 				<li>
 					<code>name</code>, <code>kind</code>: identity. Default exports carry
-					<code>name === "default"</code> (see Re-exports below)
+					<Code lang="ts" inline content={'name === "default"'} />, except Svelte components, which
+					take their filename-derived name (see <TomeLink slug="re-exports" />)
 				</li>
 				<li><code>docComment</code>: JSDoc comment text</li>
 				<li>
-					<code>typeSignature</code>: full type as a string. Where TypeScript embeds a module
-					reference — <code>typeof import("…")</code>, from an <code>import()</code> expression or a
-					<code>typeof</code>
-					over a namespace import — the path is normalized so output never carries an absolute path: a
-					module in this output is named by its
-					<code>ModuleJson.path</code>, so the string doubles as a lookup key (<code
-						>modules.find((m) =&gt; m.path === s)</code
-					>; a miss means it isn't a module here). A package is named by its path below
-					<code>node_modules/</code>, and everything else is relative to the project root —
-					root-relative for an in-project file that emits no module,
-					<code>../sibling/x.ts</code> for one outside it. The same applies to
-					<code>returnType</code>, member type signatures, and the <code>text</code> of a
-					<code>typeInfo</code> node — in the tree a module object is a terminal
-					<code>{`{kind: "other"}`}</code> node carrying the same <code>typeof import("…")</code>
-					text, never a <code>reference</code> (its symbol name is the quoted specifier, not a type name).
-				</li>
-				<li>
-					<code>typeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree beside the flat string
-					— on variable and type-alias declarations (plus type-alias, interface, and class members, component
-					props, parameters, and return types via <code>returnTypeInfo</code>). Absent when the flat
-					string is the whole story; present when the tree carries structure the string can't:
-					union/intersection <code>members</code>
-					(alias name kept; enum members as <code>{`{value, text}`}</code> pairs with the qualified
-					name as <code>text</code>), reference <code>name</code> + <code>typeArgs</code>, array
-					<code>element</code>, tuple <code>elements</code> (label, <code>?</code>/<code>...</code>
-					markers, recursive type; arrays and tuples mark <code>readonly</code>). Object literals
-					and function types stay terminal
-					<code>text</code> — callability is the load-bearing renderer signal — with one narrow
-					exception: a named generic instantiation classifies as a <code>reference</code> even when
-					callable, so <code>Snippet&lt;[a: string]&gt;</code> is a reference whose tuple typeArg
-					carries real elements (an instantiation over the <em>empty</em> tuple —
-					<code>Snippet&lt;[]&gt;</code> — says nothing the string doesn't, so it stays absent). The
-					headline case: a union alias's <code>typeSignature</code>
-					prints as just its own name, and <code>typeInfo</code> carries the enumerable members —
-					which is also why type aliases relax the absence rule: their flat string is always just
-					the alias name, so the tree is emitted whatever its shape, except for object and function
-					roots that
-					<code>members</code> already covers. An alias TypeScript dropped (an indexed-access or
-					conditional right-hand side — <code>z.infer&lt;typeof S&gt;</code>, valibot's
-					<code>InferOutput</code> — loses its alias symbol, so the checker expands the structure
-					everywhere) is recovered as
-					<code>{`{kind: "reference", name}`}</code> instead of expanding, through two channels
-					consulted only at nameless positions. The written annotation where one exists: each bare
-					written type reference resolves by checker type identity. And the alias registry — the
-					analyzed set's exported lost aliases, keyed by type identity — which also covers
-					<em>unannotated</em> positions: inferred returns and variables, nested tree positions,
-					<code>null</code>-bearing optionals. A registry-recovered reference additionally carries
-					<code>module</code> — the declaring module's <code>ModuleJson.path</code>, always one the
-					output emits, so a <code>(module, name)</code> lookup can't dangle; written-channel
-					recoveries and checker-named references never carry it. Recovery applies at the root too,
-					where the flat string carries the anonymous expansion, not the name. Names the checker has
-					are never overridden; import renames recover the importable name; two aliases over one
-					lost type resolve to a single winner everywhere; and a loss the registry can't recover
-					surfaces as an <code>alias_lost</code> warning (see <TomeLink slug="diagnostics" />)
+					<code>typeSignature</code>: the full type as a string, rendered by the TypeScript checker
+					(see <TomeLink slug="structured-types" hash="Module-paths">module paths</TomeLink>)
 				</li>
 				<li><code>sourceLine</code>: line number in the source file</li>
 				<li>
-					<code>modifiers</code>: e.g., <code>"readonly"</code>, <code>"static"</code>,
-					<code>"getter"</code>
+					<code>modifiers</code>: e.g., <Code lang="ts" inline content={'"readonly"'} />,
+					<Code lang="ts" inline content={'"static"'} />,
+					<Code lang="ts" inline content={'"getter"'} />
 				</li>
 				<li><code>genericParams</code>: type parameters with constraints and defaults</li>
 				<li>
@@ -212,134 +183,81 @@
 					<code>throws</code>, <code>since</code>: from standard JSDoc tags
 				</li>
 				<li>
-					<code>internalMessage</code>: from <code>@internal</code> — a marker, not an exclusion (presence
-					means tagged, empty string for a bare tag, trailing prose kept). Declarations and members only,
-					not component props
+					<code>internalMessage</code>: from <code>@internal</code>, a marker rather than an
+					exclusion (empty string for a bare tag)
 				</li>
 				<li>
-					<code>mutates</code>: from the non-standard <code>@mutates</code> tag, stored as
-					<code>Record&lt;string, string&gt;</code> mapping target keys to descriptions. Keys are
-					typically parameter names but compound paths (<code>this.foo</code>) and external state
-					references are accepted as-is
+					<code>mutates</code>: from <code>@mutates</code>, a
+					<Code lang="ts" inline content={'Record<string, string>'} /> of target to description
+					(empty for a target with no description). See <TomeLink slug="tags" />
 				</li>
 				<li><code>alsoExportedFrom</code>: modules that re-export this declaration</li>
-				<li><code>aliasOf</code>: original name if this is a renamed re-export</li>
 				<li>
-					<code>partial</code>: <code>true</code> when extraction failed partway through the declaration,
-					indicating incomplete data
+					<code>aliasOf</code>: the canonical <code>{`{module, name}`}</code> of a renamed re-export
+				</li>
+				<li>
+					<code>partial</code>: <code>true</code> when extraction failed partway, so the data is
+					incomplete
 				</li>
 			</ul>
 			<p>
-				Declarations tagged with <code>@nodocs</code> are excluded from the output entirely and are also
-				excluded from duplicate name checking.
-			</p>
-		</TomeSection>
-
-		<TomeSection>
-			<TomeSectionHeader text="Re-exports" />
-			<p>Re-exports are encoded with two shapes, chosen by content:</p>
-			<ul>
-				<li>
-					<strong>Same-name</strong>: the canonical declaration carries an
-					<code>alsoExportedFrom</code> array listing the modules that re-export it. One
-					declaration, multiple import paths. The same edges publish from the re-exporting side as
-					<code>ModuleJson.reExports</code> (<code>{`{name, module, typeOnly, sourceLine}`}</code>,
-					with
-					<code>module</code> the canonical module, multi-hop resolved), so barrels are
-					self-describing without inverting every <code>alsoExportedFrom</code> array.
-				</li>
-				<li>
-					<strong>Renamed</strong>: a synthesized declaration appears in the re-exporting module
-					with <code>aliasOf: {`{module, name}`}</code> pointing at the canonical. Inherits
-					<code>typeSignature</code>, <code>docComment</code>, <code>parameters</code>,
-					<code>reactivity</code>, and <code>defaultValue</code> from the canonical;
-					<code>sourceLine</code> is the local export specifier's line.
-				</li>
-				<li>
-					<strong>Star exports</strong>: <code>export * from './x'</code> patterns are tracked
-					separately on <code>ModuleJson.starExports</code> and don't synthesize per-declaration entries.
-				</li>
-				<li>
-					<strong>External re-exports</strong>: statements directly referencing a package (<code
-						>{`export {x} from 'pkg'`}</code
-					>, <code>export * as ns from 'pkg'</code>,
-					<code>export * from 'pkg'</code>) land on <code>externalReExports</code> /
-					<code>externalStarExports</code> — flat statement facts with the specifier as written, no canonical
-					to resolve.
-				</li>
-			</ul>
-			<p>
-				When a re-export statement carries its own JSDoc or <code>@nodocs</code>, an alias is
-				<em>also</em> synthesized in the re-exporting module so the local content has somewhere to
-				live, even when the name is unchanged. The trigger is "presence of local content," not
-				"presence of rename." Local doc-comment fields apply first and stick; canonical fields only
-				fill gaps. <code>@nodocs</code> on a re-export suppresses both the link and the synthesis.
+				Declarations tagged <code>@nodocs</code> are excluded from the output and from the opt-in
+				duplicate-name check.
 			</p>
 			<p>
-				To compute a module's complete export surface from these encodings, use
-				<code>resolveExportSurface(modules, path)</code> — it combines declarations, re-export
-				edges, externals, and transitively-resolved star exports with ES semantics (explicit exports
-				shadow star-projected names, names ambiguous between stars are excluded,
-				<code>default</code> never projects), and reports unresolved or external star targets whose names
-				it can't know.
+				Props and members a package contributes (like <code>HTMLButtonAttributes</code> extended by
+				a component's props) are left out, and the package type is named in
+				<code>externalTypes</code>, unless the <code>$props()</code> destructuring names them.
 			</p>
 			<p>
-				<strong>Default-slot entries</strong> carry <code>name === "default"</code> (see the
-				shared-fields note above for why). Renames out of the default slot (<code
-					>{`export {default as Foo} from './x'`}</code
-				>) carry <code>name: "Foo"</code> and
-				<code>aliasOf: {`{module, name: "default"}`}</code>. Duplicate-name checks skip
-				<code>"default"</code> since the default slot is module-scoped per the JS spec.
-			</p>
-			<p>
-				<strong>Namespace re-exports</strong> (<code>export * as ns from './x'</code>) synthesize a
-				<code>NamespaceDeclarationJson</code> with <code>module</code> pointing at the source the
-				namespace projects. Consumers render <code>ns.a</code> / <code>ns.b</code> by reading the
-				source module's <code>declarations</code>; namespaces don't inline members.
+				<code>typeInfo</code>, a structured <DeclarationLink name="TypeJson" /> tree beside the flat
+				type string, appears on variables, type aliases, variable members, component props,
+				parameters, and tuple elements; functions, function members, overloads, and callback props
+				carry <code>returnTypeInfo</code>. See <TomeLink slug="structured-types" />.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="MemberJson" />
 			<p>
-				Classes, interfaces, types, and enums can contain <DeclarationLink name="MemberJson" /> entries
-				in their <code>members</code> arrays. <code>MemberJson</code> is a discriminated union on
-				<code>kind</code> with three variants:
+				Classes, interfaces, types, and enums list <DeclarationLink name="MemberJson" /> entries in
+				<code>members</code>, a discriminated union on <code>kind</code> with three variants:
 			</p>
 			<ul>
 				<li>
-					<code>"function"</code>: methods and call signatures. Adds <code>parameters</code>,
-					<code>returnType</code>, <code>returnTypeInfo</code>, <code>returnDescription</code>,
-					<code>overloads</code>, and optional <code>defaultValue</code> (from
-					<code>@default</code> — the documented behavior when a callable option is omitted;
-					top-level function declarations never carry one). External-origin call signatures are
-					never enumerated: a property typed by an external function (<code>run?: typeof spawn</code
-					>) documents as <code>"variable"</code> with the flat type text instead of pulling the package's
-					overload set and docs into output; a mixed callable keeps its local signatures
+					<Code lang="ts" inline content={'"function"'} />: methods and call signatures. Adds
+					<code>parameters</code>, <code>returnType</code>, <code>returnTypeInfo</code>,
+					<code>returnDescription</code>, <code>overloads</code>, and optional
+					<code>defaultValue</code> (from <code>@default</code>, documenting the behavior when a
+					callable option is omitted). A property typed by an external function
+					(<Code lang="ts" inline content="run?: typeof spawn" />) is a
+					<Code lang="ts" inline content={'"variable"'} /> with the flat type text rather than the
+					package's overloads and docs; a mixed callable keeps its local signatures
 				</li>
 				<li>
-					<code>"constructor"</code>: class constructors and construct signatures. Adds
-					<code>parameters</code>, <code>overloads</code>
+					<Code lang="ts" inline content={'"constructor"'} />: class constructors and construct
+					signatures. Adds <code>parameters</code>, <code>overloads</code>
 				</li>
 				<li>
-					<code>"variable"</code>: properties, accessors, and index signatures. Adds optional
-					<code>defaultValue</code> (from <code>@default</code>), plus <code>reactivity</code> for
-					class fields initialized with a Svelte rune, plus <code>typeInfo</code> beside the
-					checker-rendered <code>typeSignature</code> — member types are checker-backed everywhere, interface
-					properties, class properties, and setter-only accessors included
+					<Code lang="ts" inline content={'"variable"'} />: properties, accessors, index signatures,
+					and enum values. Adds optional <code>defaultValue</code> (from <code>@default</code>),
+					<code>typeInfo</code>, and <code>reactivity</code> for class fields initialized with a
+					Svelte rune
 				</li>
 			</ul>
 			<p>
-				Member <code>kind</code> is restricted to these three variants. Nesting is exactly one level deep:
-				members never contain their own members.
+				Function and variable members also carry <code>optional</code> when the property or method
+				is optional (<code>?</code>, or a mapped modifier such as <code>Partial</code>).
 			</p>
+			<p>Nesting is exactly one level deep: members never contain members.</p>
 			<p>
-				Member <code>name</code> is the user-chosen identifier in most cases, but synthesized names
-				appear when no source identifier exists: <code>"constructor"</code> (class constructor),
-				<code>"(construct)"</code> (construct signature on an interface or type alias),
-				<code>"(call)"</code> (call signature on an interface or type alias), and bracketed
-				index-signature names like <code>"[key: string]"</code> (the parameter name and key type as
-				written for interfaces; a synthesized <code>key</code> for type aliases).
+				Member <code>name</code> is the source identifier, or a synthesized name where none exists:
+				<Code lang="ts" inline content={'"constructor"'} /> (class constructor),
+				<Code lang="ts" inline content={'"(construct)"'} /> and
+				<Code lang="ts" inline content={'"(call)"'} /> (construct and call signatures on an
+				interface or type alias), and index-signature names like
+				<Code lang="ts" inline content={'"[key: string]"'} /> (the parameter name as written for
+				interfaces; a synthesized <code>key</code> for type aliases).
 			</p>
 		</TomeSection>
 
@@ -347,201 +265,220 @@
 			<TomeSectionHeader text="ComponentPropJson" />
 			<p>
 				Component declarations have a <code>props</code> array of
-				<DeclarationLink name="ComponentPropJson" /> entries, in source order:
+				<DeclarationLink name="ComponentPropJson" /> entries, in source order, followed by any props
+				an external type declares that the <code>$props()</code> destructuring names, in
+				destructuring order (a legacy <Code lang="ts" inline content="export let" /> component
+				orders by its exports). Each entry has:
 			</p>
 			<ul>
 				<li><code>name</code>, <code>type</code>: prop name and TypeScript type</li>
 				<li>
-					<code>typeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree when the type carries
-					structure the flat string can't (see the declaration shared fields above)
+					<code>typeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree, when it adds
+					structure
 				</li>
 				<li><code>optional</code>: whether the prop is optional</li>
 				<li><code>description</code>: from JSDoc on the prop</li>
-				<li><code>defaultValue</code>: default value as a string, if present</li>
 				<li>
-					<code>bindable</code>: set when the prop is declared with the
-					<code>$bindable()</code> rune, so <code>&lt;Foo bind:value /&gt;</code> is supported.
-					Modeled here (not via the variable-level <code>reactivity</code> field) because
-					<code>$props</code>/<code>$bindable</code> are component-prop concerns
+					<code>defaultValue</code>: the default's source text, else the <code>@default</code> tag
+					text
+				</li>
+				<li>
+					<code>bindable</code>: set when the prop is declared with <code>$bindable()</code>, so
+					<Code lang="svelte" inline content={'<Foo bind:value />'} /> works. Every prop of a legacy
+					<Code lang="ts" inline content="export let" /> component is bindable
 				</li>
 				<li>
 					<code>parameters</code>: structured parameters for snippet-typed props (e.g.,
-					<code>Snippet&lt;[text: string]&gt;</code>), absent for non-snippet props
+					<Code lang="ts" inline content={'Snippet<[text: string]>'} />) and callback props; absent
+					when there are none
+				</li>
+				<li>
+					<code>returnType</code> and <code>returnTypeInfo</code>: a callback prop's return type
+					(<Code lang="ts" inline content={'onpick?: (value: string) => void'} />, or a project
+					alias for one). Its presence is what marks a prop as a callback, including one with no
+					parameters; snippets never carry it. Only call signatures your project declares count, so
+					a prop typed wholly by a package
+					(<Code lang="ts" inline content={'MouseEventHandler<HTMLButtonElement>'} />, a
+					<code>Component</code>) has neither field
 				</li>
 				<li>
 					<code>examples</code>, <code>deprecatedMessage</code>, <code>seeAlso</code>,
-					<code>throws</code>, <code>since</code>: symbol-scope JSDoc tags parsed from the prop's
-					own doc comment (same shape as the declaration shared fields)
+					<code>throws</code>, <code>since</code>, <code>internalMessage</code>,
+					<code>mutates</code>: from the prop's own doc comment. On a prop, <code>mutates</code>
+					declares what the component writes into the object or array it's handed
 				</li>
 			</ul>
+		</TomeSection>
+
+		<TomeSection>
+			<TomeSectionHeader text="ComponentCssPropertyJson" />
 			<p>
-				<strong>Asymmetry with <DeclarationLink name="ParameterJson" />.</strong> Props carry the
-				symbol-scope tag fields above; function parameters deliberately don't. A prop is a named
-				slot with its own documentation surface. A parameter is positional, and its
-				<code>@example</code>/<code>@deprecated</code>/<code>@since</code>/<code>@see</code>/<code
-					>@throws</code
-				>
-				belong on the enclosing function symbol per the TSDoc spec. Per-parameter content lives on
-				<code>ParameterJson.description</code> (and <code>propertyDescriptions</code> for
-				object-property docs) from <code>@param</code> only.
+				A component's <code>cssCustomProperties</code> lists its styling API as
+				<DeclarationLink name="ComponentCssPropertyJson" /> entries, documented ones first (see
+				<TomeLink slug="component-styling" />):
 			</p>
+			<ul>
+				<li><code>name</code>: the property as written, <code>--</code> included</li>
+				<li><code>description</code>: from a <code>@cssprop</code> tag</li>
+				<li>
+					<code>syntax</code>: a tag's braced syntax, else an <code>@property</code> rule's
+					<code>syntax</code> descriptor
+				</li>
+				<li>
+					<code>fallback</code>: what the style gives the property when unset, as source text: an
+					<code>@property</code> rule's <code>initial-value</code>, else the first read's fallback
+					(<Code lang="css" inline content="var(--a, var(--b))" /> gives
+					<Code lang="css" inline content="var(--b)" />)
+				</li>
+				<li>
+					<code>default</code>: a <code>@cssprop</code> tag's bracketed default, the author's claim
+					beside <code>fallback</code>; a renderer wanting one value takes
+					<code>default ?? fallback</code>
+				</li>
+				<li>
+					<code>sourceLine</code>: the first read's line, or the tag's for a property never read
+				</li>
+				<li><code>documented</code>: whether a <code>@cssprop</code> tag documents it</li>
+			</ul>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="ParameterJson" />
 			<p>
-				Functions, snippets, constructors, and snippet-typed component props use
-				<DeclarationLink name="ParameterJson" /> entries in their <code>parameters</code> arrays:
+				Functions, methods, constructors, overloads, snippets, and snippet or callback props list
+				<DeclarationLink name="ParameterJson" /> entries in <code>parameters</code>:
 			</p>
 			<ul>
 				<li>
-					<code>name</code>: parameter name (e.g., <code>"options"</code>, <code>"args"</code> — a
-					rest parameter's dots live in <code>rest</code>, never in the name)
+					<code>name</code>: parameter name (e.g., <Code lang="ts" inline content={'"options"'} />;
+					a rest parameter's dots live in <code>rest</code>, not the name)
 				</li>
 				<li><code>type</code>: resolved TypeScript type as a string</li>
 				<li>
-					<code>typeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree when the type carries
-					structure the flat string can't (see the declaration shared fields above)
+					<code>typeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree, when it adds
+					structure
 				</li>
-				<li><code>optional</code>: whether the parameter has a <code>?</code> token</li>
-				<li><code>rest</code>: whether the parameter uses rest syntax (<code>...args</code>)</li>
-				<li><code>description</code>: from <code>@param</code> JSDoc</li>
-				<li><code>defaultValue</code>: default value expression from the source, if present</li>
 				<li>
-					<code>propertyDescriptions</code>: for named object parameters, a record of sub-path →
-					description from dotted <code>@param obj.prop</code> tags, if present (destructured
-					params, named <code>__0</code> by TypeScript, are not covered)
+					<code>optional</code>: whether a caller may omit the argument (a <code>?</code>, a
+					default, or in JS a bracketed <code>@param {'{T}'} [b]</code>)
+				</li>
+				<li><code>rest</code>: whether the parameter uses rest syntax (<code>...args</code>)</li>
+				<li><code>description</code>: from <code>@param</code></li>
+				<li>
+					<code>defaultValue</code>: default value expression from the source, if present, else from
+					a bracketed <code>@param {'{T}'} [b=0]</code>
+				</li>
+				<li>
+					<code>propertyDescriptions</code>: sub-path to description, from dotted
+					<code>@param obj.prop</code> tags on a named object parameter (destructured parameters
+					aren't covered)
 				</li>
 			</ul>
+			<p>
+				<DeclarationLink name="ParameterJson" /> deliberately lacks the tag fields
+				<code>ComponentPropJson</code> has: a prop is a named slot with its own documentation, while
+				a parameter's <code>@example</code>, <code>@deprecated</code>, and similar tags belong on
+				the enclosing function per the TSDoc spec. Parameters get their docs from
+				<code>@param</code> only.
+			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="OverloadJson" />
 			<p>
-				Functions and constructors with multiple signatures use
-				<DeclarationLink name="OverloadJson" /> entries in their <code>overloads</code> arrays. Each overload
-				captures only signature-scope content, the fields that can vary meaningfully per signature:
+				Functions and constructors with multiple signatures list
+				<DeclarationLink name="OverloadJson" /> entries in <code>overloads</code>. Each carries only
+				the fields that vary per signature:
 			</p>
 			<ul>
 				<li><code>typeSignature</code>: the full overload signature as a string</li>
 				<li>
-					<code>parameters</code>: parameter list for this overload, with per-overload
-					<code>@param</code> descriptions
+					<code>parameters</code>: this overload's parameters, with its own <code>@param</code>
+					descriptions
 				</li>
 				<li><code>returnType</code>: return type for this overload (functions only)</li>
 				<li>
-					<code>returnTypeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree for this overload's
-					return type, when it carries structure the string can't
+					<code>returnTypeInfo</code>: structured <DeclarationLink name="TypeJson" /> tree for the
+					return type, when it adds structure
 				</li>
 				<li><code>genericParams</code>: type parameters for this overload</li>
 				<li><code>docComment</code>: per-overload JSDoc text, if present</li>
 				<li><code>returnDescription</code>: from <code>@returns</code> on this overload</li>
 			</ul>
 			<p>
-				Symbol-scope JSDoc tags (<code>@example</code>, <code>@deprecated</code>,
-				<code>@since</code>, <code>@see</code>, <code>@throws</code>, <code>@mutates</code>)
-				describe the function as a whole and live on the parent declaration only, not duplicated per
-				overload. The primary overload's JSDoc feeds the parent's symbol-level extraction; placing
-				one of those tags on a non-primary overload signature emits a
-				<code>misplaced_tag</code>
-				warning and the tag is dropped (no synthetic content, no silent loss). Typo'd or stale
-				<code>@param</code> keys produce <code>unknown_param</code> warnings the same way.
+				Symbol-scope tags (<code>@example</code>, <code>@deprecated</code>, and the rest) live on
+				the parent declaration only, read from the primary overload. On a non-primary overload they
+				emit <code>misplaced_tag</code> and are dropped. See
+				<TomeLink slug="tags" hash="Symbol-scope-vs-signature-scope">
+					Symbol-scope vs signature-scope
+				</TomeLink>.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="Reactivity" />
 			<p>
-				The <code>reactivity</code> field appears on <DeclarationLink
-					name="VariableDeclarationJson"
-				/>
-				and <DeclarationLink name="VariableMemberJson" /> when the initializer is a value-producing Svelte
-				rune call: <code>$state</code>, <code>$state.raw</code>, <code>$derived</code>, or
-				<code>$derived.by</code>. Detection is purely syntactic and runs on every analyzed file
-				regardless of extension, capturing the same patterns in a plain <code>.ts</code> file as in
-				<code>.svelte.ts</code> or a component's <code>&lt;script&gt;</code>.
+				<code>reactivity</code> appears on <DeclarationLink name="VariableDeclarationJson" /> and
+				<DeclarationLink name="VariableMemberJson" /> when the initializer is a value-producing
+				Svelte rune call: <code>$state</code>, <code>$state.raw</code>, <code>$derived</code>, or
+				<code>$derived.by</code>. Detection is syntactic and runs on every file, so a plain
+				<code>.ts</code> file is treated the same as <code>.svelte.ts</code> or a component script.
 			</p>
 			<p>
-				It covers variables (top-level and class fields). Function parameters and destructured
-				bindings are not annotated even when the value flows from a rune. <code>$props</code> and
-				<code>$bindable</code> are component-prop concerns and surface on
-				<DeclarationLink name="ComponentPropJson" />'s <code>bindable</code> field instead.
+				Only variables and class fields are annotated, not parameters or destructured bindings.
+				<code>$props</code> and <code>$bindable</code> surface on
+				<DeclarationLink name="ComponentPropJson" /> instead.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="GenericParamJson" />
 			<p>
-				Declarations and members with type parameters use
-				<DeclarationLink name="GenericParamJson" /> entries in their
-				<code>genericParams</code> arrays:
+				Declarations and members with type parameters list
+				<DeclarationLink name="GenericParamJson" /> entries in <code>genericParams</code>:
 			</p>
 			<ul>
-				<li><code>name</code>: type parameter name (e.g., <code>"T"</code>)</li>
+				<li>
+					<code>name</code>: type parameter name (e.g., <Code lang="ts" inline content={'"T"'} />)
+				</li>
 				<li><code>constraint</code>: <code>extends</code> constraint, if present</li>
 				<li><code>defaultType</code>: default type, if present</li>
 			</ul>
 		</TomeSection>
 
 		<TomeSection>
-			<TomeSectionHeader text="Rendering structured types" />
+			<TomeSectionHeader text="Compact JSON" />
 			<p>
-				Flat type signatures are opaque strings produced by the TypeScript compiler. Where a
-				<code>typeInfo</code>/<code>returnTypeInfo</code> tree exists beside one, flatten it with
-				<DeclarationLink name="typeJsonToTokens" /> to render per-node — linking
-				<code>name</code> tokens to in-project declarations, syntax-highlighting
-				<code>code</code> tokens, printing <code>text</code> punctuation as-is:
-			</p>
-			<Code
-				lang="ts"
-				content={`import {typeJsonToTokens} from 'svelte-docinfo';
-
-typeJsonToTokens(declaration.typeInfo);
-// e.g. [{kind: 'name', name: 'Map'}, {kind: 'text', text: '<'},
-//       {kind: 'code', text: 'string'}, {kind: 'text', text: ', '},
-//       {kind: 'name', name: 'Tome'}, {kind: 'text', text: '>'}]`}
-			/>
-			<p>
-				Spacing, separators, parenthesization, and tuple labels are decided by the tokenizer in
-				lockstep with the <DeclarationLink name="TypeJson" /> projection rules; what a token looks like
-				— link, colored span, plain text — stays the renderer's decision.
-			</p>
-		</TomeSection>
-
-		<TomeSection>
-			<TomeSectionHeader text="Compact JSON and absent-as-false" />
-			<p>
-				By default, output uses compact JSON via <DeclarationLink name="compactReplacer" />: empty
-				arrays, <code>false</code> booleans, and <code>undefined</code> fields are stripped, so
+				Output uses compact JSON via <DeclarationLink name="compactReplacer" />: empty arrays,
+				<code>false</code> booleans, and <code>undefined</code> fields are stripped, so
 				<code>optional</code>, <code>acceptsChildren</code>, <code>partial</code>,
-				<code>rest</code>,
-				<code>bindable</code>, and similar fields vanish from the wire form when their value is the
-				default. After parsing with the Zod schemas from
-				<ModuleLink module_path="types.ts">types.ts</ModuleLink> (or
-				<DeclarationLink name="AnalyzeResultJson" /> for the full
-				<code>{`{modules, diagnostics}`}</code> envelope), all defaults are restored, and the round-trip
-				is lossless.
+				<code>rest</code>, <code>bindable</code>, and similar fields vanish at their default. The
+				<code>value</code> key is exempt, so a
+				<Code lang="ts" inline content={'{kind: "literal", value: false}'} /> type node survives.
+				Parsing with <DeclarationLink name="parseAnalyzeResult" /> (or
+				<DeclarationLink name="parseModuleJson" /> for one module) restores every default and
+				validates the shape, so the round-trip is lossless. The helpers are the stable entry point;
+				the <ModuleLink module_path="types.ts">valibot schemas</ModuleLink> behind them are exported
+				too.
 			</p>
 			<p>
-				Raw-JSON consumers (e.g., <code>jq</code>, hand-rolled pipelines that skip
-				<code>.parse()</code>) must treat <em>absent</em> as <em>false</em>; a literal
-				<code>decl.optional === false</code> check silently fails because the key is gone. Use the
-				schemas, or truthy/falsy checks (<code>if (decl.optional) …</code>) on raw JSON.
+				Raw-JSON consumers (<code>jq</code>, pipelines that skip parsing) must treat <em>absent</em>
+				as <em>false</em>: <Code lang="ts" inline content="decl.optional === false" /> fails because
+				the key is gone. Parse first, or use truthiness checks like
+				<Code lang="ts" inline content="if (decl.optional)" />.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="Examples" />
-			<p>
-				The JSON output for these examples is the compact wire form described above, so empty
-				arrays, <code>false</code> booleans, and absent optional fields are stripped.
-			</p>
+			<p>These show the compact wire form, so empty and default fields are stripped.</p>
 			<p>A TypeScript function in <code>math.ts</code>:</p>
 			<Code
 				lang="ts"
 				content={`/** Clamp a number to a range. */
-export const clamp = (value: number, min: number, max: number): number =>
-	Math.min(Math.max(value, min), max);`}
+export function clamp(value: number, min: number, max: number): number {
+	return Math.min(Math.max(value, min), max);
+}`}
 			/>
 			<Code
 				lang="json"
@@ -569,7 +506,8 @@ export const clamp = (value: number, min: number, max: number): number =>
 }`}
 			/>
 			<p>
-				A Svelte component <code>Card.svelte</code> with a snippet prop, children, and an exported snippet:
+				A Svelte component <code>Card.svelte</code> with a snippet prop, children, an exported
+				snippet, and a styling hook:
 			</p>
 			<Code
 				lang="svelte"
@@ -602,7 +540,13 @@ export const clamp = (value: number, min: number, max: number): number =>
 
 {#snippet card_footer(text: string)}
 	<small>{text}</small>
-{/snippet}`}
+{/snippet}
+
+<style>
+	.card {
+		background: var(--card_bg, white);
+	}
+</style>`}
 			/>
 			<Code
 				lang="json"
@@ -621,8 +565,6 @@ export const clamp = (value: number, min: number, max: number): number =>
             {
               "name": "header",
               "type": "Snippet<[title: string]>",
-              "optional": true,
-              "description": "Custom header rendering.",
               "typeInfo": {
                 "kind": "reference",
                 "name": "Snippet",
@@ -635,13 +577,18 @@ export const clamp = (value: number, min: number, max: number): number =>
                   }
                 ]
               },
+              "optional": true,
+              "description": "Custom header rendering.",
               "parameters": [
                 {"name": "title", "type": "string"}
               ]
             },
             {"name": "children", "type": "Snippet<[]>", "optional": true}
           ],
-          "acceptsChildren": true
+          "acceptsChildren": true,
+          "cssCustomProperties": [
+            {"name": "--card_bg", "fallback": "white", "sourceLine": 33}
+          ]
         },
         {
           "name": "card_footer",
@@ -691,12 +638,12 @@ export const doubled = $derived(count * 2);`}
 }`}
 			/>
 			<p>
-				A barrel <code>index.ts</code> that re-exports <code>clamp</code> from the
-				<code>math.ts</code> above under a new name and star-exports <code>other.ts</code>. The
-				rename synthesizes a declaration with <code>aliasOf</code> that inherits the canonical's
-				signature and docs, the star export lands on <code>starExports</code>, and the dependency
-				graph fields connect the modules. (A same-name re-export would instead add the barrel to the
-				canonical's <code>alsoExportedFrom</code>.)
+				A barrel <code>index.ts</code> that re-exports <code>clamp</code> from <code>math.ts</code>
+				under a new name and star-exports <code>other.ts</code>. The rename synthesizes a
+				declaration with <code>aliasOf</code> that inherits the canonical's signature and docs, the
+				star export lands on <code>starExports</code>, and the dependency fields connect the
+				modules. A same-name re-export would instead add the barrel to the canonical's
+				<code>alsoExportedFrom</code>.
 			</p>
 			<Code
 				lang="ts"
@@ -762,7 +709,7 @@ export const TAU = Math.PI * 2;`}
 }`}
 			/>
 			<p>
-				See the <ModuleLink module_path="types.ts">types module</ModuleLink> for the full Zod schemas,
+				See the <ModuleLink module_path="types.ts">types module</ModuleLink> for the full schemas,
 				and the <TomeLink slug="api">API reference</TomeLink> for all exported types.
 			</p>
 		</TomeSection>

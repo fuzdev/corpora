@@ -11,7 +11,7 @@ import {
 } from './lexer.ts';
 
 /**
- * Hand-written JSON lexer (accepts JSONC — line and block comments).
+ * JSON lexer (accepts JSONC — line and block comments).
  *
  * Emits: `property` (a string key), `string`, `comment`, `number`,
  * `punctuation`, `operator` (`:`), `boolean`, and `null` (aliased to
@@ -119,10 +119,10 @@ const lex_json = (l: Lexer): void => {
 		}
 		if (is_ident_start(c)) {
 			const ident_end = scan_ident(text, i, end);
-			const word = text.slice(i, ident_end);
-			if (word === 'true' || word === 'false') {
+			const len = ident_end - i;
+			if ((len === 4 && text.startsWith('true', i)) || (len === 5 && text.startsWith('false', i))) {
 				l.leaf(T_BOOLEAN, i, ident_end);
-			} else if (word === 'null') {
+			} else if (len === 4 && text.startsWith('null', i)) {
 				l.leaf(T_NULL, i, ident_end);
 			}
 			i = ident_end;

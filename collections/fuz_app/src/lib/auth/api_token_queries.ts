@@ -8,10 +8,28 @@ import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import { assert_row } from '../db/assert_row.ts';
-import { columns_sql, omit_columns } from '../db/sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, omit_columns } from '../db/sql_columns.ts';
 import type { ApiToken } from './account_schema.ts';
 import { hash_api_token } from './api_token.ts';
+import { EXPIRES_IN_MS_SQL } from './credential_deadline.ts';
 import { type TokenScope, parse_stored_token_scope, serialize_token_scope } from './token_scope.ts';
+
+/**
+ * A live `api_token` row as `query_validate_api_token` returns it: the stored
+ * `scope` document already parsed, so a caller holds the narrowing the
+ * credential was minted with and never decides what an unreadable one means.
+ * The Rust twin's `ApiTokenRow` carries the parsed scope the same way.
+ */
+export type ValidatedApiToken = Omit<ApiToken, 'scope'> & {
+	scope: TokenScope;
+	/**
+	 * Milliseconds until the token expires — `expires_at - NOW()`, measured on
+	 * the database clock in the statement that found it live
+	 * (`EXPIRES_IN_MS_SQL`); `null` for an eternal token. The Rust twin's
+	 * `ApiTokenRow.expires_in`.
+	 */
+	expires_in_ms: number | null;
+};
 
 /** Extended deps for `query_validate_api_token` which needs a logger. */
 export interface ApiTokenQueryDeps extends QueryDeps {
@@ -43,6 +61,26 @@ export const API_TOKEN_COLUMNS = [
  */
 const API_TOKEN_CLIENT_COLUMNS = omit_columns(API_TOKEN_COLUMNS, 'token_hash');
 
+/** The `api_token` timestamp override; every read here is on the bare table. */
+const api_token_expr = iso8601_timestamp_expr(API_TOKEN_COLUMNS, [
+	'expires_at',
+	'last_used_at',
+	'created_at'
+])('');
+
+/**
+ * The `WHERE` fragment that makes an `api_token` row **live**: not expired (an
+ * eternal token has no expiry).
+ *
+ * One definition for every query that decides whether a token authenticates —
+ * the resolve path's `query_validate_api_token` and the re-check's
+ * `query_api_token_live_account` — so a condition added to one is added to
+ * both, and the re-check can never admit a token resolution would refuse. A
+ * new liveness condition (a `revoked_at`, a `disabled` flag) goes here. The
+ * twin of the Rust spine's `API_TOKEN_IS_LIVE`.
+ */
+const API_TOKEN_IS_LIVE = '(expires_at IS NULL OR expires_at > NOW())';
+
 /**
  * Store a new API token (the hash, not the raw token).
  *
@@ -51,6 +89,7 @@ const API_TOKEN_CLIENT_COLUMNS = omit_columns(API_TOKEN_COLUMNS, 'token_hash');
  * @param account_id - the owning account
  * @param name - human-readable name
  * @param token_hash - blake3 hash of the raw token
+ * @param scope - the token's authority narrowing, stored as `jsonb`
  * @param expires_at - optional expiration
  * @returns the stored token record
  * @mutates `api_token` table - inserts the new row keyed by `id`
@@ -67,7 +106,7 @@ export const query_create_api_token = async (
 	const row = await deps.db.query_one<ApiToken>(
 		`INSERT INTO api_token (id, account_id, name, token_hash, scope, expires_at)
 		 VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-		 RETURNING ${columns_sql(API_TOKEN_COLUMNS)}`,
+		 RETURNING ${columns_sql(API_TOKEN_COLUMNS, api_token_expr)}`,
 		[
 			id,
 			account_id,
@@ -81,17 +120,19 @@ export const query_create_api_token = async (
 };
 
 /**
- * Validate a raw API token and return the token record.
+ * Validate a raw API token and return the token record with its scope parsed.
  *
  * Hashes the token with blake3, looks up the hash, and checks
- * expiration. Updates `last_used_at` and `last_used_ip` on success
+ * expiration, reading how long the token has left on the database clock in
+ * the same statement. A row whose stored scope is unreadable is refused like an
+ * unknown hash. Updates `last_used_at` and `last_used_ip` on success
  * (fire-and-forget — errors logged, never thrown).
  *
  * @param deps - query dependencies with logger
  * @param raw_token - the raw API token from the Authorization header
  * @param ip - the client IP address (for audit)
  * @param pending_effects - optional array to register the usage-tracking effect for later awaiting
- * @returns the token record if valid, or `undefined`
+ * @returns the token record with its parsed scope if valid, or `undefined`
  * @mutates `api_token` row - fire-and-forget UPDATE of `last_used_at` / `last_used_ip` on a valid token
  * @mutates `pending_effects` - pushes the in-flight tracking promise when provided
  */
@@ -100,12 +141,13 @@ export const query_validate_api_token = async (
 	raw_token: string,
 	ip: string | undefined,
 	pending_effects: Array<Promise<void>> | undefined
-): Promise<ApiToken | undefined> => {
+): Promise<ValidatedApiToken | undefined> => {
 	const token_hash = hash_api_token(raw_token);
-	const row = await deps.db.query_one<ApiToken>(
-		`SELECT ${columns_sql(API_TOKEN_COLUMNS)} FROM api_token
+	const row = await deps.db.query_one<ApiToken & { expires_in_ms: number | null }>(
+		`SELECT ${columns_sql(API_TOKEN_COLUMNS, api_token_expr)}, ${EXPIRES_IN_MS_SQL} AS expires_in_ms
+		 FROM api_token
 		 WHERE token_hash = $1
-		   AND (expires_at IS NULL OR expires_at > NOW())`,
+		   AND ${API_TOKEN_IS_LIVE}`,
 		[token_hash]
 	);
 	if (!row) return undefined;
@@ -114,7 +156,8 @@ export const query_validate_api_token = async (
 	// outcome as an unknown token hash. The scope *is* the gate here, so a parse
 	// failure must not fall through to full authority — that would hand a
 	// narrowed token everything precisely when something is already wrong.
-	if (parse_stored_token_scope(row.scope) === null) {
+	const scope = parse_stored_token_scope(row.scope);
+	if (scope === null) {
 		deps.log.warn(`api_token.scope is unreadable for ${row.id}; refusing the credential`);
 		return undefined;
 	}
@@ -131,7 +174,33 @@ export const query_validate_api_token = async (
 		});
 	pending_effects?.push(p);
 
-	return row;
+	return { ...row, scope };
+};
+
+/**
+ * Look up the owning account of a live API token — one that still exists and
+ * has not expired — by its public id.
+ *
+ * The by-id counterpart of `query_validate_api_token`, for re-checking a token
+ * that already authenticated (`revalidate_resolved_auth`): no hash, no scope
+ * decode, and no touch of `last_used_at` / `last_used_ip` — a re-check is not
+ * a use. "Live" is the same predicate in both (`API_TOKEN_IS_LIVE`). The scope
+ * document is not re-read: the resolved credential carries the scope it was
+ * admitted with, and nothing rewrites the column after the mint.
+ *
+ * @param deps - query dependencies
+ * @param id - the public token id (e.g. `tok_abc123`)
+ * @returns the owning account id, or `undefined` when the token is gone or expired
+ */
+export const query_api_token_live_account = async (
+	deps: QueryDeps,
+	id: string
+): Promise<string | undefined> => {
+	const row = await deps.db.query_one<{ account_id: string }>(
+		`SELECT account_id FROM api_token WHERE id = $1 AND ${API_TOKEN_IS_LIVE}`,
+		[id]
+	);
+	return row?.account_id;
 };
 
 /**
@@ -185,8 +254,8 @@ export const query_api_token_list_for_account = async (
 	account_id: string
 ): Promise<Array<Omit<ApiToken, 'token_hash'>>> => {
 	return deps.db.query<Omit<ApiToken, 'token_hash'>>(
-		`SELECT ${columns_sql(API_TOKEN_CLIENT_COLUMNS)}
-		 FROM api_token WHERE account_id = $1 ORDER BY created_at DESC`,
+		`SELECT ${columns_sql(API_TOKEN_CLIENT_COLUMNS, api_token_expr)}
+		 FROM api_token WHERE account_id = $1 ORDER BY api_token.created_at DESC`,
 		[account_id]
 	);
 };
@@ -209,17 +278,22 @@ export const query_api_token_list_for_account = async (
  * caveat, as `query_session_enforce_limit` — deterministic survivors under a
  * `created_at` tie, not a guarantee that the row just inserted survives.
  *
+ * Deleting a token row does not end the connections it opened, so the
+ * returned ids are what the caller closes once the transaction commits
+ * (`queue_connection_close` with a `token` target) — `account_token_create`
+ * does.
+ *
  * @param deps - query dependencies (must be transaction-scoped)
  * @param account_id - the account to enforce the limit for
  * @param max_tokens - maximum number of tokens to keep
- * @returns the number of tokens evicted
+ * @returns the evicted tokens' ids, empty when nothing was evicted
  * @mutates `api_token` table - deletes the oldest rows past the cap
  */
 export const query_api_token_enforce_limit = async (
 	deps: QueryDeps,
 	account_id: string,
 	max_tokens: number
-): Promise<number> => {
+): Promise<Array<string>> => {
 	const rows = await deps.db.query<{ id: string }>(
 		`DELETE FROM api_token
 		 WHERE id IN (
@@ -230,5 +304,5 @@ export const query_api_token_enforce_limit = async (
 		 ) RETURNING id`,
 		[account_id, max_tokens]
 	);
-	return rows.length;
+	return rows.map((row) => row.id);
 };

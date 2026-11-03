@@ -28,6 +28,9 @@ const VALUE_SEPARATOR = ':';
 /** Strict integer matcher for the embedded `expires_at` field. */
 const EXPIRES_AT_INTEGER_RE = /^\d+$/;
 
+/** The largest `expires_at` the Rust spine's `u64` parse accepts. */
+const EXPIRES_AT_MAX = 18446744073709551615n;
+
 /**
  * Cookie options for session cookies.
  */
@@ -69,12 +72,15 @@ export const session_cookie_options: SessionCookieOptions = {
  *   requiring no server-side session state. Simpler, but individual sessions
  *   can only be invalidated by rotating the signing key (which invalidates all sessions).
  *
+ * The cookie helpers here take either. The spine's session middleware and
+ * auth chain take `SessionOptions<string>` — the identity is the session token
+ * the session leg hashes to find its `auth_session` row (`create_session_config`).
+ *
  * @example
  * ```ts
  * // zap: 3-part format (admin:session_id)
  * const zap_config: SessionOptions<string> = {
  *   cookie_name: 'zap_session',
- *   context_key: 'auth_session_id',
  *   encode_identity: (session_id) => `admin:${session_id}`,
  *   decode_identity: (payload) => {
  *     const parts = payload.split(':');
@@ -86,7 +92,6 @@ export const session_cookie_options: SessionCookieOptions = {
  * // visiones: 1-part format (account_id)
  * const visiones_config: SessionOptions<number> = {
  *   cookie_name: 'session_id',
- *   context_key: 'auth_session_id',
  *   encode_identity: (id) => String(id),
  *   decode_identity: (payload) => {
  *     const n = parseInt(payload, 10);
@@ -97,8 +102,6 @@ export const session_cookie_options: SessionCookieOptions = {
  */
 export interface SessionOptions<TIdentity> {
 	cookie_name: string;
-	/** Hono context variable name for the identity. */
-	context_key: string;
 	/**
 	 * Cookie lifetime in seconds. Single source of truth for both the embedded
 	 * `expires_at` (via `create_session_cookie_value`) and the cookie's HTTP
@@ -122,6 +125,8 @@ export interface ParsedSession<TIdentity> {
 	identity: TIdentity;
 	/** Index of the key that verified the signature (0 = primary). */
 	key_index: number;
+	/** The signed expiry, in seconds since the Unix epoch — later than the parse. */
+	expires_at: number;
 }
 
 /**
@@ -161,8 +166,9 @@ export const parse_session = async <TIdentity>(
 	// `' 123'` as `123`. HMAC integrity makes such a tampered value
 	// theoretical, but stricter parsing closes the gap as defense-in-depth.
 	if (!EXPIRES_AT_INTEGER_RE.test(expires_at_str)) return null;
+	// refuse what the Rust spine's `u64` parse refuses, leading zeros allowed
+	if (BigInt(expires_at_str) > EXPIRES_AT_MAX) return null;
 	const expires_at = parseInt(expires_at_str, 10);
-	if (!Number.isFinite(expires_at)) return null;
 
 	// Check expiration
 	const now = now_seconds ?? Math.floor(Date.now() / 1000);
@@ -170,7 +176,8 @@ export const parse_session = async <TIdentity>(
 
 	return {
 		identity,
-		key_index: result.key_index
+		key_index: result.key_index,
+		expires_at
 	};
 };
 
@@ -209,6 +216,8 @@ export interface ProcessSessionResult<TIdentity> {
 	action: 'none' | 'clear';
 	/** The decoded identity if the cookie was valid. */
 	identity?: TIdentity;
+	/** The cookie's signed expiry, epoch seconds, if the cookie was valid. */
+	expires_at?: number;
 }
 
 /**
@@ -223,7 +232,6 @@ export interface ProcessSessionResult<TIdentity> {
  */
 export const create_session_config = (cookie_name: string): SessionOptions<string> => ({
 	cookie_name,
-	context_key: 'auth_session_id',
 	encode_identity: (session_id) => session_id,
 	decode_identity: (payload) => payload || null
 });
@@ -270,5 +278,5 @@ export const process_session_cookie = async <TIdentity>(
 		return { valid: false, action: 'clear' };
 	}
 
-	return { valid: true, action: 'none', identity: parsed.identity };
+	return { valid: true, action: 'none', identity: parsed.identity, expires_at: parsed.expires_at };
 };

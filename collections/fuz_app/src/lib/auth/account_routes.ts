@@ -33,7 +33,6 @@ import {
 	type PasswordChangeInput
 } from './account_route_schema.ts';
 import {
-	hash_session_token,
 	query_session_revoke_all_for_account,
 	query_session_revoke_by_hash_unscoped
 } from './session_queries.ts';
@@ -45,16 +44,28 @@ import { query_revoke_all_api_tokens_for_account } from './api_token_queries.ts'
 import {
 	build_account_context,
 	build_request_context,
+	get_public_account_id,
 	get_request_context,
 	require_request_context,
 	resolve_acting_actor
 } from './request_context.ts';
-import { ACCOUNT_ID_KEY, CREDENTIAL_TYPE_KEY } from '../hono_context.ts';
+import { get_resolved_auth, resolved_auth_session_hash } from './resolved_auth.ts';
 import { get_route_input, type RouteSpec } from '../http/route_spec.ts';
 import { get_client_ip } from '../http/client_ip.ts';
-import { rate_limit_exceeded_response, type RateLimiter } from '../rate_limiter.ts';
+import { rate_limit_ip_key } from '../http/ip_canonical.ts';
+import { parse_acting } from '../http/auth_shape.ts';
+import {
+	rate_limit_exceeded_response,
+	reserve_optional,
+	type RateLimiter,
+	type RateLimitReservation
+} from '../rate_limiter.ts';
 import type { RouteFactoryDeps } from './deps.ts';
-import type { ConnectionCloser } from '../actions/connection_closer.ts';
+import { start_fail_floor, warn_if_fail_floor_disabled } from './fail_floor.ts';
+import {
+	close_connections_after_commit,
+	queue_connection_close
+} from '../actions/connection_closer.ts';
 import { ERROR_AUTHENTICATION_REQUIRED, ERROR_INVALID_CREDENTIALS } from '../http/error_schemas.ts';
 
 /**
@@ -63,6 +74,14 @@ import { ERROR_AUTHENTICATION_REQUIRED, ERROR_INVALID_CREDENTIALS } from '../htt
  * Handles both authenticated and unauthenticated requests:
  * - Authenticated: returns `{account}` with 200
  * - Unauthenticated: returns 401 with optional `bootstrap_available` flag
+ *
+ * A scope-narrowed API token is answered as the unauthenticated caller, byte
+ * for byte. A narrowed token reaches no non-RPC surface
+ * (`token_scope_admits_non_rpc`), and this one hands out the account's email,
+ * its verification state, and the acting actor's role grants; the route
+ * already answers anonymous callers, so that answer is the refusal — a 403
+ * would tell the holder nothing that dropping the header doesn't. The handler
+ * reads the credential through `get_public_account_id`, which applies it.
  *
  * This eliminates the need for a separate `/health` fetch on page load —
  * the frontend gets both session state and bootstrap availability in one request.
@@ -74,7 +93,8 @@ export const create_account_status_route_spec = (options?: AccountStatusOptions)
 	...account_status_route_shape,
 	path: options?.path ?? account_status_route_shape.path,
 	handler: async (c, route) => {
-		const account_id: string | null = c.get(ACCOUNT_ID_KEY) ?? null;
+		// a narrowed token is the anonymous caller here, never a refusal
+		const account_id = get_public_account_id(c);
 		if (!account_id) {
 			return c.json(
 				{
@@ -108,10 +128,16 @@ export const create_account_status_route_spec = (options?: AccountStatusOptions)
 		// Resolve actor + role_grants when the caller is unambiguous (single-actor
 		// account, or supplied `?acting=<uuid>`). On multi-actor accounts
 		// without `acting`, fall back to account-only so the frontend can
-		// surface a persona picker.
-		const acting = c.req.query('acting') ?? undefined;
-		const acting_result = await resolve_acting_actor(route, account_id, acting);
-		if (acting_result.ok) {
+		// surface a persona picker. The selector goes through the `ActingActor`
+		// schema, lowercased; a malformed value is a missing persona —
+		// account-only, never a default-actor resolve (as on the Rust spine).
+		const acting_raw = c.req.query('acting');
+		const acting = parse_acting(acting_raw);
+		const acting_result =
+			acting_raw !== undefined && acting === undefined
+				? null
+				: await resolve_acting_actor(route, account_id, acting);
+		if (acting_result?.ok) {
 			const ctx = await build_request_context(route, account_id, acting_result.actor_id);
 			if (ctx) {
 				const role_grants: Array<RoleGrantSummaryJson> = ctx.role_grants.map((p) => ({
@@ -177,12 +203,6 @@ export const DEFAULT_LOGIN_FAIL_FLOOR_MS = 250;
  */
 export const DEFAULT_LOGIN_FAIL_JITTER_MS = 25;
 
-const login_fail_delay = (floor_ms: number, jitter_ms: number): Promise<void> => {
-	if (floor_ms <= 0) return Promise.resolve();
-	const jitter = jitter_ms > 0 ? Math.floor(Math.random() * (jitter_ms * 2 + 1)) - jitter_ms : 0;
-	return new Promise((resolve) => setTimeout(resolve, floor_ms + jitter));
-};
-
 /**
  * Shared options for route factories that create sessions.
  *
@@ -219,7 +239,8 @@ export interface AccountRouteOptions extends AuthSessionRouteOptions {
 	max_sessions?: number | null;
 	/**
 	 * Minimum wall-clock time (ms) for login 401 responses. Set to `0` or a
-	 * negative number to disable (e.g., in tests). Default
+	 * negative number to disable (e.g., in tests) — announced once on stderr
+	 * (`LOGIN_FAIL_FLOOR_DISABLED_BANNER`). Default
 	 * `DEFAULT_LOGIN_FAIL_FLOOR_MS`.
 	 */
 	login_fail_floor_ms?: number;
@@ -228,15 +249,6 @@ export interface AccountRouteOptions extends AuthSessionRouteOptions {
 	 * jitter while keeping the floor. Default `DEFAULT_LOGIN_FAIL_JITTER_MS`.
 	 */
 	login_fail_jitter_ms?: number;
-	/**
-	 * Live-connection closer — when set, the `logout` and `password` handlers
-	 * eagerly close affected WebSocket sockets for the account BEFORE
-	 * emitting the corresponding audit event. Mirrors the self-service
-	 * action surface (see `AccountActionOptions.connection_closer`). When
-	 * absent, only the listener-based close (`transports_ws_auth_guard`
-	 * registered via `audit.add_listener`) runs.
-	 */
-	connection_closer?: ConnectionCloser | null;
 	/**
 	 * Runtime bootstrap status for the bundled `GET /status` route — when
 	 * `available`, its unauthenticated 401 carries `bootstrap_available: true`
@@ -260,7 +272,16 @@ export interface AccountRouteOptions extends AuthSessionRouteOptions {
  * every account surface serves it, matching the Rust `account_router`.
  * Self-service session/token management is on `auth/account_actions.ts`.
  *
- * @param deps - stateless capabilities (keyring, password, log)
+ * `/login` closes the connections of the sessions its cap evicts, and
+ * `/logout` and `/password` close the account's, each once its revocation has
+ * committed: `/logout` through the route transaction's post-commit queue
+ * (`queue_connection_close`), `/login` and `/password` — which open their own
+ * transaction around just their writes — straight after it commits
+ * (`close_connections_after_commit`, which logs a failing close rather than
+ * failing the committed request), so a later throw can't drop a close a
+ * committed revocation owes. All on `deps.connection_closer`.
+ *
+ * @param deps - stateless capabilities (keyring, password, log, audit, connection_closer)
  * @param options - per-factory configuration (session_options, login_ip_rate_limiter, login_account_rate_limiter, bootstrap_status)
  * @returns route specs (not yet applied to Hono)
  */
@@ -268,7 +289,7 @@ export const create_account_route_specs = (
 	deps: RouteFactoryDeps,
 	options: AccountRouteOptions
 ): Array<RouteSpec> => {
-	const { keyring, password } = deps;
+	const { keyring, password, connection_closer } = deps;
 	const {
 		session_options,
 		login_ip_rate_limiter,
@@ -276,9 +297,9 @@ export const create_account_route_specs = (
 		max_sessions = DEFAULT_MAX_SESSIONS,
 		login_fail_floor_ms = DEFAULT_LOGIN_FAIL_FLOOR_MS,
 		login_fail_jitter_ms = DEFAULT_LOGIN_FAIL_JITTER_MS,
-		connection_closer = null,
 		bootstrap_status
 	} = options;
+	warn_if_fail_floor_disabled('login', login_fail_floor_ms, deps.log);
 
 	const [verify_shape, login_shape, logout_shape, password_shape] = create_account_route_shapes({
 		login_account_rate_limited: login_account_rate_limiter !== null
@@ -300,125 +321,166 @@ export const create_account_route_specs = (
 		{
 			...login_shape,
 			handler: async (c, route) => {
-				// Per-IP rate limit check (before any DB/password work)
-				const ip = login_ip_rate_limiter ? get_client_ip(c) : null;
-				if (login_ip_rate_limiter && ip) {
-					const check = login_ip_rate_limiter.check(ip);
-					if (!check.allowed) {
-						return rate_limit_exceeded_response(c, check.retry_after);
+				// Per-IP rate limit (before any DB/password work). Reserved, not
+				// checked: the attempt counts against the cap from here until it
+				// settles, so a concurrent burst can't all pass before any of it
+				// records. A key at its cap only because of attempts in flight
+				// waits briefly for a slot (`RESERVATION_WAIT_MAX_MS`) rather than
+				// refusing a burst of correct logins outright. Order: IP, then the
+				// lookup, then the account (its key is the looked-up id). A wait on
+				// the account bucket keeps the IP slot: it belongs to the same
+				// address, the wait is bounded, and giving it up would let that
+				// address exceed its cap meanwhile. The `finally` releases whatever
+				// no branch recorded.
+				// keyed by the address's rate-limit key (an IPv6 client's /64)
+				const ip_key = login_ip_rate_limiter ? rate_limit_ip_key(get_client_ip(c)) : null;
+				const ip_reserved = await reserve_optional(login_ip_rate_limiter, ip_key, {
+					signal: c.req.raw.signal
+				});
+				if (!ip_reserved.ok) {
+					return rate_limit_exceeded_response(c, ip_reserved.retry_after);
+				}
+				let account_reservation: RateLimitReservation | null = null;
+				try {
+					// `UsernameProvided` canonicalizes via `.trim().toLowerCase()` at
+					// parse time — the validated value lands canonical in
+					// `c.var.validated_input`, so the per-account rate-limit key,
+					// DB lookup, and audit metadata see one form. See
+					// `primitive_schemas.ts` for the schema-layer canonicalization.
+					const { username, password: pw } = get_route_input<LoginInput>(c);
+
+					// DB lookup first so we can key the per-account rate limit by a canonical value
+					// (account.id) rather than the submitted identifier. Otherwise an attacker could
+					// alternate between username and email to double the per-account bucket.
+					const account = await query_account_by_username_or_email(route, username);
+					const account_rate_key = account ? account.id : username;
+
+					// Per-account rate limit (after DB lookup so the key is canonical)
+					const account_reserved = await reserve_optional(
+						login_account_rate_limiter,
+						account_rate_key,
+						{ signal: c.req.raw.signal }
+					);
+					if (!account_reserved.ok) {
+						return rate_limit_exceeded_response(c, account_reserved.retry_after);
 					}
-				}
+					account_reservation = account_reserved.reservation;
 
-				// `UsernameProvided` canonicalizes via `.trim().toLowerCase()` at
-				// parse time — the validated value lands canonical in
-				// `c.var.validated_input`, so the per-account rate-limit key,
-				// DB lookup, and audit metadata see one form. See
-				// `primitive_schemas.ts` for the schema-layer canonicalization.
-				const { username, password: pw } = get_route_input<LoginInput>(c);
+					// Start the minimum-delay timer concurrently with failure work.
+					// Observed response time is max(work, delay) so all 401 paths
+					// (found-wrong-pw, not-found) return in similar time.
+					const delay = start_fail_floor(login_fail_floor_ms, login_fail_jitter_ms);
 
-				// DB lookup first so we can key the per-account rate limit by a canonical value
-				// (account.id) rather than the submitted identifier. Otherwise an attacker could
-				// alternate between username and email to double the per-account bucket.
-				const account = await query_account_by_username_or_email(route, username);
-				const account_rate_key = account ? account.id : username;
-
-				// Per-account rate limit check (after DB lookup so the key is canonical)
-				if (login_account_rate_limiter) {
-					const check = login_account_rate_limiter.check(account_rate_key);
-					if (!check.allowed) {
-						return rate_limit_exceeded_response(c, check.retry_after);
+					if (!account) {
+						// enumeration prevention: verify_dummy equalizes Argon2id timing;
+						// the fail floor equalizes every other path difference.
+						await password.verify_dummy(pw);
+						ip_reserved.reservation.record();
+						account_reservation?.record();
+						await deps.audit.emit(route, {
+							event_type: 'login',
+							outcome: 'failure',
+							ip: get_client_ip(c),
+							metadata: { username }
+						});
+						await delay;
+						return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
 					}
-				}
 
-				// Start the minimum-delay timer concurrently with failure work.
-				// Observed response time is max(work, delay) so all 401 paths
-				// (found-wrong-pw, not-found) return in similar time.
-				const delay = login_fail_delay(login_fail_floor_ms, login_fail_jitter_ms);
+					const valid = await password.verify_password(pw, account.password_hash);
+					if (!valid) {
+						ip_reserved.reservation.record();
+						account_reservation?.record();
+						await deps.audit.emit(route, {
+							event_type: 'login',
+							outcome: 'failure',
+							account_id: account.id,
+							ip: get_client_ip(c),
+							metadata: { username }
+						});
+						await delay;
+						return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
+					}
 
-				if (!account) {
-					// enumeration prevention: verify_dummy equalizes Argon2id timing;
-					// login_fail_delay equalizes every other path difference.
-					await password.verify_dummy(pw);
-					if (login_ip_rate_limiter && ip) login_ip_rate_limiter.record(ip);
-					if (login_account_rate_limiter) login_account_rate_limiter.record(account_rate_key);
-					deps.audit.emit(route, {
+					// Successful login — clear the account-grain failure history only.
+					// The IP aggregate is deliberately left standing: it is the
+					// distributed-spray backstop, so a success on one account must not
+					// refund the budget shared by every other account reachable from
+					// that address. See `RateLimiter.reset`. A success records nothing:
+					// both reservations are released.
+					ip_reserved.reservation.release();
+					account_reservation?.release();
+					if (login_account_rate_limiter) login_account_rate_limiter.reset(account_rate_key);
+
+					// The session INSERT and the cap eviction are the route's only
+					// writes, and only atomic together: one transaction around just
+					// them (the route is `transaction: false`, so the reservation
+					// waits above and the Argon2 verify held no connection). Twin of
+					// the Rust login's transaction around `create_capped_session`.
+					const evicted = await route.db.transaction((tx) =>
+						create_session_and_set_cookie({
+							keyring,
+							deps: { db: tx },
+							c,
+							account_id: account.id,
+							session_options,
+							max_sessions
+						})
+					);
+					// The sessions the cap evicted are gone from the table, but not
+					// from the connections they opened — a WebSocket keeps the
+					// authority it resolved at upgrade, and an SSE stream never
+					// rechecks. Close them now the eviction has committed — inline, not
+					// queued: with no route transaction, a throw later in the handler
+					// would drop a queued close while the eviction stands. No audit
+					// row: there is no eviction event, and the `login` row records
+					// the cause.
+					for (const session_hash of evicted) {
+						close_connections_after_commit(
+							connection_closer,
+							{ kind: 'session', session_hash },
+							deps.log
+						);
+					}
+					await deps.audit.emit(route, {
 						event_type: 'login',
-						outcome: 'failure',
-						ip: get_client_ip(c),
-						metadata: { username }
-					});
-					await delay;
-					return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
-				}
-
-				const valid = await password.verify_password(pw, account.password_hash);
-				if (!valid) {
-					if (login_ip_rate_limiter && ip) login_ip_rate_limiter.record(ip);
-					if (login_account_rate_limiter) login_account_rate_limiter.record(account_rate_key);
-					deps.audit.emit(route, {
-						event_type: 'login',
-						outcome: 'failure',
 						account_id: account.id,
-						ip: get_client_ip(c),
-						metadata: { username }
+						ip: get_client_ip(c)
 					});
-					await delay;
-					return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
+					return c.json({ ok: true });
+				} finally {
+					ip_reserved.reservation.release();
+					account_reservation?.release();
 				}
-
-				// Successful login — clear the account-grain failure history only.
-				// The IP aggregate is deliberately left standing: it is the
-				// distributed-spray backstop, so a success on one account must not
-				// refund the budget shared by every other account reachable from
-				// that address. See `RateLimiter.reset`.
-				if (login_account_rate_limiter) login_account_rate_limiter.reset(account_rate_key);
-
-				await create_session_and_set_cookie({
-					keyring,
-					deps: route,
-					c,
-					account_id: account.id,
-					session_options,
-					max_sessions
-				});
-				deps.audit.emit(route, {
-					event_type: 'login',
-					account_id: account.id,
-					ip: get_client_ip(c)
-				});
-				return c.json({ ok: true });
 			}
 		},
 		{
 			...logout_shape,
 			handler: async (c, route) => {
 				const ctx = require_request_context(c);
-				const session_token: string | null = c.get(session_options.context_key) ?? null;
-				if (session_token) {
-					const token_hash = hash_session_token(session_token);
-					await query_session_revoke_by_hash_unscoped(route, token_hash);
-					// Handler-side belt+suspenders: eagerly close this account's
-					// live WS connections BEFORE the audit emit so revocation
-					// lands even if the audit INSERT fails. Account-wide (not
-					// session-targeted) to match the Rust `account_logout` handler
-					// and the sibling `/password` handler — logout is a
-					// self-initiated account-grain operation, and the audit
-					// listener (`create_ws_logout_closer`) runs the same
-					// account-wide close on the logout event afterward, so both
-					// layers converge (idempotent). Same transaction-commit trade
-					// as `password` / RPC `session_revoke`: a throw between this
-					// close and the response rolls back the DB revoke while
-					// leaving sockets severed; benign (client reconnects), but
-					// don't introduce a throw here without acknowledging the trade.
-					if (connection_closer) {
-						connection_closer.close_sockets_for_account(ctx.account.id);
-					}
+				// the shape admits only a session credential, so this is its hash
+				// (the Rust `account_logout` reads the same value)
+				const session_hash = resolved_auth_session_hash(get_resolved_auth(c));
+				if (session_hash !== null) {
+					await query_session_revoke_by_hash_unscoped(route, session_hash);
+					// Close this account's live connections once the revoke has
+					// committed — queued, so it never runs before the commit or on
+					// rollback, and it does not depend on the audit row below (written
+					// in the route transaction, so it commits with the revoke). Account-wide (not session-targeted) to match the Rust
+					// `account_logout` handler and the sibling `/password` handler
+					// — logout is a self-initiated account-grain operation. The
+					// audit listeners repeat the same close on the announced
+					// `logout` row; closing is idempotent.
+					queue_connection_close(route, connection_closer, {
+						kind: 'account',
+						account_id: ctx.account.id
+					});
 				}
 				clear_session_cookie(c, session_options);
 				// Account-grain operation — no `actor_id` (which actor was
 				// resolved per-request is incidental to "this account ended
 				// its session"). Mirrors `login`.
-				deps.audit.emit(route, {
+				await deps.audit.emit(route, {
 					event_type: 'logout',
 					account_id: ctx.account.id,
 					ip: get_client_ip(c)
@@ -429,126 +491,153 @@ export const create_account_route_specs = (
 		{
 			...password_shape,
 			handler: async (c, route) => {
-				// per-IP rate limit check (before argon2 work)
-				const ip = login_ip_rate_limiter ? get_client_ip(c) : null;
-				if (login_ip_rate_limiter && ip) {
-					const check = login_ip_rate_limiter.check(ip);
-					if (!check.allowed) {
-						return rate_limit_exceeded_response(c, check.retry_after);
-					}
-				}
-
-				const ctx = require_request_context(c);
-				const { current_password, new_password } = get_route_input<PasswordChangeInput>(c);
-				// Defense in depth — see `docs/security.md` §Credential-channel gating.
-				const credential_type = c.get(CREDENTIAL_TYPE_KEY) ?? undefined;
-
-				// per-account rate limit check (after context resolution, before argon2 work)
-				if (login_account_rate_limiter) {
-					const check = login_account_rate_limiter.check(ctx.account.id);
-					if (!check.allowed) {
-						return rate_limit_exceeded_response(c, check.retry_after);
-					}
-				}
-
-				const valid = await password.verify_password(current_password, ctx.account.password_hash);
-				if (!valid) {
-					if (login_ip_rate_limiter && ip) login_ip_rate_limiter.record(ip);
-					if (login_account_rate_limiter) login_account_rate_limiter.record(ctx.account.id);
-					deps.audit.emit(route, {
-						event_type: 'password_change',
-						outcome: 'failure',
-						account_id: ctx.account.id,
-						ip: get_client_ip(c),
-						metadata: { credential_type }
-					});
-					return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
-				}
-
-				// Verify succeeded — do the throw-y operations FIRST so a fault
-				// (Argon2 OOM, native binding error, DB outage on the UPDATE)
-				// can't wipe the rate-limit history of a caller observing 500s.
-				// Resets happen below, after both calls have settled.
-				const new_hash = await password.hash_password(new_password);
-				// Conditional UPDATE keyed on the verified hash: closes the
-				// verify-write race with a concurrent password change that
-				// already committed against the same starting hash. Account-grain
-				// operation — `updated_by` stays null (the per-request actor is
-				// incidental; password is account-level state).
-				const updated = await query_update_account_password(
-					route,
-					ctx.account.id,
-					new_hash,
-					null,
-					ctx.account.password_hash
-				);
-
-				// Verify-success contract — the caller proved knowledge, so wipe
-				// their account-grain failure history. The race-loser branch below
-				// re-records one on top of the wiped slate so net cost stays 1 on
-				// that bucket. Deferring from "after verify" to "after UPDATE
-				// settled" is what closes the S1 bypass — a throw between reset
-				// and the UPDATE could have wiped an attacker's budget.
-				//
-				// The IP aggregate is deliberately not cleared: it is the same
-				// instance login uses, so refunding it here reopens the spray path
-				// through a route that only needs the caller's *own* password. Its
-				// record on the race-loser branch below therefore accumulates
-				// rather than netting out, which is the intent.
-				if (login_account_rate_limiter) login_account_rate_limiter.reset(ctx.account.id);
-
-				if (!updated) {
-					// A concurrent password change committed first — our
-					// `current_password` was correct at read-time but the row's
-					// `password_hash` no longer matches. Mirrors the wrong-password
-					// 401 shape; tag the failure metadata so admins reading the
-					// audit log can distinguish "user typoed" from "two clients
-					// raced." Sessions/tokens were already revoked by the winner;
-					// no cookie clear here either.
-					if (login_ip_rate_limiter && ip) login_ip_rate_limiter.record(ip);
-					if (login_account_rate_limiter) login_account_rate_limiter.record(ctx.account.id);
-					deps.audit.emit(route, {
-						event_type: 'password_change',
-						outcome: 'failure',
-						account_id: ctx.account.id,
-						ip: get_client_ip(c),
-						metadata: { reason: 'concurrent_change', credential_type }
-					});
-					return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
-				}
-
-				// revoke all sessions and API tokens (force re-auth everywhere)
-				const sessions_revoked = await query_session_revoke_all_for_account(route, ctx.account.id);
-				const tokens_revoked = await query_revoke_all_api_tokens_for_account(route, ctx.account.id);
-
-				// Handler-side belt+suspenders — close every live WS socket on
-				// this account BEFORE the audit emit so the revoke-all cascade
-				// lands even if the audit INSERT fails. The real ordering
-				// invariant is "before the transaction commits": this route
-				// runs with the default `transaction: true`, so a throw between
-				// this close and the response would roll back the password
-				// update + session/token revokes while leaving sockets severed.
-				// Benign — affected clients reconnect with their still-valid
-				// session — but don't introduce a throw here without
-				// acknowledging the trade. Listener-based close
-				// (`transports_ws_auth_guard` on the `password_change` event)
-				// runs the same close afterward; idempotent on the second pass.
-				// Mirrors `zzz_server::account::password_inner`.
-				if (connection_closer) {
-					connection_closer.close_sockets_for_account(ctx.account.id);
-				}
-				clear_session_cookie(c, session_options);
-				// Account-grain operation — no `actor_id`. The password is
-				// account-level state; which per-request actor was resolved
-				// has no semantic bearing on "this account changed its
-				// password". Mirrors `login`/`logout`.
-				deps.audit.emit(route, {
-					event_type: 'password_change',
-					account_id: ctx.account.id,
-					ip: get_client_ip(c),
-					metadata: { sessions_revoked, tokens_revoked, credential_type }
+				// Per-IP rate limit (before argon2 work). Reserved, not checked:
+				// the attempt counts against the shared login limiters from here
+				// until it settles, so a concurrent burst of guesses at
+				// `current_password` can't all pass before any of it records. The
+				// `finally` releases whatever no branch recorded.
+				// keyed by the address's rate-limit key (an IPv6 client's /64)
+				const ip_key = login_ip_rate_limiter ? rate_limit_ip_key(get_client_ip(c)) : null;
+				const ip_reserved = await reserve_optional(login_ip_rate_limiter, ip_key, {
+					signal: c.req.raw.signal
 				});
-				return c.json({ ok: true, sessions_revoked, tokens_revoked });
+				if (!ip_reserved.ok) {
+					return rate_limit_exceeded_response(c, ip_reserved.retry_after);
+				}
+				let account_reservation: RateLimitReservation | null = null;
+				try {
+					const ctx = require_request_context(c);
+					const { current_password, new_password } = get_route_input<PasswordChangeInput>(c);
+					// Defense in depth — see `docs/security.md` §Credential-channel gating.
+					const credential_type = get_resolved_auth(c)?.credential_type;
+
+					// per-account rate limit (after context resolution, before argon2 work)
+					const account_reserved = await reserve_optional(
+						login_account_rate_limiter,
+						ctx.account.id,
+						{ signal: c.req.raw.signal }
+					);
+					if (!account_reserved.ok) {
+						return rate_limit_exceeded_response(c, account_reserved.retry_after);
+					}
+					account_reservation = account_reserved.reservation;
+
+					const valid = await password.verify_password(current_password, ctx.account.password_hash);
+					if (!valid) {
+						ip_reserved.reservation.record();
+						account_reservation?.record();
+						await deps.audit.emit(route, {
+							event_type: 'password_change',
+							outcome: 'failure',
+							account_id: ctx.account.id,
+							ip: get_client_ip(c),
+							metadata: { credential_type }
+						});
+						return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
+					}
+
+					// Verify succeeded — do the throw-y operations FIRST so a fault
+					// (Argon2 OOM, native binding error, DB outage on the UPDATE)
+					// can't wipe the rate-limit history of a caller observing 500s.
+					// Resets happen below, after both calls have settled.
+					const new_hash = await password.hash_password(new_password);
+					// Conditional UPDATE keyed on the verified hash: closes the
+					// verify-write race with a concurrent password change that
+					// already committed against the same starting hash. Account-grain
+					// operation — `updated_by` stays null (the per-request actor is
+					// incidental; password is account-level state).
+					//
+					// The UPDATE and the two revocations are the route's writes, and
+					// commit together or not at all: one transaction around just them
+					// (the route is `transaction: false`, so the reservation waits
+					// above and the Argon2 verify and hash held no connection). Twin of
+					// the Rust spine's `change_password`. `null` when the UPDATE matched
+					// nothing — a concurrent change committed first.
+					const change = await route.db.transaction(async (tx) => {
+						const tx_deps = { db: tx };
+						const updated = await query_update_account_password(
+							tx_deps,
+							ctx.account.id,
+							new_hash,
+							null,
+							ctx.account.password_hash
+						);
+						if (!updated) return null;
+						// revoke all sessions and API tokens (force re-auth everywhere)
+						const sessions_revoked = await query_session_revoke_all_for_account(
+							tx_deps,
+							ctx.account.id
+						);
+						const tokens_revoked = await query_revoke_all_api_tokens_for_account(
+							tx_deps,
+							ctx.account.id
+						);
+						return { sessions_revoked, tokens_revoked };
+					});
+
+					// Verify-success contract — the caller proved knowledge, so wipe
+					// their account-grain failure history. The race-loser branch below
+					// re-records one on top of the wiped slate so net cost stays 1 on
+					// that bucket. Deferring from "after verify" to "after UPDATE
+					// settled" is what closes the S1 bypass — a throw between reset
+					// and the UPDATE could have wiped an attacker's budget.
+					//
+					// The IP aggregate is deliberately not cleared: it is the same
+					// instance login uses, so refunding it here reopens the spray path
+					// through a route that only needs the caller's *own* password. Its
+					// record on the race-loser branch below therefore accumulates
+					// rather than netting out, which is the intent.
+					if (login_account_rate_limiter) login_account_rate_limiter.reset(ctx.account.id);
+
+					if (!change) {
+						// A concurrent password change committed first — our
+						// `current_password` was correct at read-time but the row's
+						// `password_hash` no longer matches. Mirrors the wrong-password
+						// 401 shape; tag the failure metadata so admins reading the
+						// audit log can distinguish "user typoed" from "two clients
+						// raced." Sessions/tokens were already revoked by the winner;
+						// no cookie clear here either.
+						ip_reserved.reservation.record();
+						account_reservation?.record();
+						await deps.audit.emit(route, {
+							event_type: 'password_change',
+							outcome: 'failure',
+							account_id: ctx.account.id,
+							ip: get_client_ip(c),
+							metadata: { reason: 'concurrent_change', credential_type }
+						});
+						return c.json({ error: ERROR_INVALID_CREDENTIALS }, 401);
+					}
+
+					const { sessions_revoked, tokens_revoked } = change;
+
+					// Close every live connection of this account now the password
+					// update and the revoke-all cascade have committed — inline, not
+					// queued: with no route transaction, a throw later in the handler
+					// would drop a queued close while the revocation stands. It does
+					// not depend on the fail-open audit write below; the audit
+					// listeners repeat it on the announced `password_change` row.
+					close_connections_after_commit(
+						connection_closer,
+						{ kind: 'account', account_id: ctx.account.id },
+						deps.log
+					);
+					clear_session_cookie(c, session_options);
+					// Account-grain operation — no `actor_id`. The password is
+					// account-level state; which per-request actor was resolved
+					// has no semantic bearing on "this account changed its
+					// password". Mirrors `login`/`logout`.
+					await deps.audit.emit(route, {
+						event_type: 'password_change',
+						account_id: ctx.account.id,
+						ip: get_client_ip(c),
+						metadata: { sessions_revoked, tokens_revoked, credential_type }
+					});
+					return c.json({ ok: true, sessions_revoked, tokens_revoked });
+				} finally {
+					ip_reserved.reservation.release();
+					account_reservation?.release();
+				}
 			}
 		}
 	];

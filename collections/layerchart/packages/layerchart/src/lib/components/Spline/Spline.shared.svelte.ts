@@ -1,20 +1,25 @@
+import { untrack } from 'svelte';
 import type { SVGAttributes } from 'svelte/elements';
 import type { CurveFactory, CurveFactoryLineOnly, Line } from 'd3-shape';
 import { line as d3Line, lineRadial } from 'd3-shape';
 import { geoPath as d3GeoPath } from 'd3-geo';
-import { max } from 'd3-array';
+import { group as d3Group, max } from 'd3-array';
 import { interpolatePath } from 'd3-interpolate-path';
 
 import { accessor, type Accessor } from '$lib/utils/common.js';
 import { isScaleBand } from '$lib/utils/scales.svelte.js';
 import {
   createMotion,
+  createPathMotionMap,
   extractTweenConfig,
   type MotionProp,
 } from '$lib/utils/motion.svelte.js';
-import { resolveColorProp, resolveStyleProp } from '$lib/utils/dataProp.js';
-import type { ColorProp, StyleProp } from '$lib/utils/dataProp.js';
+import { colorPropDataKey, resolveColorProp, resolveStyleProp } from '$lib/utils/dataProp.js';
+import type { ColorProp, DataProp, StyleProp } from '$lib/utils/dataProp.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { liftChanged } from '$lib/utils/isometric.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
@@ -24,10 +29,26 @@ import type { PathProps } from '../Path/Path.shared.svelte.js';
 export type SplinePropsWithoutHTML = {
   /** Override data instead of using context */
   data?: any;
+  /**
+   * Height to raise each point off an `isometric` floor, defaulting to the chart's `z`.
+   * - `string`: data property name, resolved via zScale
+   * - `function(d)`: accessor called per data item, result passed through zScale
+   * - `number`: pixel height
+   */
+  z?: DataProp;
+
   /** Override `x` accessor from Chart context */
   x?: Accessor;
   /** Override `y` accessor from Chart context */
   y?: Accessor;
+  /**
+   * Group the data into a separate line per distinct value, drawing them all from this one mark.
+   * Defaults to the Chart's `g` accessor.
+   *
+   * Replaces grouping the data and rendering a `Spline` per group — which registers a mark, and
+   * rebuilds the chart's domains, once per line.
+   */
+  g?: Accessor;
   /** Series key to use for accessor. Only applicable if `<Chart>` uses `series` and `x`/`y` are not set. */
   seriesKey?: string;
   /** Function to determine if a point is defined */
@@ -40,6 +61,8 @@ export type SplinePropsWithoutHTML = {
   fill?: ColorProp;
   /** Opacity or function returning opacity per data point. */
   opacity?: StyleProp<number | undefined>;
+  /** CSS class name(s), or a function returning them per data point. */
+  class?: StyleProp<string | undefined>;
   /** Whether to animate the path using tweened interpolation. */
   motion?: MotionProp;
 } & Omit<PathProps, 'x' | 'y' | 'motion' | 'stroke' | 'fill' | 'opacity'>;
@@ -51,7 +74,12 @@ export type SplineSegment = {
   stroke?: string;
   fill?: string;
   opacity?: number;
+  class?: string;
   d: string;
+  /** Whether this path starts its line, rather than continuing one a style function split */
+  lineStart: boolean;
+  /** Whether this path ends its line */
+  lineEnd: boolean;
 };
 
 /**
@@ -61,10 +89,36 @@ export type SplineSegment = {
  */
 export class SplineState {
   #getProps: () => SplineProps = () => ({}) as SplineProps;
+
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: SplineProps = $derived(this.#getProps());
+
   ctx: ChartState = getChartContext();
+  #layerIsometric = getLayerIsometric();
+
+  /** The chart's `isometricLift` when the points have heights, else `null` */
+  lift = $derived.by(() => {
+    if (this.ctx.radial || !this.#layerIsometric()) return null;
+    if (this.#props.z == null && this.ctx.props.z == null) return null;
+    return this.ctx.isometricLift;
+  });
+
+  /** A point's height off the floor, in pixels */
+  height(d: any) {
+    return this.ctx.heightOf(d, this.#props.z)[1];
+  }
+
+  markData = getMarkData();
   geo: GeoState = getGeoContext();
 
   #tweenState!: ReturnType<typeof createMotion<string>>;
+
+  /** One tween per path this mark draws — see `#segmentTargets` for what identifies each */
+  #segmentTweens: ReturnType<typeof createPathMotionMap> = null;
 
   constructor(getProps: () => SplineProps) {
     this.#getProps = getProps;
@@ -74,7 +128,7 @@ export class SplineState {
       name: 'Spline',
       kind: 'mark',
       markInfo: () => {
-        const p = getProps();
+        const p = this.#props;
         return {
           data: p.data,
           x: p.x,
@@ -85,10 +139,57 @@ export class SplineState {
       },
     });
 
-    this.#tweenState = createMotion(this.#defaultPathData(), () => this.d, {
-      type: 'tween',
-      interpolate: interpolatePath,
-    });
+    // Only build the tween when `motion` asks for one. `Spline.base` renders
+    // `c.d` unless `isTweened`, so an unconditional tween re-interpolated the
+    // full path on every data change and threw the result away — the dominant
+    // cost in streaming charts.
+    const tween = extractTweenConfig(this.#props.motion);
+    this.#tweenState = createMotion(
+      this.#defaultPathData(),
+      () => this.d,
+      tween ? { type: 'tween', interpolate: interpolatePath, ...tween.options } : undefined,
+      { instant: liftChanged(() => this.lift) }
+    );
+
+    // `#tweenState` animates the single-path case; grouped lines each need their own, since the
+    // set of them changes with the data.
+    this.#segmentTweens = createPathMotionMap(initial.motion, interpolatePath);
+    if (this.#segmentTweens) {
+      const tweens = this.#segmentTweens;
+      // The lines that were on screen last pass, so a run appearing in one of them can be told
+      // apart from a run of a line being drawn for the first time.  Rebuilt each pass, which
+      // prunes lines the data dropped — one that comes back is new again, and enters as one.
+      let drawnLines = new Set<any>();
+      const viewTurned = liftChanged(() => this.lift);
+
+      $effect(() => {
+        const targets = this.#segmentTargets;
+        if (!targets) return;
+        const instant = viewTurned();
+
+        const active = new Set<any>();
+        const lines = new Set<any>();
+        for (const seg of targets) {
+          if (seg.key === undefined) continue;
+          active.add(seg.key);
+          if (seg.lineKey !== undefined) lines.add(seg.lineKey);
+
+          const intoDrawnLine = seg.lineKey !== undefined && drawnLines.has(seg.lineKey);
+          // `update` reads and writes the tween's own state, so it must not be tracked here
+          untrack(() =>
+            tweens.update(
+              seg.key,
+              seg.d,
+              () =>
+                intoDrawnLine ? this.#collapsedPathData(seg.data) : this.#defaultPathData(seg.data),
+              instant
+            )
+          );
+        }
+        drawnLines = lines;
+        untrack(() => tweens.cleanup(active));
+      });
+    }
   }
 
   #getScaleValue(
@@ -102,33 +203,80 @@ export class SplineState {
     return value;
   }
 
-  series = $derived(
-    this.ctx.series.series.find((s) => s.key === this.#getProps().seriesKey)
-  );
+  series = $derived(this.ctx.series.series.find((s) => s.key === this.#props.seriesKey));
   seriesAccessor = $derived(
     this.series?.value ?? (this.series?.data ? undefined : this.series?.key)
   );
 
   xAccessor = $derived(
     accessor(
-      this.#getProps().x ??
-        (this.ctx.valueAxis === 'x' ? this.seriesAccessor : undefined) ??
-        this.ctx.x
+      this.#props.x ?? (this.ctx.valueAxis === 'x' ? this.seriesAccessor : undefined) ?? this.ctx.x
     )
   );
-  yAccessor = $derived(
-    accessor(
-      this.#getProps().y ??
-        (this.ctx.valueAxis === 'y' ? this.seriesAccessor : undefined) ??
-        this.ctx.y
-    )
+  /**
+   * The stacked span this line belongs to, or `null` when it draws raw values.
+   *
+   * A line over a stacked area has to follow the area's top rather than the series' own values —
+   * which `Area`'s built-in `line` gets by passing its `y1`, and a hand-composed `Spline` beside
+   * an `Area` needs too.  Mirrors the guard the other stacking marks use.
+   */
+  stackAccessors = $derived.by(() =>
+    this.ctx.stackAccessorsFor({
+      seriesKey: this.#props.seriesKey,
+      ownData: this.#props.data != null,
+    })
   );
+
+  yAccessor = $derived.by(() => {
+    const props = this.#props;
+    if (props.y) return accessor(props.y);
+    if (this.ctx.valueAxis === 'y') {
+      if (this.stackAccessors) return this.stackAccessors.y1;
+      if (this.seriesAccessor) return accessor(this.seriesAccessor);
+    }
+    return accessor(this.ctx.y);
+  });
+
+  /** Kept separate from `lines` so `gAccessor` can read it without a cycle */
+  resolvedData = $derived(this.markData(this.#props.data, this.series?.data));
+
+  /**
+   * Accessor grouping the data into one line per distinct value, or `null` for a single line.
+   *
+   * Resolves in order: this mark's `g`, the chart's `g`, the data property named by `stroke` /
+   * `fill`, then the chart's `c` — so `stroke="fruit"` alone gives a line per fruit,
+   * and so does `<Chart c="fruit">`: what colors the lines splits them.
+   *
+   * A mark carrying its own rows is left alone — whoever handed them over grouped them already.
+   */
+  gAccessor = $derived.by<((d: any) => any) | null>(() => {
+    const props = this.#props;
+    const g = props.g ?? this.ctx.props.g;
+    if (g != null) return accessor(g);
+
+    const first = this.resolvedData?.[0];
+    const implied = colorPropDataKey(props.stroke, first) ?? colorPropDataKey(props.fill, first);
+    if (implied != null) return accessor(implied);
+
+    if (props.data != null || this.series?.data != null) return null;
+    return first != null && this.ctx.cKey(first) != null ? this.ctx.cKey : null;
+  });
+
+  /** The data this Spline draws, split into one array per line */
+  lines = $derived.by<any[][]>(() => {
+    if (!this.gAccessor) return [this.resolvedData];
+    const grouped = Array.from(d3Group(this.resolvedData, this.gAccessor).values());
+    // A line the legend names and has hidden should go with it.  Rows of a hidden `c` category
+    // are already gone by here — `ChartState.data` drops those so the scales follow — so this is
+    // only about lines this mark split by itself.
+    return grouped.filter((lineData) => this.#isShown(lineData[0]));
+  });
 
   xOffset = $derived(isScaleBand(this.ctx.xScale) ? this.ctx.xScale.bandwidth() / 2 : 0);
   yOffset = $derived(isScaleBand(this.ctx.yScale) ? this.ctx.yScale.bandwidth() / 2 : 0);
 
   #buildPath(resolvedData: any[]): string {
-    const props = this.#getProps();
+    const props = this.#props;
     const path = this.ctx.radial
       ? lineRadial()
           .angle((d) => this.#getScaleValue(d, this.ctx.xScale, this.xAccessor) + 0)
@@ -137,28 +285,46 @@ export class SplineState {
           .x((d) => this.#getScaleValue(d, this.ctx.xScale, this.xAccessor) + this.xOffset)
           .y((d) => this.#getScaleValue(d, this.ctx.yScale, this.yAccessor) + this.yOffset);
 
-    path.defined(
-      props.defined ?? ((d) => this.xAccessor(d) != null && this.yAccessor(d) != null)
-    );
+    const lift = this.lift;
+    if (lift && !this.ctx.radial) {
+      const line = path as Line<any>;
+      line
+        .x(
+          (d) =>
+            this.#getScaleValue(d, this.ctx.xScale, this.xAccessor) +
+            this.xOffset +
+            lift.x * this.height(d)
+        )
+        .y(
+          (d) =>
+            this.#getScaleValue(d, this.ctx.yScale, this.yAccessor) +
+            this.yOffset +
+            lift.y * this.height(d)
+        );
+    }
+
+    path.defined(props.defined ?? ((d) => this.xAccessor(d) != null && this.yAccessor(d) != null));
     if (props.curve) path.curve(props.curve);
 
     return path(resolvedData) ?? '';
   }
 
   hasAnyStyleFn = $derived.by(() => {
-    const p = this.#getProps();
+    const p = this.#props;
     return (
       typeof p.stroke === 'function' ||
       typeof p.fill === 'function' ||
-      typeof p.opacity === 'function'
+      typeof p.opacity === 'function' ||
+      typeof p.class === 'function'
     );
   });
 
   d = $derived.by(() => {
-    const props = this.#getProps();
-    if (this.hasAnyStyleFn && !this.geo.projection) return '';
+    const props = this.#props;
+    // Both style functions and `g` produce more than one path, which `segments` builds instead
+    if ((this.hasAnyStyleFn || this.gAccessor) && !this.geo.projection) return '';
 
-    const resolvedData = props.data ?? this.series?.data ?? this.ctx.data;
+    const resolvedData = this.resolvedData;
 
     if (this.geo.projection) {
       const coordinates = resolvedData
@@ -175,31 +341,158 @@ export class SplineState {
     return this.#buildPath(resolvedData);
   });
 
-  segments = $derived.by<SplineSegment[] | null>(() => {
-    if (!this.hasAnyStyleFn) return null;
-    const props = this.#getProps();
-    const resolvedData = props.data ?? this.series?.data ?? this.ctx.data;
+  /**
+   * The segments as the data says they should be, before motion — each with the key its tween is
+   * stored under and the rows it was built from.
+   *
+   * Separate from `segments` so the effect driving the tweens can read the targets without
+   * reading the tweens' own output, which would be a cycle.
+   *
+   * The key composes both splits: the `g` group, then — where a style function splits that line
+   * further into one path per run of matching style — the style itself plus how many runs of that
+   * style came before it. A run's position in the line moves with the data, so a raw index
+   * carries no identity, but "the second dashed stretch" does: it tweens to the next render's
+   * second dashed stretch rather than morphing into the solid one beside it, and the
+   * interpolator handles the two having different point counts.
+   */
+  #segmentTargets = $derived.by<
+    (SplineSegment & { key?: any; lineKey?: any; data: any[] })[] | null
+  >(() => {
+    if (!this.hasAnyStyleFn && !this.gAccessor) return null;
+    const props = this.#props;
     if (this.geo.projection) return null;
 
-    const groups = groupConsecutive(resolvedData, (d, i, arr) => {
-      const s = resolveColorProp(props.stroke, d, this.ctx.cScale, i, arr);
-      const f = resolveColorProp(props.fill, d, this.ctx.cScale, i, arr);
-      const o = resolveStyleProp(props.opacity, d, i, arr);
-      return { key: `${s}\0${f}\0${o}`, style: { stroke: s, fill: f, opacity: o } };
-    });
+    const out: (SplineSegment & { key?: any; lineKey?: any; data: any[] })[] = [];
 
-    return groups.map((group) => ({
-      ...group.style,
-      d: this.#buildPath(group.data),
-    }));
+    for (const lineData of this.lines) {
+      const lineOpacity = this.#lineOpacity(lineData);
+
+      if (this.hasAnyStyleFn) {
+        // Style functions split each line further, into one path per run of matching style
+        const groups = groupConsecutive(lineData, (d, i, arr) => {
+          const s = resolveColorProp(props.stroke, d, this.ctx.cScale, i, arr);
+          const f = resolveColorProp(props.fill, d, this.ctx.cScale, i, arr);
+          const o = resolveStyleProp(props.opacity, d, i, arr);
+          const c = resolveStyleProp(props.class, d, i, arr);
+          return {
+            key: `${s}\0${f}\0${o}\0${c}`,
+            style: { stroke: s, fill: f, opacity: o, class: c },
+          };
+        });
+
+        // The line's own color, for the runs a `stroke` function didn't name one for — a `class`
+        // function alone splits the line without saying anything about its color, and without
+        // this every run would fall through to `Path`'s unstroked default.  Resolved from the
+        // line's first point, as the single-path case is, so the split doesn't recolor anything.
+        const lineStroke = this.#colorFromC(lineData[0]) ?? this.series?.color;
+        const lineKey = this.gAccessor ? this.gAccessor(lineData[0]) : '';
+        const seen = new Map<string, number>();
+
+        groups.forEach((group, index) => {
+          const ordinal = seen.get(group.key) ?? 0;
+          seen.set(group.key, ordinal + 1);
+
+          out.push({
+            ...group.style,
+            stroke: group.style.stroke ?? lineStroke,
+            opacity: group.style.opacity ?? lineOpacity,
+            d: this.#buildPath(group.data),
+            data: group.data,
+            key: `${lineKey}\0${group.key}\0${ordinal}`,
+            lineKey,
+            lineStart: index === 0,
+            lineEnd: index === groups.length - 1,
+          });
+        });
+      } else {
+        // One path for the whole line, styled from its first point — so `stroke="species"` picks
+        // the line's color out of the data via the chart's color scale
+        out.push({
+          stroke:
+            resolveColorProp(props.stroke, lineData[0], this.ctx.cScale) ??
+            this.#colorFromC(lineData[0]) ??
+            this.series?.color,
+          fill: resolveColorProp(props.fill, lineData[0], this.ctx.cScale),
+          opacity: resolveStyleProp(props.opacity, lineData[0]) ?? lineOpacity,
+          class: resolveStyleProp(props.class, lineData[0]),
+          d: this.#buildPath(lineData),
+          data: lineData,
+          key: this.gAccessor ? this.gAccessor(lineData[0]) : undefined,
+          lineStart: true,
+          lineEnd: true,
+        });
+      }
+    }
+
+    return out;
   });
 
-  #defaultPathData(): string {
-    const props = this.#getProps();
+  /** `#segmentTargets` with each path swapped for its in-flight tween */
+  segments = $derived.by<SplineSegment[] | null>(() => {
+    const targets = this.#segmentTargets;
+    const tweens = this.#segmentTweens;
+    if (!targets || !tweens) return targets;
+
+    return targets.map((seg) =>
+      seg.key === undefined ? seg : { ...seg, d: tweens.get(seg.key) ?? seg.d }
+    );
+  });
+
+  /**
+   * The chart's `c` channel as the colour, when `c` is what names the groups — the lines split by
+   * it would otherwise all come out in the series' one colour.
+   */
+  #colorFromC(d: any) {
+    return d != null && this.ctx.cKey(d) != null ? this.ctx.cGet(d) : undefined;
+  }
+
+  /**
+   * Fade for one line when the legend names `c` categories, or `undefined` when it names series.
+   *
+   * `seriesOpacity` can't tell these apart — a single series draws every line here, so the whole
+   * mark would fade as one.  Read from the line's first point, the way its `stroke` is.
+   */
+  #lineOpacity(lineData: any[]) {
+    const key = this.#groupKey(lineData[0]);
+    if (key == null) return undefined;
+    return this.ctx.series.isHighlighted(key, true) ? 1 : 0.1;
+  }
+
+  /**
+   * What the legend calls this line, or `null` when nothing names it.
+   *
+   * The chart's `c` first, since that is the chart's own channel.  Otherwise the mark's own
+   * grouping — `stroke="fruit"` splits the lines, and where a series is declared per fruit the
+   * legend is already listing exactly those names, so hovering one should single that line out.
+   * A `g` the legend knows nothing about stays anonymous rather than reacting to unrelated keys.
+   */
+  #groupKey(d: any): any {
+    const category = this.ctx.cKey(d);
+    if (category != null) return category;
+    if (!this.gAccessor || d == null) return null;
+    const key = this.gAccessor(d);
+    return this.#namesSeries(key) ? key : null;
+  }
+
+  #namesSeries(key: any) {
+    return key != null && this.ctx.series.series.some((s) => s.key === key);
+  }
+
+  /** Whether a line's group is currently shown, for groups the legend names */
+  #isShown(d: any) {
+    if (d == null || !this.gAccessor) return true;
+    const key = this.gAccessor(d);
+    if (!this.#namesSeries(key)) return true;
+    return this.ctx.series.visibleSeries.some((s) => s.key === key);
+  }
+
+  /** The path flattened to the baseline — what a line tweens out of when it first appears */
+  #defaultPathData(data?: any[]): string {
+    const props = this.#props;
     if (!extractTweenConfig(props.motion)) return '';
 
     if (this.ctx.config.x) {
-      const resolvedData = props.data ?? this.series?.data ?? this.ctx.data;
+      const resolvedData = data ?? this.resolvedData;
       const baseline = Math.min(this.ctx.yScale(0) ?? this.ctx.yRange[0], this.ctx.yRange[0]);
 
       const path = this.ctx.radial
@@ -221,7 +514,54 @@ export class SplineState {
     return '';
   }
 
-  isTweened = $derived(extractTweenConfig(this.#getProps().motion) != null);
+  /**
+   * The segment collapsed onto its own first point — what a run tweens out of when it appears in
+   * a line that is already on screen.
+   *
+   * Consecutive runs share their boundary point, so a run's first point is the last point of the
+   * run before it: a dashed bridge that appears mid-line grows out along the line, rather than
+   * rising from the baseline the way a line drawn for the first time does.
+   */
+  #collapsedPathData(data: any[]): string {
+    const props = this.#props;
+    if (!extractTweenConfig(props.motion) || data[0] == null) return '';
+
+    const x = this.#getScaleValue(data[0], this.ctx.xScale, this.xAccessor);
+    const y = this.#getScaleValue(data[0], this.ctx.yScale, this.yAccessor);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return '';
+
+    const path = this.ctx.radial
+      ? lineRadial()
+          .angle(() => x)
+          .radius(() => y + this.yOffset)
+      : d3Line()
+          .x(() => x + this.xOffset)
+          .y(() => y + this.yOffset);
+
+    path.defined(props.defined ?? ((d) => this.xAccessor(d) != null && this.yAccessor(d) != null));
+    if (props.curve) path.curve(props.curve);
+
+    return path(data) ?? '';
+  }
+
+  /**
+   * `stroke` / `fill` for the single-path case, resolved the way every other mark resolves them:
+   * a string naming a data property goes through the chart's color scale, anything else is a
+   * literal CSS color.  Uniform across the path, so it resolves from the first point.
+   */
+  resolvedStroke = $derived(
+    resolveColorProp(this.#props.stroke, this.lines[0]?.[0], this.ctx.cScale) ??
+      this.#colorFromC(this.lines[0]?.[0]) ??
+      this.series?.color
+  );
+  resolvedFill = $derived(resolveColorProp(this.#props.fill, this.lines[0]?.[0], this.ctx.cScale));
+  // Annotated: the inferred type reaches into `clsx`'s internals, which can't be named in the
+  // emitted declaration — without this, `tsc` drops the whole file's `.d.ts`
+  resolvedClass = $derived<string | undefined>(
+    resolveStyleProp(this.#props.class, this.lines[0]?.[0]) as string | undefined
+  );
+
+  isTweened = $derived(extractTweenConfig(this.#props.motion) != null);
 
   get tweenedPath() {
     return this.#tweenState.current;
@@ -239,33 +579,35 @@ export class SplineState {
   });
 }
 
-type SegmentStyle = { stroke?: string; fill?: string; opacity?: number };
+type SegmentStyle = { stroke?: string; fill?: string; opacity?: number; class?: string };
 
 /**
  * Groups consecutive data points by a composite key derived from function-valued style props.
  * The key at index `i` determines the style for the segment from point `i` to point `i+1`.
  * Each group includes an overlap of 1 point at boundaries for curve continuity.
+ *
+ * The key comes back out alongside the style so the caller can identify a run across renders.
  */
 function groupConsecutive(
   data: any[],
   keyFn: (d: any, index: number, data: any[]) => { key: string; style: SegmentStyle }
-): Array<{ style: SegmentStyle; data: any[] }> {
+): Array<{ key: string; style: SegmentStyle; data: any[] }> {
   if (data.length < 2) return [];
 
-  const groups: Array<{ style: SegmentStyle; data: any[] }> = [];
+  const groups: Array<{ key: string; style: SegmentStyle; data: any[] }> = [];
   let current = keyFn(data[0], 0, data);
   let startIdx = 0;
 
   for (let i = 1; i < data.length; i++) {
     const next = keyFn(data[i], i, data);
     if (next.key !== current.key) {
-      groups.push({ style: current.style, data: data.slice(startIdx, i + 1) });
+      groups.push({ key: current.key, style: current.style, data: data.slice(startIdx, i + 1) });
       startIdx = i;
       current = next;
     }
   }
   if (data.length - startIdx >= 2) {
-    groups.push({ style: current.style, data: data.slice(startIdx) });
+    groups.push({ key: current.key, style: current.style, data: data.slice(startIdx) });
   }
 
   return groups;

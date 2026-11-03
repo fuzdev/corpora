@@ -7,16 +7,12 @@
 import { join } from 'node:path';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { describe, test, inject, assert } from 'vitest';
-import {
-	default_cross_process_setup,
-	reconstruct_bootstrapped_handle
-} from '@fuzdev/fuz_app/testing/cross_backend/setup.ts';
+import { describe, test, assert } from 'vitest';
+import { inject_backend_handle } from '@fuzdev/fuz_app/testing/cross_backend/provided_context.ts';
+import { default_cross_process_setup } from '@fuzdev/fuz_app/testing/cross_backend/setup.ts';
 import { rpc_call } from '@fuzdev/fuz_app/testing/rpc_helpers.ts';
 
-import './cross_test_types.ts';
-
-const handle = reconstruct_bootstrapped_handle(inject('backend_handle'));
+const handle = inject_backend_handle();
 const setup_test = default_cross_process_setup(handle);
 
 const zzz_dir = handle.config.env.PUBLIC_ZZZ_DIR!;
@@ -65,6 +61,36 @@ describe('provider + session cross-backend', () => {
 		assert.ok(Array.isArray(data.files), 'files is array');
 		assert.ok(Array.isArray(data.provider_status), 'provider_status is array');
 		assert.ok(Array.isArray(data.workspaces), 'workspaces is array');
+
+		// the file roots are the watched dirs, so they cover zzz_dir and the scoped dirs
+		const file_roots = data.file_roots as Array<string>;
+		assert.include(file_roots, zzz_dir_out, 'zzz_dir is a file root');
+		for (const dir of scoped_dirs) assert.include(file_roots, dir, `${dir} is a file root`);
+		for (const file of data.files as Array<{ id: string }>) {
+			assert.ok(
+				file_roots.some((root) => file.id.startsWith(root)),
+				`${file.id} is under a file root`
+			);
+		}
+
+		assert.deepEqual(data.terminal_ids, [], 'a fresh account has no terminals');
+		assert.match(data.server_instance_id as string, /^[0-9a-f-]{36}$/);
+	});
+
+	test('session_load_server_instance_id_is_stable', async () => {
+		const fixture = await setup_test();
+		const load = async (): Promise<unknown> => {
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'session_load',
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(res.ok);
+			return ((res.result as Record<string, unknown>).data as Record<string, unknown>)
+				.server_instance_id;
+		};
+		assert.strictEqual(await load(), await load(), 'the same while the daemon runs');
 	});
 
 	test('session_load_returns_zzz_dir_files', async () => {

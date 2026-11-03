@@ -8,16 +8,16 @@ import { describe, assert, test, vi, afterEach } from 'vitest';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 import { wait } from '@fuzdev/fuz_util/async.ts';
 
-import { query_create_account_with_actor, query_purge_account } from '$lib/auth/account_queries.ts';
+import { query_create_account_with_actor, query_purge_account } from '#lib/auth/account_queries.ts';
 import {
 	query_create_api_token,
 	query_validate_api_token,
 	query_revoke_api_token_for_account,
 	query_api_token_list_for_account,
 	query_api_token_enforce_limit
-} from '$lib/auth/api_token_queries.ts';
-import { generate_api_token, hash_api_token, API_TOKEN_PREFIX } from '$lib/auth/api_token.ts';
-import type { Db } from '$lib/db/db.ts';
+} from '#lib/auth/api_token_queries.ts';
+import { generate_api_token, hash_api_token, API_TOKEN_PREFIX } from '#lib/auth/api_token.ts';
+import type { Db } from '#lib/db/db.ts';
 
 import { describe_db } from '../db_fixture.ts';
 import { serialize_token_scope, token_scope_full } from '../../lib/auth/token_scope.ts';
@@ -278,7 +278,7 @@ describe_db('ApiTokenQueries', (get_db) => {
 		);
 
 		const evicted = await query_api_token_enforce_limit(deps, account_id, 5);
-		assert.strictEqual(evicted, 0);
+		assert.strictEqual(evicted.length, 0);
 
 		const list = await query_api_token_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 2);
@@ -316,7 +316,14 @@ describe_db('ApiTokenQueries', (get_db) => {
 		}
 
 		const evicted = await query_api_token_enforce_limit(deps, account_id, 2);
-		assert.strictEqual(evicted, 2);
+		// the evicted tokens' ids — what the caller closes connections by
+		assert.deepStrictEqual(
+			[...evicted].sort(),
+			tokens
+				.filter((t) => t.label === 'oldest' || t.label === 'old')
+				.map((t) => t.id)
+				.sort()
+		);
 
 		const list = await query_api_token_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 2);
@@ -357,7 +364,7 @@ describe_db('ApiTokenQueries', (get_db) => {
 		);
 
 		const evicted = await query_api_token_enforce_limit(deps, account_id, 3);
-		assert.strictEqual(evicted, 0);
+		assert.strictEqual(evicted.length, 0);
 
 		const list = await query_api_token_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 3);
@@ -392,7 +399,7 @@ describe_db('ApiTokenQueries', (get_db) => {
 		}
 
 		const evicted = await query_api_token_enforce_limit(deps, account_id, 1);
-		assert.strictEqual(evicted, 2);
+		assert.strictEqual(evicted.length, 2);
 
 		const list = await query_api_token_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 1);
@@ -422,7 +429,7 @@ describe_db('ApiTokenQueries', (get_db) => {
 		);
 
 		const evicted = await query_api_token_enforce_limit(deps, account_id, 0);
-		assert.strictEqual(evicted, 2);
+		assert.strictEqual(evicted.length, 2);
 
 		const list = await query_api_token_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 0);

@@ -38,7 +38,7 @@
 		iteration_key++;
 
 		// Both boundaries are measured from the same `start`. The commit promise
-		// resolves when the highlight work is laid out; the paint promise resolves
+		// resolves when the styling work is laid out; the paint promise resolves
 		// a couple of frames later once pixels settle.
 		const commit_promise: Promise<void> = new Promise((resolve, reject) => {
 			commit_resolver = resolve;
@@ -137,6 +137,6 @@
 		overflow: hidden;
 		pointer-events: none;
 		z-index: 100;
-		background-color: var(--fg_05);
+		background-color: var(--ink_05);
 	}
 </style>

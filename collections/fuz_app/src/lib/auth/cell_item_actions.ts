@@ -12,11 +12,12 @@
  *   collision-error shape as insert.
  * - `cell_item_delete` — admin / owner / editor-grant on `parent`.
  *   Idempotent: `deleted: false` when no row matched.
- * - `cell_item_list` — bidirectional. Forward (pass `parent_id`) is
- *   gated on `can_view_cell(parent)` and filters children to those the
- *   caller may view (strict target-visibility, batched). Reverse (pass
- *   `child_id`) has 2-layer authz: gate on `can_view_cell(child)`, then
- *   filter rows by `can_view_cell(parent)`.
+ * - `cell_item_list` — bidirectional, a page of up to `limit` items whose
+ *   other end the caller may view (filtered in SQL, before the limit).
+ *   Forward (pass `parent_id`) is gated on `can_view_cell(parent)` and
+ *   pages the items whose child is viewable (strict target-visibility).
+ *   Reverse (pass `child_id`) has 2-layer authz: gate on
+ *   `can_view_cell(child)`, then page the items whose parent is viewable.
  *
  * IDOR-mask 404s on cell-miss / cell-unviewable, mirroring the existence-
  * leak guards in `auth/cell_actions.ts`.
@@ -32,7 +33,7 @@ import {
 	type ActionActorContext,
 	type ActionContext,
 	type RpcAction
-} from '../actions/action_rpc.ts';
+} from '../actions/action_types.ts';
 import { jsonrpc_errors } from '../http/jsonrpc_errors.ts';
 import { is_pg_unique_violation } from '../db/pg_error.ts';
 import type { ActionFactoryDeps } from './deps.ts';
@@ -43,6 +44,7 @@ import {
 	cell_item_delete_action_spec,
 	cell_item_list_action_spec,
 	ERROR_CELL_ITEM_POSITION_TAKEN,
+	ERROR_CELL_ITEM_LIST_REQUIRES_PARENT_OR_CHILD,
 	type CellItemInsertInput,
 	type CellItemInsertOutput,
 	type CellItemMoveInput,
@@ -55,10 +57,13 @@ import {
 	type ItemJson
 } from './cell_item_action_specs.ts';
 import { ERROR_CELL_NOT_FOUND } from './cell_action_specs.ts';
-import { can_view_cell, can_edit_cell } from './cell_authorize.ts';
-import { filter_visible_target_ids } from './cell_relation_visibility.ts';
-import { query_cell_get } from '../db/cell_queries.ts';
-import { query_cell_grant_list_for_cell } from '../db/cell_grant_queries.ts';
+import { cell_viewer_from_auth } from './cell_authorize.ts';
+import {
+	emit_cell_audit,
+	require_editable_cell,
+	require_viewable_cell
+} from './cell_action_helpers.ts';
+import { CELL_RELATION_LIST_LIMIT_DEFAULT } from './cell_relation_list_limit.ts';
 import {
 	query_cell_item_insert,
 	query_cell_item_move,
@@ -83,7 +88,7 @@ export const to_item_json = (row: CellItemRow): ItemJson => ({
 	// on ingress).
 	position: row.position as CellItemPosition,
 	child_id: row.child_id,
-	created_at: typeof row.created_at === 'string' ? row.created_at : row.created_at.toISOString()
+	created_at: row.created_at
 });
 
 const position_taken_error = (): ReturnType<typeof jsonrpc_errors.invalid_params> =>
@@ -98,23 +103,9 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 		ctx: ActionActorContext
 	): Promise<CellItemInsertOutput> => {
 		const auth = ctx.auth;
-		const parent = await query_cell_get(ctx, input.parent_id);
-		if (!parent) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		const parent_grants = await query_cell_grant_list_for_cell(ctx, parent.id);
-		if (!can_edit_cell(auth, parent, parent_grants)) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		const child = await query_cell_get(ctx, input.child_id);
-		if (!child) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
+		await require_editable_cell(ctx, auth, input.parent_id);
 		// Child must be view-admitted — otherwise insert leaks existence.
-		const child_grants = await query_cell_grant_list_for_cell(ctx, child.id);
-		if (!can_view_cell(auth, child, child_grants)) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
+		await require_viewable_cell(ctx, auth, input.child_id);
 		let row: CellItemRow;
 		try {
 			row = await query_cell_item_insert(ctx, {
@@ -126,17 +117,11 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 			if (is_pg_unique_violation(err)) throw position_taken_error();
 			throw err;
 		}
-		deps.audit.emit(ctx, {
-			event_type: 'cell_item_insert',
-			actor_id: auth.actor.id,
-			account_id: auth.account.id,
-			ip: ctx.client_ip,
-			metadata: {
-				parent_id: row.parent_id,
-				position: row.position,
-				child_id: row.child_id
-			} satisfies CellItemInsertAuditMetadata
-		});
+		await emit_cell_audit(ctx, deps.audit, auth, 'cell_item_insert', {
+			parent_id: row.parent_id,
+			position: row.position,
+			child_id: row.child_id
+		} satisfies CellItemInsertAuditMetadata);
 		return { item: to_item_json(row) };
 	};
 
@@ -145,14 +130,7 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 		ctx: ActionActorContext
 	): Promise<CellItemMoveOutput> => {
 		const auth = ctx.auth;
-		const parent = await query_cell_get(ctx, input.parent_id);
-		if (!parent) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		const parent_grants = await query_cell_grant_list_for_cell(ctx, parent.id);
-		if (!can_edit_cell(auth, parent, parent_grants)) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
+		await require_editable_cell(ctx, auth, input.parent_id);
 		let row: CellItemRow | null;
 		try {
 			row = await query_cell_item_move(ctx, input.parent_id, input.position, input.new_position);
@@ -164,17 +142,11 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 			// Source row missing — raced with deleter. 404 covers the gap.
 			throw jsonrpc_errors.not_found('cell_item', { reason: ERROR_CELL_NOT_FOUND });
 		}
-		deps.audit.emit(ctx, {
-			event_type: 'cell_item_move',
-			actor_id: auth.actor.id,
-			account_id: auth.account.id,
-			ip: ctx.client_ip,
-			metadata: {
-				parent_id: row.parent_id,
-				position_old: input.position,
-				position_new: row.position
-			} satisfies CellItemMoveAuditMetadata
-		});
+		await emit_cell_audit(ctx, deps.audit, auth, 'cell_item_move', {
+			parent_id: row.parent_id,
+			position_old: input.position,
+			position_new: row.position
+		} satisfies CellItemMoveAuditMetadata);
 		return { item: to_item_json(row) };
 	};
 
@@ -183,27 +155,14 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 		ctx: ActionActorContext
 	): Promise<CellItemDeleteOutput> => {
 		const auth = ctx.auth;
-		const parent = await query_cell_get(ctx, input.parent_id);
-		if (!parent) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		const parent_grants = await query_cell_grant_list_for_cell(ctx, parent.id);
-		if (!can_edit_cell(auth, parent, parent_grants)) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
+		await require_editable_cell(ctx, auth, input.parent_id);
 		const deleted = await query_cell_item_delete(ctx, input.parent_id, input.position);
 		if (deleted) {
-			deps.audit.emit(ctx, {
-				event_type: 'cell_item_delete',
-				actor_id: auth.actor.id,
-				account_id: auth.account.id,
-				ip: ctx.client_ip,
-				metadata: {
-					parent_id: deleted.parent_id,
-					position: deleted.position,
-					child_id: deleted.child_id
-				} satisfies CellItemDeleteAuditMetadata
-			});
+			await emit_cell_audit(ctx, deps.audit, auth, 'cell_item_delete', {
+				parent_id: deleted.parent_id,
+				position: deleted.position,
+				child_id: deleted.child_id
+			} satisfies CellItemDeleteAuditMetadata);
 		}
 		return { ok: true, deleted: deleted !== null };
 	};
@@ -213,48 +172,38 @@ export const create_cell_item_actions = (deps: CellItemActionDeps): Array<RpcAct
 		ctx: ActionContext
 	): Promise<CellItemListOutput> => {
 		const auth = ctx.auth;
-		// Forward listing: gate on can_view_cell(parent), then filter the
-		// children to those the caller may view (strict target-visibility).
-		if (input.parent_id !== undefined) {
-			const parent = await query_cell_get(ctx, input.parent_id);
-			if (!parent) {
-				throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-			}
-			const parent_grants = auth ? await query_cell_grant_list_for_cell(ctx, parent.id) : null;
-			if (!can_view_cell(auth, parent, parent_grants)) {
-				throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-			}
-			const rows = await query_cell_item_list_for_parent(ctx, parent.id, {
-				limit: input.limit,
-				position_after: input.position_after
+		// exactly one endpoint — both optional on the wire, so the handler
+		// holds the rule and names it in the reason
+		if ((input.parent_id === undefined) === (input.child_id === undefined)) {
+			throw jsonrpc_errors.invalid_params('invalid params', {
+				reason: ERROR_CELL_ITEM_LIST_REQUIRES_PARENT_OR_CHILD
 			});
-			const visible_children = await filter_visible_target_ids(
+		}
+		// an omitted limit is the default page, either direction
+		const limit = input.limit ?? CELL_RELATION_LIST_LIMIT_DEFAULT;
+		// Forward listing: gate on can_view_cell(parent), then page the items
+		// whose child the caller may view (strict target-visibility, in SQL
+		// before the limit).
+		if (input.parent_id !== undefined) {
+			const parent = await require_viewable_cell(ctx, auth, input.parent_id);
+			const rows = await query_cell_item_list_for_parent(
 				ctx,
-				auth,
-				rows.map((r) => r.child_id)
+				cell_viewer_from_auth(auth),
+				parent.id,
+				{ limit, position_after: input.position_after }
 			);
-			return { items: rows.filter((r) => visible_children.has(r.child_id)).map(to_item_json) };
+			return { items: rows.map(to_item_json) };
 		}
 		// Reverse listing: 2-layer authz. First, can_view_cell(child).
-		const child = await query_cell_get(ctx, input.child_id!);
-		if (!child) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		const child_grants = auth ? await query_cell_grant_list_for_cell(ctx, child.id) : null;
-		if (!can_view_cell(auth, child, child_grants)) {
-			throw jsonrpc_errors.not_found('cell', { reason: ERROR_CELL_NOT_FOUND });
-		}
-		// Then filter rows by per-parent can_view_cell. Batched (not N+1):
-		// one bulk visibility filter over all parent ids, same as the forward
-		// branch. Bounded by `limit` at the query so a heavily inbound-linked
-		// child can't force an unbounded fetch on this public endpoint.
-		const rows = await query_cell_item_list_for_child(ctx, child.id, { limit: input.limit });
-		const visible_parents = await filter_visible_target_ids(
-			ctx,
-			auth,
-			rows.map((r) => r.parent_id)
-		);
-		return { items: rows.filter((r) => visible_parents.has(r.parent_id)).map(to_item_json) };
+		const child = await require_viewable_cell(ctx, auth, input.child_id!);
+		// Then page the items whose parent the caller may view — filtered in
+		// SQL before the limit, so hidden parents never crowd out visible ones,
+		// and bounded so a heavily inbound-linked child can't force an
+		// unbounded read on this public endpoint.
+		const rows = await query_cell_item_list_for_child(ctx, cell_viewer_from_auth(auth), child.id, {
+			limit
+		});
+		return { items: rows.map(to_item_json) };
 	};
 
 	return [

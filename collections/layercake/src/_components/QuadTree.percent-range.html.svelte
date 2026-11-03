@@ -1,46 +1,51 @@
 <!--
 	@component
-	Creates an interaction layer (in HTML) using [d3-quadtree](https://github.com/d3/d3-quadtree) to find the nearest datapoint to the mouse. This component creates a snippet that exposes variables `x`, `y`, `found` (the found datapoint), `visible` (a Boolean whether any data was found) and `e` (the event object). This component works with a percent range so the `x` and `y` values coming back will be percentages.
+	Finds the data point nearest the mouse with [d3-quadtree](https://github.com/d3/d3-quadtree) and renders its `children` snippet with the result: `x` and `y` are the point's position as percentages, for a `percentRange={true}` chart, `found` is its row, `visible` is whether a point was found and `e` is the mouse event.
 
-	The quadtree searches across both the x and y dimensions at the same time. But if you want to only search across one, set the `x` and `y` props to the same value. For example, the [shared tooltip component](https://layercake.graphics/components/SharedTooltip.html.svelte) sets `y='x'` since it's nicer behavior to only pick up on the nearest x-value.
+	The search covers both dimensions. To search one only, set `x` and `y` to the same dimension. The [shared tooltip](https://layercake.graphics/components/SharedTooltip.percent-range.html.svelte) sets `y='x'` so it snaps to the nearest x value.
  -->
 <script>
-	import { getContext } from 'svelte';
 	import { quadtree } from 'd3-quadtree';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, xGet, yGet, width, height } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	let visible = $state(false);
+	/** @type {Record<string, any>} */
 	let found = $state({});
-	let e = $state({});
+	/** @type {MouseEvent|undefined} */
+	let e = $state();
+
+	/**
+	 * What the `children` snippet receives: the nearest point's position as percentages, its row, whether a point was found and the mouse event.
+	 * @typedef {{ x: number, y: number, found: Record<string, any>, visible: boolean, e: MouseEvent|undefined }} Nearest
+	 */
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {string} [x='x'] - The dimension to search across when moving the mouse left and right.
-	 * @property {string} [y='y'] - The dimension to search across when moving the mouse up and down.
-	 * @property {number|undefined} [searchRadius] - The number of pixels to search around the mouse's location. This is the third argument passed to [`quadtree.find`](https://github.com/d3/d3-quadtree#quadtree_find) and by default a value of `undefined` means an unlimited range.
-	 * @property {Array<Object>|undefined} [dataset] - The dataset to work off of—defaults to $data if left unset. You can pass something custom in here in case you don't want to use the main data or it's in a strange format.
-	 * @property {import('svelte').Snippet<[any]>} [children]
+	 * @property {'x'|'y'} [x='x'] - The dimension a left-right mouse move searches. Set `x` and `y` to the same dimension to search one only.
+	 * @property {'x'|'y'} [y='y'] - The dimension an up-down mouse move searches.
+	 * @property {number|undefined} [searchRadius] - How many pixels around the mouse to search. Unlimited by default. Passed to [quadtree.find](https://github.com/d3/d3-quadtree#quadtree_find).
+	 * @property {Array<Object>|undefined} [dataset] - Rows to search, defaulting to `k.data`. Pass your own list when the chart data is nested or reshaped.
+	 * @property {import('svelte').Snippet<[Nearest]>} [children] - Renders with the nearest point. See the `Nearest` typedef above for what it gets.
 	 */
 
 	/** @type {Props} */
 	let { x = 'x', y = 'y', searchRadius, dataset, children } = $props();
 
-	let xGetter = $derived(x === 'x' ? $xGet : $yGet);
-	let yGetter = $derived(y === 'y' ? $yGet : $xGet);
+	let xGetter = $derived(x === 'x' ? k.xGet : k.yGet);
+	let yGetter = $derived(y === 'y' ? k.yGet : k.xGet);
 
-	/** @param {MouseEvent} evt*/
+	/** @param {MouseEvent} evt */
 	function findItem(evt) {
 		e = evt;
 
-		const xLayerKey = /** @type {'layerX'|'layerY'} */ (`layer${x.toUpperCase()}`);
-		const yLayerKey = /** @type {'layerX'|'layerY'}*/ (`layer${y.toUpperCase()}`);
+		// The mouse position as percentages of the chart, swapped when a prop points at the other dimension
+		const [px, py] = k.pointer(evt);
+		const xVal = (x === 'x' ? px / k.width : py / k.height) * 100;
+		const yVal = (y === 'y' ? py / k.height : px / k.width) * 100;
 
-		const xLayerVal = (evt[xLayerKey] / (x === 'x' ? $width : $height)) * 100;
-		const yLayerVal = (evt[yLayerKey] / (y === 'y' ? $height : $width)) * 100;
-
-		found = finder.find(xLayerVal, yLayerVal, searchRadius) || {};
-
+		found = finder.find(xVal, yVal, searchRadius) || {};
 		visible = Object.keys(found).length > 0;
 	}
 
@@ -48,20 +53,21 @@
 		quadtree()
 			.extent([
 				[-1, -1],
-				[$width + 1, $height + 1]
+				[k.width + 1, k.height + 1]
 			])
 			.x(xGetter)
 			.y(yGetter)
-			.addAll(dataset || $data)
+			.addAll(dataset || k.data)
 	);
 </script>
 
+<!-- The hit area only tracks the mouse. It is hidden from screen readers and has no keyboard path. -->
+<!-- svelte-ignore a11y_mouse_events_have_key_events, a11y_no_static_element_interactions -->
 <div
 	class="bg"
 	onmousemove={findItem}
 	onmouseout={() => (visible = false)}
-	onblur={() => (visible = false)}
-	role="tooltip"
+	aria-hidden="true"
 ></div>
 {@render children?.({ x: xGetter(found) || 0, y: yGetter(found) || 0, found, visible, e })}
 

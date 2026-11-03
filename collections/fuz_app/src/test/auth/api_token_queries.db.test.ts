@@ -15,19 +15,19 @@ import {
 	query_revoke_api_token_for_account,
 	query_api_token_list_for_account,
 	query_api_token_enforce_limit
-} from '$lib/auth/api_token_queries.ts';
-import { generate_api_token } from '$lib/auth/api_token.ts';
-import { query_create_account, query_create_actor } from '$lib/auth/account_queries.ts';
-import { is_pg_unique_violation } from '$lib/db/pg_error.ts';
+} from '#lib/auth/api_token_queries.ts';
+import { generate_api_token } from '#lib/auth/api_token.ts';
+import { query_create_account, query_create_actor } from '#lib/auth/account_queries.ts';
+import { is_pg_unique_violation } from '#lib/db/pg_error.ts';
 
 import { describe_db } from '../db_fixture.ts';
-import { token_scope_full } from '../../lib/auth/token_scope.ts';
+import { token_scope_full, token_scope_methods } from '../../lib/auth/token_scope.ts';
 
 const log = new Logger('test', { level: 'off' });
 
 /** Create a test account + actor and return both ids. */
 const setup_account = async (
-	get_db: () => import('$lib/db/db.ts').Db
+	get_db: () => import('#lib/db/db.ts').Db
 ): Promise<{ account_id: string; actor_id: string }> => {
 	const db = get_db();
 	const deps = { db };
@@ -123,6 +123,37 @@ describe_db('ApiTokenQueries', (get_db) => {
 			assert.ok(result);
 			assert.strictEqual(result.id, id);
 			assert.strictEqual(result.account_id, account_id);
+		});
+
+		test('returns the stored scope parsed', async () => {
+			const { account_id } = await setup_account(get_db);
+			const db = get_db();
+			const deps = { db };
+			const { id, token, token_hash } = generate_api_token();
+			const scope = token_scope_methods(['account_verify']);
+			await query_create_api_token(deps, id, account_id, 'narrowed', token_hash, scope);
+
+			const result = await query_validate_api_token({ db, log }, token, '127.0.0.1', undefined);
+
+			assert.ok(result);
+			assert.deepStrictEqual(result.scope, scope);
+		});
+
+		test('refuses a token whose stored scope is unreadable', async () => {
+			const { account_id } = await setup_account(get_db);
+			const db = get_db();
+			const deps = { db };
+			const { id, token, token_hash } = generate_api_token();
+			await query_create_api_token(deps, id, account_id, 'garbled', token_hash, token_scope_full());
+			// a version no reader understands — fail-closed, never widened to `full`
+			await db.query(`UPDATE api_token SET scope = $1::jsonb WHERE id = $2`, [
+				JSON.stringify({ version: 999, kind: 'full' }),
+				id
+			]);
+
+			const result = await query_validate_api_token({ db, log }, token, '127.0.0.1', undefined);
+
+			assert.strictEqual(result, undefined);
 		});
 
 		test('returns undefined for unknown token', async () => {
@@ -439,7 +470,7 @@ describe_db('ApiTokenQueries', (get_db) => {
 			}
 
 			const evicted = await query_api_token_enforce_limit(deps, account_id, limit);
-			assert.strictEqual(evicted, expected_evictions);
+			assert.strictEqual(evicted.length, expected_evictions);
 
 			const remaining = await query_api_token_list_for_account(deps, account_id);
 			assert.strictEqual(remaining.length, token_count - expected_evictions);

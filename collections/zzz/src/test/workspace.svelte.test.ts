@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
 import { test, beforeEach, describe, assert } from 'vitest';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Workspace } from '$lib/workspace.svelte.ts';
-import { Workspaces } from '$lib/workspaces.svelte.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
-import { DiskfileDirectoryPath } from '$lib/diskfile_types.ts';
+import { Workspace } from '#lib/workspace.svelte.ts';
+import { Workspaces } from '#lib/workspaces.svelte.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
+import { DiskfileDirectoryPath } from '#lib/diskfile_types.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 

@@ -1,6 +1,6 @@
 import { test, assert, describe, beforeEach, afterEach } from 'vitest';
-import { HighlightManager, supports_css_highlight_api } from '$lib/highlight_manager.ts';
-import { TokenTypeRegistry, type LexedSyntax } from '$lib/lexer.ts';
+import { HighlightManager, supports_css_highlight_api } from '#lib/highlight_manager.ts';
+import { TokenTypeRegistry, type LexedSyntax } from '#lib/lexer.ts';
 import {
 	setup_mock_highlight_api,
 	restore_globals,

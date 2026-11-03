@@ -10,30 +10,26 @@
 import { describe, test, assert } from 'vitest';
 import { Hono } from 'hono';
 
-import { create_keyring } from '$lib/auth/keyring.ts';
+import type { Keyring } from '#lib/auth/keyring.ts';
 import {
 	create_session_config,
 	create_session_cookie_value,
 	SESSION_AGE_MAX,
 	type SessionOptions
-} from '$lib/auth/session_cookie.ts';
-import { create_session_middleware } from '$lib/auth/session_middleware.ts';
+} from '#lib/auth/session_cookie.ts';
+import { create_session_middleware } from '#lib/auth/session_middleware.ts';
+import { SESSION_TOKEN_KEY } from '#lib/hono_context.ts';
 
-import { OLD_KEY, TEST_KEY } from './session_test_helpers.ts';
-
-const create_test_keyring = (key = TEST_KEY) => create_keyring(key)!;
+import { OLD_KEY, TEST_KEY, create_test_keyring } from './session_test_helpers.ts';
 
 const create_config = (cookie_name = 'test_session') => create_session_config(cookie_name);
 
 /** Create a Hono test app with session middleware and a test handler that echoes the identity. */
-const create_test_app = (
-	keyring: ReturnType<typeof create_keyring>,
-	options: SessionOptions<string>
-): Hono => {
+const create_test_app = (keyring: Keyring, options: SessionOptions<string>): Hono => {
 	const app = new Hono();
-	app.use('/*', create_session_middleware(keyring!, options));
+	app.use('/*', create_session_middleware(keyring, options));
 	app.get('/test', (c) => {
-		const identity = (c as any).get(options.context_key);
+		const identity = c.get(SESSION_TOKEN_KEY);
 		return c.json({ identity });
 	});
 	return app;
@@ -101,7 +97,7 @@ describe('create_session_middleware', () => {
 		const cookie_value = await create_session_cookie_value(old_keyring, 'user-42', options);
 
 		// New keyring has new key first, old key second (for rotation)
-		const rotated_keyring = create_keyring(`${TEST_KEY}__${OLD_KEY}`);
+		const rotated_keyring = create_test_keyring(`${TEST_KEY}__${OLD_KEY}`);
 		const app = create_test_app(rotated_keyring, options);
 
 		const res = await app.request('/test', {
@@ -144,30 +140,6 @@ describe('create_session_middleware', () => {
 
 		const set_cookie = res.headers.get('set-cookie');
 		assert.ok(set_cookie, 'should clear cookie with invalid signature');
-	});
-
-	test('custom context_key works', async () => {
-		const keyring = create_test_keyring();
-		const options: SessionOptions<string> = {
-			...create_config(),
-			context_key: 'custom_identity'
-		};
-
-		const app = new Hono();
-		app.use('/*', create_session_middleware(keyring, options));
-		app.get('/test', (c) => {
-			const identity = (c as any).get('custom_identity');
-			return c.json({ identity });
-		});
-
-		const cookie_value = await create_session_cookie_value(keyring, 'user-99', options);
-		const res = await app.request('/test', {
-			headers: { Cookie: `${options.cookie_name}=${cookie_value}` }
-		});
-
-		assert.strictEqual(res.status, 200);
-		const body = await res.json();
-		assert.strictEqual(body.identity, 'user-99');
 	});
 
 	test('calls next() for downstream handlers', async () => {

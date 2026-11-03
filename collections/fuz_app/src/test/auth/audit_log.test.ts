@@ -10,23 +10,29 @@
 import { describe, test, assert, vi, afterEach, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 
-import { REQUEST_CONTEXT_KEY, type RequestContext } from '$lib/auth/request_context.ts';
-import { ACCOUNT_ID_KEY, CREDENTIAL_TYPE_KEY, TEST_CONTEXT_PRESET_KEY } from '$lib/hono_context.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { apply_route_specs } from '$lib/http/route_spec.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { create_keyring } from '$lib/auth/keyring.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { RateLimiter } from '$lib/rate_limiter.ts';
-import { create_proxy_middleware } from '$lib/http/proxy.ts';
-import type { AuditLogInput } from '$lib/auth/audit_log_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { create_stub_db, create_noop_stub } from '$lib/testing/stubs.ts';
+import { REQUEST_CONTEXT_KEY, type RequestContext } from '#lib/auth/request_context.ts';
+import {
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { apply_route_specs } from '#lib/http/route_spec.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { RateLimiter } from '#lib/rate_limiter.ts';
+import type { AuditLogInput } from '#lib/auth/audit_log_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { create_stub_db, create_noop_stub } from '#lib/testing/stubs.ts';
 import {
 	create_recording_audit_emitter,
 	type RecordingAuditEmitter
-} from '$lib/testing/audit_drift_guard.ts';
+} from '#lib/testing/audit_drift_guard.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
+import { create_realtime_closer } from '#lib/actions/connection_closer.ts';
+import { TEST_CONNECTION_IP, test_proxy_middleware } from '../rate_limiter_test_helpers.ts';
+import { create_test_keyring } from './session_test_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 
@@ -55,14 +61,14 @@ const {
 	),
 	mock_update_password: vi.fn((..._args: Array<any>) => Promise.resolve(true)),
 	mock_session_create: vi.fn((..._args: Array<any>) => Promise.resolve()),
-	mock_session_enforce_limit: vi.fn((..._args: Array<any>) => Promise.resolve(0)),
+	mock_session_enforce_limit: vi.fn((..._args: Array<any>) => Promise.resolve([])),
 	mock_session_revoke: vi.fn((..._args: Array<any>) => Promise.resolve()),
 	mock_session_revoke_all: vi.fn((..._args: Array<any>) => Promise.resolve(2)),
 	mock_session_revoke_for_account: vi.fn((..._args: Array<any>) => Promise.resolve(true)),
 	mock_session_list_for_account: vi.fn((..._args: Array<any>) => Promise.resolve([] as Array<any>)),
 	mock_session_list_all_active: vi.fn((..._args: Array<any>) => Promise.resolve([] as Array<any>)),
 	mock_api_token_create: vi.fn((..._args: Array<any>) => Promise.resolve()),
-	mock_api_token_enforce_limit: vi.fn((..._args: Array<any>) => Promise.resolve()),
+	mock_api_token_enforce_limit: vi.fn((..._args: Array<any>) => Promise.resolve([])),
 	mock_api_token_revoke_for_account: vi.fn((..._args: Array<any>) => Promise.resolve(true)),
 	mock_api_token_list_for_account: vi.fn((..._args: Array<any>) =>
 		Promise.resolve([] as Array<any>)
@@ -87,14 +93,14 @@ const {
 let audit_log_capture: RecordingAuditEmitter = create_recording_audit_emitter();
 let audit_log_calls: Array<AuditLogInput> = audit_log_capture.calls;
 
-vi.mock('$lib/auth/account_queries.js', () => ({
+vi.mock('#lib/auth/account_queries.ts', () => ({
 	query_account_by_username_or_email: mock_find_by_username_or_email,
 	query_update_account_password: mock_update_password,
 	query_admin_account_list: vi.fn(() => Promise.resolve([]))
 }));
 
-vi.mock('$lib/auth/session_queries.js', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$lib/auth/session_queries.ts')>();
+vi.mock('#lib/auth/session_queries.ts', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('#lib/auth/session_queries.ts')>();
 	return {
 		...actual,
 		query_create_session: mock_session_create,
@@ -107,7 +113,7 @@ vi.mock('$lib/auth/session_queries.js', async (importOriginal) => {
 	};
 });
 
-vi.mock('$lib/auth/api_token_queries.js', () => ({
+vi.mock('#lib/auth/api_token_queries.ts', () => ({
 	query_create_api_token: mock_api_token_create,
 	query_api_token_enforce_limit: mock_api_token_enforce_limit,
 	query_api_token_list_for_account: mock_api_token_list_for_account,
@@ -116,8 +122,8 @@ vi.mock('$lib/auth/api_token_queries.js', () => ({
 	query_validate_api_token: vi.fn(() => Promise.resolve(undefined))
 }));
 
-vi.mock('$lib/auth/audit_log_queries.js', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$lib/auth/audit_log_queries.ts')>();
+vi.mock('#lib/auth/audit_log_queries.ts', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('#lib/auth/audit_log_queries.ts')>();
 	return {
 		...actual,
 		query_audit_log: mock_audit_log,
@@ -132,11 +138,8 @@ vi.mock('$lib/auth/audit_log_queries.js', async (importOriginal) => {
 const ACC_TEST = '00000000-0000-4000-8000-000000000001' as Uuid;
 const ACT_TEST = '00000000-0000-4000-8000-000000000002' as Uuid;
 
-const keyring = create_keyring('audit_integration_test_key')!;
+const keyring = create_test_keyring('audit-integration-test-key-at-least-32-chars');
 const session_options = create_session_config('test_session');
-
-/** Simulated connection IP for test requests. */
-const TEST_CONNECTION_IP = '127.0.0.1';
 
 const db = create_stub_db();
 const noop = create_noop_stub('deps');
@@ -147,8 +150,8 @@ const fake_account = {
 	email: null,
 	email_verified: false,
 	password_hash: 'fake_hash',
-	created_at: '2025-01-01T00:00:00.000Z',
-	updated_at: '2025-01-01T00:00:00.000Z',
+	created_at: '2025-01-01T00:00:00Z',
+	updated_at: '2025-01-01T00:00:00Z',
 	created_by: null,
 	updated_by: null,
 	deleted_at: null,
@@ -159,7 +162,7 @@ const fake_actor = {
 	id: ACT_TEST,
 	account_id: ACC_TEST,
 	name: 'testuser',
-	created_at: '2025-01-01T00:00:00.000Z',
+	created_at: '2025-01-01T00:00:00Z',
 	updated_at: null,
 	updated_by: null,
 	deleted_at: null,
@@ -171,15 +174,6 @@ const fake_ctx: RequestContext = {
 	actor: fake_actor,
 	role_grants: []
 };
-
-/**
- * Proxy middleware for tests: trusts the simulated connection IP
- * so that `get_client_ip(c)` returns a real value.
- */
-const test_proxy_middleware = create_proxy_middleware({
-	trusted_proxies: [TEST_CONNECTION_IP],
-	get_connection_ip: () => TEST_CONNECTION_IP
-});
 
 // --- Tests ---
 
@@ -224,7 +218,8 @@ describe('account route audit logging', () => {
 				} as any,
 				read_secure_file: noop,
 				delete_file: noop,
-				audit: audit_log_capture.emitter
+				audit: audit_log_capture.emitter,
+				connection_closer: create_realtime_closer()
 			},
 			{
 				session_options,
@@ -235,13 +230,25 @@ describe('account route audit logging', () => {
 		);
 
 		const app = new Hono();
+		// the request's two side-effect queues — the handlers queue their
+		// connection closes on the post-commit one
+		app.use('*', async (c, next) => {
+			c.set('pending_effects', []);
+			c.set('post_commit_effects', []);
+			await next();
+		});
 		app.use('*', test_proxy_middleware);
 		if (options?.inject_ctx) {
 			app.use('/*', async (c, next) => {
-				c.set(ACCOUNT_ID_KEY, options.inject_ctx!.account.id);
+				c.set(
+					RESOLVED_AUTH_KEY,
+					create_test_resolved_auth({
+						credential_type: 'session',
+						account_id: options.inject_ctx!.account.id
+					})
+				);
 				c.set(REQUEST_CONTEXT_KEY, options.inject_ctx!);
-				c.set(TEST_CONTEXT_PRESET_KEY, true);
-				c.set(CREDENTIAL_TYPE_KEY, 'session');
+				c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 				await next();
 			});
 		}
@@ -308,7 +315,10 @@ describe('account route audit logging', () => {
 
 	test('logout creates audit entry', async () => {
 		const app = create_account_test_app({ inject_ctx: fake_ctx });
-		const res = await app.request('/logout', { method: 'POST' });
+		const res = await app.request('/logout', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 200);
 
 		assert.strictEqual(audit_log_calls.length, 1);
@@ -388,10 +398,11 @@ describe('account route audit logging', () => {
 					hash_password: vi.fn(() => Promise.resolve('h')),
 					verify_password: vi.fn(() => Promise.resolve(true)),
 					verify_dummy: vi.fn(() => Promise.resolve(false))
-				} as any,
+				},
 				read_secure_file: noop,
 				delete_file: noop,
-				audit: audit_log_capture.emitter
+				audit: audit_log_capture.emitter,
+				connection_closer: create_realtime_closer()
 			},
 			{
 				session_options,

@@ -15,18 +15,18 @@
 
 import { describe, test, assert, vi, afterEach, beforeEach, type MockInstance } from 'vitest';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 
 import {
 	create_admin_rpc_adapters,
 	provide_admin_rpc_contexts,
 	type AdminRpcApi
-} from '$lib/ui/admin_rpc_adapters.ts';
-import { admin_accounts_rpc_context } from '$lib/ui/admin_accounts_state.svelte.ts';
-import { admin_invites_rpc_context } from '$lib/ui/admin_invites_state.svelte.ts';
-import { audit_log_rpc_context } from '$lib/ui/audit_log_state.svelte.ts';
-import { app_settings_rpc_context } from '$lib/ui/app_settings_state.svelte.ts';
-import { format_scope_context, type FormatScope } from '$lib/ui/format_scope.ts';
+} from '#lib/ui/admin_rpc_adapters.ts';
+import { admin_accounts_rpc_context } from '#lib/ui/admin_accounts_state.svelte.ts';
+import { admin_invites_rpc_context } from '#lib/ui/admin_invites_state.svelte.ts';
+import { audit_log_rpc_context } from '#lib/ui/audit_log_state.svelte.ts';
+import { app_settings_rpc_context } from '#lib/ui/app_settings_state.svelte.ts';
+import { format_scope_context, type FormatScope } from '#lib/ui/format_scope.ts';
 
 // Test fixtures — narrow `Admin*Rpc` interfaces require `Uuid`-branded ids
 // (matching the wire spec types). Real values would arrive pre-branded from
@@ -49,15 +49,18 @@ const make_admin_api = (
 	responses: Record<string, unknown> = {}
 ): { api: AdminRpcApi; calls: Array<{ method: string; input: unknown }> } => {
 	const calls: Array<{ method: string; input: unknown }> = [];
-	const api = new Proxy({} as Record<string, (input?: unknown) => Promise<unknown>>, {
-		get: (_t, method) => {
-			if (typeof method !== 'string') return undefined;
-			return async (input?: unknown) => {
-				calls.push({ method, input });
-				return responses[method];
-			};
+	const api = new Proxy(
+		{},
+		{
+			get: (_t, method) => {
+				if (typeof method !== 'string') return undefined;
+				return async (input?: unknown) => {
+					calls.push({ method, input });
+					return responses[method];
+				};
+			}
 		}
-	}) as unknown as AdminRpcApi;
+	) as unknown as AdminRpcApi;
 	return { api, calls };
 };
 
@@ -80,27 +83,27 @@ const assert_called_with = (
 };
 
 describe('create_admin_rpc_adapters — admin_accounts mappings', () => {
-	test('list_accounts maps to admin_account_list, threading include_deleted', async () => {
+	test('list_accounts maps to admin_account_list, forwarding params', async () => {
 		const { api, calls } = make_admin_api({
 			admin_account_list: { accounts: [], grantable_roles: [] }
 		});
 		const { admin_accounts } = create_admin_rpc_adapters(api);
-		const result = await admin_accounts.list_accounts(true);
+		const result = await admin_accounts.list_accounts({ include_deleted: true });
 		assert_called_with(calls, { method: 'admin_account_list', input: { include_deleted: true } });
 		assert.deepEqual(result, { accounts: [], grantable_roles: [] });
 	});
 
-	test('delete_account maps to account_delete with the account id', async () => {
+	test('delete_account maps to account_delete, forwarding params', async () => {
 		const { api, calls } = make_admin_api({ account_delete: { ok: true, deleted: true } });
 		const { admin_accounts } = create_admin_rpc_adapters(api);
-		await admin_accounts.delete_account(acct_id);
+		await admin_accounts.delete_account({ account_id: acct_id });
 		assert_called_with(calls, { method: 'account_delete', input: { account_id: acct_id } });
 	});
 
-	test('undelete_account maps to account_undelete with the account id', async () => {
+	test('undelete_account maps to account_undelete, forwarding params', async () => {
 		const { api, calls } = make_admin_api({ account_undelete: { ok: true, undeleted: true } });
 		const { admin_accounts } = create_admin_rpc_adapters(api);
-		await admin_accounts.undelete_account(acct_id);
+		await admin_accounts.undelete_account({ account_id: acct_id });
 		assert_called_with(calls, { method: 'account_undelete', input: { account_id: acct_id } });
 	});
 
@@ -109,6 +112,20 @@ describe('create_admin_rpc_adapters — admin_accounts mappings', () => {
 		const { admin_accounts } = create_admin_rpc_adapters(api);
 		await admin_accounts.list_sessions();
 		assert_called_with(calls, { method: 'admin_session_list' });
+	});
+
+	test('the defaulted-input reads forward their params', async () => {
+		const acting = 'actor-1' as Uuid;
+		const { api, calls } = make_admin_api();
+		const { admin_accounts, admin_invites, app_settings } = create_admin_rpc_adapters(api);
+		await admin_accounts.list_sessions({ acting });
+		await admin_invites.list({ acting });
+		await app_settings.get({ acting });
+		assert.deepEqual(calls, [
+			{ method: 'admin_session_list', input: { acting } },
+			{ method: 'invite_list', input: { acting } },
+			{ method: 'app_settings_get', input: { acting } }
+		]);
 	});
 
 	test('create_role_grant maps to role_grant_offer_create and forwards params', async () => {
@@ -131,10 +148,10 @@ describe('create_admin_rpc_adapters — admin_accounts mappings', () => {
 		});
 	});
 
-	test('retract_offer wraps bare offer_id into {offer_id}', async () => {
+	test('retract_offer maps to role_grant_offer_retract, forwarding params', async () => {
 		const { api, calls } = make_admin_api();
 		const { admin_accounts } = create_admin_rpc_adapters(api);
-		await admin_accounts.retract_offer(offer_id);
+		await admin_accounts.retract_offer({ offer_id });
 		assert_called_with(calls, { method: 'role_grant_offer_retract', input: { offer_id } });
 	});
 
@@ -186,11 +203,11 @@ describe('create_admin_rpc_adapters — admin_invites mappings', () => {
 });
 
 describe('create_admin_rpc_adapters — audit_log mappings', () => {
-	test('list maps to audit_log_list with empty default', async () => {
+	test('list maps to audit_log_list, passing omitted params through', async () => {
 		const { api, calls } = make_admin_api();
 		const { audit_log } = create_admin_rpc_adapters(api);
 		await audit_log.list();
-		assert_called_with(calls, { method: 'audit_log_list', input: {} });
+		assert_called_with(calls, { method: 'audit_log_list' });
 	});
 
 	test('list forwards filter options', async () => {
@@ -213,11 +230,11 @@ describe('create_admin_rpc_adapters — audit_log mappings', () => {
 		});
 	});
 
-	test('role_grant_history defaults to empty params when omitted', async () => {
+	test('role_grant_history passes omitted params through', async () => {
 		const { api, calls } = make_admin_api();
 		const { audit_log } = create_admin_rpc_adapters(api);
 		await audit_log.role_grant_history();
-		assert_called_with(calls, { method: 'audit_log_role_grant_history', input: {} });
+		assert_called_with(calls, { method: 'audit_log_role_grant_history' });
 	});
 });
 
@@ -246,11 +263,14 @@ describe('create_admin_rpc_adapters — error propagation', () => {
 			code: -32002,
 			data: { reason: 'role_grant_offer_not_authorized' }
 		});
-		const api = new Proxy({} as Record<string, (input?: unknown) => Promise<unknown>>, {
-			get: () => async () => {
-				throw err;
+		const api = new Proxy(
+			{},
+			{
+				get: () => async () => {
+					throw err;
+				}
 			}
-		}) as unknown as AdminRpcApi;
+		) as unknown as AdminRpcApi;
 		const { admin_accounts } = create_admin_rpc_adapters(api);
 		const caught = await assert_rejects(() =>
 			admin_accounts.create_role_grant({ to_account_id: acct_id, role: 'admin' })

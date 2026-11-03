@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Hue } from '@fuzdev/fuz_util/colors.ts';
+	import { parse_hue, type Hue } from '@fuzdev/fuz_util/colors.ts';
 	import type { Snippet } from 'svelte';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
@@ -11,16 +11,6 @@
 		value?: Hue;
 		children?: Snippet;
 	} = $props();
-
-	// TODO probably upstream this to fuz_util
-	const parse_hue = (v: any): Hue | null => {
-		const t = typeof v;
-		if (t === 'number') return v;
-		if (t !== 'string') return null;
-		const parsed = Number(v);
-		if (Number.isNaN(parsed)) return null;
-		return parsed;
-	};
 
 	const update_hue = (v: Hue) => {
 		value = v;

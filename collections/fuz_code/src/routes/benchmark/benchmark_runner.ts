@@ -10,7 +10,7 @@ import type {
 	BenchmarkHarnessController,
 	BenchmarkComponentProps
 } from './benchmark_types.ts';
-import type { CodeSample } from '$lib/code_sample.ts';
+import type { CodeSample } from '#lib/code_sample.ts';
 import { inter_test_cooldown } from './benchmark_dom.ts';
 import {
 	check_system_stability,
@@ -27,9 +27,6 @@ const MIN_VALID_TIMING_MS = 0.01;
 const MAX_VALID_TIMING_MS = 60000;
 const SUSPICIOUS_MEAN_MS = 0.1;
 const HIGH_OUTLIER_RATIO = 0.2;
-// Cap the rolling jitter window so it can't grow unbounded across a long suite;
-// `calculate_timing_jitter` only reads the last handful of entries anyway.
-const MAX_RECENT_TIMINGS = 50;
 
 // Warmup phase using harness with large content
 export const warmup_phase = async (
@@ -58,7 +55,6 @@ export const measurement_phase = async (
 	content: string,
 	lang: string,
 	config: BenchmarkConfig,
-	recent_timings: Array<number>,
 	harness: BenchmarkHarnessController,
 	on_progress?: () => void,
 	should_stop?: () => boolean
@@ -66,7 +62,9 @@ export const measurement_phase = async (
 	const work_ms: Array<number> = [];
 	const paint_ms: Array<number> = [];
 	const stability_checks = [];
-	const timestamps = [];
+	// the jitter window is this test's own timings, so one workload's spread
+	// isn't read against another's
+	const recent_timings: Array<number> = [];
 
 	for (let i = 0; i < config.iterations; i++) {
 		// Check for stop signal
@@ -99,57 +97,49 @@ export const measurement_phase = async (
 		try {
 			const { work_ms: work, paint_ms: paint } = await harness.run_iteration(impl.component, props);
 
-			// Validate against the work time — the highlighter's compute cost — and
+			// Validate against the work time — the styler's compute cost — and
 			// keep the two series index-aligned (a failed iteration is NaN in both).
-			if (work <= 0) {
-				console.warn(`[Measurement] Suspicious timing (${work}ms) - marking as failed`);
-				work_ms.push(NaN);
-				paint_ms.push(NaN);
-				timestamps.push(Date.now());
-			} else if (work < MIN_VALID_TIMING_MS) {
-				console.warn(`[Measurement] Suspiciously fast timing (${work}ms) - possible no-op render`);
-				work_ms.push(work);
-				paint_ms.push(paint);
-				timestamps.push(Date.now());
-				recent_timings.push(work);
-			} else if (work > MAX_VALID_TIMING_MS) {
-				console.warn(`[Measurement] Extremely slow timing (${work}ms) - possible hang`);
-				work_ms.push(NaN);
-				paint_ms.push(NaN);
-				timestamps.push(Date.now());
-			} else {
-				console.log(
-					`[Measurement] Iteration ${i + 1} complete: ${work.toFixed(2)}ms work / ${paint.toFixed(2)}ms paint`
+			if (work <= 0 || work > MAX_VALID_TIMING_MS) {
+				console.warn(
+					work <= 0
+						? `[Measurement] Suspicious timing (${work}ms) - marking as failed`
+						: `[Measurement] Extremely slow timing (${work}ms) - possible hang`
 				);
+				work_ms.push(NaN);
+				paint_ms.push(NaN);
+			} else {
+				if (work < MIN_VALID_TIMING_MS) {
+					console.warn(
+						`[Measurement] Suspiciously fast timing (${work}ms) - possible no-op render`
+					);
+				} else {
+					console.log(
+						`[Measurement] Iteration ${i + 1} complete: ${work.toFixed(2)}ms work / ${paint.toFixed(2)}ms paint`
+					);
+				}
 				work_ms.push(work);
 				paint_ms.push(paint);
-				timestamps.push(Date.now());
 				recent_timings.push(work);
-			}
-
-			// Bound the rolling jitter window (see `MAX_RECENT_TIMINGS`).
-			if (recent_timings.length > MAX_RECENT_TIMINGS) {
-				recent_timings.splice(0, recent_timings.length - MAX_RECENT_TIMINGS);
 			}
 		} catch (error) {
+			// record the failure and continue rather than failing the whole test
 			console.error(`[Measurement] Iteration ${i + 1} failed:`, error);
-			// Continue with next iteration instead of failing entire test
-			// Record a null/NaN to indicate failure
 			work_ms.push(NaN);
 			paint_ms.push(NaN);
-			timestamps.push(Date.now());
 		}
 
 		if (on_progress) {
 			on_progress();
 		}
 
+		// a minor collection only: a forced full one discards optimized code, so
+		// the next iteration would re-optimize inside the clock
 		if (globalThis.gc) {
-			globalThis.gc();
+			globalThis.gc({ type: 'minor' });
 		}
 	}
 
-	return { work_ms, paint_ms, stability_checks, timestamps };
+	return { work_ms, paint_ms, stability_checks };
 };
 
 // Run complete benchmark suite
@@ -165,7 +155,6 @@ export const run_all_benchmarks = async (
 	const langs = custom_languages || languages;
 	const results: Array<BenchmarkResult> = [];
 	const warnings: Array<string> = [];
-	const recent_timings: Array<number> = [];
 
 	const total_tests = impls.length * langs.length;
 	const total_iterations = total_tests * config.iterations;
@@ -214,7 +203,6 @@ export const run_all_benchmarks = async (
 					content,
 					lang,
 					config,
-					recent_timings,
 					harness,
 					() => {
 						current_progress++;

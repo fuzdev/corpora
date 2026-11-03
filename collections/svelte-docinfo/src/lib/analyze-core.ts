@@ -1,22 +1,21 @@
 /**
  * Pure two-phase analysis orchestrator.
  *
- * Extracted from `analyze.ts` to break what would otherwise be a circular
- * import: `session.ts` → `analyze.ts` (for the orchestrator) → `session.ts`
- * (for the wrappers). With the orchestrator here, both `session.ts` and
- * `analyze.ts` import downward into this module without depending on each
- * other.
+ * Separate from `analyze.ts` so `session.ts` (which needs the orchestrator)
+ * and `analyze.ts` (which needs the session) both import downward into this
+ * module without a cycle.
  *
  * Public surface:
  *
  * - `analyzeCore` — runs phase 1 module dispatch + phase 2 re-export merge,
  *   returns `AnalyzeResultJson`. Caller supplies pre-prepared inputs (program,
  *   svelte virtuals, transform-failed IDs).
- * - `analyzeModule` — the per-module dispatcher (TS / Svelte / CSS / JSON).
- *   `@internal`; exposed for tests and power users via the subpath.
- * - `AnalyzeResultJson` / `OnDuplicates` / `OnDuplicatesCallback` — shared types
+ * - `analyzeModule` — the per-module dispatcher for non-Svelte files (TS / CSS /
+ *   JSON; Svelte needs `analyzeSvelteModule`). `@internal`; exposed for tests
+ *   and power users via the subpath.
+ * - `AnalyzeResultJson` / `parseAnalyzeResult` / `AnalyzeResultJsonWire` /
+ *   `OnDuplicates` — the envelope schema, its parse helper, and shared types,
  *   surfaced through the main barrel directly from this module.
- * - `throwOnDuplicates` — convenience callback paired with `OnDuplicates`.
  * - `finalizeDiagnostics` — the diagnostic boundary passes (virtual position
  *   remap, then path normalization) in their required order; the one call for
  *   callers assembling modules themselves.
@@ -28,23 +27,27 @@
  *   assembling modules itself through `analyzeModule` can meet the same
  *   output contract.
  *
- * @internal — module split is implementation detail; consumers go through
- * `analyze.ts` / `session.ts` for the stable surface.
+ * The barrel-surfaced schemas and types are stable API.
+ * Everything else is subpath-only; `analyzeCore` and `analyzeModule` are
+ * `@internal`.
  *
  * @module
  */
 
 import { relative } from 'node:path';
 import ts from 'typescript';
-import { z } from 'zod';
+import * as v from 'valibot';
 
-import { ModuleJson, type ModuleJsonInput } from './types.ts';
+import { ModuleJson, parseModuleJson, type ModuleJsonInput } from './types.ts';
+import { parseWithSummary, type Named } from './schema.ts';
 import type { ModuleAnalysis } from './declaration-build.ts';
-import { Diagnostic } from './diagnostics.ts';
+import { Diagnostic, type ModuleSkippedDiagnostic } from './diagnostics.ts';
 import type { AnalysisLog } from './log.ts';
 import { analyzeTypescriptModule } from './typescript-exports.ts';
+import { toModuleDocFields } from './tsdoc.ts';
 import {
 	analyzeSvelteModule,
+	reclassifySnippetDeclaration,
 	remapVirtualDiagnosticPositions,
 	type SvelteVirtualFile
 } from './svelte.ts';
@@ -58,7 +61,11 @@ import { type ModuleSourceOptions, extractPath, extractDependencies } from './so
 import { toPosixPath, isAbsolutePosixPath } from './paths.ts';
 import { buildAliasRegistry, type AliasRegistrySource } from './typescript-alias-registry.ts';
 import type { AliasRegistry } from './typescript-extract-type-json.ts';
-import { createExtractContext } from './typescript-extract-shared.ts';
+import {
+	createExtractContext,
+	type FileExists,
+	type IsEmittedFile
+} from './typescript-extract-shared.ts';
 import {
 	sortModules,
 	findDuplicates,
@@ -71,53 +78,24 @@ import {
 // Duplicate handling
 
 /**
- * Custom callback for handling duplicate declaration names.
+ * Opt-in check that declaration names are unique across modules.
  *
- * Use the `'throw'` or `'warn'` shortcuts on `onDuplicates` for the common
- * cases. Pass a function to fully control reporting.
+ * For packages that keep a flat export namespace, where every exported name
+ * is unique across the whole package. Most packages don't, and two modules
+ * exporting the same name is ordinary, so the check is off by default:
+ * omitted, duplicate detection doesn't run and nothing is reported.
  *
- * @param duplicates - map of declaration names to their `DuplicateDeclaration` occurrences across modules
- * @param log - logger for reporting (only `error` method required)
+ * Every mode emits a `duplicate_declaration` diagnostic per colliding name:
+ *
+ * - `'diagnostic'` — the diagnostics only
+ * - `'warn'` — also log the collisions to `log.warn` and continue
+ * - `'throw'` — also throw an `Error` listing every duplicate
+ *
+ * The throw fires before the result is returned, so `'throw'` callers never
+ * reach the diagnostics array. For custom handling, use `'diagnostic'` and
+ * read the records with `byKind(diagnostics, 'duplicate_declaration')`.
  */
-export type OnDuplicatesCallback = (
-	duplicates: Map<string, Array<DuplicateDeclaration>>,
-	log: Pick<AnalysisLog, 'error'>
-) => void;
-
-/**
- * Behavior selector for duplicate declaration names across modules.
- *
- * - `'throw'` — throw an `Error` listing every duplicate (strict flat-namespace enforcement)
- * - `'warn'` — log to `log.error` and continue
- * - `OnDuplicatesCallback` — custom handler
- *
- * Omitted entirely: no dispatch runs, but a `duplicate_declaration` diagnostic
- * is still emitted into the diagnostics array for every collision (the diagnostic
- * is the data; this option is the action).
- *
- * **`'throw'` trade-off**: the throw fires after diagnostics are emitted but
- * before the result is returned, so `'throw'` callers never reach the
- * diagnostics array. Callers that want fail-fast *and* diagnostic access
- * should omit `onDuplicates` and inspect themselves:
- *
- * ```ts
- * const result = await analyze({...});
- * if (hasErrors(result.diagnostics)) throw new Error('analysis errors');
- * ```
- *
- * Or use an `OnDuplicatesCallback` and stash the data before throwing.
- */
-export type OnDuplicates = 'throw' | 'warn' | OnDuplicatesCallback;
-
-/**
- * Convenience `OnDuplicatesCallback` that throws on any duplicate.
- *
- * @throws Error listing every duplicate name and module location
- */
-export const throwOnDuplicates: OnDuplicatesCallback = (duplicates) => {
-	if (duplicates.size === 0) return;
-	throw new Error(formatDuplicates(duplicates));
-};
+export type OnDuplicates = 'diagnostic' | 'warn' | 'throw';
 
 const formatDuplicates = (duplicates: Map<string, Array<DuplicateDeclaration>>): string => {
 	const details = Array.from(duplicates)
@@ -134,9 +112,8 @@ const formatDuplicates = (duplicates: Map<string, Array<DuplicateDeclaration>>):
 
 	return (
 		`Found ${duplicates.size} duplicate declaration name${duplicates.size === 1 ? '' : 's'} across modules. ` +
-		'The flat namespace requires unique names. To resolve: ' +
-		'(1) rename one of the conflicting declarations, or ' +
-		'(2) add /** @nodocs */ to exclude from documentation.\n' +
+		'To resolve, rename one of the conflicting declarations, ' +
+		'or mark one /** @nodocs */ if it is not public API.\n' +
 		details
 	);
 };
@@ -178,20 +155,38 @@ const dispatchOnDuplicates = (
 	duplicates: Map<string, Array<DuplicateDeclaration>>,
 	log?: AnalysisLog
 ): void => {
-	if (duplicates.size === 0) return;
-	if (mode === 'throw') {
-		throw new Error(formatDuplicates(duplicates));
-	}
-	const errorLog: Pick<AnalysisLog, 'error'> = log ?? { error: (msg) => console.error(msg) };
-	if (mode === 'warn') {
-		errorLog.error(formatDuplicates(duplicates));
-		return;
-	}
-	mode(duplicates, errorLog);
+	if (duplicates.size === 0 || mode === 'diagnostic') return;
+	const message = formatDuplicates(duplicates);
+	if (mode === 'throw') throw new Error(message);
+	(log?.warn ?? console.warn)(message);
 };
 
 // Result types
 
+// named through an interface for declaration emit, as in `types.ts`
+const AnalyzeResultJsonEntries = v.strictObject({
+	modules: v.optional(v.array(ModuleJson), () => []),
+	diagnostics: v.optional(v.array(Diagnostic), () => [])
+});
+// Both keys are optional, and `v.strictObject` takes any non-null object, so
+// without the guard an empty array would parse as an empty result (a
+// plausible slip: passing a `modules` array where the envelope belongs).
+// Every other object schema has a required key an array can't carry.
+// The input interface is exported so a consumer's emitted declarations can
+// name the envelope's input type.
+/** @nodocs */
+export interface AnalyzeResultJsonEntriesInput extends Named<
+	v.InferInput<typeof AnalyzeResultJsonEntries>
+> {}
+const AnalyzeResultJsonImpl = v.pipe(
+	v.custom<AnalyzeResultJsonEntriesInput>(
+		(input) => !Array.isArray(input),
+		'Invalid type: Expected Object but received Array'
+	),
+	AnalyzeResultJsonEntries
+);
+/** @nodocs */
+export interface AnalyzeResultJsonSchema extends Named<typeof AnalyzeResultJsonImpl> {}
 /**
  * Result of `analyze`, `analyzeFromFiles`, and `AnalysisSession.query`.
  *
@@ -201,49 +196,72 @@ const dispatchOnDuplicates = (
  *
  * ## Schema-validated round-trip
  *
- * The envelope is a Zod schema (`AnalyzeResultJson`) — both fields default to
- * `[]`, so `JSON.stringify(result, compactReplacer)` strips empty arrays on
- * the wire and `AnalyzeResultJson.parse(JSON.parse(json))` restores them.
- * Consumers programmatically ingesting analysis JSON should parse through the
- * schema to get defaults restored; raw-JSON consumers (e.g., `jq`) treat
+ * The envelope is a valibot schema (`AnalyzeResultJson`) — both fields default
+ * to `[]`, so `JSON.stringify(result, compactReplacer)` strips empty arrays on
+ * the wire and `parseAnalyzeResult(JSON.parse(json))` restores them.
+ * Consumers programmatically ingesting analysis JSON should parse through
+ * `parseAnalyzeResult` to get defaults restored; raw-JSON consumers (e.g., `jq`) treat
  * missing keys as null-equivalent (`jq '.diagnostics | length'` returns `0`
  * on `{}`) and don't need the parse step.
  *
  * Construction sites (one-shot wrappers, `session.query`) hand back hand-built
- * objects without re-running `.parse()` — the inner `modules` and
- * `diagnostics` arrays are already Zod-validated upstream, and the envelope
+ * objects without re-parsing — the inner `modules` and `diagnostics` arrays
+ * are already schema-validated upstream, and the envelope
  * schema is the type contract, not a validation gate.
  *
  * See `AnalyzeResultJsonWire` for the serialized input-side shape published on
  * `virtual:svelte-docinfo`.
  */
-export const AnalyzeResultJson = z.strictObject({
-	modules: z.array(ModuleJson).default([]),
-	diagnostics: z.array(Diagnostic).default([])
-});
-export type AnalyzeResultJson = z.infer<typeof AnalyzeResultJson>;
+export const AnalyzeResultJson: AnalyzeResultJsonSchema = AnalyzeResultJsonImpl;
+export type AnalyzeResultJson = v.InferOutput<typeof AnalyzeResultJson>;
+
+/**
+ * Validate an analysis result, restoring the defaults the wire form omits.
+ *
+ * The stable way to consume serialized output (the CLI's JSON, a file written
+ * with `compactReplacer`, `virtual:svelte-docinfo`'s data), independent of the
+ * schema library behind `AnalyzeResultJson`: empty arrays and `false`
+ * booleans that `compactReplacer` stripped come back, and anything that
+ * doesn't match the schema throws.
+ *
+ * @param value - an analysis result, typically from `JSON.parse`
+ * @returns the validated result with every default present
+ * @throws Error when `value` doesn't match the schema; the message lists the
+ *   reported issues, one per line, as `path: message`
+ *   (`modules.0.declarations.1.kind: Invalid type: …`), the dot path omitted for an
+ *   issue at the root. The class is the schema library's (valibot's `ValiError`, the
+ *   structured list on `issues`), so catch it as a plain `Error` unless you
+ *   depend on valibot
+ *
+ * @example
+ * ```ts
+ * const result = parseAnalyzeResult(JSON.parse(await readFile('docinfo.json', 'utf8')));
+ * ```
+ */
+export const parseAnalyzeResult = (value: unknown): AnalyzeResultJson =>
+	parseWithSummary(AnalyzeResultJson, value);
 
 /**
  * Serialized wire shape of an analysis result, as published by the Vite plugin
  * on `virtual:svelte-docinfo` — the input-side counterpart to
- * `AnalyzeResultJson` (the validated output of `.parse()`).
+ * `AnalyzeResultJson` (the validated output of `parseAnalyzeResult`).
  *
  * The two fields are deliberately asymmetric:
  *
- * - `modules` is `ModuleJsonInput` (the `z.input` of `ModuleJson`) because the
- *   plugin runs it through `compactReplacer`, which strips `.default([])`
- *   arrays and `.default(false)` booleans. Default-bearing fields therefore
- *   arrive `undefined`.
+ * - `modules` is `ModuleJsonInput` (the `v.InferInput` of `ModuleJson`)
+ *   because the plugin runs it through `compactReplacer`, which strips
+ *   defaulted empty arrays and `false` booleans. Default-bearing fields
+ *   therefore arrive `undefined`.
  * - `diagnostics` is the output `Diagnostic` — the plugin serializes it
  *   without the replacer, and `Diagnostic` has no defaults to strip, so the
  *   array is always present and the shape matches runtime exactly.
  *
- * Consumers restore defaults by parsing through `AnalyzeResultJson`.
+ * Consumers restore defaults with `parseAnalyzeResult`.
  *
  * Note this describes the Vite virtual module specifically. The CLI runs the
  * whole envelope through `compactReplacer`, so its JSON may additionally omit
  * an empty `diagnostics` array — CLI consumers should parse through
- * `AnalyzeResultJson` rather than assume this shape.
+ * `parseAnalyzeResult` rather than assume this shape.
  */
 export interface AnalyzeResultJsonWire {
 	modules: Array<ModuleJsonInput>;
@@ -279,7 +297,7 @@ const toModuleJson = (raw: ModuleAnalysis): ModuleJson => {
 				compareStrings(a.specifier, b.specifier) ||
 				(a.sourceLine ?? 0) - (b.sourceLine ?? 0)
 		);
-	return ModuleJson.parse({
+	return parseModuleJson({
 		path: raw.path,
 		declarations: filtered,
 		dependencies: raw.dependencies,
@@ -288,19 +306,15 @@ const toModuleJson = (raw: ModuleAnalysis): ModuleJson => {
 		reExports,
 		externalReExports,
 		externalStarExports: raw.externalStarExports,
-		...(raw.moduleComment ? { moduleComment: raw.moduleComment } : {})
+		...toModuleDocFields(raw.moduleDoc)
 	});
 };
 
 // Module dispatch
 
 /**
- * Analyze a single non-Svelte source file and extract module metadata.
- *
- * @internal Single-module dispatcher used internally by the two-phase
- * orchestrator. Importable from `svelte-docinfo/analyze-core.js` for tests
- * and power users — not part of the stable barrel API and not guaranteed
- * across minor versions.
+ * Analyze a single non-Svelte source file and extract module metadata — the
+ * per-module dispatcher behind `analyzeCore`.
  *
  * Dispatches on file type:
  * - TypeScript/JS → `analyzeTypescriptModule`
@@ -308,8 +322,8 @@ const toModuleJson = (raw: ModuleAnalysis): ModuleJson => {
  * - Svelte → `module_skipped: requires_program` (callers using session API
  *   should not reach this path; the session pre-handles Svelte)
  *
- * Returns `undefined` when the file is skipped; the diagnostic is added to
- * `diagnostics` so the caller can keep iterating.
+ * Returns `undefined` when the file is skipped (see `findModuleSkip`); the
+ * diagnostic is added to `diagnostics` so the caller can keep iterating.
  *
  * `alsoExportedFrom` on returned declarations is always empty from this path —
  * cross-module re-export resolution requires all modules (`mergeReExports`
@@ -318,6 +332,13 @@ const toModuleJson = (raw: ModuleAnalysis): ModuleJson => {
  * `aliasRegistry` is optional at this boundary: direct callers assembling
  * modules themselves get written-name recovery only, while `analyzeCore`
  * passes the registry its pre-pass built (see `buildAliasRegistry`).
+ * `isEmittedFile` likewise: `analyzeCore` answers from its emitted set, and a
+ * direct caller falls back to `isSource` (see `IsEmittedFile`). `fileExists`
+ * too: `analyzeCore` sees its inputs' in-memory content, and a direct caller
+ * falls back to the disk (see `SvelteFileStatus`).
+ *
+ * @internal Importable from `svelte-docinfo/analyze-core.js` for tests and
+ * power users; not stable API.
  */
 export const analyzeModule = (
 	sourceFile: SourceFileInfo & { dependents?: ReadonlyArray<string> },
@@ -325,50 +346,49 @@ export const analyzeModule = (
 	options: ModuleSourceOptions,
 	diagnostics: Array<Diagnostic>,
 	log?: AnalysisLog,
-	aliasRegistry?: AliasRegistry
+	aliasRegistry?: AliasRegistry,
+	isEmittedFile?: IsEmittedFile,
+	fileExists?: FileExists
 ): ModuleJson | undefined => {
 	const checker = program.getTypeChecker();
-	const modulePath = extractPath(sourceFile.id, options);
 	// diagnostics carry the absolute id (see the `Diagnostic.file` schema doc);
 	// the returned `ModuleJson` keeps `modulePath`, a different base
-	const diagnosticFile = toPosixPath(sourceFile.id);
-	const analyzerType = options.getAnalyzerType(sourceFile.id);
+	const modulePath = extractPath(sourceFile.id, options);
 
-	let raw: ModuleAnalysis | undefined;
-
-	if (analyzerType === 'svelte') {
-		diagnostics.push({
-			kind: 'module_skipped',
-			file: diagnosticFile,
-			message:
-				'Svelte files require program integration. Use createAnalysisSession or analyze()/analyzeFromFiles() instead.',
-			severity: 'warning',
-			reason: 'requires_program'
-		});
-		log?.warn(`Svelte file skipped in analyzeModule: ${sourceFile.id}`);
+	const skip = findModuleSkip(sourceFile, program, options);
+	if (skip) {
+		diagnostics.push(skip);
+		// the raw id, unlike the diagnostic: logs are for developers, diagnostics ship
+		log?.warn(`Module skipped (${skip.reason}): ${sourceFile.id}`);
 		return undefined;
-	} else if (analyzerType === 'typescript') {
-		const tsSourceFile = program.getSourceFile(sourceFile.id);
-		if (!tsSourceFile) {
-			diagnostics.push({
-				kind: 'module_skipped',
-				file: diagnosticFile,
-				// interpolating the same id as `file` keeps the two from naming the
-				// file differently — the message gets the same project-root scrub.
-				// The log line below keeps the raw id: logs are for developers,
-				// diagnostics ship.
-				message: `Could not get source file from program: ${diagnosticFile}`,
-				severity: 'warning',
-				reason: 'not_in_program'
-			});
-			log?.warn(`Could not get source file from program: ${sourceFile.id}`);
-			return undefined;
-		}
+	}
+
+	// past the skip, a TypeScript file is in the program, and anything else is CSS or JSON
+	let raw: ModuleAnalysis;
+	const tsSourceFile =
+		options.getAnalyzerType(sourceFile.id) === 'typescript'
+			? program.getSourceFile(sourceFile.id)
+			: undefined;
+	if (tsSourceFile) {
 		// the pass-scoped extraction context — constructed here because the
 		// dispatcher is where the program is in hand (see `analyzeExports`)
-		const ctx = createExtractContext(program, checker, options, diagnostics, aliasRegistry);
+		const ctx = createExtractContext(
+			program,
+			checker,
+			options,
+			diagnostics,
+			aliasRegistry,
+			isEmittedFile,
+			fileExists
+		);
 		raw = analyzeTypescriptModule(sourceFile, tsSourceFile, modulePath, ctx, options);
-	} else if (analyzerType === 'css' || analyzerType === 'json') {
+		// a TS module can't declare a snippet, but it can re-export one from a
+		// component that emits nothing, and the synthesized alias is analyzed
+		// off the svelte2tsx virtual like the component's own would be
+		for (const d of raw.declarations) {
+			if (d.declaration.aliasOf) reclassifySnippetDeclaration(d.declaration);
+		}
+	} else {
 		const { dependencies, dependents } = extractDependencies(sourceFile, options);
 		raw = {
 			path: modulePath,
@@ -380,19 +400,75 @@ export const analyzeModule = (
 			externalReExports: [],
 			externalStarExports: []
 		};
-	} else {
-		diagnostics.push({
-			kind: 'module_skipped',
-			file: diagnosticFile,
-			message: `No analyzer for file type: ${diagnosticFile}`,
-			severity: 'warning',
-			reason: 'no_analyzer'
-		});
-		log?.warn(`No analyzer for file: ${sourceFile.id}`);
-		return undefined;
 	}
 
 	return toModuleJson(raw);
+};
+
+/**
+ * `sourceFiles` less the `removed` ids, with the remaining files' dependency
+ * edges to them dropped.
+ */
+const withoutModules = (
+	sourceFiles: ReadonlyArray<SourceFileInfo & { dependents?: ReadonlyArray<string> }>,
+	removed: ReadonlySet<string>
+): Array<SourceFileInfo & { dependents?: ReadonlyArray<string> }> => {
+	const kept = (ids: ReadonlyArray<string> | undefined): Array<string> | undefined =>
+		ids?.filter((id) => !removed.has(toPosixPath(id)));
+	return sourceFiles
+		.filter((f) => !removed.has(toPosixPath(f.id)))
+		.map((f) => ({ ...f, dependencies: kept(f.dependencies), dependents: kept(f.dependents) }));
+};
+
+/**
+ * The `module_skipped` diagnostic the module dispatch gives a file, or
+ * `undefined` when it analyzes: a Svelte file without its virtual (only the
+ * session API transforms one), a TS/JS file or a Svelte virtual the program
+ * lacks, or a file with no analyzer. `analyzeCore` asks before analyzing
+ * anything, so a skipped file leaves the emitted set before any module can
+ * link to it; `analyzeModule` asks for its direct callers.
+ */
+const findModuleSkip = (
+	sourceFile: SourceFileInfo,
+	program: ts.Program,
+	options: ModuleSourceOptions,
+	virtualFile?: SvelteVirtualFile
+): ModuleSkippedDiagnostic | undefined => {
+	// interpolating the same id as `file` keeps the two from naming the file
+	// differently — the message gets the same project-root scrub
+	const file = toPosixPath(sourceFile.id);
+	const skip = (
+		reason: ModuleSkippedDiagnostic['reason'],
+		message: string
+	): ModuleSkippedDiagnostic => ({
+		kind: 'module_skipped',
+		file,
+		message,
+		severity: 'warning',
+		reason
+	});
+	if (virtualFile) {
+		// `virtualPath` would leak the svelte2tsx suffix
+		return program.getSourceFile(virtualFile.virtualPath)
+			? undefined
+			: skip('not_in_program', `Virtual file not found in program: ${file}`);
+	}
+	switch (options.getAnalyzerType(sourceFile.id)) {
+		case 'svelte':
+			return skip(
+				'requires_program',
+				'Svelte files require program integration. Use createAnalysisSession or analyze()/analyzeFromFiles() instead.'
+			);
+		case 'typescript':
+			return program.getSourceFile(sourceFile.id)
+				? undefined
+				: skip('not_in_program', `Could not get source file from program: ${file}`);
+		case 'css':
+		case 'json':
+			return undefined;
+		default:
+			return skip('no_analyzer', `No analyzer for file type: ${file}`);
+	}
 };
 
 // Core two-phase loop
@@ -417,35 +493,32 @@ export interface AnalyzeCoreInputs {
 	/** Svelte file IDs whose svelte2tsx transform failed at ingest. */
 	transformFailedIds?: ReadonlySet<string>;
 	/**
-	 * Gated Svelte files (owned but failing `isSource` — the `internal/`
-	 * convention) whose virtuals are in `svelteVirtualFiles`. Analyzed only
+	 * Svelte files that are owned but emit no module — gated ones (the
+	 * `internal/` convention) and source-scope components ingested only as
+	 * checker context — whose virtuals are in `svelteVirtualFiles`. Analyzed only
 	 * when an emitted component alias references them, as canonical-fill
 	 * context for `resolveComponentAliases` — their modules never emit and
 	 * their analysis diagnostics are dropped (`partial` on the canonical
 	 * propagates to the filled alias instead).
+	 *
+	 * Resolution requires the component's virtual to exist — via the context
+	 * closure (`analyzeFromFiles` included) or by passing the file as `analyze()`
+	 * input. Without it a gated component re-export documents as a `partial`
+	 * component with nothing filled.
 	 */
 	contextSvelteFiles?: ReadonlyArray<SourceFileInfo>;
+	/**
+	 * Whether a path exists — owned in-memory content or disk. It tells a
+	 * `.svelte` file with no svelte2tsx virtual from a mistyped specifier (see
+	 * `SvelteFileStatus`). Defaults to the files handed in plus the disk; a
+	 * session passes its whole owned set, which also holds files that emit
+	 * nothing and aren't offered as context.
+	 */
+	fileExists?: FileExists;
 	onDuplicates?: OnDuplicates;
 	log?: AnalysisLog;
 }
 
-/**
- * Run the two-phase analysis loop on pre-prepared inputs.
- *
- * @internal Shared two-phase orchestrator used internally by `session.query`
- * and the one-shot wrappers. Importable from `svelte-docinfo/analyze-core.js`
- * for tests and power users — not part of the stable barrel API and not
- * guaranteed across minor versions.
- *
- * Phase 1: per-file dispatch (TS / Svelte / CSS / JSON / placeholder for
- * transform-failed Svelte). Phase 2: re-export merge, component-alias fill,
- * sort, duplicate detection. Diagnostic paths are normalized to
- * project-root-relative form before return.
- *
- * Dependents are read from `sourceFile.dependents` (caller-supplied via
- * `extractDependencies`); `analyzeCore` does not compute them. `session.query`
- * runs `computeDependents` on the owned set before invoking this.
- */
 /**
  * Analyze the gated Svelte canonicals referenced by an emitted component
  * alias, as `resolveComponentAliases` fill context only (see
@@ -457,7 +530,9 @@ const analyzeContextComponents = (
 	contextSvelteFiles: ReadonlyArray<SourceFileInfo>,
 	emittedModules: ReadonlyArray<ModuleJson>,
 	inputs: AnalyzeCoreInputs,
-	aliasRegistry: AliasRegistry
+	aliasRegistry: AliasRegistry,
+	isEmittedFile: IsEmittedFile,
+	fileExists: FileExists
 ): Array<ModuleJson> => {
 	const { sourceOptions, program, svelteVirtualFiles } = inputs;
 	const referenced = new Set<string>();
@@ -482,16 +557,36 @@ const analyzeContextComponents = (
 			droppedDiagnostics,
 			program,
 			virtualFile,
-			aliasRegistry
+			aliasRegistry,
+			isEmittedFile,
+			fileExists
 		);
 		if (raw) contextModules.push(toModuleJson(raw));
 	}
 	return contextModules;
 };
 
+/**
+ * Run the two-phase analysis loop on pre-prepared inputs. The orchestrator
+ * behind `session.query`, and so behind the one-shot wrappers, which query a
+ * single-use session.
+ *
+ * Runs the alias-registry pre-pass (`buildAliasRegistry`) over the emitted
+ * set, then phase 1: per-file dispatch (TS / Svelte / CSS / JSON /
+ * placeholder for transform-failed Svelte), plus gated Svelte canonicals
+ * analyzed as fill context. Phase 2: re-export merge, component-alias fill,
+ * sort, duplicate detection, and module-path normalization in printed types
+ * (`normalizeModulePathsInTypes`), then `finalizeDiagnostics`.
+ *
+ * Dependents are read from `sourceFile.dependents` via `extractDependencies`;
+ * `analyzeCore` does not compute them. `session.query` runs
+ * `computeDependents` on the emitted set before invoking this.
+ *
+ * @internal Importable from `svelte-docinfo/analyze-core.js` for tests and
+ * power users; not stable API.
+ */
 export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 	const {
-		sourceFiles,
 		sourceOptions,
 		program,
 		svelteVirtualFiles,
@@ -503,6 +598,40 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 
 	const checker = program.getTypeChecker();
 	const diagnostics: Array<Diagnostic> = [];
+
+	// Skip pre-pass: a file the module dispatch would skip (`module_skipped`)
+	// leaves the emitted set before anything is analyzed, and the edges naming
+	// it go with it, so output never references a module it doesn't contain.
+	const skippedIds = new Set<string>();
+	for (const sourceFile of inputs.sourceFiles) {
+		if (transformFailedIds?.has(sourceFile.id)) continue;
+		const skip = findModuleSkip(
+			sourceFile,
+			program,
+			sourceOptions,
+			svelteVirtualFiles.get(sourceFile.id)
+		);
+		if (!skip) continue;
+		diagnostics.push(skip);
+		log?.warn(`Module skipped (${skip.reason}): ${sourceFile.id}`);
+		skippedIds.add(toPosixPath(sourceFile.id));
+	}
+	const sourceFiles = skippedIds.size
+		? withoutModules(inputs.sourceFiles, skippedIds)
+		: inputs.sourceFiles;
+
+	// The emitted set is exactly the files handed in, less the skipped ones.
+	// `isSource` can't stand in for it: a source file left out of the set
+	// emits nothing (see `IsEmittedFile`), and the re-export arms must tell a
+	// canonical they can link to from one they have to document in place.
+	const emittedIds = new Set(sourceFiles.map((f) => toPosixPath(f.id)));
+	const isEmittedFile: IsEmittedFile = (file) => emittedIds.has(file);
+	// Existence for `SvelteFileStatus`: the caller's answer, else the files
+	// handed in (in-memory content counts, skipped ones too) plus the disk.
+	const knownIds = new Set([...emittedIds, ...skippedIds]);
+	for (const f of contextSvelteFiles ?? []) knownIds.add(toPosixPath(f.id));
+	const fileExists: FileExists =
+		inputs.fileExists ?? ((file) => knownIds.has(file) || ts.sys.fileExists(file));
 
 	// Registry pre-pass: register the emitted set's exported lost aliases
 	// before any extraction, so every `resolveTypeInfo` call this cycle can
@@ -554,7 +683,7 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 			const componentName = getComponentName(modulePath);
 			const { dependencies, dependents } = extractDependencies(sourceFile, sourceOptions);
 			pushModule(
-				ModuleJson.parse({
+				parseModuleJson({
 					path: modulePath,
 					declarations: [],
 					dependencies,
@@ -581,7 +710,9 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 				diagnostics,
 				program,
 				virtualFile,
-				aliasRegistry
+				aliasRegistry,
+				isEmittedFile,
+				fileExists
 			);
 			if (raw) {
 				mod = toModuleJson(raw);
@@ -589,7 +720,16 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 				log?.error(`Svelte module analysis failed: ${sourceFile.id}`);
 			}
 		} else {
-			mod = analyzeModule(sourceFile, program, sourceOptions, diagnostics, log, aliasRegistry);
+			mod = analyzeModule(
+				sourceFile,
+				program,
+				sourceOptions,
+				diagnostics,
+				log,
+				aliasRegistry,
+				isEmittedFile,
+				fileExists
+			);
 		}
 
 		if (!mod) continue;
@@ -601,7 +741,14 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 	// `mergeReExports` (their edges would back-link modules absent from
 	// output) and out of the emitted set.
 	const contextModules = contextSvelteFiles?.length
-		? analyzeContextComponents(contextSvelteFiles, modules, inputs, aliasRegistry)
+		? analyzeContextComponents(
+				contextSvelteFiles,
+				modules,
+				inputs,
+				aliasRegistry,
+				isEmittedFile,
+				fileExists
+			)
 		: [];
 
 	// Phase 2a: build alsoExportedFrom arrays from the modules' forward edges
@@ -613,13 +760,10 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
 
 	const sortedModules = sortModules(resolvedModules);
 
-	// Always run duplicate detection so a `duplicate_declaration` diagnostic
-	// reaches consumers regardless of `onDuplicates`. The `onDuplicates`
-	// callback/shortcut still fires for callers that want fail-fast or custom
-	// handling — diagnostics is the data, `onDuplicates` is the action.
-	const duplicates = findDuplicates(sortedModules);
-	emitDuplicateDiagnostics(diagnostics, duplicates, sourceIdsByModulePath);
+	// opt-in flat-namespace check, see `OnDuplicates`
 	if (onDuplicates) {
+		const duplicates = findDuplicates(sortedModules);
+		emitDuplicateDiagnostics(diagnostics, duplicates, sourceIdsByModulePath);
 		dispatchOnDuplicates(onDuplicates, duplicates, log);
 	}
 
@@ -645,7 +789,12 @@ export const analyzeCore = (inputs: AnalyzeCoreInputs): AnalyzeResultJson => {
  * ordering unrepresentable instead of a contract to remember. Omit
  * `virtualFiles` when no Svelte virtuals are in play.
  *
- * @mutates diagnostics — rewrites positions, `file`, and `message`
+ * Last, identical diagnostics collapse to the first: a symbol analyzed more
+ * than once (a renamed re-export's alias re-analyzes its canonical, a type
+ * alias over a class reads its members) re-reports the same warning at the
+ * same position.
+ *
+ * @mutates diagnostics - rewrites positions, `file`, and `message`, and removes duplicates
  */
 export const finalizeDiagnostics = (
 	diagnostics: Array<Diagnostic>,
@@ -655,6 +804,16 @@ export const finalizeDiagnostics = (
 		remapVirtualDiagnosticPositions(diagnostics, options.virtualFiles);
 	}
 	normalizeDiagnosticPaths(diagnostics, options.projectRoot);
+	const seen: Set<string> = new Set();
+	let kept = 0;
+	for (const d of diagnostics) {
+		// every producer builds a kind's fields in one order, so the JSON is a stable key
+		const key = JSON.stringify(d);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		diagnostics[kept++] = d;
+	}
+	diagnostics.length = kept;
 };
 
 /**
@@ -665,14 +824,12 @@ export const finalizeDiagnostics = (
  * paths (svelte2tsx output like `Foo.svelte.__svelte2tsx__.ts`). This pass
  * collapses both to the public contract: a path relative to `projectRoot`
  * with no leading slash and no `./` prefix. A file outside the root gets the
- * `../` form, matching module paths in printed type text — and making the
- * documented "rejoin with `projectRoot` to get an absolute path" actually
- * hold for it, which dropping the leading slash did not.
+ * `../` form, matching module paths in printed type text — so the documented
+ * "rejoin with `projectRoot` to get an absolute path" holds for it too.
  *
  * `message` gets the same treatment as `file`, by textual substitution. A
  * message is free-form, and not every path in one comes from a field this
- * pass can see — `import_parse_failed` wraps an es-module-lexer error that
- * embeds the file name itself. Scrubbing here means the contract holds for
+ * pass can see — a wrapped error message can embed the file name itself. Scrubbing here means the contract holds for
  * the whole record rather than one field, so a producer can't reintroduce an
  * absolute path through prose.
  *
@@ -683,7 +840,7 @@ export const finalizeDiagnostics = (
  * pass can only correct the absolute form — a relative path on a base other
  * than the project root passes through and ships as-is.
  *
- * @mutates diagnostics — rewrites each diagnostic's `file` and `message`
+ * @mutates diagnostics - rewrites each diagnostic's `file` and `message`
  * @see `finalizeDiagnostics` — when Svelte virtuals are in play, the position
  * remap must run before this pass (it strips the suffix the remap matches on)
  */
@@ -706,7 +863,7 @@ export const normalizeDiagnosticPaths = (
 			file = file.slice(prefix.length);
 		} else if (isAbsolutePosixPath(file)) {
 			// Outside the root. Relativize rather than dropping the leading slash,
-			// which produced a string that reads as root-relative but resolves
+			// which would produce a string that reads as root-relative but resolves
 			// somewhere else entirely. A path already relative is left alone —
 			// `relative` would resolve it against `cwd`.
 			file = toPosixPath(relative(root, file));
@@ -791,6 +948,7 @@ const QUOTED_ABSOLUTE_PATH_RE = /"((?:\/|[A-Za-z]:\/)[^"\n]*)"/g;
  * resolution check, not this list, is the real guard.
  */
 const NON_TYPE_TEXT_KEYS: ReadonlySet<string> = new Set([
+	'cssCustomProperties',
 	'dependencies',
 	'dependents',
 	'deprecatedMessage',
@@ -960,22 +1118,27 @@ const rewriteTypeText = (value: unknown, rewrite: (printed: string) => string): 
  *
  * The checker prints a module object as `typeof import("<absolute path>")`,
  * which reaches output through every checker-printed field — `typeSignature`
- * on declarations and members, `returnType`, and the `text`/`name` of a
- * `TypeJson` node. Left alone it makes output machine-dependent (two checkouts
+ * on declarations and members, `returnType`, and the `text` of a
+ * `TypeJson` node (a module object is a terminal `other` node, never a
+ * `reference`). Left alone it makes output machine-dependent (two checkouts
  * of the same source produce different bytes), publishes local filesystem
  * paths on any site that renders `typeSignature`, and exposes the svelte2tsx
- * virtual suffix that `stripVirtualSuffix` exists to hide.
+ * virtual suffix that `stripVirtualSuffix` exists to hide. A written
+ * `import('./x').T` annotation resolves to the type's own name and never
+ * carries a path.
  *
  * A path that resolves to a module in this output is rewritten to that
  * module's `ModuleJson.path`, so the string doubles as a lookup key: a
  * consumer linkifies with `modules.find((m) => m.path === s)` and reads a miss
  * as "not a module here." See `createModulePathNormalizer` for the remaining
- * tiers.
+ * tiers. The string's shape doesn't distinguish them (`sub/nested.ts` and
+ * `pkg/index.d.ts` look alike) — the lookup does, which keeps `sourceRoot` out
+ * of the output envelope.
  *
  * Runs as a whole-output pass rather than at the ~20 `typeToString` /
  * `signatureToString` call sites, so a new printing site can't miss it.
  *
- * @mutates modules — rewrites printed type text on declarations and members
+ * @mutates modules - rewrites printed type text on declarations and members
  */
 export const normalizeModulePathsInTypes = (
 	modules: Array<ModuleJson>,

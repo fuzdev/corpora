@@ -11,14 +11,17 @@
 	import type { Socket } from './socket.svelte.ts';
 	import { icon_cancel, icon_connect, icon_disconnect, icon_reset } from '@fuzdev/fuz_ui/icons.ts';
 	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import { format_placeholder } from './helpers.ts';
 	import { format_ms_to_readable, format_timestamp } from './time_helpers.ts';
 	import {
 		DEFAULT_HEARTBEAT_INTERVAL,
 		DEFAULT_RECONNECT_DELAY,
 		DEFAULT_RECONNECT_DELAY_MAX
-	} from './socket_helpers.ts';
+	} from '@fuzdev/fuz_app/actions/socket.svelte.ts';
+	import { HEARTBEAT_INTERVAL_BOUNDS, RECONNECT_DELAY_BOUNDS } from './socket_helpers.ts';
 	import SocketMessageQueue from './SocketMessageQueue.svelte';
+	import MsSettingInput from './MsSettingInput.svelte';
 	import { WEBSOCKET_URL } from './constants.ts';
 
 	const pid = $props.id();
@@ -77,9 +80,9 @@
 		<div class="display:flex flex-direction:column gap_sm mb_sm">
 			<div
 				class="chip plain flex:1 font_size_xl px_xl flex-direction:column"
-				style:display="display:flex !important"
-				style:align-items="flex-start !important"
-				style:font-weight="400 !important"
+				style:display="inline-flex"
+				style:align-items="start"
+				style:font-weight="400"
 				class:palette_b={capabilities.websocket.status === 'success' && socket.connected}
 				class:palette_c={capabilities.websocket.status === 'failure'}
 				class:palette_d={capabilities.websocket.status === 'pending'}
@@ -125,7 +128,7 @@
 						}}
 					>
 						<div class={has_undo_state ? 'transform:scaleX(-1)' : ''}>
-							<Svg data={icon_reset} />
+							<Icon data={icon_reset} />
 						</div>
 					</button>
 				</div>
@@ -187,13 +190,13 @@
 				<label class="display:flex gap_xs align-items:center my_sm">
 					<input
 						type="checkbox"
-						class="sm font_size_sm"
+						class="sized_sm font_size_sm"
 						bind:checked={
 							() => socket.auto_reconnect,
 							(v) => {
 								// Turning off during a pending reconnect: cancel it.
 								// Turning on while disconnected: try to connect immediately.
-								// Delay/factor changes propagate live via the $effect below.
+								// Delay changes propagate live through the socket's setters.
 								if (!v && socket.is_reconnect_pending) {
 									socket.cancel_reconnect();
 								} else if (v && !socket.connected && socket.status !== 'pending') {
@@ -215,10 +218,10 @@
 								socket.cancel_reconnect();
 							}}
 						>
-							<Svg data={icon_cancel} />
+							<Icon data={icon_cancel} />
 						</button>
 						<div
-							class="bg_d_5 width:100% border_radius_xs position:relative overflow:hidden font-weight:600"
+							class="bg_d_50 width:100% border_radius_xs position:relative overflow:hidden font-weight:600"
 							style:height="24px"
 						>
 							<div
@@ -229,7 +232,7 @@
 							</div>
 							{#key socket.reconnect_attempt}
 								<div
-									class="progress-fill bg_d_6"
+									class="progress-fill bg_d_60"
 									style:animation-duration="{socket.current_reconnect_delay}ms"
 								></div>
 							{/key}
@@ -253,22 +256,14 @@
 					<div>heartbeat interval</div>
 					<small>{format_ms_to_readable(socket.heartbeat_interval)}</small>
 				</label>
-				<div class="display:flex gap_xs">
-					<input
-						type="range"
-						min="10000"
-						max="600000"
-						step="10000"
-						class="flex:1 sm plain"
-						bind:value={socket.heartbeat_interval}
-					/>
-					<input
-						id="heartbeat_interval_{pid}"
-						type="text"
-						class="input-xs sm plain"
-						bind:value={socket.heartbeat_interval}
-					/>
-				</div>
+				<MsSettingInput
+					id="heartbeat_interval_{pid}"
+					label="heartbeat interval"
+					value={socket.heartbeat_interval}
+					bounds={HEARTBEAT_INTERVAL_BOUNDS}
+					step={1000}
+					onvalue={(v) => (socket.heartbeat_interval = v)}
+				/>
 			</div>
 
 			<div class="row">
@@ -279,24 +274,17 @@
 					style:min-width="170px"
 				>
 					<div>reconnect delay</div>
-					<small>{format_ms_to_readable(socket.reconnect_delay, 1)}</small>
+					<small>{format_ms_to_readable(socket.reconnect_delay)}</small>
 				</label>
-				<div class="display:flex gap_xs">
-					<input
-						type="range"
-						min="100"
-						max="10000"
-						step="100"
-						class="flex:1 sm plain"
-						bind:value={socket.reconnect_delay}
-					/>
-					<input
-						id="reconnect_delay_{pid}"
-						type="text"
-						class="input-xs sm plain"
-						bind:value={socket.reconnect_delay}
-					/>
-				</div>
+				<MsSettingInput
+					id="reconnect_delay_{pid}"
+					label="reconnect delay"
+					value={socket.reconnect_delay}
+					bounds={RECONNECT_DELAY_BOUNDS}
+					range_max={10_000}
+					step={100}
+					onvalue={(v) => (socket.reconnect_delay = v)}
+				/>
 			</div>
 
 			<div class="row">
@@ -309,26 +297,21 @@
 					<div>max reconnect delay</div>
 					<small>{format_ms_to_readable(socket.reconnect_delay_max)}</small>
 				</label>
-				<div class="display:flex gap_xs">
-					<input
-						type="range"
-						min="1000"
-						max="300000"
-						step="1000"
-						class="flex:1 sm plain"
-						bind:value={socket.reconnect_delay_max}
-					/>
-					<input
-						id="reconnect_delay_max_{pid}"
-						type="text"
-						class="input-xs sm plain"
-						bind:value={socket.reconnect_delay_max}
-					/>
-				</div>
+				<MsSettingInput
+					id="reconnect_delay_max_{pid}"
+					label="max reconnect delay"
+					value={socket.reconnect_delay_max}
+					bounds={RECONNECT_DELAY_BOUNDS}
+					step={100}
+					onvalue={(v) => (socket.reconnect_delay_max = v)}
+				/>
 			</div>
 
 			<div class="display:flex justify-content:end">
-				<ConfirmButton onconfirm={reset_to_defaults} class="plain font_size_sm sm font-weight:600">
+				<ConfirmButton
+					onconfirm={reset_to_defaults}
+					class="plain font_size_sm sized_sm font-weight:600"
+				>
 					reset to defaults
 
 					{#snippet popover_content(popover)}
@@ -341,7 +324,7 @@
 								popover.hide();
 							}}
 						>
-							<Svg data={icon_reset} />
+							<Icon data={icon_reset} />
 						</button>
 					{/snippet}
 				</ConfirmButton>
@@ -352,7 +335,9 @@
 
 <div class="display:flex gap_xl5">
 	<!-- Connection Stats with retries included -->
-	<div class="width_atmost_xs mt_md border_top pt_md">
+	<div
+		class="width_atmost_xs mt_md border-top:var(--border_width_1)~var(--border_style)~var(--border_color) pt_md"
+	>
 		<div class="display:flex flex-direction:column gap_sm mb_sm">
 			{#if socket.reconnect_count > 0}
 				<div class="display:flex justify-content:space-between" transition:slide>
@@ -361,7 +346,9 @@
 				</div>
 				<div class="display:flex justify-content:space-between" transition:slide>
 					<small>current reconnect delay:</small>
-					<span class="font-weight:600">{socket.current_reconnect_delay}</span>
+					<span class="font-weight:600">
+						{format_ms_to_readable(socket.current_reconnect_delay)}
+					</span>
 				</div>
 			{/if}
 
@@ -372,7 +359,9 @@
 						? formatDuration(
 								intervalToDuration({ start: 0, end: socket.connection_duration_rounded })
 							)
-						: '-'}
+						: socket.connection_duration !== null
+							? 'less than a minute'
+							: '-'}
 				</small>
 			</div>
 			<div class="display:flex justify-content:space-between">
@@ -393,7 +382,10 @@
 
 <!-- Message Queue Stats -->
 {#if socket.queued_message_count > 0 || socket.failed_message_count > 0}
-	<div class="mt_md border_top pt_md" transition:slide>
+	<div
+		class="mt_md border-top:var(--border_width_1)~var(--border_style)~var(--border_color) pt_md"
+		transition:slide
+	>
 		<h4 class="mt_0 mb_sm">message queue</h4>
 
 		<div class="display:flex flex-direction:column gap_md mb_sm">

@@ -5,7 +5,12 @@ import type { CommonStyleProps, Without } from '$lib/utils/types.js';
 import { isScaleBand, type AnyScale } from '$lib/utils/scales.svelte.js';
 import { accessor, type Accessor } from '$lib/utils/common.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getMarkData } from '$lib/contexts/facet.js';
+import { getGeoContext } from '$lib/contexts/geo.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { markLift } from '$lib/utils/isometric.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
+import type { GeoState } from '$lib/states/geo.svelte.js';
 import type { CircleProps } from '../Circle/Circle.shared.svelte.js';
 
 export type Point = {
@@ -17,6 +22,8 @@ export type Point = {
   data: any;
   /** Index within array accessor (0 = start/low edge, 1 = end/high edge). Undefined for single-value points. */
   edgeIndex?: number;
+  /** Height off an `isometric` floor, in pixels, when the points are raised */
+  z?: number;
 };
 
 type Offset = number | ((value: number, context: any) => number) | undefined;
@@ -48,7 +55,22 @@ export type PointsProps = PointsPropsWithoutHTML &
  */
 export class PointsState {
   #getProps: () => PointsProps = () => ({}) as PointsProps;
+
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: PointsProps = $derived(this.#getProps());
+
   ctx: ChartState = getChartContext();
+
+  markData = getMarkData();
+  geo: GeoState = getGeoContext();
+  #layerIsometric = getLayerIsometric();
+
+  /** The chart's `isometricLift` when the points float off the floor — by `z`, or the chart's */
+  #lift = $derived.by(() => markLift(this.ctx, this.#layerIsometric, this.#props.z, true));
 
   constructor(getProps: () => PointsProps) {
     this.#getProps = getProps;
@@ -56,7 +78,7 @@ export class PointsState {
       name: 'Points',
       kind: 'mark',
       markInfo: () => {
-        const p = getProps();
+        const p = this.#props;
         return {
           data: p.data,
           x: p.x,
@@ -68,30 +90,26 @@ export class PointsState {
     });
   }
 
-  series = $derived(
-    this.ctx.series.series.find((s) => s.key === this.#getProps().seriesKey)
-  );
+  series = $derived(this.ctx.series.series.find((s) => s.key === this.#props.seriesKey));
   seriesAccessor = $derived(
     this.series?.value ?? (this.series?.data ? undefined : this.series?.key)
   );
 
-  stackAccessors = $derived.by(() => {
-    const seriesKey = this.#getProps().seriesKey;
-    return seriesKey && this.ctx.series.isStacked
-      ? this.ctx.series.getStackAccessors(seriesKey)
-      : null;
-  });
+  stackAccessors = $derived.by(() =>
+    this.ctx.stackAccessorsFor({
+      seriesKey: this.#props.seriesKey,
+      ownData: this.#props.data != null,
+    })
+  );
 
   xAccessor = $derived(
     accessor(
-      this.#getProps().x ??
-        (this.ctx.valueAxis === 'x' ? this.seriesAccessor : undefined) ??
-        this.ctx.x
+      this.#props.x ?? (this.ctx.valueAxis === 'x' ? this.seriesAccessor : undefined) ?? this.ctx.x
     )
   );
 
   yAccessor = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     if (props.y) return accessor(props.y);
     if (this.stackAccessors) return this.stackAccessors.y1;
     if (Array.isArray(this.seriesAccessor) && this.ctx.valueAxis === 'y') {
@@ -100,15 +118,10 @@ export class PointsState {
     return accessor((this.ctx.valueAxis === 'y' ? this.seriesAccessor : undefined) ?? this.ctx.y);
   });
 
-  pointsData = $derived(this.#getProps().data ?? this.series?.data ?? this.ctx.data);
+  pointsData = $derived(this.markData(this.#props.data, this.series?.data));
 
-  #getOffset(
-    value: any,
-    offset: Offset,
-    scale: AnyScale,
-    subScale?: AnyScale
-  ): number {
-    const seriesKey = this.#getProps().seriesKey;
+  #getOffset(value: any, offset: Offset, scale: AnyScale, subScale?: AnyScale): number {
+    const seriesKey = this.#props.seriesKey;
     if (typeof offset === 'function') {
       return offset(value, this.ctx);
     } else if (offset != null) {
@@ -122,7 +135,22 @@ export class PointsState {
   }
 
   #getPointObject(xVal: number, yVal: number, d: any, edgeIndex?: number): Point {
-    const props = this.#getProps();
+    const props = this.#props;
+
+    // In a geo chart, project the [x, y] pair directly (no band offsets / radial)
+    if (this.geo.projection) {
+      const [projX, projY] = this.geo.projection([xVal, yVal]) ?? [0, 0];
+      return {
+        x: projX,
+        y: projY,
+        r: this.ctx.config.r ? this.ctx.rGet(d) : (props.r ?? 5),
+        xValue: xVal,
+        yValue: yVal,
+        data: d,
+        edgeIndex,
+      };
+    }
+
     const scaledX: number = this.ctx.xScale(xVal);
     const scaledY: number = this.ctx.yScale(yVal);
 
@@ -138,7 +166,7 @@ export class PointsState {
     return {
       x: this.ctx.radial ? radialPoint[0] : x,
       y: this.ctx.radial ? radialPoint[1] : y,
-      r: this.ctx.config.r ? this.ctx.rGet(d) : props.r ?? 5,
+      r: this.ctx.config.r ? this.ctx.rGet(d) : (props.r ?? 5),
       xValue: xVal,
       yValue: yVal,
       data: d,
@@ -147,16 +175,14 @@ export class PointsState {
   }
 
   points = $derived.by<Point[]>(() => {
-    return this.pointsData.flatMap((d: any) => {
+    const points = this.pointsData.flatMap((d: any) => {
       const xValue: number | number[] = this.xAccessor(d);
       const yValue: number | number[] = this.yAccessor(d);
 
       if (Array.isArray(xValue)) {
         return xValue
           .filter(Boolean)
-          .map((xVal: number, i: number) =>
-            this.#getPointObject(xVal, yValue as number, d, i)
-          );
+          .map((xVal: number, i: number) => this.#getPointObject(xVal, yValue as number, d, i));
       } else if (Array.isArray(yValue)) {
         return yValue
           .filter(Boolean)
@@ -166,5 +192,11 @@ export class PointsState {
       }
       return [];
     });
+
+    const m = this.#layerIsometric();
+    if (!m || !this.#lift) return points;
+    // Each at its height, back to front by where it stands on the floor
+    for (const point of points) point.z = this.ctx.heightOf(point.data, this.#props.z)[1];
+    return points.sort((a, b) => m.b * a.x + m.d * a.y - (m.b * b.x + m.d * b.y));
   });
 }

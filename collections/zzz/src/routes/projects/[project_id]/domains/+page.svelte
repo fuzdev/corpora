@@ -3,13 +3,13 @@
 
 	import { resolve } from '$app/paths';
 
-	import { projects_context } from '$routes/projects/projects.svelte.ts';
-	import ProjectSidebar from '$routes/projects/ProjectSidebar.svelte';
-	import SectionSidebar from '$routes/projects/SectionSidebar.svelte';
-	import DomainsSidebar from '$routes/projects/DomainsSidebar.svelte';
+	import { projects_context } from '#routes/projects/projects.svelte.ts';
+	import ProjectSidebar from '#routes/projects/ProjectSidebar.svelte';
+	import SectionSidebar from '#routes/projects/SectionSidebar.svelte';
+	import DomainsSidebar from '#routes/projects/DomainsSidebar.svelte';
 	import { icon_add, icon_checkmark } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
-	import ProjectNotFound from '$routes/projects/ProjectNotFound.svelte';
+	import Icon from '#lib/Icon.svelte';
+	import ProjectNotFound from '#routes/projects/ProjectNotFound.svelte';
 
 	const projects = projects_context.get();
 
@@ -38,7 +38,7 @@
 								class="palette_a"
 								onclick={() => project_viewmodel.create_new_domain()}
 							>
-								<Svg data={icon_add} />&nbsp; add your first domain
+								<Icon data={icon_add} />&nbsp; add your first domain
 							</button>
 						</p>
 					</div>
@@ -58,9 +58,10 @@
 								<tr>
 									<td>
 										<a
-											href={resolve(
-												`/projects/${project_viewmodel.project_id}/domains/${domain.id}`
-											)}
+											href={resolve('/projects/[project_id]/domains/[domain_id]', {
+												project_id: project_viewmodel.project_id,
+												domain_id: domain.id
+											})}
 										>
 											{domain.name || '[new domain]'}
 										</a>
@@ -77,7 +78,7 @@
 										</span>
 									</td>
 									<td>
-										{#if domain.ssl}<Svg data={icon_checkmark} />{/if}
+										{#if domain.ssl}<Icon data={icon_checkmark} />{/if}
 									</td>
 									<td>{new Date(domain.created).toLocaleString()}</td>
 									<td>{new Date(domain.updated).toLocaleString()}</td>
@@ -93,7 +94,7 @@
 						class="palette_a"
 						onclick={() => project_viewmodel.create_new_domain()}
 					>
-						<Svg data={icon_add} />&nbsp; new domain
+						<Icon data={icon_add} />&nbsp; new domain
 					</button>
 				</div>
 			</div>

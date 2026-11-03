@@ -1,15 +1,15 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
-	import { render_theme_style, type Theme } from '@fuzdev/fuz_css/theme.ts';
-	import type { StyleVariable } from '@fuzdev/fuz_css/variable.ts';
+	import { render_theme_style } from '@fuzdev/fuz_css/theme.ts';
+	import type { StyleVariable, Theme } from '@fuzdev/fuz_css/variable.ts';
 
-	import CopyToClipboard from '$lib/CopyToClipboard.svelte';
-	import Dialog from '$lib/Dialog.svelte';
-	import DialogContent from '$lib/DialogContent.svelte';
+	import CopyToClipboard from '#lib/CopyToClipboard.svelte';
+	import Dialog from '#lib/Dialog.svelte';
+	import DialogContent from '#lib/DialogContent.svelte';
 	import StyleVariableDetail from './StyleVariableDetail.svelte';
 
-	// TODO @many add to $lib?
+	// TODO @many add to `src/lib`?
 
 	// TODO should this be merged with `ThemeInput`?
 
@@ -33,9 +33,9 @@
 
 	const new_theme: Theme = $derived({ name: new_name, variables: new_variables });
 
-	const code = $derived(render_theme_style(new_theme, { empty_default_theme: false }));
+	const code = $derived(render_theme_style(new_theme));
 
-	const light_count = $derived(new_variables.reduce((c, v) => (v.light ? c + 1 : c), 0));
+	const base_count = $derived(new_variables.reduce((c, v) => (v.base ? c + 1 : c), 0));
 	const dark_count = $derived(new_variables.reduce((c, v) => (v.dark ? c + 1 : c), 0));
 
 	let selected_variable: StyleVariable | null = $state.raw(null);
@@ -71,7 +71,7 @@
 	</aside>
 	<header>
 		<div class="flex:1">
-			<p>variables: {light_count} light, {dark_count} dark</p>
+			<p>variables: {base_count} base, {dark_count} dark</p>
 			<button type="button" class="width:100%" onclick={add_variable} disabled>
 				add a variable
 			</button>

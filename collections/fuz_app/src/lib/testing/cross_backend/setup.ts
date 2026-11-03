@@ -24,10 +24,9 @@ import '../assert_dev_env.ts';
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, USERNAME_LENGTH_MAX } from '../../primitive_schemas.ts';
 
 import { DAEMON_TOKEN_HEADER } from '../../auth/daemon_token.ts';
-import { USERNAME_LENGTH_MAX } from '../../primitive_schemas.ts';
 import { DEFAULT_TEST_PASSWORD } from '../test_credentials.ts';
 import type { TestAccount } from '../app_server.ts';
 import type { BackendCapabilities } from './capabilities.ts';
@@ -35,6 +34,7 @@ import { create_fetch_transport, type FetchTransport } from '../transports/fetch
 import { MigrationTracker, type SchemaSnapshot } from '../schema_introspect.ts';
 import { ActionManifest } from './action_manifest.ts';
 import type { BackendHandle } from './spawn_backend.ts';
+import { SPINE_ACCOUNT_LOGIN_PATH, SPINE_ACCOUNT_SIGNUP_PATH } from './spine_surface_constants.ts';
 
 /**
  * Options for `TestFixture.create_account` — mints an additional
@@ -58,15 +58,6 @@ export interface CreateTestAccountOptions {
 }
 
 /**
- * Shape returned by `TestFixture.create_account`. Aliased to the
- * existing `TestAccount` interface from `testing/app_server.ts` — same shape,
- * stable name on the cross-backend testing surface so call sites read
- * `fixture.create_account(...)` returning `TestAccountFixture` without
- * crossing module boundaries.
- */
-export type TestAccountFixture = TestAccount;
-
-/**
  * Spec for a bootstrap-time secondary account seeded alongside the
  * keeper by `_testing_reset` (cross-process) or `create_test_app`
  * (in-process). Used for accounts whose required roles aren't
@@ -85,28 +76,21 @@ export interface ExtraAccountSpec {
 	readonly roles: ReadonlyArray<string>;
 }
 
-/** Bootstrap-time-seeded secondary account exposed on the fixture. */
-export interface ExtraAccountFixture {
-	readonly account: { readonly id: Uuid; readonly username: string };
-	readonly actor: { readonly id: Uuid };
-	readonly api_token: string;
-	readonly session_cookie: string;
-	readonly create_session_headers: (extra?: Record<string, string>) => Record<string, string>;
-	readonly create_bearer_headers: (extra?: Record<string, string>) => Record<string, string>;
-}
-
 /**
- * Build an `ExtraAccountFixture` from a seeded `{account, actor,
- * api_token, session_cookie}` bundle and the session cookie name.
+ * Build a `TestAccount` from a seeded `{account, actor, api_token,
+ * session_cookie}` bundle and the session cookie name — the header builders
+ * close over its credentials.
  *
- * Same shape produced by either path that seeds bootstrap-time
- * secondaries: in-process via `create_test_account_with_credentials`
- * against the live backend's DB, or cross-process via the
- * `_testing_reset` RPC's `extra_accounts` output. Both call this
- * helper so the fixture-side header builders + field plumbing stays
- * in one place.
+ * Every fixture path that hands out a secondary account builds it here: the
+ * bootstrap-time `extra_accounts` (in-process via
+ * `create_test_account_with_credentials`, cross-process from the
+ * `_testing_reset` output) and the cross-process `fixture.create_account`.
+ *
+ * @param seeded - the account's identity and credentials
+ * @param cookie_name - the backend's session cookie name
+ * @returns the account with its header builders
  */
-export const build_extra_account_fixture = (
+export const to_test_account = (
 	seeded: {
 		account: { id: Uuid; username: string };
 		actor: { id: Uuid };
@@ -114,7 +98,7 @@ export const build_extra_account_fixture = (
 		session_cookie: string;
 	},
 	cookie_name: string
-): ExtraAccountFixture => ({
+): TestAccount => ({
 	account: seeded.account,
 	actor: seeded.actor,
 	api_token: seeded.api_token,
@@ -130,8 +114,16 @@ export const build_extra_account_fixture = (
 });
 
 /**
- * Fields shared by every `TestFixture` regardless of transport. The
- * discriminated union below adds in-process-only fields conditionally.
+ * The per-test bundle returned by `SetupTest`. Every Tier 1 suite body
+ * reads exclusively from this shape — no `test_app.backend.*` reads remain
+ * in the suite bodies.
+ *
+ * Transport-agnostic: in-process and cross-process producers return the
+ * same shape. Behaviors that once needed raw backend access (keyring for
+ * forging cookies) are reached through wire-shaped seams instead —
+ * `mint_expired_session()` mints over the `_testing_mint_session` channel
+ * cross-process and directly in-process, so suite bodies never branch on
+ * the transport.
  *
  * **Keeper ≠ admin.** `fixture.account` / `fixture.actor` refer to the
  * **fresh keeper** seeded per test. The keeper account holds
@@ -143,7 +135,7 @@ export const build_extra_account_fixture = (
  * via `extra_accounts: [{username, roles: [ROLE_KEEPER]}]` and read it
  * from `fixture.extra_accounts[username]`.
  */
-export interface TestFixtureBase {
+export interface TestFixture {
 	/**
 	 * Transport for this test's HTTP requests. Typed as `FetchTransport`
 	 * so cross-process tests can call `transport.cookies()` for WS upgrade
@@ -193,14 +185,14 @@ export interface TestFixtureBase {
 	 * cross-process: goes through the consumer-supplied DB-admin
 	 * channel.
 	 */
-	readonly create_account: (options?: CreateTestAccountOptions) => Promise<TestAccountFixture>;
+	readonly create_account: (options?: CreateTestAccountOptions) => Promise<TestAccount>;
 	/**
 	 * Bootstrap-time-seeded secondaries, keyed by their declared
 	 * `username`. Populated from the `extra_accounts` option passed to
 	 * `default_in_process_setup` / `default_cross_process_setup`. Empty
 	 * for suites that don't declare any.
 	 */
-	readonly extra_accounts: Readonly<Record<string, ExtraAccountFixture>>;
+	readonly extra_accounts: Readonly<Record<string, TestAccount>>;
 	/**
 	 * Additional actors seeded on the **keeper** account (beyond its single
 	 * bootstrap `actor`), in declaration order. Populated from the
@@ -223,25 +215,19 @@ export interface TestFixtureBase {
 	 * RPC over the keeper's daemon-token channel (the driver has no keyring).
 	 */
 	readonly mint_expired_session: () => Promise<string>;
+	/**
+	 * Whether the suites' audit reads refuse metadata keys an event type
+	 * doesn't declare — the setup's `reject_unknown_audit_metadata_keys`.
+	 * `list_audit_events` and the admin suite's readers pass it to
+	 * `assert_audit_event_metadata`.
+	 */
+	readonly reject_unknown_audit_metadata_keys?: boolean;
 }
 
 /**
- * The per-test bundle returned by `SetupTest`. Every Tier 1 suite body
- * reads exclusively from this shape — no `test_app.backend.*` reads remain
- * in the suite bodies.
- *
- * Transport-agnostic: in-process and cross-process producers return the
- * same shape. Behaviors that once needed raw backend access (keyring for
- * forging cookies) are reached through wire-shaped seams instead —
- * `mint_expired_session()` mints over the `_testing_mint_session` channel
- * cross-process and directly in-process, so suite bodies never branch on
- * the transport.
- */
-export type TestFixture = TestFixtureBase;
-
-/**
- * Per-test fixture-producing function. Invoked once inside every
- * `test()` body. The implementation captures factory inputs (in-process)
+ * Fixture-producing function. Invoked once inside every `test()` body by
+ * default; a suite whose cases share no state past the reset may call it once
+ * in `beforeAll` instead. The implementation captures factory inputs (in-process)
  * or a long-running backend handle (cross-process) and creates
  * a fresh per-test bundle on each call.
  */
@@ -251,16 +237,28 @@ export type SetupTest = () => Promise<TestFixture>;
  * Base options shared by every imperative cross-backend parity suite
  * (`origin` / `ready` / `body_size` / `cell_*` / `actor_*` /
  * `account_lifecycle` / `app_settings` / `testing_backdoor` / …). The
- * `{setup_test, capabilities}` core is identical across them; each suite
- * extends this with its own path field (`rpc_path` for RPC-dispatched
- * suites via `RpcPathCrossSuiteOptions`, `ready_path` for the readiness
- * probe, etc.). Lives here in the neutral fixture-types home rather than in
- * any one domain helper, so a non-cell suite no longer reaches into the
- * cell helpers for its option shape.
+ * `setup_test` core is identical across them; each suite extends this with
+ * its own path field (`rpc_path` for RPC-dispatched suites via
+ * `RpcPathCrossSuiteOptions`, `ready_path` for the readiness probe, etc.),
+ * and a suite that actually gates cases on a capability flag extends
+ * `CapabilityGatedCrossSuiteOptions` instead. Lives here in the neutral
+ * fixture-types home rather than in any one domain helper, so a non-cell
+ * suite never reaches into the cell helpers for its option shape.
  */
 export interface CrossSuiteOptions {
 	/** Per-test fixture-producing function (fresh keeper + db per call). */
 	readonly setup_test: SetupTest;
+}
+
+/**
+ * `CrossSuiteOptions` for a suite that reads capability flags — the ones
+ * whose cases are `test_if`-gated on a per-backend declaration. The field is
+ * on this variant rather than the base so a suite's option type states
+ * whether it consults capabilities: a caller cannot pass a flag bundle to a
+ * suite that ignores it, and a suite cannot quietly stop reading one while
+ * still demanding it.
+ */
+export interface CapabilityGatedCrossSuiteOptions extends CrossSuiteOptions {
 	/** Backend capability declarations — each suite gates on its own flag. */
 	readonly capabilities: BackendCapabilities;
 }
@@ -268,14 +266,24 @@ export interface CrossSuiteOptions {
 /**
  * `CrossSuiteOptions` plus the RPC endpoint path the suite dispatches
  * against — the shape every JSON-RPC-driven imperative suite takes (cell
- * verbs, origin, body-size, actor lookup/search, account lifecycle, app
- * settings, testing backdoor). Suites alias this under a self-documenting
+ * verbs, origin, body-size, actor lookup, account lifecycle, app
+ * settings). Suites alias this under a self-documenting
  * per-suite name (e.g. `OriginCrossTestOptions = RpcPathCrossSuiteOptions`).
  */
 export interface RpcPathCrossSuiteOptions extends CrossSuiteOptions {
 	/** RPC endpoint path the methods are mounted on. Default `/api/rpc`. */
 	readonly rpc_path?: string;
 }
+
+/**
+ * The RPC-dispatched shape for a capability-gating suite — the intersection
+ * of `RpcPathCrossSuiteOptions` and `CapabilityGatedCrossSuiteOptions`, and
+ * the most common option shape among the imperative cross suites (every
+ * `cell_*` suite, `query_shape`, `token_scope_surface`, `fact_serving`,
+ * `account_lifecycle`, `testing_backdoor`).
+ */
+export interface RpcPathCapabilityGatedCrossSuiteOptions
+	extends RpcPathCrossSuiteOptions, CapabilityGatedCrossSuiteOptions {}
 
 /**
  * Cross-process backend handle enriched with the bootstrapped keeper's
@@ -343,7 +351,7 @@ export type ReconstructedBootstrappedBackendHandle = Omit<
 >;
 
 /**
- * Serializable subset of {@link BootstrappedBackendHandle} suitable for
+ * Serializable subset of `BootstrappedBackendHandle` suitable for
  * vitest's `project.provide()` — vitest 4 hard-rejects non-serializable
  * values, so the live `child: ChildProcess` + `teardown: () => Promise<void>`
  * + `keeper_transport: FetchTransport` (closure) must stay in the
@@ -351,8 +359,8 @@ export type ReconstructedBootstrappedBackendHandle = Omit<
  * (`config`, `daemon_token`, `keeper_account`, `keeper_actor`,
  * `keeper_cookies`) round-trip through structured clone fine.
  *
- * `globalSetup` calls {@link serialize_bootstrapped_handle} before
- * `project.provide`; test files call {@link reconstruct_bootstrapped_handle}
+ * `globalSetup` calls `serialize_bootstrapped_handle` before
+ * `project.provide`; test files call `reconstruct_bootstrapped_handle`
  * on the injected value to rebuild a usable handle (without `child` /
  * `teardown` — lifecycle stays with `globalSetup`).
  */
@@ -380,7 +388,7 @@ export const serialize_bootstrapped_handle = (
 
 /**
  * Rebuild a usable handle from the serialized subset. Synthesizes a
- * fresh {@link FetchTransport} primed with the keeper's `Set-Cookie`
+ * fresh `FetchTransport` primed with the keeper's `Set-Cookie`
  * values so `_testing_reset` and other keeper-authenticated calls work.
  * The returned shape omits `child` and `teardown` — lifecycle stays
  * with `globalSetup`; tests that try to teardown themselves wouldn't
@@ -444,9 +452,27 @@ export interface CrossProcessSetupOptions {
 	 * single bootstrap actor — exposed on `fixture.extra_actors`. Declare
 	 * to put the keeper into a multi-actor state so the `actor_required` /
 	 * explicit-`acting` branches are reachable cross-process. See
-	 * `TestFixtureBase.extra_actors`.
+	 * `TestFixture.extra_actors`.
 	 */
 	readonly extra_actors?: ReadonlyArray<string>;
+	/**
+	 * Hold every audit row the fixture's readers parse to a closed world:
+	 * metadata keys its event type doesn't declare are refused, not just
+	 * mistyped or missing ones (`assert_audit_event_metadata`'s
+	 * `reject_unknown_keys`). Off by default, since the builtin schemas are
+	 * open for consumer-added fields; a backend's own spine suite turns it on
+	 * so neither spine can add an undeclared key. Exposed on
+	 * `fixture.reject_unknown_audit_metadata_keys`.
+	 */
+	readonly reject_unknown_audit_metadata_keys?: boolean;
+	/**
+	 * REST signup route `fixture.create_account` mints through. Default
+	 * `SPINE_ACCOUNT_SIGNUP_PATH`; set it for a backend mounting the account
+	 * routes under another prefix.
+	 */
+	readonly signup_path?: string;
+	/** REST login route `fixture.create_account` logs in through. Default `SPINE_ACCOUNT_LOGIN_PATH`. */
+	readonly login_path?: string;
 }
 
 /**
@@ -498,7 +524,8 @@ const generate_default_username = (): string => {
  * harness and doesn't need spec-shape validation (callers narrow the
  * `unknown` result against the shape they expect).
  *
- * `extra_headers` covers the daemon-token auth case for
+ * An `undefined` `params` leaves the key off the envelope — the no-arg call
+ * of a void-input method. `extra_headers` covers the daemon-token auth case for
  * `_testing_reset`; `Content-Type: application/json` is always set.
  * The JSON-RPC `id` mirrors `method` so server-side logs correlate
  * cleanly.
@@ -507,7 +534,7 @@ const rpc_via_transport = async (
 	transport: FetchTransport,
 	rpc_path: string,
 	method: string,
-	params: Record<string, unknown>,
+	params: Record<string, unknown> | undefined,
 	backend_name: string,
 	extra_headers?: Record<string, string>
 ): Promise<unknown> => {
@@ -564,8 +591,8 @@ export const capture_schema_snapshot = async (
 };
 
 /**
- * Capture a no-arg daemon-token introspection RPC and validate the wire
- * response against `schema`. The shared shape behind the parse-based
+ * Capture a no-arg (void-input) daemon-token introspection RPC, sent with no
+ * params, and validate the wire response against `schema`. The shared shape behind the parse-based
  * `capture_*` cross-impl parity probes: call a `_testing_*` introspection
  * action over the keeper's daemon-token channel, then `parse` so a shape
  * drift between the TS and Rust answers fails loud at the boundary.
@@ -584,7 +611,7 @@ const capture_via_daemon = async <T>(
 		handle.keeper_daemon_transport,
 		handle.config.rpc_path,
 		method,
-		{},
+		undefined,
 		handle.config.name,
 		{ [DAEMON_TOKEN_HEADER]: handle.daemon_token }
 	);
@@ -757,7 +784,13 @@ const extract_cookie_value = (
  */
 const mint_account = async (
 	handle: ReconstructedBootstrappedBackendHandle,
-	options: { username?: string; password_value?: string; email?: string }
+	options: {
+		username?: string;
+		password_value?: string;
+		email?: string;
+		signup_path: string;
+		login_path: string;
+	}
 ): Promise<{
 	transport: FetchTransport;
 	account: { id: Uuid; username: string };
@@ -782,12 +815,14 @@ const mint_account = async (
 	// it. The keeper holds `ROLE_ADMIN` from bootstrap (see
 	// `bootstrap_account.ts` — both `ROLE_KEEPER` and `ROLE_ADMIN` grants
 	// are created in the bootstrap transaction), so `invite_create` (admin-
-	// only) authorizes without any extra grants.
+	// only) authorizes without any extra grants. It acts as the keeper's
+	// bootstrap actor, the one holding those grants, so a keeper seeded with
+	// `extra_actors` resolves it too rather than answering `actor_required`.
 	const invite_result = (await rpc_via_transport(
 		handle.keeper_transport,
 		handle.config.rpc_path,
 		'invite_create',
-		{ username },
+		{ username, acting: handle.keeper_actor.id },
 		handle.config.name
 	)) as { ok?: true; invite?: { id?: string } } | undefined;
 	if (!invite_result?.invite?.id) {
@@ -805,7 +840,7 @@ const mint_account = async (
 	// `app_server.ts`): "requested" is `undefined` vs present, so a
 	// caller-supplied value is forwarded verbatim and signup validates it,
 	// rather than the truthy form silently dropping an empty string.
-	const signup_response = await transport('/api/account/signup', {
+	const signup_response = await transport(options.signup_path, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({
@@ -830,7 +865,7 @@ const mint_account = async (
 		);
 	}
 
-	const login_response = await transport('/api/account/login', {
+	const login_response = await transport(options.login_path, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ username, password })
@@ -896,7 +931,8 @@ const grant_roles_via_offer_accept = async (
 			handle.keeper_transport,
 			handle.config.rpc_path,
 			'role_grant_offer_create',
-			{ to_account_id: minted.account.id, role },
+			// as the keeper's bootstrap actor, like `mint_account`'s invite
+			{ to_account_id: minted.account.id, role, acting: handle.keeper_actor.id },
 			`${handle.config.name}, role=${role}`
 		)) as { offer?: { id?: string } } | undefined;
 		if (!offer_result?.offer?.id) {
@@ -989,6 +1025,8 @@ export const default_cross_process_setup = (
 	const extra_keeper_roles = options?.extra_keeper_roles ?? [];
 	const extra_account_specs = options?.extra_accounts ?? [];
 	const extra_actor_names = options?.extra_actors ?? [];
+	const signup_path = options?.signup_path ?? SPINE_ACCOUNT_SIGNUP_PATH;
+	const login_path = options?.login_path ?? SPINE_ACCOUNT_LOGIN_PATH;
 	const { cookie_name } = handle.config;
 	return async () => {
 		const {
@@ -1046,6 +1084,8 @@ export const default_cross_process_setup = (
 			account_options?: CreateTestAccountOptions
 		): Promise<TestAccount> => {
 			const other = await mint_account(refreshed_handle, {
+				signup_path,
+				login_path,
 				...(account_options?.username !== undefined && { username: account_options.username }),
 				...(account_options?.password_value !== undefined && {
 					password_value: account_options.password_value
@@ -1055,28 +1095,15 @@ export const default_cross_process_setup = (
 			if (account_options?.roles && account_options.roles.length > 0) {
 				await grant_roles_via_offer_accept(refreshed_handle, other, account_options.roles);
 			}
-			return {
-				account: other.account,
-				actor: other.actor,
-				session_cookie: other.session_cookie,
-				api_token: other.api_token,
-				create_session_headers: (extra?: Record<string, string>): Record<string, string> => ({
-					cookie: `${cookie_name}=${other.session_cookie}`,
-					...extra
-				}),
-				create_bearer_headers: (extra?: Record<string, string>): Record<string, string> => ({
-					authorization: `Bearer ${other.api_token}`,
-					...extra
-				})
-			};
+			return to_test_account(other, cookie_name);
 		};
 
-		const extra_accounts: Record<string, ExtraAccountFixture> = {};
+		const extra_accounts: Record<string, TestAccount> = {};
 		for (let i = 0; i < extra_account_specs.length; i++) {
 			const spec = extra_account_specs[i];
 			const seeded = seeded_extras[i];
 			if (!spec || !seeded) continue;
-			extra_accounts[spec.username] = build_extra_account_fixture(seeded, cookie_name);
+			extra_accounts[spec.username] = to_test_account(seeded, cookie_name);
 		}
 
 		// Per-test transport — fresh jar carrying the new keeper's cookie
@@ -1104,6 +1131,7 @@ export const default_cross_process_setup = (
 			create_account,
 			extra_accounts,
 			extra_actors,
+			reject_unknown_audit_metadata_keys: options?.reject_unknown_audit_metadata_keys ?? false,
 			// Forge over the wire — the cross-process driver has no keyring,
 			// so `_testing_mint_session` mints the backdated row + signs the
 			// cookie server-side over the keeper's daemon-token channel.

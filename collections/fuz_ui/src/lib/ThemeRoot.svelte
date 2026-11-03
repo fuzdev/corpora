@@ -4,7 +4,8 @@
 
 <script lang="ts">
 	import { onMount, type Snippet } from 'svelte';
-	import { render_theme_style, type Theme } from '@fuzdev/fuz_css/theme.ts';
+	import { render_theme_style } from '@fuzdev/fuz_css/theme.ts';
+	import type { Theme } from '@fuzdev/fuz_css/variable.ts';
 	import { DEFAULT_THEME } from '@fuzdev/fuz_css/themes.ts';
 	import { DEV } from 'esm-env';
 

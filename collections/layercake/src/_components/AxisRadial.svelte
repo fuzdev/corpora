@@ -1,11 +1,11 @@
 <!--
 	@component
-	Generates an SVG radial scale, useful for radar charts.
+	Generates SVG axis lines and labels around a circle, for radar charts. The keys of the x accessor become the labels.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { width, height, xScale, extents, config } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
@@ -16,12 +16,13 @@
 	/** @type {Props} */
 	let { lineLengthFactor = 1.1, labelPlacementFactor = 1.25 } = $props();
 
-	let max = $derived($xScale(Math.max(...$extents.x)));
+	// The largest x value, scaled, is the outer circle's radius
+	let outerRadius = $derived(k.xScale(Math.max(...k.extents.x)));
 
-	let lineLength = $derived(max * lineLengthFactor);
-	let labelPlacement = $derived(max * labelPlacementFactor);
+	let lineLength = $derived(outerRadius * lineLengthFactor);
+	let labelPlacement = $derived(outerRadius * labelPlacementFactor);
 
-	let angleSlice = $derived((Math.PI * 2) / $config.x.length);
+	let angleSlice = $derived((Math.PI * 2) / k.config.x.length);
 
 	/** @param {number} total
 	 *  @param {number} i */
@@ -35,12 +36,19 @@
 	}
 </script>
 
-<g transform="translate({$width / 2}, {$height / 2})">
-	<circle cx="0" cy="0" r={max} stroke="#ccc" stroke-width="1" fill="#CDCDCD" fill-opacity="0.1"
+<g transform="translate({k.width / 2}, {k.height / 2})">
+	<circle
+		cx="0"
+		cy="0"
+		r={outerRadius}
+		stroke="#ccc"
+		stroke-width="1"
+		fill="#CDCDCD"
+		fill-opacity="0.1"
 	></circle>
-	<circle cx="0" cy="0" r={max / 2} stroke="#ccc" stroke-width="1" fill="none"></circle>
+	<circle cx="0" cy="0" r={outerRadius / 2} stroke="#ccc" stroke-width="1" fill="none"></circle>
 
-	{#each $config.x as label, i}
+	{#each k.config.x as label, i}
 		{@const thisAngleSlice = angleSlice * i - Math.PI / 2}
 		<line
 			x1="0"
@@ -53,7 +61,7 @@
 		>
 		</line>
 		<text
-			text-anchor={anchor($config.x.length, i)}
+			text-anchor={anchor(k.config.x.length, i)}
 			dy="0.35em"
 			font-size="12px"
 			transform="translate({labelPlacement * Math.cos(thisAngleSlice)}, {labelPlacement *

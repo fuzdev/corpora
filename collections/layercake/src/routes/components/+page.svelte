@@ -32,24 +32,26 @@
 		return parts;
 	}
 
-	const componentGroups = svelteComponents.map(/** @param {ComponentGroup} d */ d => {
-		return {
-			name: `${d.name.replace(/^\w/, /** @param {string} w */ w => w.toUpperCase())} components`,
-			components: sortBy(d.components, 'slug').map(
-				/** @param {ComponentEntry} args */
-				({ name, slug, component }) => {
-					const classes = getClasses(slug);
-					return {
-						name,
-						slug,
-						component,
-						classes,
-						group: classes.filter(/** @param {string} d */ d => d !== 'percent-range')[0]
-					};
-				}
-			)
-		};
-	});
+	const componentGroups = svelteComponents.map(
+		/** @param {ComponentGroup} d */ d => {
+			return {
+				name: `${d.name.replace(/^\w/, /** @param {string} w */ w => w.toUpperCase())} components`,
+				components: sortBy(d.components, 'slug').map(
+					/** @param {ComponentEntry} args */
+					({ name, slug, component }) => {
+						const classes = getClasses(slug);
+						return {
+							name,
+							slug,
+							component,
+							classes,
+							group: classes.filter(/** @param {string} d */ d => d !== 'percent-range')[0]
+						};
+					}
+				)
+			};
+		}
+	);
 
 	/** @param {string} name */
 	function formatName(name) {
@@ -125,11 +127,10 @@
 	<meta name="twitter:title" content="Layer Cake — Component gallery" />
 </svelte:head>
 
-<sidebar>
+<aside>
 	<ul>
 		{#each componentGroups as componentGroup}
 			<li>
-				<!-- {console.log(activeSection, slugify(componentGroup.name))} -->
 				<a
 					class="section {activeSection === slugify(componentGroup.name) ? 'active' : ''}"
 					href="/components#{slugify(componentGroup.name)}">{componentGroup.name}</a
@@ -137,7 +138,7 @@
 			</li>
 		{/each}
 	</ul>
-</sidebar>
+</aside>
 
 <div id="container" bind:this={container}>
 	<h2>Components</h2>
@@ -177,6 +178,9 @@
 				href="https://mhkeller.github.io/layercake-prerunes/components"
 				target="_blank"
 				rel="noreferrer">documentation archive</a
+			>. Looking for the version 10 components that used the store API? They're at the
+			<a href="https://mhkeller.github.io/layercake-v10/components" target="_blank" rel="noreferrer"
+				>v10 documentation archive</a
 			>.
 		</p>
 	</div>
@@ -218,7 +222,7 @@
 </div>
 
 <style>
-	sidebar {
+	aside {
 		position: fixed;
 		background-color: #fff;
 		top: 61px;
@@ -252,7 +256,7 @@
 		width: 80%;
 	}
 
-	sidebar ul {
+	aside ul {
 		list-style: none;
 		padding: 0;
 		margin: 0;
@@ -300,11 +304,6 @@
 		padding-top: 3.5em;
 	}
 
-	/* h3#axis {
-		padding-top: 4.5em;
-		top: -1em;
-	} */
-
 	h4 {
 		display: block;
 		padding: 7px 0;
@@ -329,42 +328,11 @@
 		border-radius: 5px;
 	}
 
-	/* .component-block:nth-child(3),
-	.component-block:nth-child(6),
-	.component-block:nth-child(9),
-	.component-block:nth-child(12),
-	.component-block:nth-child(15),
-	.component-block:nth-child(18),
-	.component-block:nth-child(21) {
-		margin-right: 0;
-	} */
-
 	@media (max-width: 1150px) {
 		#dek {
 			width: 95%;
 		}
-		/* .component-block {
-			width: 43%;
-		} */
-		/* .component-block:nth-child(3),
-		.component-block:nth-child(6),
-		.component-block:nth-child(9),
-		.component-block:nth-child(12),
-		.component-block:nth-child(15),
-		.component-block:nth-child(18),
-		.component-block:nth-child(21) {
-			margin-right: 21px;
-		}
-		.component-block:nth-child(even) {
-			margin-right: 0 !important;
-		} */
 	}
-
-	/* @media (max-width: 860px) {
-		.component-block {
-			width: 40%;
-		}
-	} */
 
 	@media (max-width: 800px) {
 		.component-block {
@@ -426,7 +394,7 @@
 	}
 
 	@media (min-width: 768px) {
-		sidebar {
+		aside {
 			display: block;
 		}
 

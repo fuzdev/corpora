@@ -15,10 +15,10 @@
 
 {#if declarations.length === 0}
 	<section>
-		{#if search_query}
-			<p>No declarations found matching "{search_query}"</p>
+		{#if search_query.trim()}
+			<p class="text_70">No declarations match your search.</p>
 		{:else}
-			<p>No declarations</p>
+			<p class="text_70">No declarations.</p>
 		{/if}
 	</section>
 {:else}

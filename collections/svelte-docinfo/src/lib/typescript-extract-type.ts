@@ -15,13 +15,15 @@
  * @see `typescript-extract-shared.ts` for shared helpers
  * @see `typescript-extract-type-properties.ts` for type-alias property walking
  *
+ * @internal
+ *
  * @module
  */
 
 import ts from 'typescript';
 
 import type { DeclarationJsonBuild, MemberJsonBuild } from './declaration-build.ts';
-import { to_error_message } from './error.ts';
+import { toErrorMessage } from './error.ts';
 import { parseComment, applyToDeclaration } from './tsdoc.ts';
 import {
 	applyHeritageExternalTypes,
@@ -35,7 +37,12 @@ import {
 	populatePropertyMember,
 	type ExtractContext
 } from './typescript-extract-shared.ts';
-import { resolveTypeInfo } from './typescript-extract-type-json.ts';
+import {
+	isTypeAliasLike,
+	resolveTypeInfo,
+	typeAliasTypeNode,
+	typeAliasTypeParameters
+} from './typescript-extract-type-json.ts';
 import { extractTypeAliasProperties } from './typescript-extract-type-properties.ts';
 
 /**
@@ -63,11 +70,12 @@ export const extractTypeInfo = (
 		// terminal by the `TypeJson` absence contract, and its variant has no field.
 		// The right-hand side is the written node: an alias *over* an alias-lost
 		// name recovers it (`type B = Inferred` references `Inferred`).
-		// `ownAliasName` doubles as the registry self-skip — see `resolveTypeInfo`
-		if (ts.isTypeAliasDeclaration(node)) {
+		// `ownAliasName` doubles as the registry self-skip — see `resolveTypeInfo`.
+		// A JSDoc typedef or callback is a type alias too (`isTypeAliasLike`)
+		if (isTypeAliasLike(node)) {
 			const typeInfo = resolveTypeInfo(nodeType, checker, ctx.aliasRegistry, false, {
-				ownAliasName: node.name.text,
-				writtenNode: node.type
+				ownAliasName: node.name?.text,
+				writtenNode: typeAliasTypeNode(node)
 			});
 			if (typeInfo) declaration.typeInfo = typeInfo;
 		}
@@ -79,19 +87,22 @@ export const extractTypeInfo = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to extract type for "${declaration.name}": ${to_error_message(err)}`,
+			message: `Failed to extract type for "${declaration.name}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			symbolName: declaration.name ?? '<default export>'
 		});
 	}
 
-	if (ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)) {
-		if (node.typeParameters?.length) {
-			declaration.genericParams = node.typeParameters.map(parseGenericParam);
-		}
+	const typeParams = isTypeAliasLike(node)
+		? typeAliasTypeParameters(node)
+		: ts.isInterfaceDeclaration(node)
+			? node.typeParameters
+			: undefined;
+	if (typeParams?.length) {
+		declaration.genericParams = typeParams.map(parseGenericParam);
 	}
 
-	if (ts.isTypeAliasDeclaration(node) && nodeType) {
+	if (isTypeAliasLike(node) && nodeType) {
 		extractTypeAliasProperties(node, nodeType, declaration, ctx);
 	}
 
@@ -128,7 +139,7 @@ export const extractTypeInfo = (
 				}
 
 				// Extract modifiers
-				const modifierFlags = extractModifiers(ts.getModifiers(member));
+				const modifierFlags = extractModifiers(member);
 				if (modifierFlags.length > 0) {
 					propDeclaration.modifiers = modifierFlags;
 				}
@@ -167,7 +178,7 @@ export const extractTypeInfo = (
 						file: loc.file,
 						line: loc.line,
 						column: loc.column,
-						message: `Failed to extract type for interface property "${propName}" in "${declaration.name}": ${to_error_message(err)}`,
+						message: `Failed to extract type for interface property "${propName}" in "${declaration.name}": ${toErrorMessage(err)}`,
 						severity: 'warning',
 						symbolName: propName
 					});
@@ -191,7 +202,7 @@ export const extractTypeInfo = (
 				}
 
 				// Extract modifiers
-				const modifierFlags = extractModifiers(ts.getModifiers(member));
+				const modifierFlags = extractModifiers(member);
 				if (modifierFlags.length > 0) {
 					methodDeclaration.modifiers = modifierFlags;
 				}
@@ -233,7 +244,7 @@ export const extractTypeInfo = (
 						file: loc.file,
 						line: loc.line,
 						column: loc.column,
-						message: `Failed to analyze interface method "${methodName}": ${to_error_message(err)}`,
+						message: `Failed to analyze interface method "${methodName}": ${toErrorMessage(err)}`,
 						severity: 'warning',
 						functionName: methodName
 					});
@@ -248,7 +259,7 @@ export const extractTypeInfo = (
 					const indexDeclaration: MemberJsonBuild = { name, kind: 'variable' };
 
 					// `readonly [key: string]: T` carries the modifier like a property
-					const indexModifiers = extractModifiers(ts.getModifiers(member));
+					const indexModifiers = extractModifiers(member);
 					if (indexModifiers.length > 0) {
 						indexDeclaration.modifiers = indexModifiers;
 					}
@@ -272,7 +283,7 @@ export const extractTypeInfo = (
 								file: loc.file,
 								line: loc.line,
 								column: loc.column,
-								message: `Failed to extract type for index signature "${name}" in "${declaration.name}": ${to_error_message(err)}`,
+								message: `Failed to extract type for index signature "${name}" in "${declaration.name}": ${toErrorMessage(err)}`,
 								severity: 'warning',
 								symbolName: name
 							});
@@ -336,6 +347,12 @@ export const extractTypeInfo = (
  * Iterates `node.members` to extract each enum member's name, initializer value,
  * type, and JSDoc. Members are represented as `MemberJson` with kind `'variable'`.
  *
+ * A JS `@enum {T}` const (`isJSDocEnumSymbol`) arrives as its variable
+ * declaration. Its `typeSignature` is the tag's type, `T`, the type the name
+ * means in an annotation (`@param {A} a` takes any `T`), and its members are
+ * the value's properties in declaration order, each with its own JSDoc and
+ * checker type.
+ *
  * @internal Used by `analyzeDeclaration` — not part of the public barrel export.
  *
  * @mutates declaration - adds members and typeSignature
@@ -346,9 +363,10 @@ export const extractEnumInfo = (
 	ctx: ExtractContext
 ): void => {
 	const { checker, diagnostics } = ctx;
+	const enumTag = ts.isVariableDeclaration(node) ? ts.getJSDocEnumTag(node) : undefined;
 	// Extract type signature
 	try {
-		const nodeType = checker.getTypeAtLocation(node);
+		const nodeType = checker.getTypeAtLocation(enumTag ?? node);
 		declaration.typeSignature = checker.typeToString(nodeType);
 	} catch (err) {
 		declaration.partial = true;
@@ -358,12 +376,16 @@ export const extractEnumInfo = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to extract type for "${declaration.name}": ${to_error_message(err)}`,
+			message: `Failed to extract type for "${declaration.name}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			symbolName: declaration.name ?? '<default export>'
 		});
 	}
 
+	if (enumTag) {
+		extractJSDocEnumMembers(node, declaration, ctx);
+		return;
+	}
 	if (!ts.isEnumDeclaration(node)) return;
 
 	for (const member of node.members) {
@@ -398,12 +420,65 @@ export const extractEnumInfo = (
 				file: loc.file,
 				line: loc.line,
 				column: loc.column,
-				message: `Failed to extract type for enum member "${memberName}" in "${declaration.name}": ${to_error_message(err)}`,
+				message: `Failed to extract type for enum member "${memberName}" in "${declaration.name}": ${toErrorMessage(err)}`,
 				severity: 'warning',
 				symbolName: memberName
 			});
 		}
 
 		(declaration.members ??= []).push(memberDeclaration);
+	}
+};
+
+/**
+ * Members of a JS `@enum` const: the value's properties, read like a type
+ * alias's (`extractTypeAliasProperties`) but each kept `kind: 'variable'`, as
+ * a TypeScript enum's are. Properties declared only in external files (a
+ * string or array initializer's library members) are skipped, and with them
+ * the members of an external-typed or external-spread initializer.
+ *
+ * @mutates declaration - adds members (and `partial: true` on extraction failure)
+ * @mutates ctx.diagnostics - adds `type_extraction_failed` on checker errors
+ */
+const extractJSDocEnumMembers = (
+	node: ts.Node,
+	declaration: DeclarationJsonBuild,
+	ctx: ExtractContext
+): void => {
+	const { checker, diagnostics } = ctx;
+	try {
+		for (const prop of checker.getTypeAtLocation(node).getProperties()) {
+			// a computed symbol key (`[Symbol.iterator]`) has no member name
+			if (prop.getName().startsWith('__@')) continue;
+			// a non-object initializer (`'x'`, `['a']`, a `Map`) has its library
+			// type's members, which the author didn't write; a spread from a
+			// project object, or `Object.freeze({…})`, keeps its local declarations.
+			// The filter is by declaration origin, so an external-typed initializer
+			// (`/** @type {S} */ ({a})` with `S` from a package) loses those members,
+			// and an external spread (`{...pkgBase, z}`) loses all but `z`
+			const propDecls = prop.getDeclarations();
+			if (propDecls?.length && propDecls.every((d) => ctx.isExternalFile(d.getSourceFile()))) {
+				continue;
+			}
+			const member: MemberJsonBuild = { name: prop.getName(), kind: 'variable' };
+			const propDecl = propDecls?.[0];
+			if (propDecl) {
+				applyToDeclaration(member, parseComment(propDecl, propDecl.getSourceFile()), true);
+			}
+			member.typeSignature = checker.typeToString(checker.getTypeOfSymbolAtLocation(prop, node));
+			(declaration.members ??= []).push(member);
+		}
+	} catch (err) {
+		declaration.partial = true;
+		const loc = getNodeLocation(node);
+		diagnostics.push({
+			kind: 'type_extraction_failed',
+			file: loc.file,
+			line: loc.line,
+			column: loc.column,
+			message: `Failed to extract members of enum "${declaration.name}": ${toErrorMessage(err)}`,
+			severity: 'warning',
+			symbolName: declaration.name ?? '<default export>'
+		});
 	}
 };

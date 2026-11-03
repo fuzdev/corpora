@@ -11,44 +11,34 @@
  */
 
 import { test, assert } from 'vitest';
-import { Uuid, create_uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, create_uuid } from '#lib/primitive_schemas.ts';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { create_actor_search_actions } from '$lib/auth/actor_search_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_actor_search_actions } from '#lib/auth/actor_search_actions.ts';
 import {
 	ACTOR_SEARCH_LIMIT_DEFAULT,
 	ACTOR_SEARCH_LIMIT_MAX,
 	ERROR_ACTOR_SEARCH_SCOPE_REQUIRED,
 	actor_search_action_spec
-} from '$lib/auth/actor_search_action_specs.ts';
-import { query_create_role_grant } from '$lib/auth/role_grant_queries.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/auth/actor_search_action_specs.ts';
+import { query_create_role_grant } from '#lib/auth/role_grant_queries.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_actor_search');
 const RPC_PATH = '/api/rpc';
 
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
-
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 	...create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: create_actor_search_actions({ log: ctx.deps.log }),
 		log: ctx.deps.log
@@ -174,6 +164,42 @@ describe_db('actor_search_actions', (get_db) => {
 		assert.ok(res.ok, JSON.stringify(res));
 	});
 
+	test('a soft-deleted granting actor does not unlock the global arm', async () => {
+		// The tombstone half of the account-grain case above, and its mutation
+		// check: identical setup, plus a soft-delete on the actor holding the
+		// grant. Soft-delete leaves the `role_grant` row intact (undelete
+		// restores it), so the tombstone-blind account-role query still reports
+		// admin here — the handler reads the active-only one instead.
+		//
+		// The caller's own primary actor stays live, so the session still
+		// resolves and the only thing that can refuse the call is the admin gate.
+		const db = get_db();
+		const test_app = await create_test_app({ session_options, create_route_specs, db });
+		const admin = await test_app.create_account({ username: 'admin_tombstoned' });
+		const second_actor = await db.query_one<{ id: Uuid }>(
+			`INSERT INTO actor (account_id, name) VALUES ($1, 'second') RETURNING id`,
+			[admin.account.id]
+		);
+		assert.ok(second_actor);
+		await query_create_role_grant(
+			{ db },
+			{ actor_id: second_actor.id, role: ROLE_ADMIN, granted_by: null }
+		);
+		await db.query(`UPDATE actor SET deleted_at = NOW() WHERE id = $1`, [second_actor.id]);
+
+		const res = await rpc_call_for_spec({
+			app: test_app.app,
+			path: RPC_PATH,
+			spec: actor_search_action_spec,
+			params: { query: 'a' },
+			headers: admin.create_session_headers()
+		});
+		assert.ok(!res.ok, JSON.stringify(res));
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_params);
+		const data = res.error.data as { reason?: string } | undefined;
+		assert.strictEqual(data?.reason, ERROR_ACTOR_SEARCH_SCOPE_REQUIRED);
+	});
+
 	test('display_name is omitted (not null) when actor.name trims to empty', async () => {
 		const db = get_db();
 		const test_app = await create_test_app({ session_options, create_route_specs, db });
@@ -257,7 +283,7 @@ describe_db('actor_search_actions', (get_db) => {
 			app: test_app.app,
 			path: RPC_PATH,
 			spec: actor_search_action_spec,
-			params: { query: '' } as never,
+			params: { query: '' },
 			headers: caller.create_session_headers()
 		});
 		assert.ok(!res.ok);

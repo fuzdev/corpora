@@ -15,7 +15,7 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '../primitive_schemas.ts';
 
 import { ActingActor } from '../http/auth_shape.ts';
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
@@ -39,6 +39,21 @@ export const ERROR_CELL_GRANT_PRINCIPAL_IS_OWNER = 'cell_grant_principal_is_owne
  * no role_grant could match.
  */
 export const ERROR_CELL_GRANT_UNKNOWN_ROLE = 'cell_grant_unknown_role' as const;
+
+/**
+ * Error reason — `cell_grant_create` on a cell whose `moderation` doesn't
+ * admit an audience (pending, rejected, or an unknown marker). A grant would
+ * extend an audience the cell doesn't have yet.
+ */
+export const ERROR_CELL_GRANT_UNAPPROVED = 'cell_grant_unapproved' as const;
+
+/**
+ * Error reason — the mounted `CellGrantCreateAuthorize` refused a manager's
+ * `cell_grant_create`. A **403** `forbidden`, answered only to a caller who
+ * manages the cell (everyone else gets the 404 mask before the hook runs).
+ * Twin of the Rust `ERROR_CELL_GRANT_NOT_AUTHORIZED`.
+ */
+export const ERROR_CELL_GRANT_NOT_AUTHORIZED = 'cell_grant_not_authorized' as const;
 
 // -- Shared schemas ---------------------------------------------------------
 
@@ -114,8 +129,8 @@ export type CellGrantRevokeInput = z.infer<typeof CellGrantRevokeInput>;
 /**
  * Output for `cell_grant_revoke`. `still_admitted` is `true` when the
  * caller retains some admit path on the cell after the revoke (other
- * grant, ownership, admin). Always `true` for non-self revokes (the
- * caller didn't admit via this row to begin with).
+ * grant, ownership, admin). Always `true` for a manager's revoke; a
+ * self-revoker or a scope steward may hold no other path.
  */
 export const CellGrantRevokeOutput = z.strictObject({
 	ok: z.literal(true),
@@ -161,7 +176,7 @@ export const cell_grant_revoke_action_spec = {
 	output: CellGrantRevokeOutput,
 	async: true,
 	description:
-		'Revoke a grant. Manage-tier only (admin / owner), plus self for actor-shaped grants ("leave shared cell"). Returns `still_admitted` so the UI can tell the recipient whether other admit paths remain.'
+		'Revoke a grant. Manage-tier only (admin / owner), plus self for actor-shaped grants ("leave shared cell"), plus the steward of a scoped role-shaped grant\'s scope when the consumer mounts a revoke authorizer. Returns `still_admitted` so the UI can tell the recipient whether other admit paths remain.'
 } satisfies RequestResponseActionSpec;
 
 export const cell_grant_list_action_spec = {

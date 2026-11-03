@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { Part, PartJson, type PartJsonInput, type PartUnion } from './part.svelte.ts';
-import { HANDLED } from './cell_helpers.ts';
+import { create_collection_decoder } from './cell_helpers.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
 import { create_single_index } from './indexed_collection_helpers.svelte.ts';
 import { get_unique_name } from './helpers.ts';
@@ -20,18 +20,17 @@ export interface PartsOptions extends CellOptions<typeof PartsJson> {}
 export class Parts extends Cell<typeof PartsJson> {
 	// Initialize items with proper typing and unified indexes
 	readonly items: IndexedCollection<PartUnion> = new IndexedCollection({
+		dispose_item: (part) => part.dispose(),
 		indexes: [
 			create_single_index({
 				key: 'by_name',
-				extractor: (part) => part.name,
-				query_schema: z.string()
+				extractor: (part) => part.name
 			}),
 			create_single_index({
 				key: 'by_diskfile_path',
-				extractor: (part) => (part.type === 'diskfile' ? part.path : undefined),
-				query_schema: z.string()
+				extractor: (part) => (part.type === 'diskfile' ? part.path : undefined)
 			})
-			// TODO dynamic index with the rendered content? needs to be lazy, ideally just using $derived
+			// TODO an index over the rendered content? needs to be lazy, ideally a `reactive` index
 		]
 	});
 
@@ -39,16 +38,10 @@ export class Parts extends Cell<typeof PartsJson> {
 		super(PartsJson, options);
 
 		this.decoders = {
-			// TODO @many improve this API, maybe infer or create a helper, duplicated many places
-			items: (items) => {
-				if (Array.isArray(items)) {
-					this.items.clear();
-					for (const item_json of items) {
-						this.add(item_json);
-					}
-				}
-				return HANDLED;
-			}
+			items: create_collection_decoder(
+				() => this.items.clear(),
+				(json) => this.add(json)
+			)
 		};
 
 		this.init();
@@ -77,6 +70,27 @@ export class Parts extends Cell<typeof PartsJson> {
 	 */
 	remove(id: Uuid): boolean {
 		return this.items.remove(id);
+	}
+
+	/**
+	 * Removes the parts in `ids` that no turn references anymore. Turns are the only
+	 * owners of the parts in this collection — a prompt's parts are its own instances,
+	 * and `Diskfile.part` is a lookup, not a reference.
+	 *
+	 * @returns the number of parts removed
+	 */
+	remove_unreferenced(ids: Iterable<Uuid>): number {
+		const referenced: Set<Uuid> = new Set();
+		for (const thread of this.app.threads.items.by_id.values()) {
+			for (const turn of thread.turns.by_id.values()) {
+				for (const id of turn.part_ids) referenced.add(id);
+			}
+		}
+		const unreferenced: Array<Uuid> = [];
+		for (const id of ids) {
+			if (!referenced.has(id)) unreferenced.push(id);
+		}
+		return this.items.remove_many(unreferenced);
 	}
 
 	/**

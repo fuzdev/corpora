@@ -16,18 +16,21 @@
  * ## Auth filtering — `scope_ids`
  *
  * When `scope_ids` is non-empty, the result is filtered to actors
- * holding an **active** role_grant on one of the supplied scopes. Active
- * means `revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`.
- * Stale (revoked / expired) role_grants do **not** confer membership for
- * search-visibility purposes — otherwise a removed student would
- * remain visible to teachers indefinitely.
+ * holding an **active** role_grant on one of the supplied scopes — active
+ * as `role_grant_active_sql` (`auth/role_grant_sql.ts`) defines it. Stale
+ * (revoked / expired) role_grants do **not** confer membership for
+ * search-visibility purposes — otherwise a removed student would remain
+ * visible to teachers indefinitely.
  *
  * The `DISTINCT` on `actor.id` collapses the case where an actor holds
  * multiple matching role_grants in the supplied scope set into one row.
  *
  * When `scope_ids` is omitted (admin-only global path; the handler
- * gates), no role_grant join — every actor with a matching prefix is
- * returned.
+ * gates), no role_grant join — every active actor with a matching prefix
+ * is returned.
+ *
+ * Both paths return only active actors of active accounts: a soft-deleted
+ * actor, or any actor of a soft-deleted account, is never a search result.
  *
  * ## Info-leak posture (see `auth/actor_search_action_specs.ts` §audit)
  *
@@ -52,10 +55,11 @@
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import type { ActorLookupRow } from './actor_lookup_queries.ts';
+import { role_grant_active_sql } from './role_grant_sql.ts';
 
 /** Inputs for `query_actor_search`. */
 export interface ActorSearchQueryInput {
@@ -95,7 +99,9 @@ export const query_actor_search = async (
 			`SELECT act.id, a.username, act.name AS display_name
 			 FROM actor act
 			 JOIN account a ON a.id = act.account_id
-			 WHERE LOWER(act.name) LIKE $1 || '%' ESCAPE '\\'
+			 WHERE act.deleted_at IS NULL
+			   AND a.deleted_at IS NULL
+			   AND LOWER(act.name) LIKE $1 || '%' ESCAPE '\\'
 			 ORDER BY display_name, id
 			 LIMIT $2`,
 			[escaped_prefix, input.limit]
@@ -113,11 +119,12 @@ export const query_actor_search = async (
 		 JOIN account a ON a.id = act.account_id
 		 JOIN role_grant rg ON rg.actor_id = act.id
 		   AND rg.scope_id = ANY($2)
-		   AND rg.revoked_at IS NULL
-		   AND (rg.expires_at IS NULL OR rg.expires_at > NOW())
-		 WHERE LOWER(act.name) LIKE $1 || '%' ESCAPE '\\'
+		   AND ${role_grant_active_sql('rg')}
+		 WHERE act.deleted_at IS NULL
+		   AND a.deleted_at IS NULL
+		   AND LOWER(act.name) LIKE $1 || '%' ESCAPE '\\'
 		 ORDER BY display_name, id
 		 LIMIT $3`,
-		[escaped_prefix, scope_ids as Array<Uuid>, input.limit]
+		[escaped_prefix, scope_ids, input.limit]
 	);
 };

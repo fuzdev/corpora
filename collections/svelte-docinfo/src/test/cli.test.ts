@@ -18,7 +18,7 @@ import { join } from 'node:path';
 
 import { withTestProject } from './test-helpers.ts';
 import { runCliCapture, runNodeSubprocess, PROJECT_ROOT } from './test-cli-helpers.ts';
-import { AnalyzeResultJson } from '$lib/analyze-core.ts';
+import { parseAnalyzeResult } from '#lib/analyze-core.ts';
 
 /** Simple project with one module. */
 const SIMPLE_PROJECT = {
@@ -184,11 +184,11 @@ describe('runCli', { timeout: 15_000 }, () => {
 
 			assert.strictEqual(exitCode, 0);
 
-			// Wire format strips empty arrays via `compactReplacer`. Schema-side
-			// `.default([])` on both fields restores them at `.parse()` — so
+			// Wire format strips empty arrays via `compactReplacer`. The schema's
+			// `[]` default on both fields restores them when parsed — so
 			// consumers programmatically ingesting analysis JSON should parse
-			// through `AnalyzeResultJson` to get the symmetric envelope back.
-			const output = AnalyzeResultJson.parse(JSON.parse(stdout.join('\n')));
+			// through `parseAnalyzeResult` to get the symmetric envelope back.
+			const output = parseAnalyzeResult(JSON.parse(stdout.join('\n')));
 			assert.ok(Array.isArray(output.diagnostics));
 			assert.deepStrictEqual(output.diagnostics, [], 'Clean project should have no diagnostics');
 		});
@@ -244,6 +244,24 @@ describe('runCli', { timeout: 15_000 }, () => {
 		);
 	});
 
+	test('returns 2 on an unknown flag', async () => {
+		const { exitCode, stderr } = await runCliCapture(['node', 'svelte-docinfo', '--bogus']);
+		assert.strictEqual(exitCode, 2);
+		assert.ok(
+			stderr.some((e) => e.includes("unknown option '--bogus'")),
+			stderr.join('; ')
+		);
+	});
+
+	test('returns 2 on a missing option value', async () => {
+		const { exitCode, stderr } = await runCliCapture(['node', 'svelte-docinfo', '--tsconfig']);
+		assert.strictEqual(exitCode, 2);
+		assert.ok(
+			stderr.some((e) => e.includes('argument missing')),
+			stderr.join('; ')
+		);
+	});
+
 	test('returns 0 on empty project (no files match)', async () => {
 		await withTestProject(
 			{
@@ -261,7 +279,7 @@ describe('runCli', { timeout: 15_000 }, () => {
 				assert.strictEqual(exitCode, 0);
 
 				// Both arrays empty → wire form is `{}`; schema restores `[]`.
-				const output = AnalyzeResultJson.parse(JSON.parse(stdout.join('\n')));
+				const output = parseAnalyzeResult(JSON.parse(stdout.join('\n')));
 				assert.strictEqual(output.modules.length, 0);
 			}
 		);
@@ -337,7 +355,7 @@ let {label}: {label: string} = $props();
 
 			// Parse through the schema so empty `diagnostics` / per-module
 			// `dependencies`/`dependents` defaults are restored.
-			const output = AnalyzeResultJson.parse(JSON.parse(stdout.join('\n')));
+			const output = parseAnalyzeResult(JSON.parse(stdout.join('\n')));
 			assert.ok(Array.isArray(output.diagnostics));
 			for (const mod of output.modules) {
 				assert.deepStrictEqual(mod.dependencies, []);
@@ -408,7 +426,7 @@ let {label}: {label: string} = $props();
 			const raw = stdout.join('\n');
 			// Wire form may strip empty `diagnostics`; parse through schema to
 			// confirm both keys are present after default restoration.
-			const output = AnalyzeResultJson.parse(JSON.parse(raw));
+			const output = parseAnalyzeResult(JSON.parse(raw));
 			assert.ok(Array.isArray(output.modules));
 			assert.ok(Array.isArray(output.diagnostics));
 			assert.ok(raw.includes('  '), 'Should be pretty-printed');
@@ -524,7 +542,9 @@ let {label}: {label: string} = $props();
 
 				assert.strictEqual(exitCode, 0, 'Warnings should not fail the run');
 				assert.ok(
-					stderr.some((e) => e.includes('Both HTML @component comment and JSDoc')),
+					stderr.some((e) =>
+						e.includes('Both the JSDoc in <script> and the HTML @component comment')
+					),
 					`Expected duplicate_comment warning on stderr under --quiet, got: ${stderr.join('; ')}`
 				);
 				assert.ok(
@@ -840,6 +860,51 @@ let {label}: {label: string} = $props();
 		);
 	});
 
+	test('--no-tsconfig analyzes a project that has none', async () => {
+		await withTestProject(
+			{ 'src/lib/a.ts': 'export const nullable: string | null = null;' },
+			async (projectRoot) => {
+				const missing = await runCliCapture(['node', 'svelte-docinfo', projectRoot, '--quiet']);
+				assert.strictEqual(missing.exitCode, 2);
+
+				const { exitCode, stdout } = await runCliCapture([
+					'node',
+					'svelte-docinfo',
+					projectRoot,
+					'--no-tsconfig',
+					'--quiet'
+				]);
+				assert.strictEqual(exitCode, 0);
+				const output = JSON.parse(stdout.join('\n'));
+				assert.strictEqual(output.modules[0].declarations[0].typeSignature, 'string | null');
+			},
+			{ tsconfig: false }
+		);
+	});
+
+	test('--tsconfig selects a config by path', async () => {
+		await withTestProject(
+			{
+				'src/lib/a.ts': 'export const nullable: string | null = null;',
+				'tsconfig.json': JSON.stringify({ compilerOptions: { strict: true } }),
+				'tsconfig.loose.json': JSON.stringify({ compilerOptions: { strict: false } })
+			},
+			async (projectRoot) => {
+				const { exitCode, stdout } = await runCliCapture([
+					'node',
+					'svelte-docinfo',
+					projectRoot,
+					'--tsconfig',
+					'tsconfig.loose.json',
+					'--quiet'
+				]);
+				assert.strictEqual(exitCode, 0);
+				const output = JSON.parse(stdout.join('\n'));
+				assert.strictEqual(output.modules[0].declarations[0].typeSignature, 'string');
+			}
+		);
+	});
+
 	test('--on-duplicates rejects invalid values', async () => {
 		await withTestProject(SIMPLE_PROJECT, async (projectRoot) => {
 			const { exitCode, stderr } = await runCliCapture([
@@ -1044,7 +1109,7 @@ let {label}: {label: string} = $props();
 
 			// Empty `modules` is stripped by `compactReplacer` — parse through
 			// the schema to restore the default and assert on the symmetric envelope.
-			const output = AnalyzeResultJson.parse(JSON.parse(stdout.join('\n')));
+			const output = parseAnalyzeResult(JSON.parse(stdout.join('\n')));
 			assert.deepStrictEqual(output.modules, []);
 		});
 	});
@@ -1067,12 +1132,14 @@ let {label}: {label: string} = $props();
 					projectRoot,
 					'--only',
 					'wanted.ts',
+					'--on-duplicates',
+					'diagnostic',
 					'--quiet'
 				]);
 
 				assert.strictEqual(exitCode, 0);
 
-				const output = AnalyzeResultJson.parse(JSON.parse(stdout.join('\n')));
+				const output = parseAnalyzeResult(JSON.parse(stdout.join('\n')));
 				const [only_module] = output.modules;
 				assert.ok(only_module, 'Expected exactly one module to survive --only');
 				assert.strictEqual(output.modules.length, 1);

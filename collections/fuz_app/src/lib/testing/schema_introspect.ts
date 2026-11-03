@@ -15,9 +15,21 @@ import './assert_dev_env.ts';
  *   so a label set / ordering drift (e.g. `cell_visibility`) is a gated fact,
  *   not invisible
  *
- * Designed for `pg_catalog` introspection — works against both PostgreSQL
- * and PGlite. The snapshot is fully deterministic: every collection sorts by
+ * Designed for `pg_catalog` introspection — it runs on PostgreSQL, PGlite and
+ * pglet. The snapshot is fully deterministic: every collection sorts by
  * a stable key and excludes time-varying fields like `applied_at`.
+ *
+ * Index and constraint definitions are compared as the engine renders them,
+ * so both sides of a parity comparison need engines that render alike. pglet
+ * leaves an index's modifiers out of `pg_indexes.indexdef` — per-key sort
+ * direction, `NULLS` placement, operator classes, `NULLS NOT DISTINCT` — and
+ * that misleads a comparison in both directions: a pglet snapshot diffed
+ * against a PostgreSQL one reports every index that uses a modifier, with
+ * identical DDL on both sides (a false difference), and two pglet snapshots
+ * agree when the two schemas differ only in a modifier (a false agreement).
+ * So `query_schema_snapshot` throws on pglet when the snapshot holds an
+ * index, unless the caller passes `accept_pglet_index_definitions`. Take both
+ * snapshots of a parity comparison on PostgreSQL.
  *
  * Paired with `testing/schema_parity.ts` for comparison + assertion helpers.
  *
@@ -108,7 +120,7 @@ export type SchemaSnapshot = z.infer<typeof SchemaSnapshot>;
  * to the schema snapshot — is a gated fact, not a latent interop break.
  */
 export const MigrationTrackerEntry = z.object({
-	/** Migration namespace (e.g. `fuz_cell`, `fuz_cell_history`). */
+	/** Migration namespace (e.g. `fuz_auth`, `fuz_cell`). */
 	namespace: z.string(),
 	/** Migration name within the namespace (e.g. `full_cell_schema`). */
 	name: z.string(),
@@ -164,7 +176,21 @@ export interface QuerySchemaSnapshotOptions {
 	 * consumer's domain schema.
 	 */
 	readonly exclude_tables?: ReadonlyArray<string>;
+	/**
+	 * Take the snapshot on pglet even though it holds indexes. Default `false`:
+	 * pglet's `pg_indexes.indexdef` omits index modifiers (sort direction,
+	 * `NULLS` placement, operator classes, `NULLS NOT DISTINCT`), so the
+	 * snapshot's index definitions cannot be compared with another engine's,
+	 * and do not tell two pglet schemas apart when they differ only in a
+	 * modifier. Pass `true` only where no index definition is compared —
+	 * reading tables, columns, constraints, sequences or enums off the
+	 * snapshot. No effect on PostgreSQL or PGlite.
+	 */
+	readonly accept_pglet_index_definitions?: boolean;
 }
+
+/** The marker pglet's `version()` carries. */
+const PGLET_VERSION_MARKER = '(pglet)';
 
 interface ColumnRow {
 	table_name: string;
@@ -235,6 +261,11 @@ const contype_to_kind = (contype: string): string => {
  * The `schema_version` migration tracker never appears in the `tables`
  * field — it's framework bookkeeping created by the migration runner,
  * identical across consumers, and would only add noise.
+ *
+ * @param db - the database to introspect
+ * @param options - schema, table excludes, and the pglet opt-in
+ * @returns the snapshot, every collection sorted
+ * @throws Error on pglet when the snapshot holds an index and `accept_pglet_index_definitions` is not set — its index definitions omit modifiers, so a comparison built on them is wrong in both directions
  */
 export const query_schema_snapshot = async (
 	db: Db,
@@ -276,11 +307,11 @@ export const query_schema_snapshot = async (
 	);
 
 	// Constraints — pg_get_constraintdef produces a canonical text rendering.
-	// Skip NOT NULL constraints (`contype = 'n'`): PG17+ catalogs them as
-	// named `pg_constraint` rows while PGlite / older PG don't, and
-	// nullability is already captured per-column by `is_nullable` — including
-	// them would report a pure engine-cataloging artifact as cross-backend
-	// drift between a PGlite and a real-Postgres backend.
+	// Skip NOT NULL constraints (`contype = 'n'`): a named `pg_constraint` row
+	// per NOT NULL column is something an engine may or may not catalog
+	// (PostgreSQL 18, PGlite 0.5 and pglet 0.1 each do), and nullability is
+	// already captured per-column by `is_nullable` — including the rows would
+	// report an engine-cataloging difference as drift between two backends.
 	const constraint_rows = await db.query<ConstraintRow>(
 		`SELECT c.conrelid::regclass::text AS table_name,
 		        c.conname,
@@ -353,6 +384,23 @@ export const query_schema_snapshot = async (
 	const enums: Record<string, EnumTypeSnapshot> = {};
 	for (const row of enum_rows) {
 		(enums[row.enum_name] ??= { labels: [] }).labels.push(row.label);
+	}
+
+	if (
+		!options.accept_pglet_index_definitions &&
+		Object.values(tables).some((table) => table.indexes.length > 0)
+	) {
+		const [version_row] = await db.query<{ version: string }>(`SELECT version() AS version`);
+		if (version_row?.version.includes(PGLET_VERSION_MARKER)) {
+			throw new Error(
+				'query_schema_snapshot: this database is pglet, whose pg_indexes.indexdef omits index ' +
+					'modifiers (sort direction, NULLS placement, operator classes, NULLS NOT DISTINCT), so ' +
+					"the snapshot's index definitions report false differences against PostgreSQL and false " +
+					'agreement between two pglet schemas. Take the snapshot on PostgreSQL (a TS backend ' +
+					'config defaults to memory://, which is pglet), or pass ' +
+					'{accept_pglet_index_definitions: true} when no index definition is compared.'
+			);
+		}
 	}
 
 	return {

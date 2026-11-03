@@ -25,6 +25,10 @@
 
 <svelte:head>
 	<title>tsv.fuz.dev</title>
+	<meta
+		name="description"
+		content="Precise language tools for TypeScript/JS, CSS, and Svelte in Rust: a formatter that closely follows Prettier and a drop-in for Svelte's parser."
+	/>
 </svelte:head>
 
 <ThemeRoot>

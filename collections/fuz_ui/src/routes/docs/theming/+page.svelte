@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeLink from '$lib/TomeLink.svelte';
-	import MdnLink from '$lib/MdnLink.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeLink from '#lib/TomeLink.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
 
 	const TOME_SLUG = 'theming';
 

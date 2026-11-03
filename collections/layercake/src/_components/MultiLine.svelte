@@ -3,27 +3,26 @@
 	Generates an SVG multi-series line chart. It expects your data to be an array of objects, each with a `values` key that is an array of data objects.
  -->
 <script>
-	import { getContext } from 'svelte';
 	import { line, curveLinear } from 'd3-shape';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, xGet, yGet, zGet } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/** @typedef {import('d3-shape').CurveFactory} CurveFactory */
 	/**
 	 * @typedef {Object} Props
-	 * @property {CurveFactory} [curve] - An optional D3 interpolation function. See [d3-shape](https://github.com/d3/d3-shape#curves) for options. Pass this function in uncalled, i.e. without the open-close parentheses.
+	 * @property {CurveFactory} [curve=curveLinear] - A D3 curve factory such as `curveCardinal`, passed uncalled. See [d3-shape](https://github.com/d3/d3-shape#curves) for the options.
 	 */
 
 	/** @type {Props} */
 	let { curve = curveLinear } = $props();
 
-	let path = $derived(line().x($xGet).y($yGet).curve(curve));
-	// .defined($y)
+	let path = $derived(line().x(k.xGet).y(k.yGet).curve(curve));
 </script>
 
 <g class="line-group">
-	{#each $data as group}
-		<path class="path-line" d={path(group.values)} stroke={$zGet(group)}></path>
+	{#each k.data as group}
+		<path class="path-line" d={path(group.values)} stroke={k.cGet?.(group) ?? '#ccc'}></path>
 	{/each}
 </g>
 

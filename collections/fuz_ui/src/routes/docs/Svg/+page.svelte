@@ -1,13 +1,13 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import Svg from '$lib/Svg.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import { logo_fuz, logo_github } from '$lib/logos.ts';
-	import type { SvgData } from '$lib/svg.ts';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import Svg from '#lib/Svg.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import { logo_fuz, logo_github } from '#lib/logos.ts';
+	import type { SvgData } from '#lib/svg.ts';
 
 	const TOME_SLUG = 'Svg';
 	const tome = tome_get_by_slug(TOME_SLUG);

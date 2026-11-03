@@ -2,7 +2,7 @@
  * Generic cell-data base schema.
  *
  * The wire-side shape every cell consumer can read without per-kind
- * knowledge: a permissive bag with three universally-relevant typed
+ * knowledge: a permissive bag with two universally-relevant typed
  * fields. Per-kind schemas extend this and narrow `kind` to a literal.
  *
  * Loose object: arbitrary additional fields pass through unvalidated,
@@ -24,6 +24,11 @@
  * update / clone-patch boundary (single source of truth). Access control
  * (`cell.visibility`) is likewise a peer column, enforced by `can_view_cell`
  * reading the column directly (no JSON dive).
+ *
+ * **An own `__proto__` key never reaches this schema.** The dispatcher
+ * refuses params holding one at any depth (`ERROR_PARAMS_PROTO_KEY`), so
+ * stored `data` carries none — the loose object would drop a top-level one
+ * silently and keep a nested one.
  *
  * @module
  */

@@ -69,7 +69,7 @@
 	class={[
 		'copy-to-clipboard',
 		rest.class,
-		{ icon_button: children ? false : icon_button, copied, failed, color_c: failed }
+		{ icon_button: children ? false : icon_button, copied, failed, palette_c: failed }
 	]}
 	onclick={(e) => {
 		onclick?.(e); // before the internal handler, which is async

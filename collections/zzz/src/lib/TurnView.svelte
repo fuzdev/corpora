@@ -1,14 +1,13 @@
 <script lang="ts">
 	import type { Turn } from './turn.svelte.ts';
 	import PartStats from './PartStats.svelte';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import { get_part_type_icon } from './part_helpers.ts';
 	import PartEditorForText from './PartEditorForText.svelte';
 	import TurnContextmenu from './TurnContextmenu.svelte';
 	import PartEditorForDiskfile from './PartEditorForDiskfile.svelte';
 	import PartToggleButton from './PartToggleButton.svelte';
 	import PartRemoveButton from './PartRemoveButton.svelte';
-	import { frontend_context } from './frontend.svelte.ts';
 
 	const {
 		turn,
@@ -17,9 +16,6 @@
 		turn: Turn;
 		show_actions?: boolean | undefined;
 	} = $props();
-
-	const app = frontend_context.get();
-	const { prompts } = app;
 </script>
 
 <TurnContextmenu {turn}>
@@ -28,12 +24,12 @@
 			<div class="column gap_sm mb_md" class:dormant={!part.enabled}>
 				<div class="display:flex mb_0 justify-content:space-between">
 					<div class="font_size_lg m_0">
-						<Svg data={get_part_type_icon(part)} />&nbsp;
+						<Icon data={get_part_type_icon(part)} />&nbsp;
 						{part.name}
 					</div>
 					<div class="display:flex gap_xs">
 						<PartToggleButton {part} />
-						<PartRemoveButton {part} {prompts} />
+						<PartRemoveButton {part} owner={turn} />
 					</div>
 				</div>
 

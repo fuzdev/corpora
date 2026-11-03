@@ -96,7 +96,9 @@ export const format_value = (value: unknown): string => {
 	if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint')
 		return String(value);
 	if (typeof value === 'symbol') return value.toString();
-	return String(value as (...args: Array<unknown>) => unknown);
+	// only functions reach here, whose source text is the intended display
+	// eslint-disable-next-line @typescript-eslint/no-base-to-string
+	return String(value);
 };
 
 /**
@@ -111,6 +113,30 @@ export const format_datetime_local = (timestamp: string | number | Date): string
 		.toISOString()
 		.replace('T', ' ')
 		.replace(/\.\d+Z$/, ' UTC');
+};
+
+/**
+ * Count the rows of a newest-first list created at or after `window_start`,
+ * for a list fetched with a row cap. The label reads `N+` when the cap may cut
+ * the window off — the list is full and its oldest row is still inside the
+ * window.
+ *
+ * @param rows - newest-first rows, as a capped list query returns them
+ * @param window_start - the window's start, in epoch milliseconds
+ * @param cap - the row limit the list was fetched with
+ * @returns the count and its display label
+ */
+export const count_in_window = (
+	rows: ReadonlyArray<{ created_at: string }>,
+	window_start: number,
+	cap: number
+): { count: number; label: string } => {
+	let count = 0;
+	for (const row of rows) if (Date.parse(row.created_at) >= window_start) count++;
+	const oldest = rows.at(-1);
+	const cut_off =
+		rows.length >= cap && oldest !== undefined && Date.parse(oldest.created_at) >= window_start;
+	return { count, label: cut_off ? `${count}+` : String(count) };
 };
 
 /**

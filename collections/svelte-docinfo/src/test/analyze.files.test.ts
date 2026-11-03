@@ -4,10 +4,11 @@
  * These are integration tests covering the full pipeline from file discovery to analysis.
  */
 
+import { join } from 'node:path';
 import { test, assert, describe } from 'vitest';
 
-import { analyzeFromFiles } from '$lib/analyze.ts';
-import { errorsOf } from '$lib/diagnostics.ts';
+import { analyzeFromFiles } from '#lib/analyze.ts';
+import { errorsOf } from '#lib/diagnostics.ts';
 
 import {
 	createTestProject,
@@ -17,7 +18,9 @@ import {
 	assertHasDeclaration,
 	assertHasComponentDeclaration,
 	assertHasParameters,
-	assertHasProps
+	assertHasProps,
+	TEST_TSCONFIG_COMPILER_OPTIONS,
+	withTestProject
 } from './test-helpers.ts';
 
 describe('analyzeFromFiles', { timeout: 15_000 }, () => {
@@ -204,13 +207,17 @@ let {label}: {label: string} = $props();
 		});
 
 		test('applies default exclude globs at discovery when no exclude provided', async () => {
-			// Without explicit exclude, **/*.test.ts and **/*.spec.ts should be filtered
+			// Without explicit exclude, test and spec files of every module extension
+			// (`**/*.{test,spec}.{ts,mts,tsx,js,mjs,jsx}`) should be filtered
 			// at discovery time (not just analysis time) — verifies defaulting at both
 			// the exports-based and glob-based call sites.
 			const { projectRoot, cleanup } = await createTestProject({
 				'src/lib/foo.ts': 'export const foo = 1;',
 				'src/lib/foo.test.ts': 'test("foo", () => {});',
 				'src/lib/bar.spec.ts': 'test("bar", () => {});',
+				'src/lib/x.test.tsx': 'test("x", () => {});',
+				'src/lib/y.spec.js': 'test("y", () => {});',
+				'src/lib/z.test.mts': 'test("z", () => {});',
 				'src/lib/baz.ts': 'export const baz = 2;'
 			});
 
@@ -235,6 +242,8 @@ let {label}: {label: string} = $props();
 				'src/lib/foo.ts': 'export const foo = 1;',
 				'src/lib/foo.test.ts': 'test("foo", () => {});',
 				'src/lib/bar.spec.ts': 'test("bar", () => {});',
+				'src/lib/x.test.tsx': 'test("x", () => {});',
+				'src/lib/y.spec.js': 'test("y", () => {});',
 				'package.json': JSON.stringify({
 					name: 'test-pkg',
 					exports: {
@@ -564,6 +573,40 @@ export const exposed = secret + 1;`,
 		});
 	});
 
+	describe('tsconfig found by walking up', () => {
+		// `projectRoot` has no tsconfig of its own, so `ts.findConfigFile` finds
+		// the parent's, whose `include` resolves from the parent's directory:
+		// its files join the program (an ambient type in `other/` resolves) but
+		// stay out of the documented modules, which come from `projectRoot` only,
+		// even the parent's own `src/lib/b.ts`, where the default source path
+		// would match were it resolved from the config's directory
+		test('adds the config include to the program without documenting out-of-root files', async () => {
+			await withTestProject(
+				{
+					'tsconfig.json': JSON.stringify({
+						compilerOptions: TEST_TSCONFIG_COMPILER_OPTIONS,
+						include: ['**/*.ts']
+					}),
+					'other/ambient.d.ts': 'declare global { type Ambient = {k: string} } export {};',
+					'src/lib/b.ts': 'export const b = 1;',
+					'pkg/src/lib/a.ts': 'export const a = (x: Ambient) => x.k;'
+				},
+				async (root) => {
+					const { modules } = await analyzeFromFiles({ projectRoot: join(root, 'pkg') });
+					assert.deepStrictEqual(
+						modules.map((m) => m.path),
+						['a.ts']
+					);
+					const a = assertHasDeclaration(findModule(modules, 'a.ts'), 'a');
+					assert.ok(
+						a.typeSignature?.endsWith(': string'),
+						`the ambient type resolves, got ${a.typeSignature}`
+					);
+				}
+			);
+		});
+	});
+
 	describe('glob edge cases', () => {
 		test('handles include patterns that match no files', async () => {
 			const { projectRoot, cleanup } = await createTestProject({
@@ -702,6 +745,37 @@ export function add(a: number, b: number): number {
 			}
 		});
 
+		test("'exports' types an exported component through an unexported sibling", async () => {
+			const { projectRoot, cleanup } = await createTestProject({
+				'src/lib/Button.svelte': `<script lang="ts">\n\tlet { variant }: { variant: 'primary' | 'secondary' } = $props();\n</script>\n<button>{variant}</button>`,
+				'src/lib/Modal.svelte': `<script lang="ts">\n\timport type { ComponentProps } from 'svelte';\n\timport Button from './Button.svelte';\n\tlet { confirm }: { confirm: ComponentProps<typeof Button>['variant'] } = $props();\n</script>\n<Button variant={confirm} />`,
+				'package.json': JSON.stringify({
+					name: 'test-pkg',
+					exports: { './Modal.svelte': { svelte: './dist/Modal.svelte' } }
+				})
+			});
+
+			try {
+				const { modules, diagnostics } = await analyzeFromFiles({
+					projectRoot,
+					discovery: 'exports'
+				});
+
+				// the sibling shapes the exported component's types without
+				// joining the emitted set
+				assert.deepStrictEqual(
+					modules.map((m) => m.path),
+					['Modal.svelte']
+				);
+				assert.deepStrictEqual(diagnostics, []);
+				const modal = modules[0]?.declarations.find((d) => d.name === 'Modal');
+				assert(modal?.kind === 'component');
+				assert.strictEqual(modal.props[0]?.type, '"primary" | "secondary"');
+			} finally {
+				await cleanup();
+			}
+		});
+
 		test("'exports' strict mode rejects combination with `include`", async () => {
 			const { projectRoot, cleanup } = await createTestProject({
 				'src/lib/foo.ts': 'export const foo = 1;',
@@ -778,7 +852,7 @@ export function add(a: number, b: number): number {
 
 				await analyzeFromFiles({
 					projectRoot,
-					log: mockLog as any
+					log: mockLog
 				});
 
 				// Should have some info logs about discovery

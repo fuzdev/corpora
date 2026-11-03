@@ -1,53 +1,40 @@
 <!--
 	@component
-	Generates a canvas scatter plot.
+	Generates a canvas scatter plot. If the x or y scale is a band scale, each circle sits in the middle of its band.
  -->
 <script>
-	import { getContext } from 'svelte';
-	import { scaleCanvas } from 'layercake';
+	import { getLayerCakeContext, getCanvasContext } from 'layercake';
 
-	const { data, xGet, yGet, width, height } = getContext('LayerCake');
-
-	const { ctx } = getContext('canvas');
+	const k = getLayerCakeContext();
+	const canvas = getCanvasContext();
 
 	/**
 	 * @typedef {Object} Props
 	 * @property {number} [r=5] - The circle's radius.
 	 * @property {string} [fill='#0cf'] - The circle's fill color.
 	 * @property {string} [stroke='#000'] - The circle's stroke color.
-	 * @property {number} [strokeWidth=1] - The circle's stroke width.
+	 * @property {number} [strokeWidth=0] - The circle's stroke width in pixels.
 	 */
 
 	/** @type {Props} */
-	let { r = 5, fill = '#0cf', stroke = '#000', strokeWidth = 1 } = $props();
+	let { r = 5, fill = '#0cf', stroke = '#000', strokeWidth = 0 } = $props();
 
-	$effect(() => {
-		if (!$width || !$height || !$ctx) return;
-
-		// Assign to a local variable: setting properties on `$ctx` directly
-		// would re-notify the store and re-trigger this effect
-		const context = $ctx;
-
-		/**
-		 * If you were to have multiple canvas layers
-		 * maybe for some artistic layering purposes
-		 * put these reset functions in the first layer, not each one
-		 * since they should only run once per update
-		 */
-		scaleCanvas(context, $width, $height);
-		context.clearRect(0, 0, $width, $height);
-
-		/**
-		 * Draw our scatterplot
-		 */
-		$data.forEach((/** @type {any} d */ d) => {
-			context.beginPath();
-			context.arc($xGet(d), $yGet(d), r, 0, 2 * Math.PI, false);
-			context.lineWidth = strokeWidth;
-			context.strokeStyle = stroke;
-			context.stroke();
-			context.fillStyle = fill;
-			context.fill();
+	// Layer Cake runs this on every repaint: resize, new data or a prop change
+	canvas.draw(ctx => {
+		k.data.forEach(d => {
+			const cx = k.xGet(d) + (k.xScale.bandwidth ? k.xScale.bandwidth() / 2 : 0);
+			const cy = k.yGet(d) + (k.yScale.bandwidth ? k.yScale.bandwidth() / 2 : 0);
+			ctx.beginPath();
+			ctx.arc(cx, cy, r, 0, 2 * Math.PI, false);
+			// Fill first, then stroke on top, the same as an SVG circle
+			ctx.fillStyle = fill;
+			ctx.fill();
+			// A lineWidth of 0 is ignored by canvas, so skip the stroke instead
+			if (strokeWidth > 0) {
+				ctx.lineWidth = strokeWidth;
+				ctx.strokeStyle = stroke;
+				ctx.stroke();
+			}
 		});
 	});
 </script>

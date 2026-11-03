@@ -1,13 +1,17 @@
 /**
- * Built-in CSS class definitions combining token classes and composites.
+ * Built-in CSS class definitions combining composites, keyword classes, and
+ * token classes.
  *
- * Token classes map to CSS variables (design tokens).
- * For other CSS properties, use CSS-literal syntax like `display:flex` or `position:absolute`.
+ * Token classes map to CSS variables (design tokens), and keyword classes are
+ * CSS value keywords that identify their property (`flex`, `sticky`). For
+ * other CSS values, use CSS-literal syntax like `justify-content:center` or
+ * `overflow:hidden`.
  *
  * @module
  */
 
 import type { CssClassDefinition } from './css_class_generation.ts';
+import type { ClassDefinitionsOption } from './css_plugin_options.ts';
 import {
 	generate_classes,
 	generate_property_classes,
@@ -36,19 +40,21 @@ import {
 	darken_lighten_variants
 } from './variable_data.ts';
 import { css_class_composites } from './css_class_composites.ts';
+import { css_class_keywords } from './css_class_keywords.ts';
 
 // TODO add animation support, either as a separate thing or rename `css_class_definitions` to be more generic, like `css_by_name` - need to collect `animation: foo ...` names like we do classes
 
-// TODO think about variable support (much harder problem, need dependency graph)
-
 /**
- * All built-in CSS class definitions (token classes + composites).
+ * All built-in CSS class definitions (composites, keyword classes, and token classes).
  *
  * @see `generate_classes_css`
  */
 export const css_class_definitions: Record<string, CssClassDefinition | undefined> = {
 	// Composite classes go first, so they can be overridden by the more specific classes.
 	...css_class_composites,
+
+	// Keyword classes - bare CSS value keywords like `flex` and `sticky`, plus `hidden`
+	...css_class_keywords,
 
 	/*
 
@@ -148,11 +154,10 @@ export const css_class_definitions: Record<string, CssClassDefinition | undefine
 		(v) => `var(--lighten_${v})`,
 		'lighten'
 	),
-	// The adaptive alpha overlay variables (`--fg_*` toward foreground,
-	// `--bg_*` toward background) have no bare token classes: `bg_` is the
-	// opaque background prefix (`bg_a_50`, `bg_positive_50`), and a bare
-	// `bg_50` alpha wash beside those was the one collision in the family.
-	// Reach the overlays with literals - `background-color:var(--fg_10)`.
+	// The adaptive alpha overlay variables (`--ink_*`, a wash toward the text
+	// color, and `--paper_*`, toward the ground) have no token classes - `bg_`
+	// stays the opaque background prefix (`bg_a_50`, `bg_positive_50`). Reach
+	// the overlays with literals - `background-color:var(--ink_10)`.
 	/*
 
 	borders
@@ -178,8 +183,13 @@ export const css_class_definitions: Record<string, CssClassDefinition | undefine
 		palette_variants,
 		intensity_variants
 	),
-	// Outline colors using shade scale
-	...generate_property_classes('outline-color', shade_variants, (v) => `var(--shade_${v})`),
+	// Outline colors using shade scale (sets both property and contextual variable,
+	// so hover and focus borders follow it like the palette family)
+	...generate_property_classes(
+		'outline-color',
+		shade_variants,
+		(v) => `var(--shade_${v}); --outline_color: var(--shade_${v})`
+	),
 	// Outline colors using palette hue + intensity (sets both property and contextual variable);
 	// the letter alone implies the palette - the shade family is `outline_color_NN`
 	...generate_classes(
@@ -301,24 +311,28 @@ export const css_class_definitions: Record<string, CssClassDefinition | undefine
 };
 
 /**
- * Merges user class definitions with the built-in defaults.
- * User definitions take precedence over defaults with the same name.
+ * Resolves the `class_definitions` option against the built-in definitions.
+ * A record merges over the defaults, taking precedence over a default with
+ * the same name, and a callback receives a copy of the defaults and returns
+ * the whole set.
  *
- * @param user_definitions - user-provided class definitions to merge
- * @param include_defaults - whether to include built-in definitions
- * @returns merged class definitions
- * @throws Error if `include_defaults` is false and no user definitions provided
+ * @param option - the `class_definitions` option
+ * @returns the class definitions to generate with
+ * @throws Error - if a callback returns something other than an object
  */
-export const merge_class_definitions = (
-	user_definitions: Record<string, CssClassDefinition | undefined> | undefined,
-	include_defaults: boolean
+export const resolve_class_definitions = (
+	option: ClassDefinitionsOption
 ): Record<string, CssClassDefinition | undefined> => {
-	if (!include_defaults && !user_definitions) {
-		throw new Error('class_definitions is required when include_default_classes is false');
+	if (typeof option === 'function') {
+		const result: unknown = option({ ...css_class_definitions });
+		if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+			throw new Error(
+				`The class_definitions callback must return an object of definitions, got ${
+					result === null ? 'null' : Array.isArray(result) ? 'an array' : typeof result
+				}`
+			);
+		}
+		return result as Record<string, CssClassDefinition | undefined>;
 	}
-	return include_defaults
-		? user_definitions
-			? { ...css_class_definitions, ...user_definitions }
-			: css_class_definitions
-		: user_definitions!;
+	return option ? { ...css_class_definitions, ...option } : css_class_definitions;
 };

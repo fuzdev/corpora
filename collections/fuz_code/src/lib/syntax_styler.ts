@@ -19,7 +19,7 @@ export interface SyntaxStylerOptions {
 
 /**
  * A no-op lexer — `plaintext` emits no events, so its text renders escaped but
- * unstyled. Registered on every styler as the explicit "highlight nothing"
+ * unstyled. Registered on every styler as the explicit "style nothing"
  * language.
  */
 const lexer_plaintext: SyntaxLang = {
@@ -30,9 +30,9 @@ const lexer_plaintext: SyntaxLang = {
 };
 
 /**
- * Registry and facade over the hand-written lexer engine (`lexer.ts`): registers
- * languages, lexes text to a flat token event stream, and renders that stream to
- * syntax-highlighted HTML.
+ * Registry and facade over the lexer engine (`lexer.ts`): registers
+ * languages, lexes text to a flat event stream, and renders that stream to
+ * syntax-styled HTML.
  *
  * @example
  * ```ts
@@ -77,7 +77,8 @@ export class SyntaxStyler {
 
 	/**
 	 * Lexes `text` with the language registered as `lang`, returning the flat
-	 * token event stream. Throws when `lang` is not registered — see `has_lang`.
+	 * event stream, valid until the next lex (see `lex_syntax`). Throws when
+	 * `lang` is not registered — see `has_lang`.
 	 */
 	lex(text: string, lang: string): LexedSyntax {
 		const l = this.langs.get(lang);
@@ -86,7 +87,7 @@ export class SyntaxStyler {
 	}
 
 	/**
-	 * Generates syntax-highlighted HTML (spans with `.token_*` classes) from
+	 * Generates syntax-styled HTML (spans with `.token_*` classes) from
 	 * `text`. Throws when `lang` is not registered — see `has_lang`.
 	 */
 	stylize(text: string, lang: string): string {

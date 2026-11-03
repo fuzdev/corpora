@@ -14,8 +14,8 @@
 <ul {...rest}>
 	<li>
 		<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-		<a rel="me" href={FUZ_DEV_URL} class={{ selected: selected === 'fuz.dev' }}>fuz.dev</a>
-		- the Fuz stack homepage{#if selected === 'fuz.dev'}, you are here{/if}
+		<a rel="me" href={FUZ_DEV_URL} class={{ selected: selected === 'fuz.dev' }}>fuz.dev</a> - the
+		Fuz stack homepage{#if selected === 'fuz.dev'}, you are here{/if}
 	</li>
 	<li>
 		GitHub as <a rel="me" href="https://github.com/fuzdev">@fuzdev</a>

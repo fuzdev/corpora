@@ -7,10 +7,10 @@
 import { describe, assert, test } from 'vitest';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 
-import { to_session_account, type Account } from '$lib/auth/account_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
+import { to_session_account, type Account } from '#lib/auth/account_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { run_migrations } from '#lib/db/migrate.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
 
 import { describe_db } from '../db_fixture.ts';
 
@@ -39,7 +39,7 @@ describe_db('auth schema', (get_db) => {
 	test('migrations are idempotent', async () => {
 		const db = get_db();
 		// run again — should not throw, no-ops since version is current
-		const results = await run_migrations(db, [auth_migration_ns]);
+		const results = await run_migrations(db, [AUTH_MIGRATION_NS]);
 		assert.strictEqual(results.length, 0);
 	});
 
@@ -371,7 +371,7 @@ describe_db('auth schema', (get_db) => {
 	// Load-bearing column defaults — checked via regex/inclusion to tolerate
 	// minor cross-version rendering differences in `column_default` (e.g.
 	// `NOW()` vs `now()`, `'success'` vs `'success'::text`). Exact-string
-	// snapshots would surface as flaky on PGlite version bumps.
+	// snapshots would differ between engines and across their versions.
 	test('key column defaults match expected patterns', async () => {
 		const db = get_db();
 		const rows = await db.query<{

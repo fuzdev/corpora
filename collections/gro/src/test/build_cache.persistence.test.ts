@@ -1,6 +1,6 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 
-import { load_build_cache_metadata, save_build_cache_metadata } from '$lib/build_cache.ts';
+import { load_build_cache_metadata, save_build_cache_metadata } from '#lib/build_cache.ts';
 
 import {
 	create_mock_logger,
@@ -8,7 +8,7 @@ import {
 } from './build_cache_test_helpers.ts';
 
 // Mock dependencies
-vi.mock('$lib/paths.js', () => ({
+vi.mock('#lib/paths.ts', () => ({
 	paths: {
 		root: './',
 		source: './src/',
@@ -164,7 +164,7 @@ describe('load_build_cache_metadata', () => {
 		expect(result).toBeNull();
 	});
 
-	test('rejects cache with missing required fields (Zod validation)', async () => {
+	test('rejects cache with missing required fields (schema validation)', async () => {
 		const { readFile } = await import('node:fs/promises');
 		const { fs_exists } = await import('@fuzdev/fuz_util/fs.ts');
 
@@ -184,7 +184,7 @@ describe('load_build_cache_metadata', () => {
 		expect(result).toBeNull();
 	});
 
-	test('rejects cache with wrong field types (Zod validation)', async () => {
+	test('rejects cache with wrong field types (schema validation)', async () => {
 		const { readFile } = await import('node:fs/promises');
 		const { fs_exists } = await import('@fuzdev/fuz_util/fs.ts');
 
@@ -204,7 +204,7 @@ describe('load_build_cache_metadata', () => {
 		expect(result).toBeNull();
 	});
 
-	test('rejects cache with unexpected extra fields (strictObject)', async () => {
+	test('rejects cache with unexpected extra fields (strict object schema)', async () => {
 		const { readFile } = await import('node:fs/promises');
 		const { fs_exists } = await import('@fuzdev/fuz_util/fs.ts');
 

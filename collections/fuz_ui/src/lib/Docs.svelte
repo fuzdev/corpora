@@ -5,7 +5,7 @@
 	import { page } from '$app/state';
 
 	import Breadcrumb from './Breadcrumb.svelte';
-	import { Tome, tomes_context } from './tome.ts';
+	import { type Tome, tomes_context } from './tome.ts';
 	import DocsPrimaryNav from './DocsPrimaryNav.svelte';
 	import DocsSecondaryNav from './DocsSecondaryNav.svelte';
 	import DocsTertiaryNav from './DocsTertiaryNav.svelte';
@@ -18,9 +18,30 @@
 
 	const {
 		tomes,
+		primary_nav,
+		secondary_nav_header,
+		secondary_nav_footer,
+		footer,
 		children
 	}: {
 		tomes: Array<Tome>;
+		/**
+		 * Rendered in the primary nav after the breadcrumb, at its end, e.g. links to the
+		 * site's other sections.
+		 */
+		primary_nav?: Snippet;
+		/**
+		 * Rendered above the tome menu in the secondary nav, in the sidebar and in the
+		 * menu dialog of narrow screens, where the primary nav has little room.
+		 */
+		secondary_nav_header?: Snippet;
+		/** Rendered below the tome menu in the secondary nav, in the sidebar and in the menu dialog. */
+		secondary_nav_footer?: Snippet;
+		/**
+		 * Replaces the default footer, a `DocsFooter` with the site's repo and a link to
+		 * fuz.dev, e.g. for a site that isn't part of the Fuz stack.
+		 */
+		footer?: Snippet;
 		children: Snippet;
 	} = $props();
 
@@ -52,6 +73,11 @@
 
 <div class="docs" style:--docs_menu_width={docs_menu_width}>
 	<DocsPrimaryNav>
+		{#if primary_nav}
+			<div class="primary-nav-end">
+				{@render primary_nav()}
+			</div>
+		{/if}
 		<div class="nav-dialog-toggle">
 			<button class="plain" type="button" onclick={() => toggle_secondary_nav_dialog()}>
 				menu
@@ -61,7 +87,7 @@
 	<!-- TODO @many dialog navs -->
 	{#if !innerWidth.current || innerWidth.current > SECONDARY_NAV_BREAKPOINT}
 		<div class="secondary-nav-wrapper">
-			<DocsSecondaryNav {tomes} />
+			<DocsSecondaryNav {tomes} header={secondary_nav_header} footer={secondary_nav_footer} />
 		</div>
 	{/if}
 	<main>
@@ -73,11 +99,15 @@
 			<DocsTertiaryNav {tomes} {tomes_by_slug} />
 		{/if}
 		<section class="box">
-			<DocsFooter repo_url={site.repo_url} root_url={FUZ_DEV_URL}>
-				<div class="mb_xl5">
-					<Breadcrumb />
-				</div>
-			</DocsFooter>
+			{#if footer}
+				{@render footer()}
+			{:else}
+				<DocsFooter repo_url={site.repo_url} root_url={FUZ_DEV_URL}>
+					<div class="mb_xl5">
+						<Breadcrumb />
+					</div>
+				</DocsFooter>
+			{/if}
 		</section>
 	</main>
 </div>
@@ -94,7 +124,12 @@
 					<Breadcrumb />
 				</div>
 				<div class="px_lg pb_xl">
-					<DocsSecondaryNav {tomes} sidebar={false} />
+					<DocsSecondaryNav
+						{tomes}
+						sidebar={false}
+						header={secondary_nav_header}
+						footer={secondary_nav_footer}
+					/>
 					<DocsTertiaryNav {tomes} {tomes_by_slug} sidebar={false} />
 				</div>
 			</div>
@@ -118,7 +153,7 @@
 
 	main {
 		position: relative;
-		min-height: calc(100vh - var(--docs_primary_nav_height));
+		min-height: calc(100svh - var(--docs_primary_nav_height));
 		width: calc(100% - var(--docs_sidebar_width) * 2);
 		max-width: var(--docs_content_max_width);
 		padding: var(--docs_content_padding);
@@ -131,6 +166,12 @@
 		display: contents;
 	}
 
+	.primary-nav-end {
+		display: flex;
+		align-items: center;
+		gap: var(--space_md);
+		padding: 0 var(--space_md);
+	}
 	.nav-dialog-toggle {
 		display: none;
 	}

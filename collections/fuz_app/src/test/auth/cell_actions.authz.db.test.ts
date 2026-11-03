@@ -21,7 +21,7 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
 import {
 	cell_create_action_spec,
 	cell_get_action_spec,
@@ -31,12 +31,13 @@ import {
 	ERROR_CELL_PATH_ADMIN_ONLY,
 	ERROR_CELL_VISIBILITY_MANAGE_ONLY,
 	type CellPath
-} from '$lib/auth/cell_action_specs.ts';
-import { cell_grant_create_action_spec } from '$lib/auth/cell_grant_action_specs.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import type { TestApp, TestAccount } from '$lib/testing/app_server.ts';
-import { create_cell_test_app, create_cell, call, error_reason } from './cell_test_helpers.ts';
+} from '#lib/auth/cell_action_specs.ts';
+import { cell_grant_create_action_spec } from '#lib/auth/cell_grant_action_specs.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import type { TestApp, TestAccount } from '#lib/testing/app_server.ts';
+import { create_cell_test_app, create_cell, call } from './cell_test_helpers.ts';
+import { error_reason } from './rpc_test_helpers.ts';
 import { describe_db } from '../cell_db_fixture.ts';
 
 /** Grant an actor-shaped grant from `granter` onto `cell_id`. */

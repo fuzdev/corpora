@@ -1,0 +1,42 @@
+/**
+ * Cross-backend differential gate for fuz_app's own spine, TS against Rust.
+ *
+ * Sends every conformance case to both the TS spine (Node) and the Rust
+ * `testing_spine_stub`, and asserts the two normalized responses are equal
+ * (`describe_spine_differential_suites`, over
+ * `describe_differential_conformance_tests`): status, header names and the
+ * whole body, ids and timestamps placeholdered by position. Each impl is the
+ * oracle for the other, so an extra field one spine sends — which a loose
+ * output schema passes — or any body difference on a case pinned by status
+ * alone fails here. Tracked differences are the ledger in
+ * `differential_known_divergences.ts`.
+ *
+ * Runs under the dual-spawn `cross_backend_parity` project (`parity_handle_a`
+ * = TS, `parity_handle_b` = Rust), both spines on Postgres, so no engine
+ * difference can show up as a body difference.
+ *
+ * @module
+ */
+
+import { inject_parity_handles } from '#lib/testing/cross_backend/provided_context.ts';
+
+import {
+	differential_known_divergences,
+	differential_participation_known_divergences,
+	differential_ws_known_divergences
+} from './differential_known_divergences.ts';
+import { describe_spine_differential_suites } from './spine_differential.ts';
+
+const parity = inject_parity_handles();
+
+describe_spine_differential_suites({
+	backends: [
+		{ name: 'ts', handle: parity.a },
+		{ name: 'rust', handle: parity.b }
+	],
+	known_divergences: {
+		http: differential_known_divergences,
+		ws: differential_ws_known_divergences,
+		participation: differential_participation_known_divergences
+	}
+});

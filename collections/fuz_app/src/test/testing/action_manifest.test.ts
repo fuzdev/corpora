@@ -2,28 +2,41 @@
  * Unit tests for `build_action_manifest` — the spec → normalized
  * `ActionManifestEntry` mapper the cross-impl manifest-parity gate dumps.
  *
- * Pins the normalization contract both impls must match: auth axes pass
- * through, `roles` / `credential_types` flatten to sorted arrays (absent and
- * empty both → `[]`), `side_effects` passes through, and entries sort by
- * `method`. A drift in any of these would surface as a spurious cross-impl
- * diff, so they're pinned here in-process.
+ * Pins the normalization contract both impls must match: `input` reads
+ * `'void'` for a `z.void()` input and `'object'` for anything else, auth axes
+ * pass through, `roles` / `credential_types` flatten to sorted arrays (absent and
+ * empty both → `[]`), `side_effects` passes through, `rate_limit` is always
+ * present (`null` when undeclared), and entries sort by `method`. A drift in
+ * any of these would surface as a spurious cross-impl diff, so they're pinned
+ * here in-process.
  *
  * @module
  */
 
 import { describe, test, assert } from 'vitest';
+import { z } from 'zod';
 
 import {
+	ActionManifestEntry,
 	action_manifest_entry,
 	build_action_manifest
-} from '$lib/testing/cross_backend/action_manifest.ts';
-import type { RouteAuth } from '$lib/http/auth_shape.ts';
+} from '#lib/testing/cross_backend/action_manifest.ts';
+import type { RouteAuth } from '#lib/http/auth_shape.ts';
+import type { RateLimitKey } from '#lib/http/error_schemas.ts';
 
 const spec = (
 	method: string,
 	auth: RouteAuth,
-	side_effects = false
-): { method: string; auth: RouteAuth; side_effects: boolean } => ({ method, auth, side_effects });
+	side_effects = false,
+	rate_limit?: RateLimitKey,
+	input: z.ZodType = z.strictObject({})
+): {
+	method: string;
+	input: z.ZodType;
+	auth: RouteAuth;
+	side_effects: boolean;
+	rate_limit?: RateLimitKey;
+} => ({ method, input, auth, side_effects, rate_limit });
 
 describe('action_manifest_entry', () => {
 	test('passes the auth axes + side_effects through', () => {
@@ -36,12 +49,34 @@ describe('action_manifest_entry', () => {
 		);
 		assert.deepStrictEqual(entry, {
 			method: 'admin_account_list',
+			input: 'object',
 			side_effects: false,
 			account: 'required',
 			actor: 'required',
 			roles: ['admin'],
-			credential_types: []
+			credential_types: [],
+			rate_limit: null
 		});
+	});
+
+	test('an undeclared rate_limit normalizes to an explicit null, never absent', () => {
+		const entry = action_manifest_entry(
+			spec('account_verify', { account: 'required', actor: 'none' })
+		);
+		assert.strictEqual(entry.rate_limit, null);
+		// The column is required, not optional: a backend that omits it fails
+		// the manifest capture's strict parse rather than reading as a default.
+		const { rate_limit: _omitted, ...without_rate_limit } = entry;
+		assert.ok(!ActionManifestEntry.safeParse(without_rate_limit).success);
+	});
+
+	test('a declared rate_limit class passes through', () => {
+		for (const key of ['ip', 'account', 'both'] as const) {
+			const entry = action_manifest_entry(
+				spec('x', { account: 'required', actor: 'none' }, false, key)
+			);
+			assert.strictEqual(entry.rate_limit, key);
+		}
 	});
 
 	test('absent roles + credential_types normalize to empty arrays', () => {
@@ -63,6 +98,21 @@ describe('action_manifest_entry', () => {
 		);
 		assert.deepStrictEqual(entry.roles, ['admin', 'keeper']);
 		assert.deepStrictEqual(entry.credential_types, ['daemon_token', 'session']);
+	});
+
+	test('a z.void() input is void and every other input is an object', () => {
+		const auth: RouteAuth = { account: 'required', actor: 'none' };
+		assert.strictEqual(
+			action_manifest_entry(spec('account_verify', auth, false, undefined, z.void())).input,
+			'void'
+		);
+		// `z.strictObject({})` admits the same calls but is an object schema.
+		for (const input of [z.strictObject({}), z.strictObject({ id: z.string() })]) {
+			assert.strictEqual(
+				action_manifest_entry(spec('x', auth, false, undefined, input)).input,
+				'object'
+			);
+		}
 	});
 
 	test('side_effects passes through for mutations', () => {

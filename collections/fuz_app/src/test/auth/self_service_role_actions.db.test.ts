@@ -10,45 +10,37 @@
  */
 
 import { describe, test, assert } from 'vitest';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
+import { create_uuid } from '#lib/primitive_schemas.ts';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { create_role_schema, ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { create_self_service_role_actions } from '$lib/auth/self_service_role_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_role_schema, ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { create_self_service_role_actions } from '#lib/auth/self_service_role_actions.ts';
 import {
 	ERROR_ROLE_NOT_SELF_SERVICE_ELIGIBLE,
 	self_service_role_set_action_spec
-} from '$lib/auth/self_service_role_action_specs.ts';
-import { query_create_role_grant } from '$lib/auth/role_grant_queries.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import { rpc_call, rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { create_test_audit_emitter } from '$lib/testing/stubs.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/auth/self_service_role_action_specs.ts';
+import { query_create_role_grant } from '#lib/auth/role_grant_queries.ts';
+import { query_role_grant_offer_create } from '#lib/auth/role_grant_offer_queries.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { rpc_call, rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { create_test_audit_emitter } from '#lib/testing/stubs.ts';
+import { noop_connection_closer } from '#lib/actions/connection_closer.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 const test_roles = create_role_schema([{ name: 'teacher', grant_paths: ['self_service'] }]);
 
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 	...create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: create_self_service_role_actions(ctx.deps, {
 			eligible_roles: ['teacher'],
@@ -64,7 +56,11 @@ describe_db('self_service_role_actions', (get_db) => {
 			assert.throws(
 				() =>
 					create_self_service_role_actions(
-						{ log: console as never, audit: create_test_audit_emitter() },
+						{
+							log: console as never,
+							audit: create_test_audit_emitter(),
+							connection_closer: noop_connection_closer
+						},
 						{ eligible_roles: ['nonexistent'], roles: test_roles }
 					),
 				/eligible_roles entry "nonexistent" is not registered/
@@ -77,7 +73,11 @@ describe_db('self_service_role_actions', (get_db) => {
 			// full role schema.
 			assert.doesNotThrow(() =>
 				create_self_service_role_actions(
-					{ log: console as never, audit: create_test_audit_emitter() },
+					{
+						log: console as never,
+						audit: create_test_audit_emitter(),
+						connection_closer: noop_connection_closer
+					},
 					{ eligible_roles: ['anything'] }
 				)
 			);
@@ -215,6 +215,79 @@ describe_db('self_service_role_actions', (get_db) => {
 			// populated even on self-service.
 			assert.strictEqual(audit_rows[0]!.target_account_id, caller.account.id);
 			assert.strictEqual(audit_rows[0]!.target_actor_id, caller.actor.id);
+		});
+
+		test('revoke supersedes a pending offer of the role and audits it', async () => {
+			// a role both offerable and self-service-eligible, so a pending offer
+			// to the caller's account is a sibling of the self-granted role
+			const test_app = await create_test_app({
+				session_options,
+				create_route_specs,
+				db: get_db()
+			});
+			const caller = await test_app.create_account({ username: 'set_supersede_user' });
+			const grantor = await test_app.create_account({ username: 'set_supersede_grantor' });
+			const headers = caller.create_session_headers();
+			const set = (enabled: boolean) =>
+				rpc_call_for_spec({
+					app: test_app.app,
+					path: RPC_PATH,
+					spec: self_service_role_set_action_spec,
+					params: { role: 'teacher', enabled },
+					headers
+				});
+			assert.ok((await set(true)).ok);
+			const offer = await query_role_grant_offer_create(
+				{ db: get_db() },
+				{
+					from_actor_id: grantor.actor.id,
+					to_account_id: caller.account.id,
+					role: 'teacher',
+					expires_at: new Date(Date.now() + 60_000)
+				}
+			);
+
+			const res = await set(false);
+			assert.ok(res.ok, JSON.stringify(res));
+			assert.strictEqual(res.result.changed, true);
+
+			const revoke = await get_db().query_one<{ metadata: Record<string, unknown> | null }>(
+				`SELECT metadata FROM audit_log
+				 WHERE event_type = 'role_grant_revoke' AND account_id = $1
+				 ORDER BY seq DESC LIMIT 1`,
+				[caller.account.id]
+			);
+			assert.ok(revoke);
+			const rows = await get_db().query<{
+				outcome: string;
+				actor_id: string | null;
+				account_id: string | null;
+				target_account_id: string | null;
+				target_actor_id: string | null;
+				metadata: Record<string, unknown> | null;
+			}>(
+				`SELECT outcome, actor_id, account_id, target_account_id, target_actor_id, metadata
+				 FROM audit_log WHERE event_type = 'role_grant_offer_supersede'`
+			);
+			assert.strictEqual(rows.length, 1, JSON.stringify(rows));
+			const row = rows[0]!;
+			assert.strictEqual(row.outcome, 'success');
+			assert.strictEqual(row.actor_id, caller.actor.id);
+			assert.strictEqual(row.account_id, caller.account.id);
+			assert.strictEqual(row.target_account_id, caller.account.id);
+			assert.strictEqual(row.target_actor_id, null);
+			assert.deepStrictEqual(row.metadata, {
+				offer_id: offer.id,
+				role: 'teacher',
+				scope_id: null,
+				reason: 'role_grant_revoked',
+				cause_id: revoke.metadata?.role_grant_id
+			});
+			const after = await get_db().query_one<{ superseded_at: string | null }>(
+				`SELECT superseded_at FROM role_grant_offer WHERE id = $1`,
+				[offer.id]
+			);
+			assert.ok(after?.superseded_at, 'the offer is superseded');
 		});
 
 		test('revoke without prior grant returns changed:false and writes no audit row', async () => {

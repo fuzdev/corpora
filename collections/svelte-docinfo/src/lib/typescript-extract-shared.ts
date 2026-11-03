@@ -10,6 +10,8 @@
  *   `typescript-extract-class.ts` for the per-declaration extractors that
  *   build on these helpers
  *
+ * @internal
+ *
  * @module
  */
 
@@ -27,17 +29,37 @@ import type {
 } from './types.ts';
 import type { DeclarationJsonBuild, MemberJsonBuild } from './declaration-build.ts';
 import { type Diagnostic, type MisplacedTagDiagnostic } from './diagnostics.ts';
-import { to_error_message } from './error.ts';
-import { stripVirtualSuffix } from './source.ts';
-import { applyToDeclaration, parseComment, type TsdocParsedComment } from './tsdoc.ts';
+import { toErrorMessage } from './error.ts';
 import {
+	SVELTE_COMPONENT_ALIAS_SUFFIX,
+	SVELTE_VIRTUAL_SUFFIX,
+	stripVirtualSuffix
+} from './source.ts';
+import {
+	applyToDeclaration,
+	firstJSDocOverloadSignature,
+	functionInitializer,
+	jsdocOverloadSignatures,
+	hasDocContent,
+	jsdocParamTagDefault,
+	parseComment,
+	parseHiddenJSDocImplementationComment,
+	type TsdocParsedComment
+} from './tsdoc.ts';
+import {
+	isTypeAliasLike,
 	specifierExportedName,
 	optionalWideningTarget,
+	writtenReturnTypeNode,
+	writtenTypeAnnotation,
 	resolveTypeInfo,
+	isJavaScriptNode,
+	typeAliasTypeNode,
+	typeAliasTypeParameters,
 	type AliasRegistry
 } from './typescript-extract-type-json.ts';
 import { createIsExternalFile, type IsExternalFile } from './typescript-program.ts';
-import type { ModuleSourceOptions } from './source-config.ts';
+import { isSource, type ModuleSourceOptions } from './source-config.ts';
 
 /**
  * The pass-scoped, cross-cutting state one extraction run threads through the
@@ -71,7 +93,54 @@ export interface ExtractContext {
 	 * construction site decides explicitly, like `aliasRegistry`.
 	 */
 	exactOptionalPropertyTypes: boolean;
+	/** Whether a file emits a module this pass (see `IsEmittedFile`). */
+	isEmittedFile: IsEmittedFile;
+	/** What the pass can see of a `.svelte` file (see `SvelteFileStatus`). */
+	svelteFileStatus: (file: string) => SvelteFileStatus;
 }
+
+/**
+ * What an extraction pass can see of a `.svelte` file at an absolute POSIX
+ * path, which decides how a relative `.svelte` re-export reads:
+ *
+ * - `'virtual'` — the program has its svelte2tsx virtual, so ordinary
+ *   resolution applies
+ * - `'virtualless'` — the file exists (owned content or disk) but the program
+ *   has no virtual for it: its transform failed, or it was never supplied
+ * - `'missing'` — no virtual and no file, as for a mistyped specifier
+ *
+ * Without a virtual, a `.svelte` specifier would otherwise resolve to nothing,
+ * or to the `svelte` package's ambient `declare module '*.svelte'` once some
+ * file in the program imports `svelte` — so the reading would turn on
+ * unrelated files. The re-export arms ask this by path instead.
+ */
+export type SvelteFileStatus = 'virtual' | 'virtualless' | 'missing';
+
+/** Whether a path exists for an analysis pass — owned in-memory content or disk. */
+export type FileExists = (file: string) => boolean;
+
+/**
+ * Whether the file at an absolute POSIX path emits a module in this analysis
+ * pass — the question the re-export encodings turn on: a re-export of an
+ * emitted canonical links to it, while one whose canonical emits nothing is
+ * documented where it's re-exported.
+ *
+ * Not the same as `isSource`. A file can pass `isSource` and still emit
+ * nothing because it isn't one of the analyzed inputs: under exports
+ * discovery, a source file outside `package.json` `exports`; in a session, a
+ * file ingested only as checker context, or one never handed over at all.
+ * Linking a re-export to such a file would point at a module the output
+ * doesn't contain and leave the name documented nowhere, so it is documented
+ * in the re-exporting module instead, exactly as for a gated `internal/`
+ * file. `analyzeCore` answers from the set it was handed; a caller analyzing
+ * one module with no set to consult falls back to `isSource`.
+ *
+ * Stars follow the same rule: `export * from` a file that emits nothing is
+ * read as the named re-exports it stands for (`collectMaterializedStars` in
+ * `typescript-exports.ts`), and only a star over an emitted module is a
+ * `starExports` entry.
+ */
+export type IsEmittedFile = (file: string) => boolean;
 
 /**
  * The module dispatchers' `ExtractContext` construction — `analyzeModule` and
@@ -82,7 +151,9 @@ export interface ExtractContext {
  * `isExternalPath` from that object, and the two axes must agree), and
  * `exactOptionalPropertyTypes` is read off the *merged* compiler options
  * rather than the raw tsconfig, so a session-level override reaches the strip
- * gate (`optionalWidened`).
+ * gate (`optionalWidened`). `svelteFileStatus` reads virtuals off the program
+ * and existence off `fileExists`, which defaults to the disk; `analyzeCore`
+ * passes one that also sees owned in-memory content.
  *
  * Direct callers outside the dispatchers (tests, fixture harnesses, subpath
  * consumers) build the object literal themselves and decide every field
@@ -93,13 +164,22 @@ export const createExtractContext = (
 	checker: ts.TypeChecker,
 	options: ModuleSourceOptions,
 	diagnostics: Array<Diagnostic>,
-	aliasRegistry: AliasRegistry | undefined
+	aliasRegistry: AliasRegistry | undefined,
+	isEmittedFile: IsEmittedFile = (file) => isSource(file, options),
+	fileExists: FileExists = ts.sys.fileExists
 ): ExtractContext => ({
 	checker,
 	diagnostics,
 	isExternalFile: createIsExternalFile(options),
 	aliasRegistry,
-	exactOptionalPropertyTypes: !!program.getCompilerOptions().exactOptionalPropertyTypes
+	exactOptionalPropertyTypes: !!program.getCompilerOptions().exactOptionalPropertyTypes,
+	isEmittedFile,
+	svelteFileStatus: (file) =>
+		program.getSourceFile(file + SVELTE_VIRTUAL_SUFFIX)
+			? 'virtual'
+			: fileExists(file)
+				? 'virtualless'
+				: 'missing'
 });
 
 /**
@@ -109,7 +189,7 @@ export const createExtractContext = (
  * at all, so every `undefined` in the type is author-written and stripping
  * would corrupt it: `x?: T | undefined` trimmed to `T`, `x?: T | null |
  * undefined` to `T | null`, and a null-free multi-member union rebuilt through
- * `getNonNullableType` (`x?: E | F` printed as `(E & {}) | (F & {})`).
+ * `getNonNullableType` (`x?: E | F` printed as `NonNullable<E> | NonNullable<F>`).
  *
  * Property sites only — component props, type-alias and interface properties,
  * class properties. Optional *parameters* and optional *tuple elements* widen
@@ -145,7 +225,8 @@ export const isDeclaredInFile = (symbol: ts.Symbol, fileName: string): boolean =
  * The local export statement and binding node for an alias export symbol —
  * `{node, statement}` where `node` is the `ExportSpecifier` (or, for
  * `export * as ns`, the `NamespaceExport`) and `statement` its
- * `ExportDeclaration`.
+ * `ExportDeclaration`, or both are the `ExportAssignment` of an
+ * `export default x`.
  *
  * Returns `undefined` when the statement isn't in `sourceFile`: merged
  * symbols can put a foreign declaration first, and parsing JSDoc or
@@ -159,9 +240,14 @@ export const getLocalExportStatement = (
 	sourceFile: ts.SourceFile
 ):
 	| { node: ts.ExportSpecifier | ts.NamespaceExport; statement: ts.ExportDeclaration }
+	| { node: ts.ExportAssignment; statement: ts.ExportAssignment }
 	| undefined => {
 	const node = exportSymbol.declarations?.[0];
 	if (!node) return undefined;
+	if (ts.isExportAssignment(node)) {
+		if (node.getSourceFile() !== sourceFile) return undefined;
+		return { node, statement: node };
+	}
 	if (ts.isExportSpecifier(node)) {
 		const statement = node.parent.parent;
 		if (statement.getSourceFile() !== sourceFile) return undefined;
@@ -182,8 +268,12 @@ export const getLocalExportStatement = (
  * - Classes → `'class'`
  * - Functions (declarations, expressions, arrows) → `'function'`
  * - Interfaces → `'interface'`
- * - Type aliases → `'type'`
- * - Enums (regular and const) → `'enum'`
+ * - Type aliases → `'type'`, JSDoc `@typedef` / `@callback` included
+ * - Enums (regular and const) → `'enum'`, and a JS `@enum` const
+ *   (`@enum {string}` on `export const A = {a: 'a'}`): the checker binds
+ *   the tag as a type alias over the value's name, but like a TypeScript
+ *   enum the name is a runtime object of members and a type, so it
+ *   documents as one
  * - Variables → `'variable'` (unless function-valued → `'function'`)
  *
  * Note: namespace re-exports (`export * as ns from './x'`) have no inline
@@ -192,12 +282,17 @@ export const getLocalExportStatement = (
  * call here on a `ValueModule` symbol would fall through to `'variable'` and
  * leak `typeof import("/abs/path")` into the output — keep the namespace
  * dispatch in `analyzeExports`.
+ *
+ * Standalone `namespace Foo {}` declarations aren't modeled: they fall through
+ * to `'variable'` and document as `typeof Foo` (or `any` for a type-only
+ * namespace) with no members.
  */
 export const inferDeclarationKind = (symbol: ts.Symbol, node: ts.Node): DeclarationKind => {
 	// Check symbol flags
 	if (symbol.flags & ts.SymbolFlags.Class) return 'class';
 	if (symbol.flags & ts.SymbolFlags.Function) return 'function';
 	if (symbol.flags & ts.SymbolFlags.Interface) return 'interface';
+	if (isJSDocEnumSymbol(symbol)) return 'enum';
 	if (symbol.flags & ts.SymbolFlags.TypeAlias) return 'type';
 	if (symbol.flags & ts.SymbolFlags.Enum) return 'enum';
 	if (symbol.flags & ts.SymbolFlags.ConstEnum) return 'enum';
@@ -207,19 +302,20 @@ export const inferDeclarationKind = (symbol: ts.Symbol, node: ts.Node): Declarat
 		return 'function';
 	if (ts.isClassDeclaration(node)) return 'class';
 	if (ts.isInterfaceDeclaration(node)) return 'interface';
-	if (ts.isTypeAliasDeclaration(node)) return 'type';
+	if (isTypeAliasLike(node)) return 'type';
 	if (ts.isEnumDeclaration(node)) return 'enum';
-	if (ts.isVariableDeclaration(node)) {
-		// Check if it's a function-valued variable
-		const init = node.initializer;
-		if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) {
-			return 'function';
-		}
-		return 'variable';
-	}
+	if (ts.isVariableDeclaration(node)) return functionInitializer(node) ? 'function' : 'variable';
 
 	return 'variable';
 };
+
+/**
+ * Whether a symbol is a JS `@enum` const: the tag declares a type alias
+ * merged with the value (`inferDeclarationKind` documents it as an enum, from
+ * the value declaration).
+ */
+export const isJSDocEnumSymbol = (symbol: ts.Symbol): boolean =>
+	!!(symbol.flags & ts.SymbolFlags.TypeAlias) && !!symbol.declarations?.some(ts.isJSDocEnumTag);
 
 /**
  * Select the declaration node that carries a symbol's documented meaning.
@@ -234,7 +330,13 @@ export const inferDeclarationKind = (symbol: ts.Symbol, node: ts.Node): Declarat
  * selected instead; value-space kinds (and unmerged symbols) keep the
  * `valueDeclaration`-first selection. The merged value meaning goes
  * undocumented under the one-declaration-per-export-name model — the type is
- * what consumers look up.
+ * what consumers look up. A class+interface merge resolves value-space
+ * (`class`), so it documents the class with no doc fallback and no
+ * `mergedValue` marker — a class already implies value+type.
+ *
+ * JS merges the same way: `const Foo = …` beside `@typedef {…} Foo` selects
+ * the typedef tag, as `type Foo` would be. A JS `@enum` const selects its
+ * value declaration, which holds the members (`isJSDocEnumSymbol`).
  */
 export const selectDeclarationNode = (symbol: ts.Symbol): ts.Declaration | undefined => {
 	// Class/Function flags win in inferDeclarationKind, so only a flag set
@@ -243,8 +345,8 @@ export const selectDeclarationNode = (symbol: ts.Symbol): ts.Declaration | undef
 		let matches: ((node: ts.Node) => boolean) | undefined;
 		if (symbol.flags & ts.SymbolFlags.Interface) {
 			matches = ts.isInterfaceDeclaration;
-		} else if (symbol.flags & ts.SymbolFlags.TypeAlias) {
-			matches = ts.isTypeAliasDeclaration;
+		} else if (symbol.flags & ts.SymbolFlags.TypeAlias && !isJSDocEnumSymbol(symbol)) {
+			matches = isTypeAliasLike;
 		} else if (symbol.flags & (ts.SymbolFlags.Enum | ts.SymbolFlags.ConstEnum)) {
 			matches = ts.isEnumDeclaration;
 		}
@@ -253,6 +355,40 @@ export const selectDeclarationNode = (symbol: ts.Symbol): ts.Declaration | undef
 	}
 	return symbol.valueDeclaration ?? symbol.declarations?.[0];
 };
+
+/**
+ * Whether a JSDoc `@typedef`/`@callback` tag sits in svelte2tsx's copy of the
+ * HTML `@component` comment. svelte2tsx emits that copy directly on the
+ * generated component statement (`const <Name>__SvelteComponent_ = …`, or
+ * `$$Component` when svelte2tsx gets no filename), so a typedef line in the
+ * HTML comment declares a virtual-only type the author never wrote in a
+ * script. The test is structural (the tag's comment hosted by
+ * that statement) and needs no source map. If svelte2tsx moves the copy, it
+ * fails open: the typedef documents again, with a `sourceLine` past the end of
+ * the original source.
+ */
+const isStrayComponentTypedefTag = (node: ts.Node): boolean => {
+	if (!ts.isJSDocTypedefTag(node) && !ts.isJSDocCallbackTag(node)) return false;
+	const host = node.parent.parent;
+	return (
+		ts.isVariableStatement(host) &&
+		host.declarationList.declarations.some(
+			(d) =>
+				ts.isIdentifier(d.name) &&
+				(d.name.text.endsWith(SVELTE_COMPONENT_ALIAS_SUFFIX) || d.name.text === '$$Component')
+		)
+	);
+};
+
+/**
+ * Whether a Svelte virtual's export is declared only by stray component-comment
+ * typedefs (`isStrayComponentTypedefTag`). It documents nothing:
+ * `analyzeSvelteModule` drops it with its `alias_lost` warnings and
+ * `buildAliasRegistry` never registers it. A merged symbol (a `<script module>`
+ * declaration of the same name) isn't stray.
+ */
+export const isStrayComponentTypedef = (symbol: ts.Symbol): boolean =>
+	!!symbol.declarations?.length && symbol.declarations.every(isStrayComponentTypedefTag);
 
 /** Separator the TypeScript printer emits before a top-level `undefined` union member. */
 const UNDEFINED_UNION_SUFFIX = ' | undefined';
@@ -279,7 +415,14 @@ const UNDEFINED_UNION_SUFFIX = ' | undefined';
  *
  * Applies to the structured fields only. A callable's `typeSignature` comes from
  * `checker.signatureToString`, which has no flag to omit the widening, so it renders
- * optional parameters as the checker does — `(a?: number | undefined): void`.
+ * optional parameters as the checker does — `(a?: number | undefined): void`. The strip
+ * is top-level only, so an optional property nested in a printed object type keeps its
+ * widening too (`b: {c?: boolean}` → `"{ c?: boolean | undefined; }"`).
+ *
+ * The result is the checker's canonical rendering, not what an editor shows on hover:
+ * the language service prints from the declaration node, so for an alias-lost
+ * `type Foo = z.infer<typeof S>` (any alias over an indexed access or conditional) hover
+ * reads `Foo` while this carries the expanded, possibly truncated, structure.
  *
  * A non-union optional is printed as written, since there's no widening member to
  * remove: `x?: undefined` stays `"undefined"` (stripping would leave `never`, the same
@@ -338,11 +481,12 @@ export const getTypeSignature = (
  * under `exactOptionalPropertyTypes` a written `fn?: (() => void) | undefined`
  * classifies callable like `fn?: () => void` (that spelling is often forced
  * there — assigning a possibly-`undefined` handler to the property requires
- * it). `| null` stays demoted per the paragraph above — `null` is a real value
- * absence doesn't imply. The printed and structured outputs still gate their
- * strips on `optionalWidened`, where a written `undefined` is content. On the
- * method sites the strip is identity under the flag anyway — method syntax
- * can't write `| undefined`.
+ * it). Two cases stay non-callable and land as `kind: 'variable'` with the
+ * union kept: `| null` (a real value, per the paragraph above) and a
+ * *required* property's written `undefined` (nothing else carries it; `false`
+ * here is identity). The printed and structured outputs still gate their
+ * strips on `optionalWidened`, where a written `undefined` is content; on
+ * method sites the gate is moot, since method syntax can't write `| undefined`.
  */
 export const getNonOptionalType = (
 	type: ts.Type,
@@ -369,18 +513,47 @@ export const extractSignatureParameters = (
 	const { checker, aliasRegistry } = ctx;
 	return sig.parameters.map((param) => {
 		const paramDecl = param.valueDeclaration;
-		const optional = !!(paramDecl && ts.isParameter(paramDecl) && paramDecl.questionToken);
+		// a `@callback`'s or an `@overload`'s parameters are declared by its
+		// `@param` tags, which read like the `@param` tags of a JS function's
+		// parameters: `{...T}` is the rest form, and a bracket or `{T=}` makes
+		// the tag omittable
+		const paramTag = paramDecl && isSignatureParameterTag(paramDecl) ? paramDecl : undefined;
+		const rest = paramTag
+			? !!paramTag.typeExpression && ts.isJSDocVariadicType(paramTag.typeExpression.type)
+			: !!(paramDecl && ts.isParameter(paramDecl) && paramDecl.dotDotDotToken);
+		// whether a caller may omit the argument, the checker's own reading: a `?`,
+		// an initializer with no required parameter after it, and in JS a
+		// bracketed `@param {T} [b]` or `@param {T=} b`; never a rest parameter,
+		// which the checker reads as optional under a bracketed `@param [rest]`.
+		// The checker's `isOptionalParameter` takes a `@param` tag too, though
+		// its public signature names only `ParameterDeclaration`
+		const optional =
+			!rest &&
+			!!(
+				paramDecl &&
+				(ts.isParameter(paramDecl) || paramTag) &&
+				checker.isOptionalParameter(paramDecl as ts.ParameterDeclaration)
+			);
 
 		// Get type - use declaration location if available, otherwise get declared type.
 		// An optional parameter is widened to include `undefined` like an optional
 		// property, and is stripped the same way so `optional` carries it alone.
+		// An initializer isn't widened, so there the strip removes only an
+		// `undefined` the type already holds (written `b: T | undefined = x`, or
+		// inferred, `b = this.maybe`): passing it and omitting the argument both
+		// run the default.
 		// `exactOptionalPropertyTypes` governs properties only, so it never applies here.
 		let typeString = 'unknown';
 		let typeInfo: TypeJson | undefined;
 		if (paramDecl) {
 			const paramType = checker.getTypeOfSymbolAtLocation(param, paramDecl);
 			typeString = getTypeSignature(paramType, checker, optional);
-			const annotation = ts.isParameter(paramDecl) ? paramDecl.type : undefined;
+			// a `@callback` parameter's written type is part of the alias's own
+			// right-hand side, like a property tag's, and an `@overload`
+			// parameter's is its signature's annotation
+			const annotation = ts.isParameter(paramDecl)
+				? writtenTypeAnnotation(paramDecl)
+				: paramTag && writtenTypeAnnotation(paramTag);
 			typeInfo = resolveTypeInfo(paramType, checker, aliasRegistry, optional, {
 				writtenNode: annotation
 			});
@@ -395,27 +568,40 @@ export const extractSignatureParameters = (
 
 		// Collect dotted `@param obj.prop` descriptions for object/destructured
 		// parameters, keyed by the sub-path relative to this parameter
-		// (`obj.prop` → `prop`, `obj.a.b` → `a.b`).
+		// (`obj.prop` → `prop`, `obj.a.b` → `a.b`, an array element's
+		// `arr[].prop` → `[].prop`).
 		let propertyDescriptions: Record<string, string> | undefined;
 		if (tsdocParams) {
-			const prefix = param.name + '.';
 			for (const [key, value] of Object.entries(tsdocParams)) {
-				if (key.startsWith(prefix)) {
+				if (paramKeyRoot(key) === param.name && key !== param.name) {
 					// Null-prototype map: the sliced sub-path is source-derived and is
 					// emitted as `propertyDescriptions`; a `@param obj.__proto__` key on a
 					// plain object would pollute the prototype on write.
-					(propertyDescriptions ??= Object.create(null))[key.slice(prefix.length)] = value;
+					const subPath = key.slice(param.name.length).replace(/^\./, '');
+					(propertyDescriptions ??= Object.create(null))[subPath] = value;
 				}
 			}
 		}
 
-		// Extract default value from AST
+		// the initializer's text, else the default a bracketed `@param [b=0]` writes
+		// when the parameter is omittable (a bracket on a required one is ignored).
+		// Only identifier-named tags count: TS matches a binding-pattern parameter's
+		// tags by position, counting unbraced dotted tags (`@param [opts.z=3]`) as
+		// positions, so a dotted tag's default would land on the wrong parameter.
 		let defaultValue: string | undefined;
-		if (paramDecl && ts.isParameter(paramDecl) && paramDecl.initializer) {
-			defaultValue = paramDecl.initializer.getText();
+		if (paramTag) {
+			if (optional) defaultValue = jsdocParamTagDefault(paramTag);
+		} else if (paramDecl && ts.isParameter(paramDecl)) {
+			if (paramDecl.initializer) {
+				defaultValue = paramDecl.initializer.getText();
+			} else if (optional) {
+				defaultValue = ts
+					.getJSDocParameterTags(paramDecl)
+					.filter((tag) => ts.isIdentifier(tag.name))
+					.map((tag) => jsdocParamTagDefault(tag))
+					.find((value) => value !== undefined);
+			}
 		}
-
-		const rest = !!(paramDecl && ts.isParameter(paramDecl) && paramDecl.dotDotDotToken);
 
 		const parameter: ParameterJson = {
 			name: param.name,
@@ -429,6 +615,27 @@ export const extractSignatureParameters = (
 		if (typeInfo) parameter.typeInfo = typeInfo;
 		return parameter;
 	});
+};
+
+/**
+ * Whether a declaration is a `@param` tag declaring a `@callback`'s or an
+ * `@overload`'s parameter (its parent is the tag's `JSDocSignature`), rather
+ * than documenting a function's own parameter.
+ */
+const isSignatureParameterTag = (node: ts.Node): node is ts.JSDocParameterTag => {
+	if (!ts.isJSDocParameterTag(node)) return false;
+	// typed as the enclosing `JSDoc`, but a signature's parameter tags sit under the signature
+	const parent: ts.Node = node.parent;
+	return ts.isJSDocSignature(parent);
+};
+
+/**
+ * The parameter a `@param` key documents: the segment before the first `.`
+ * or `[` (`obj.a.b` → `obj`, `arr[].prop` → `arr`), else the whole key.
+ */
+const paramKeyRoot = (key: string): string => {
+	const end = key.search(/[.[]/);
+	return end === -1 ? key : key.slice(0, end);
 };
 
 /**
@@ -451,10 +658,10 @@ const validateParamKeys = (
 	if (!tsdocParams) return;
 	const known = new Set(parameters.map((p) => p.name));
 	for (const key of Object.keys(tsdocParams)) {
-		// Dotted keys (`@param obj.prop`) document a property of an object/destructured
-		// parameter — valid JSDoc/TSDoc. Treat as known when the root segment is a real param.
-		const root = key.includes('.') ? key.slice(0, key.indexOf('.')) : key;
-		if (!known.has(key) && !known.has(root)) {
+		// Dotted keys (`@param obj.prop`, `arr[].prop`) document a property of an
+		// object/destructured parameter — valid JSDoc/TSDoc. Treat as known when
+		// the root segment is a real param.
+		if (!known.has(key) && !known.has(paramKeyRoot(key))) {
 			const loc = getNodeLocation(declNode);
 			diagnostics.push({
 				kind: 'unknown_param',
@@ -502,7 +709,7 @@ const collectSymbolScopeTags = (
  * `optional`, hence the constant `false`). The written return annotation, when
  * one exists, feeds the tree's name recovery for aliases TypeScript dropped.
  */
-const applyReturnType = (
+export const applyReturnType = (
 	target: { returnType?: string; returnTypeInfo?: TypeJson },
 	sig: ts.Signature,
 	ctx: ExtractContext
@@ -510,9 +717,15 @@ const applyReturnType = (
 	const { checker } = ctx;
 	const returnType = checker.getReturnTypeOfSignature(sig);
 	target.returnType = checker.typeToString(returnType);
-	// a JSDoc signature's `type` is a return *tag*, not a TypeNode
+	// a JSDoc signature's `type` is a return *tag*, not a TypeNode. A
+	// `@callback`'s `@returns {T}` is part of the alias's own right-hand side,
+	// and an `@overload`'s is its signature's annotation, so its written type
+	// feeds recovery like a TypeScript function type's
 	const decl = sig.declaration;
-	const returnNode = decl && !ts.isJSDocSignature(decl) ? decl.type : undefined;
+	const returnNode =
+		decl && ts.isJSDocSignature(decl)
+			? decl.type?.typeExpression?.type
+			: decl && writtenReturnTypeNode(decl);
 	const returnTypeInfo = resolveTypeInfo(returnType, checker, ctx.aliasRegistry, false, {
 		writtenNode: returnNode
 	});
@@ -520,37 +733,76 @@ const applyReturnType = (
 };
 
 /**
+ * A signature declaration's own type parameters, the checker's reading
+ * (`ts.getEffectiveTypeParameterDeclarations`), so a JS function or method's
+ * `@template` tags count like `<T>`, and an `@overload`'s are its block's
+ * `@template` tags (a block of several overloads gives each of them its
+ * templates, as the checker does; one inside the overload's signature, after
+ * its `@overload` and before its last `@param`/`@returns`, is a parse error
+ * the checker drops; one at the block's end is accepted). An implementation
+ * with `@overload` tags (`firstJSDocOverloadSignature`) reads its first
+ * overload's, as a TypeScript function's generics are its first overload's;
+ * its own `@template` tags are hidden with it. None for a `@callback`'s
+ * signature: its templates document on the alias (`typeAliasTypeParameters`),
+ * as a generic `type A<T> = (x: T) => T` keeps `T` off its `(call)` member.
+ */
+export const signatureTypeParameters = (
+	decl: ts.Node | undefined
+): ReadonlyArray<ts.TypeParameterDeclaration> | undefined => {
+	if (!decl) return undefined;
+	if (ts.isJSDocSignature(decl)) {
+		return ts.isJSDocOverloadTag(decl.parent)
+			? ts.getEffectiveTypeParameterDeclarations(decl)
+			: undefined;
+	}
+	if (!ts.isFunctionLike(decl)) return undefined;
+	const overload = firstJSDocOverloadSignature(decl);
+	return ts.getEffectiveTypeParameterDeclarations(overload ?? decl);
+};
+
+/**
  * Extract all public overload signatures for a function.
  *
  * Each overload gets its own typeSignature, parameters, returnType, and
  * per-overload JSDoc if available. The implementation signature is excluded
- * (TypeScript's `getCallSignatures()` already omits it).
+ * (TypeScript's `getCallSignatures()` already omits it). A JS `@overload`'s
+ * signature is a `JSDocSignature`, whose JSDoc is the block hosting its tag
+ * (`parseComment`), and whose `@param` tags declare its parameters.
  *
  * Per-overload `@param` descriptions flow through to that overload's
  * `parameters[i].description`. Per-overload `@returns` populates
  * `returnDescription`. These are signature-scope: each overload may
  * describe its own parameters and return value distinctly.
  *
- * Symbol-scope tags (`@example`, `@deprecated`, `@internal`, `@since`, `@see`,
- * `@throws`, `@mutates`) describe the function as a whole and belong on the parent
- * declaration. The primary overload — the one whose JSDoc text matches the
- * parent's `docComment` — already feeds the parent's symbol-level extraction,
- * so its symbol-scope tags reach the parent through that path. On non-primary
- * overloads, symbol-scope tags would otherwise be silently dropped from
- * output; this function emits a `misplaced_tag` warning instead, pointing the
- * author at the primary signature.
+ * Symbol-scope tags describe the function as a whole and belong on the parent
+ * declaration. When the signatures are the parent's own, the primary overload
+ * is the one the parent's docs come from (`primaryDecl`), and it already feeds
+ * the parent's symbol-level extraction. The primary is matched by identity:
+ * for a JS `@overload`, every overload sharing the primary's block (prose
+ * can't tell them apart: every JS overload parses to a comment, empty when
+ * proseless), for a TS overload the declaration itself, so another overload
+ * repeating its prose is still non-primary, and the checker's signature order
+ * doesn't matter (an interface merged ahead of a class lists its signatures
+ * first, though the class's member is the one documented). Tags on
+ * non-primary overloads are dropped, but not silently: this function emits
+ * `misplaced_tag` for each (tag set and rationale on
+ * `MisplacedTagDiagnostic`). Borrowed signatures (`m: typeof g`,
+ * `@property {typeof g} m`, a property typed by an interface with call
+ * signatures) have no primary, since the parent's docs are its own, never the
+ * lender's, and they warn nothing: the tags sit where the lender's author put
+ * them, and the lender's own analysis is where they're checked.
  *
  * @param signatures - all call signatures from the type checker
  * @param ctx - the extraction pass's context
- * @param parentTsdoc - parsed JSDoc of the parent declaration (for primary-signature detection)
  * @param parentName - parent function/method name (for diagnostic messages)
+ * @param primaryDecl - the declaration of the overload the parent's docs come from, or undefined when the signatures are borrowed (`ownsSignatureDeclarations`), which skips the `misplaced_tag` check
  * @returns array of overload info objects
  */
 const extractOverloads = (
 	signatures: ReadonlyArray<ts.Signature>,
 	ctx: ExtractContext,
-	parentTsdoc: TsdocParsedComment | undefined,
-	parentName: string
+	parentName: string,
+	primaryDecl: ts.Node | undefined
 ): Array<OverloadJsonInput> => {
 	const { checker, diagnostics } = ctx;
 	return signatures.map((sig) => {
@@ -574,21 +826,19 @@ const extractOverloads = (
 		}
 
 		// Extract per-overload generic type parameters
-		if (ts.isFunctionLike(decl) && decl.typeParameters?.length) {
-			overload.genericParams = decl.typeParameters.map(parseGenericParam);
-		}
+		const typeParams = signatureTypeParameters(decl);
+		if (typeParams?.length) overload.genericParams = typeParams.map(parseGenericParam);
 
-		// Detect primary overload by matching JSDoc text against the parent's.
-		// The TS API resolves the parent declaration's JSDoc by walking from the
-		// implementation node to the first overload signature with JSDoc; that
-		// signature is the "primary" — its symbol-scope tags already reach the
-		// parent through symbol-level extraction. Non-primary overloads with
-		// symbol-scope tags would silently lose them; surface as warnings instead.
+		// Detect the primary overload, whose symbol-scope tags already reach
+		// the parent (rule in the TSDoc above). Non-primary overloads with
+		// symbol-scope tags would silently lose them; surface as warnings instead
+		// (`getDeclaration()`'s type omits the `JSDocSignature` an `@overload` declares)
+		const sigDecl = sig.declaration;
 		const isPrimary =
-			tsdoc?.text !== undefined &&
-			parentTsdoc?.text !== undefined &&
-			tsdoc.text === parentTsdoc.text;
-		if (!isPrimary && tsdoc) {
+			sigDecl && primaryDecl && ts.isJSDocSignature(sigDecl) && ts.isJSDocSignature(primaryDecl)
+				? sigDecl.parent.parent === primaryDecl.parent.parent
+				: sigDecl === primaryDecl;
+		if (primaryDecl && !isPrimary && tsdoc) {
 			const misplaced = collectSymbolScopeTags(tsdoc);
 			if (misplaced.length > 0) {
 				const loc = getNodeLocation(decl);
@@ -625,7 +875,8 @@ const extractOverloads = (
  * target. No-op when `signatures` is empty.
  *
  * @param target - declaration or member build object (mutated)
- * @param signatures - public call/construct signatures (`signatures[0]` is primary)
+ * @param signatures - public call/construct signatures (`signatures[0]` supplies
+ *   `typeSignature`, `parameters`, and the return type)
  * @param ctx - the extraction pass's context
  * @param tsdoc - parsed TSDoc for the target (supplies `@param`/`@returns`)
  * @param paramValidationNode - node `validateParamKeys` reports `unknown_param` against
@@ -656,9 +907,98 @@ export const populateCallableMember = (
 	target.parameters = extractSignatureParameters(sig, ctx, tsdoc?.params);
 	validateParamKeys(tsdoc?.params, target.parameters, paramValidationNode, name, ctx.diagnostics);
 
+	const owns = ownsSignatureDeclarations(paramValidationNode, sig, ctx.checker);
 	if (signatures.length > 1) {
-		target.overloads = extractOverloads(signatures, ctx, tsdoc, name);
+		// the parent's docs are `paramValidationNode`'s, or its first
+		// `@overload`'s when it has them
+		const primaryDecl = owns
+			? (firstJSDocOverloadSignature(paramValidationNode) ?? paramValidationNode)
+			: undefined;
+		target.overloads = extractOverloads(signatures, ctx, name, primaryDecl);
 	}
+	if (owns) warnHiddenImplementationDoc(paramValidationNode, ctx, name);
+};
+
+/**
+ * Warn `implementation_doc_hidden` when an overloaded function, method, or
+ * constructor's implementation carries docs, which the output hides as the
+ * checker does (only the overloads are public signatures): a JS
+ * implementation's non-`@overload` JSDoc blocks
+ * (`parseHiddenJSDocImplementationComment`), or the JSDoc of a TS
+ * implementation, the bodied declaration among same-kind siblings that
+ * include a bodiless overload. Without the warning its prose and tags
+ * (`@nodocs` included) would vanish silently.
+ *
+ * @param node - the declaration whose docs document the symbol (`paramValidationNode`)
+ * @param ctx - the extraction pass's context
+ * @param name - the function's name, for the message
+ * @mutates ctx.diagnostics - adds one `implementation_doc_hidden` per implementation with docs
+ */
+const warnHiddenImplementationDoc = (node: ts.Node, ctx: ExtractContext, name: string): void => {
+	let implementation: ts.Node | undefined;
+	if (parseHiddenJSDocImplementationComment(node)) {
+		implementation = node;
+	} else if (ts.isFunctionLike(node) && !hasBody(node)) {
+		// same kind and parent, so a class method's interface-merged twin doesn't count
+		implementation = overloadSiblings(node, ctx.checker).find(
+			(d) => d.kind === node.kind && d.parent === node.parent && hasBody(d)
+		);
+		const tsdoc = implementation && parseComment(implementation);
+		if (!tsdoc || !hasDocContent(tsdoc)) implementation = undefined;
+	}
+	if (!implementation) return;
+	const loc = getNodeLocation(implementation);
+	ctx.diagnostics.push({
+		kind: 'implementation_doc_hidden',
+		file: loc.file,
+		line: loc.line,
+		column: loc.column,
+		message: `JSDoc on the implementation of overloaded "${name}" is hidden — move it to the first overload's JSDoc (only overload signatures are public)`,
+		severity: 'warning',
+		functionName: name
+	});
+};
+
+const hasBody = (node: ts.Node): boolean => 'body' in node && !!node.body;
+
+/**
+ * The declarations that overload `node` with it: its symbol's declarations
+ * (all of a TS function's or method's overloads, merged across declarations),
+ * or, for a nameless declaration (a constructor, an `export default function`
+ * overload), its nameless siblings of the same kind.
+ */
+const overloadSiblings = (node: ts.Node, checker: ts.TypeChecker): ReadonlyArray<ts.Node> => {
+	const name = ts.getNameOfDeclaration(node as ts.Declaration);
+	if (name) return checker.getSymbolAtLocation(name)?.declarations ?? [];
+	const container: ReadonlyArray<ts.Node> = ts.isClassLike(node.parent)
+		? node.parent.members
+		: ts.isSourceFile(node.parent) || ts.isModuleBlock(node.parent)
+			? node.parent.statements
+			: [];
+	return container.filter(
+		(d) => d.kind === node.kind && !ts.getNameOfDeclaration(d as ts.Declaration)
+	);
+};
+
+/**
+ * Whether a signature is declared by `node` itself, so `node`'s JSDoc is that
+ * signature's, rather than borrowed through its type (`m: typeof g`,
+ * `@property {typeof g} m`, `m: I` for an interface `I` with call
+ * signatures). A JS `@overload`'s signature is `node`'s when it is one of
+ * `node`'s own `jsdocOverloadSignatures`, and any other when it's one of
+ * `overloadSiblings`.
+ */
+const ownsSignatureDeclarations = (
+	node: ts.Node,
+	sig: ts.Signature,
+	checker: ts.TypeChecker
+): boolean => {
+	// `getDeclaration()`'s type omits the `JSDocSignature` an `@overload` declares
+	const decl = sig.declaration;
+	if (!decl) return false;
+	if (ts.isJSDocSignature(decl)) return jsdocOverloadSignatures(node).includes(decl);
+	// every caller's `node` is the parent declaration (`paramValidationNode`)
+	return overloadSiblings(node, checker).includes(decl);
 };
 
 /**
@@ -736,10 +1076,8 @@ export const populatePropertyMember = (
 		populateCallableMember(member, callSigs, ctx, tsdoc, paramValidationNode, name);
 		// generic signatures carry genericParams like method signatures and
 		// (call) members do — read from the primary signature's declaration
-		const sigDecl = callSigs[0]!.getDeclaration();
-		if (ts.isFunctionLike(sigDecl) && sigDecl.typeParameters?.length) {
-			member.genericParams = sigDecl.typeParameters.map(parseGenericParam);
-		}
+		const typeParams = signatureTypeParameters(callSigs[0]!.getDeclaration());
+		if (typeParams?.length) member.genericParams = typeParams.map(parseGenericParam);
 	} else {
 		member.typeSignature = getTypeSignature(propType, checker, widened);
 		const typeInfo = resolveTypeInfo(propType, checker, ctx.aliasRegistry, widened, {
@@ -794,15 +1132,22 @@ const isExternalProperty = (prop: ts.Symbol, isExternalFile: IsExternalFile): bo
 
 /**
  * Check whether a member declaration is private to the class that declares it —
- * a `#` private identifier name, or a `private` modifier.
+ * a `#` private identifier name, or a `private` modifier on a class element, a
+ * parameter property, or a `this.x = …` assignment. In JS a `@private`
+ * tag is the modifier (`ts.getCombinedModifierFlags` reads JSDoc modifier tags
+ * in JS files only); in a `.ts` file the tag marks nothing, as for the checker.
+ * An object literal's property or method keeps its `@private` member, since the
+ * checker enforces the tag in classes only. Expandos (`A.prototype.x = …`,
+ * `A.x = …`, `o.x = …`) declare through the assigned property access, so a
+ * `@private` expando hides nothing, though the checker enforces it on a class's.
  *
  * The one visibility rule, shared by the two ways a class's members reach
  * output: `extractClassInfo` walking `node.members` at the class's own
  * declaration, and `filterDocumentedProperties` projecting a class *type* at a
- * structural container (`type X = LocalClass`, and since generic
- * instantiations extract, `type X = LocalGen<string>`). Held in one place
- * because the two paths disagreeing is what let `#` fields reach `members`
- * through an alias while the class itself dropped them.
+ * structural container (`type X = LocalClass`, `type X = LocalGen<string>`).
+ * Held in one place so an alias over a class hides exactly what the class
+ * hides — the two paths disagreeing would leak `#` fields into `members`
+ * through the alias.
  *
  * `protected` is deliberately not private: it is part of the extension API a
  * subclass author documents against. Only classes can declare either form —
@@ -812,10 +1157,11 @@ const isExternalProperty = (prop: ts.Symbol, isExternalFile: IsExternalFile): bo
 export const isPrivateMemberDeclaration = (decl: ts.Declaration): boolean => {
 	const { name } = decl as ts.NamedDeclaration;
 	if (name !== undefined && ts.isPrivateIdentifier(name)) return true;
-	return (
-		ts.canHaveModifiers(decl) &&
-		(ts.getModifiers(decl)?.some((m) => m.kind === ts.SyntaxKind.PrivateKeyword) ?? false)
-	);
+	const isClassMember = ts.isClassElement(decl)
+		? ts.isClassLike(decl.parent)
+		: ts.isParameter(decl) || ts.isBinaryExpression(decl);
+	if (!isClassMember) return false;
+	return (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Private) !== 0;
 };
 
 /**
@@ -823,13 +1169,44 @@ export const isPrivateMemberDeclaration = (decl: ts.Declaration): boolean => {
  * symbol-side form of `isPrivateMemberDeclaration`, for the checker-backed
  * paths that see properties rather than written members.
  *
- * Any private declaration hides the symbol: an accessor pair must agree in
- * visibility for TypeScript to accept it, so `some` and `every` can only
- * differ on code that already fails to compile, and hiding is the safe answer
- * there.
+ * In JS the checker's `valueDeclaration` decides, as the checker
+ * enforces the modifier from that declaration only: a property several
+ * `this.x = …` assignments declare is hidden by a `@private` on the first in
+ * source order, as `collectThisAssignedMembers` reads it on the class. A synthetic
+ * property has no `valueDeclaration` (a mapped type's, as in `Readonly<A>` or
+ * `Pick<A, 'x'>`, or an intersection's that several constituents declare), so
+ * the source property's `valueDeclaration`, reached through its first
+ * declaration, stands in: the declarations keep binding order, which needn't
+ * put the checker's choice first. In TypeScript any private declaration hides it: TypeScript
+ * requires a property's declarations to agree in modifiers, so the two
+ * readings differ only on code that fails to compile. For an accessor pair,
+ * any private side hides it in either language, so a public getter beside a
+ * `private set` is hidden whole, as `extractClassInfo` drops it on the class.
  */
-const isPrivateProperty = (prop: ts.Symbol): boolean =>
-	prop.getDeclarations()?.some(isPrivateMemberDeclaration) ?? false;
+const isPrivateProperty = (prop: ts.Symbol, checker: ts.TypeChecker): boolean => {
+	const declarations = prop.getDeclarations();
+	// a synthetic property (`Readonly<A>`'s) has no `valueDeclaration`, so read
+	// the source property's through its first declaration
+	const declared = prop.valueDeclaration ?? sourceValueDeclaration(declarations?.[0], checker);
+	const decls =
+		declared && isJavaScriptNode(declared) && !(prop.flags & ts.SymbolFlags.Accessor)
+			? [declared]
+			: declarations;
+	return decls?.some(isPrivateMemberDeclaration) ?? false;
+};
+
+/**
+ * The `valueDeclaration` of the property `decl` declares, read back through its
+ * name, else `decl` itself.
+ */
+const sourceValueDeclaration = (
+	decl: ts.Declaration | undefined,
+	checker: ts.TypeChecker
+): ts.Declaration | undefined => {
+	if (!decl) return undefined;
+	const name = ts.getNameOfDeclaration(decl);
+	return (name && checker.getSymbolAtLocation(name)?.valueDeclaration) ?? decl;
+};
 
 /**
  * Check whether an index signature comes from an external file.
@@ -858,10 +1235,9 @@ export const isExternalSignature = (sig: ts.Signature, isExternalFile: IsExterna
  * signatures. An empty entry is a contribution the checker synthesized, with
  * no origin to test.
  *
- * The enumeration membership filters against, in one place — so a contribution
- * kind can't be dropped from `members` without also counting toward
- * attribution, which is how call/construct signatures came to be filtered
- * nowhere and labeled nowhere.
+ * The enumeration membership filters against, held in one place so membership
+ * filtering and `externalTypes` labeling cover the same contribution kinds and
+ * can't disagree.
  */
 const contributionOrigins = (
 	type: ts.Type,
@@ -942,6 +1318,10 @@ const pushExternalTypeRef = (out: Array<string>, text: string): void => {
  * spelling already matches. That is also why the shared rule's export-specifier
  * arm never fires here: it answers with the specifier's own published name,
  * which is what an identifier reaching it was already spelled as.
+ *
+ * The substitution is one hop — the `ImportSpecifier`'s exported name — so a
+ * package's own `export {Foo as Bar}` and a local re-export chain both keep the
+ * importable name rather than walking to the declaration's own.
  */
 const importedNameOf = (symbol: ts.Symbol, writtenText: string): string | undefined => {
 	const name = specifierExportedName(symbol);
@@ -1118,13 +1498,13 @@ const referencesTypeParamBoundInDescent = (
 				.getSymbolAtLocation(n)
 				?.getDeclarations()
 				?.find(ts.isTypeParameterDeclaration);
-			const owner = paramDecl?.parent;
+			const owner = paramDecl && typeParameterOwner(paramDecl);
 			if (
 				owner &&
 				paramDecl &&
 				!subst?.has(paramDecl) &&
 				(ts.isInterfaceDeclaration(owner) ||
-					ts.isTypeAliasDeclaration(owner) ||
+					isTypeAliasLike(owner) ||
 					ts.isClassDeclaration(owner)) &&
 				seen.has(owner)
 			) {
@@ -1136,6 +1516,17 @@ const referencesTypeParamBoundInDescent = (
 	};
 	visit(node);
 	return found;
+};
+
+/**
+ * The declaration a type parameter belongs to: its parent, or for a JSDoc
+ * `@template` the typedef or callback its block declares (the block's other
+ * tags are the parameter's siblings, so the parent is only the template tag).
+ */
+const typeParameterOwner = (param: ts.TypeParameterDeclaration): ts.Node | undefined => {
+	const parent = param.parent;
+	if (!ts.isJSDocTemplateTag(parent)) return parent;
+	return ts.isJSDoc(parent.parent) ? parent.parent.tags?.find(isTypeAliasLike) : undefined;
 };
 
 /**
@@ -1218,16 +1609,20 @@ const collectFromLocalComposition = (
 	for (const decl of decls) {
 		if (isExternalFile(decl.getSourceFile()) || seen.has(decl)) continue;
 		if (
-			!ts.isTypeAliasDeclaration(decl) &&
+			!isTypeAliasLike(decl) &&
 			!ts.isInterfaceDeclaration(decl) &&
 			!ts.isClassDeclaration(decl)
 		) {
 			continue;
 		}
 		seen.add(decl);
-		const inner = buildParamSubstitutions(decl.typeParameters, typeArgs, walk, subst);
-		if (ts.isTypeAliasDeclaration(decl)) {
-			collectExternalTypeRefs(decl.type, walk, out, depth + 1, inner);
+		const typeParams = isTypeAliasLike(decl)
+			? typeAliasTypeParameters(decl)
+			: ts.getEffectiveTypeParameterDeclarations(decl);
+		const inner = buildParamSubstitutions(typeParams, typeArgs, walk, subst);
+		if (isTypeAliasLike(decl)) {
+			const rhs = typeAliasTypeNode(decl);
+			if (rhs) collectExternalTypeRefs(rhs, walk, out, depth + 1, inner);
 		} else {
 			// interfaces and classes both compose through `extends` entries — an
 			// interface's only clause kind is `extends`, and a class's
@@ -1303,12 +1698,11 @@ const collectFromLocalIndexedAccess = (
 					propDecl.end <= d.end
 			);
 			const containerParams =
-				container &&
-				(ts.isInterfaceDeclaration(container) ||
-					ts.isClassDeclaration(container) ||
-					ts.isTypeAliasDeclaration(container))
-					? container.typeParameters
-					: undefined;
+				container && (ts.isInterfaceDeclaration(container) || ts.isClassDeclaration(container))
+					? ts.getEffectiveTypeParameterDeclarations(container)
+					: container && isTypeAliasLike(container)
+						? typeAliasTypeParameters(container)
+						: undefined;
 			const inner = buildParamSubstitutions(
 				containerParams,
 				node.objectType.typeArguments,
@@ -1402,11 +1796,11 @@ const collectExternalTypeRefs = (
  * local names itself, so a reference to a local alias — the generated
  * `$$ComponentProps` the svelte2tsx props annotation names, or an author's own
  * `type Props = …` — reaches the composition behind it without unwrapping the
- * node first. Unwrapping was lossy at exactly the position the leaf fallback
- * covers: it replaced a generic reference with the definition's right-hand
- * side, dropping the written type arguments, and left an untraversable
- * definition (mapped, conditional) with no node to attribute at all, where the
- * root reference is the name the contract says to record.
+ * node first. Unwrapping would be lossy at exactly the position the leaf
+ * fallback covers: it would replace a generic reference with the definition's
+ * right-hand side, dropping the written type arguments, and leave an
+ * untraversable definition (mapped, conditional) with no node to attribute at
+ * all, where the root reference is the name the contract says to record.
  */
 const resolveAnnotationTypeNode = (typeNode: ts.Node): ts.TypeNode | undefined =>
 	ts.isTypeNode(typeNode) ? typeNode : undefined;
@@ -1437,16 +1831,36 @@ const resolveAnnotationTypeNode = (typeNode: ts.Node): ts.TypeNode | undefined =
  * inherited via `interface Props extends Bag` is labeled like an inline
  * `Bag & {…}` branch. Private properties are dropped silently: they are the
  * project's own code, with nothing to attribute.
+ *
+ * `admitNames` exempts named properties from the origin axis only: an
+ * external-origin property whose name is in the set lands in `admitted`
+ * instead of being dropped. Components pass the names their `$props()`
+ * destructuring binds, since naming a prop there shows the component handles
+ * it. Only named properties qualify: a name matching nothing but an index
+ * signature (`data-${string}`) has no property symbol to admit. Admission
+ * leaves `externalTypes` alone: the walk labels contributors by the written
+ * type, not by which of their properties survive, so a bag stays listed
+ * after some of its properties are admitted. It still contributes the rest,
+ * and it is where the admitted ones are declared.
  */
 export const filterDocumentedProperties = (
 	type: ts.Type,
 	typeNode: ts.Node,
 	checker: ts.TypeChecker,
-	isExternalFile: IsExternalFile
-): { properties: Array<ts.Symbol>; externalTypes: Array<string> } => {
-	const properties = type
-		.getProperties()
-		.filter((prop) => !isPrivateProperty(prop) && !isExternalProperty(prop, isExternalFile));
+	isExternalFile: IsExternalFile,
+	admitNames?: ReadonlySet<string>
+): {
+	properties: Array<ts.Symbol>;
+	admitted: Array<ts.Symbol>;
+	externalTypes: Array<string>;
+} => {
+	const properties: Array<ts.Symbol> = [];
+	const admitted: Array<ts.Symbol> = [];
+	for (const prop of type.getProperties()) {
+		if (isPrivateProperty(prop, checker)) continue;
+		if (!isExternalProperty(prop, isExternalFile)) properties.push(prop);
+		else if (admitNames?.has(prop.name)) admitted.push(prop);
+	}
 
 	const externalTypes: Array<string> = [];
 	const annotation = resolveAnnotationTypeNode(typeNode);
@@ -1460,7 +1874,7 @@ export const filterDocumentedProperties = (
 		);
 	}
 
-	return { properties, externalTypes };
+	return { properties, admitted, externalTypes };
 };
 
 /**
@@ -1478,6 +1892,12 @@ export const filterDocumentedProperties = (
  *
  * Only `extends` entries are passed by either caller: an interface has no
  * other clause kind, and a class's `implements` adds no members.
+ *
+ * Scoped to the processed declaration's own heritage clauses — the same node
+ * `extends` and `members` come from — so on a merged interface only the
+ * selected block contributes, while a reference to that interface elsewhere
+ * descends every block. The three fields stay consistent with each other rather
+ * than with the descent.
  *
  * @mutates declaration - sets `externalTypes` when the walk finds any, left absent when not
  */
@@ -1555,6 +1975,12 @@ export const getNodeLocation = (node: ts.Node): { file: string; line: number; co
 /**
  * Parse a TypeScript generic type parameter declaration into structured info.
  *
+ * A JSDoc `@template {C} T` writes its constraint on the tag rather than the
+ * parameter, for the tag's first parameter only, which
+ * `ts.getEffectiveConstraintOfTypeParameter` reads; the braces are dropped,
+ * so `constraint` is `C` as in `<T extends C>`. A bracketed default
+ * (`@template [T=D]`) is on the parameter like TypeScript's.
+ *
  * @param param - the TypeScript type parameter declaration node
  * @returns structured `GenericParamJson` with name, constraint, and default type
  */
@@ -1563,8 +1989,11 @@ export const parseGenericParam = (param: ts.TypeParameterDeclaration): GenericPa
 		name: param.name.text
 	};
 
-	if (param.constraint) {
-		result.constraint = param.constraint.getText();
+	const constraint = ts.getEffectiveConstraintOfTypeParameter(param);
+	if (constraint) {
+		result.constraint = (
+			ts.isJSDocTypeExpression(constraint) ? constraint.type : constraint
+		).getText();
 	}
 
 	if (param.default) {
@@ -1575,25 +2004,39 @@ export const parseGenericParam = (param: ts.TypeParameterDeclaration): GenericPa
 };
 
 /**
- * Extract modifier keywords from a node's modifiers.
+ * The modeled modifiers, each one's flag and output name, in the order
+ * TypeScript requires them written (an accessibility, then `static` or
+ * `abstract`, then `readonly`).
+ */
+const MODELED_MODIFIERS: ReadonlyArray<readonly [ts.ModifierFlags, DeclarationModifier]> = [
+	[ts.ModifierFlags.Public, 'public'],
+	[ts.ModifierFlags.Protected, 'protected'],
+	[ts.ModifierFlags.Static, 'static'],
+	[ts.ModifierFlags.Abstract, 'abstract'],
+	[ts.ModifierFlags.Readonly, 'readonly']
+];
+
+/**
+ * Extract a declaration's modifiers, like `['public', 'static', 'readonly']`,
+ * in the order TypeScript requires them written, so a JS declaration's tags
+ * and keywords order like its TS twin's keywords.
  *
- * Returns an array of modifier strings like `['public', 'readonly', 'static']`.
+ * Read through `ts.getCombinedModifierFlags`, which in JS adds the
+ * JSDoc modifier tags the checker reads (`@public`, `@protected`,
+ * `@readonly`; `@private` hides the member, see `isPrivateMemberDeclaration`)
+ * and in a `.ts` file reads keywords only. The checker reads no `@static` or
+ * `@abstract` tag, so neither does this; `@override` it reads, but `override`
+ * isn't a modeled modifier in either language.
+ *
+ * @param extraFlags - flags the declaration's position implies, like a static
+ *   `this.x = …` member's `Static`
  */
 export const extractModifiers = (
-	modifiers: ReadonlyArray<ts.ModifierLike> | undefined
+	node: ts.Declaration,
+	extraFlags: ts.ModifierFlags = ts.ModifierFlags.None
 ): Array<DeclarationModifier> => {
-	const modifierFlags: Array<DeclarationModifier> = [];
-	if (!modifiers) return modifierFlags;
-
-	for (const mod of modifiers) {
-		if (mod.kind === ts.SyntaxKind.PublicKeyword) modifierFlags.push('public');
-		else if (mod.kind === ts.SyntaxKind.ProtectedKeyword) modifierFlags.push('protected');
-		else if (mod.kind === ts.SyntaxKind.ReadonlyKeyword) modifierFlags.push('readonly');
-		else if (mod.kind === ts.SyntaxKind.StaticKeyword) modifierFlags.push('static');
-		else if (mod.kind === ts.SyntaxKind.AbstractKeyword) modifierFlags.push('abstract');
-	}
-
-	return modifierFlags;
+	const flags = ts.getCombinedModifierFlags(node) | extraFlags;
+	return MODELED_MODIFIERS.filter(([flag]) => flags & flag).map(([, name]) => name);
 };
 
 /**
@@ -1660,13 +2103,13 @@ export const emitCallOrConstructSignature = (
 			diagnostics
 		);
 
-		const sigDecl = sig.getDeclaration();
-		if (ts.isFunctionLike(sigDecl) && sigDecl.typeParameters?.length) {
-			member.genericParams = sigDecl.typeParameters.map(parseGenericParam);
-		}
+		const typeParams = signatureTypeParameters(sig.getDeclaration());
+		if (typeParams?.length) member.genericParams = typeParams.map(parseGenericParam);
 
 		if (signatures.length > 1) {
-			member.overloads = extractOverloads(signatures, ctx, tsdoc, memberName);
+			// a `(call)`/`(construct)` member's JSDoc is its first signature's
+			// (`resolveTsdocNode`), so that signature is the primary
+			member.overloads = extractOverloads(signatures, ctx, memberName, sig.declaration);
 		}
 
 		(declaration.members ??= []).push(member);
@@ -1678,7 +2121,7 @@ export const emitCallOrConstructSignature = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to analyze ${signatureKind} signatures for ${errorContext.kindLabel} "${declaration.name}": ${to_error_message(err)}`,
+			message: `Failed to analyze ${signatureKind} signatures for ${errorContext.kindLabel} "${declaration.name}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			functionName: declaration.name ?? '<default export>'
 		});

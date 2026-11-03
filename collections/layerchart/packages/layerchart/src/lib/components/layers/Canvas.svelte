@@ -1,6 +1,7 @@
 <script lang="ts" module>
-  import type { ComponentNode } from '$lib/contexts/chart.js';
-  import type { ChartState } from '$lib/states/chart.svelte.js';
+  // aliased — `Facet` is the component rendering the panels
+  import type { Facet as Panel } from '$lib/states/facet.svelte.js';
+  import type { ChartState, ComponentNode } from '$lib/states/chart.svelte.js';
 
   type SSRCaptureTarget = {
     chartState?: ChartState<any, any, any>;
@@ -64,7 +65,7 @@
     center?: boolean | 'x' | 'y';
 
     /**
-     * Ignore TransformContext.
+     * Ignore TransformContext and the chart's `isometric` view.
      *
      * Useful to add static elements such as legends.
      *
@@ -93,7 +94,13 @@
     ssrCaptureCallback?: (data: SSRCaptureTarget) => void;
 
     children?: Snippet<
-      [{ ref: HTMLCanvasElement; canvasContext: CanvasRenderingContext2D | undefined }]
+      [
+        {
+          ref: HTMLCanvasElement;
+          canvasContext: CanvasRenderingContext2D | undefined;
+          facet: Panel;
+        },
+      ]
     >;
   };
 
@@ -102,12 +109,14 @@
 </script>
 
 <script lang="ts">
+  import Facet from '../Facet.svelte';
   import { onMount, untrack, type Snippet } from 'svelte';
   import { Logger, localPoint } from '@layerstack/utils';
   import { MediaQueryPresets } from '@layerstack/svelte-state';
 
   import { getChartContext } from '$lib/contexts/chart.js';
   import { setLayerContext } from '$lib/contexts/layer.js';
+  import { setLayerIsometric } from '$lib/contexts/isometric.js';
   import { getPixelColor, scaleCanvas } from '../../utils/canvas.js';
   import { getColorStr, rgbColorGenerator } from '../../utils/color.js';
   import { useMutationObserver, watch } from 'runed';
@@ -118,7 +127,7 @@
     type CanvasContextValue,
     type ComponentRender,
   } from '$lib/contexts/canvas.js';
-  import { renderTree } from '$lib/server/renderTree.js';
+  import { paintOrder, renderTree } from '$lib/server/renderTree.js';
 
   let {
     ref: refProp = $bindable(),
@@ -134,7 +143,7 @@
     ignoreTransform = false,
     disableHitCanvas = false,
     class: className,
-    children,
+    children: childrenProp,
     onclick,
     ondblclick,
     onpointerenter,
@@ -157,6 +166,9 @@
   });
 
   const ctx = getChartContext();
+
+  /** Pan / zoom, the isometric view, and `center` — the one matrix the layer draws through */
+  const matrix = $derived(ctx.layerMatrix({ ignoreTransform, center }));
 
   const logger = new Logger('Canvas');
 
@@ -282,18 +294,10 @@
     // apply padding translation
     context.translate(ctx.padding.left ?? 0, ctx.padding.top ?? 0);
 
-    let newTranslate: undefined | { x: number; y: number };
-
-    // apply centering or transform
-    if (center) {
-      newTranslate = {
-        x: center === 'x' || center === true ? ctx.width / 2 : 0,
-        y: center === 'y' || center === true ? ctx.height / 2 : 0,
-      };
-      context.translate(newTranslate.x, newTranslate.y);
-    } else if (ctx.transform.mode === 'canvas' && !ignoreTransform) {
-      context.translate(ctx.transform.translate.x, ctx.transform.translate.y);
-      context.scale(ctx.transform.scale, ctx.transform.scale);
+    // Shared with the tooltip's pointer lookups, so what's drawn and what's hit agree
+    if (matrix) {
+      const { a, b, c, d, e, f } = matrix;
+      context.transform(a, b, c, d, e, f);
     }
 
     // Recursively render the component tree with proper save/restore scoping
@@ -345,7 +349,7 @@
       // Group: apply transform, recurse children (scoped by save/restore)
       hitCtx.save();
       node.canvasRender.render(hitCtx);
-      for (const child of node.children) {
+      for (const child of paintOrder(node)) {
         renderHitTree(hitCtx, child, groupHasEvents);
       }
       hitCtx.restore();
@@ -362,7 +366,7 @@
       }
     } else {
       // Non-rendering node: recurse children
-      for (const child of node.children) {
+      for (const child of paintOrder(node)) {
         renderHitTree(hitCtx, child, ancestorHasEvents);
       }
     }
@@ -409,12 +413,20 @@
   const canvasContext = createCanvasContext();
 
   $effect.pre(() => {
-    [ctx.height, ctx.width, ctx.containerHeight, ctx.containerWidth, ctx.transform.dragging];
+    [
+      ctx.height,
+      ctx.width,
+      ctx.containerHeight,
+      ctx.containerWidth,
+      ctx.transform.dragging,
+      matrix,
+    ];
     canvasContext.invalidate();
   });
 
   setCanvasContext(canvasContext);
   setLayerContext('canvas');
+  setLayerIsometric(() => (ignoreTransform ? null : ctx.isometricMatrix));
 </script>
 
 <canvas
@@ -472,7 +484,11 @@
 <!-- Hit canvas used for hidden context -->
 <canvas bind:this={hitCanvasElement} class="lc-hit-canvas" class:debug></canvas>
 
-{@render children?.({ ref, canvasContext: context })}
+<Facet>
+  {#snippet children({ facet })}
+    {@render childrenProp?.({ ref: ref!, canvasContext: context, facet })}
+  {/snippet}
+</Facet>
 {captureSSR()}
 
 <style>

@@ -9,17 +9,19 @@
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 	import StyleVariableButton from '@fuzdev/fuz_ui/StyleVariableButton.svelte';
 
-	import FontWeightControl from '$routes/FontWeightControl.svelte';
-	import FontSizeControl from '$routes/FontSizeControl.svelte';
-	import { default_variables } from '$lib/variables.ts';
+	import FontWeightControl from '#routes/FontWeightControl.svelte';
+	import FontSizeControl from '#routes/FontSizeControl.svelte';
+	import { default_variables } from '#lib/variables.ts';
 	import IconSizes from './IconSizes.svelte';
 	import {
 		line_height_names,
 		font_size_names,
 		text_scale_variants,
 		font_family_variants
-	} from '$lib/variable_data.ts';
-	import UnfinishedImplementationWarning from '$routes/docs/UnfinishedImplementationWarning.svelte';
+	} from '#lib/variable_data.ts';
+	import UnfinishedImplementationWarning from '#routes/docs/UnfinishedImplementationWarning.svelte';
+	import ResolvedLength from '#routes/docs/ResolvedLength.svelte';
+	import RootFontSize from '#routes/docs/RootFontSize.svelte';
 
 	const LIBRARY_ITEM_NAME = 'typography';
 
@@ -38,7 +40,7 @@
 	let selected_size = $state.raw(3);
 
 	// @fuz-classes font_family_sans font_family_serif font_family_mono
-	// @fuz-classes xs sm md lg xl
+	// @fuz-classes sized_xs sized_sm sized_md sized_lg sized_xl
 </script>
 
 <TomeContent {tome}>
@@ -85,13 +87,13 @@
 	<TomeSection>
 		<TomeSectionHeader text="Font families" />
 		<p>
-			These three are the <em>stacks</em>, and they keep meaning what they say. What the page
-			actually renders body text in is <code>--font_family</code>, which defaults to
-			<code>var(--font_family_sans)</code> - a theme that wants serif or mono body text retargets
-			that one rather than redefining a stack. Headings take
-			<code>--heading_font_family</code> (default <code>var(--font_family_serif)</code>), so serif
-			headings over a sans body is the default and "one family everywhere" is deliberately two
-			knobs.
+			These three are the <em>stacks</em>, and each keeps meaning what it says. Body text renders in
+			<code>--font_family</code> (default <code>var(--font_family_sans)</code>), so a theme that
+			wants serif or mono body text retargets it rather than redefining a stack. Headings take
+			<code>--heading_font_family</code> (default <code>var(--font_family_serif)</code>), so "one
+			family everywhere" is deliberately two knobs, and <code>--heading_letter_spacing</code>
+			(default <code>normal</code>) sets their tracking, where an <code>em</code> value follows each
+			heading's size.
 		</p>
 		<div>
 			{#each font_family_variants as font_family (font_family)}
@@ -113,12 +115,21 @@
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="Font sizes" />
+		<p>
+			Two knobs set the sizes. <code>--font_size_scale</code> multiplies every size, body text
+			(<code>md</code>) and the smaller sizes included, so a
+			<TomeLink slug="themes">theme</TomeLink> can enlarge reading text while small text keeps its
+			proportion to it. The sizes above <code>md</code> also step by one ratio,
+			<code>--type_scale_ratio</code>, which flattens or opens up the whole heading hierarchy
+			without moving body text.
+		</p>
+		<RootFontSize />
 		<form class="width_atmost_sm">
 			<FontWeightControl bind:selected_font_weight></FontWeightControl>
 		</form>
 		{#each font_size_variants as size (size.name)}
 			<div class="row flex-wrap:wrap">
-				<StyleVariableButton title={size.light} name={size.name}>
+				<StyleVariableButton title={size.base} name={size.name}>
 					<span
 						style:font-size="var(--{size.name})"
 						style:font-weight={selected_font_weight}
@@ -129,7 +140,7 @@
 				</StyleVariableButton>
 				<div class="row">
 					<span class="pr_sm">=</span>
-					<code>{computed_styles?.getPropertyValue('--' + size.name)}</code>
+					<code><ResolvedLength name={size.name} /></code>
 				</div>
 			</div>
 		{/each}
@@ -162,8 +173,7 @@
 			The text scale (<code>text_00</code> through <code>text_100</code>) provides tinted neutral
 			colors optimized for text legibility. The scale uses "prominence" semantics for light and dark
 			modes: low numbers are subtle, high numbers are strong. This matches the
-			<TomeLink slug="shading">shade scale</TomeLink>
-			pattern.
+			<TomeLink slug="shading">shade scale</TomeLink> pattern.
 		</p>
 		<ul>
 			<li><code>text_00</code> - surface-side endpoint: essentially invisible on surface</li>
@@ -221,18 +231,18 @@
 		<TomeSectionHeader text="Size composites" />
 		<p>
 			The <TomeLink slug="classes" hash="#Composite-classes">size composite classes</TomeLink>
-			<code>.xs</code>, <code>.sm</code>, <code>.md</code>, <code>.lg</code>, and <code>.xl</code>
-			set
-			<code>--flow_margin</code>, scaling the vertical spacing between flow elements and headings.
-			Apply on a container to cascade to children.
+			<code>.sized_xs</code>, <code>.sized_sm</code>, <code>.sized_md</code>,
+			<code>.sized_lg</code>, and <code>.sized_xl</code> set <code>--flow_margin</code>, scaling the
+			vertical spacing between flow elements and headings. Apply on a container to cascade to
+			children.
 		</p>
 		<Code
-			content={`<div class="lg">\n\t<h3>heading</h3>\n\t<p>paragraph</p>\n\t<p>paragraph</p>\n</div>`}
+			content={`<div class="sized_lg">\n\t<h3>heading</h3>\n\t<p>paragraph</p>\n\t<p>paragraph</p>\n</div>`}
 		/>
-		<div class="display:flex align-items:start flex-wrap:wrap gap_lg mb_lg">
-			{#each ['xs', 'sm', 'md', 'lg', 'xl'] as size (size)}
+		<div class="display:flex align-items:start flex-wrap:wrap gap_lg mb_flow">
+			{#each ['sized_xs', 'sized_sm', 'sized_md', 'sized_lg', 'sized_xl'] as size (size)}
 				<div class="panel p_md {size} width_atmost_sm">
-					<h4 class="mt_0">.{size}</h4>
+					<h4>.{size}</h4>
 					<p>Paragraph with size-composite flow margins between elements.</p>
 					<p>Another paragraph with the matching spacing.</p>
 				</div>
@@ -242,35 +252,34 @@
 			Here, size composites adjust the vertical rhythm by setting <code>--flow_margin</code>, not
 			the text size. Paragraph text keeps its fixed size, and headings keep their own sizes to
 			preserve hierarchy; only controls like buttons and chips read the composite's
-			<code>--font_size</code>. A bare <code>.heading</code> is the exception: it reads the
-			current <code>--font_size</code>, so <code>.heading.lg</code> or a
-			<code>--font_size</code> literal tiers it. Scaling headers and prose with size composites
-			is under consideration, design feedback is welcome.
+			<code>--font_size</code>. A bare <code>.heading</code> is the exception: it reads the current
+			<code>--font_size</code>, so <code>.heading.sized_lg</code> or a <code>--font_size</code>
+			literal tiers it. Scaling headers and prose with size composites is under consideration,
+			design feedback is welcome.
 		</UnfinishedImplementationWarning>
 	</TomeSection>
 
 	<TomeSection>
-		<TomeSectionHeader text="Reset with .md">
-			Reset with <code>.md</code>
+		<TomeSectionHeader text="Reset with .sized_md">
+			Reset with <code>.sized_md</code>
 		</TomeSectionHeader>
 		<p>
-			The <code>.md</code>
-			<TomeLink slug="classes" hash="#Composite-classes">composite class</TomeLink>
-			resets sizing to the defaults. Use it inside a sized container to restore normal sizing for a
-			subtree.
+			The <code>.sized_md</code>
+			<TomeLink slug="classes" hash="#Composite-classes">composite class</TomeLink> resets sizing to
+			the defaults. Use it inside a sized container to restore normal sizing for a subtree.
 		</p>
 		<Code
-			content={`<div class="sm">\n\t<p>small text</p>\n\t<div class="md">\n\t\t<p>back to normal</p>\n\t</div>\n</div>`}
+			content={`<div class="sized_sm">\n\t<p>small text</p>\n\t<div class="sized_md">\n\t\t<p>back to normal</p>\n\t</div>\n</div>`}
 		/>
-		<div class="display:flex align-items:start gap_lg mb_lg">
-			<div class="panel p_md sm">
-				<h4 class="mt_0">small region</h4>
+		<div class="display:flex align-items:start gap_lg">
+			<div class="panel p_md sized_sm">
+				<h4>small region</h4>
 				<p>Everything here is <span class="chip">small</span>.</p>
-				<div class="panel p_md md">
-					<h4 class="mt_0">normal nested inside</h4>
+				<div class="panel p_md sized_md">
+					<h4>normal nested inside</h4>
 					<p>
 						This region is back to <span class="chip">default sizing</span> despite the parent
-						having <code>.sm</code>.
+						having <code>.sized_sm</code>.
 					</p>
 				</div>
 			</div>

@@ -5,31 +5,29 @@ import { describe, test, assert, vi, afterEach } from 'vitest';
 import { flushSync } from 'svelte';
 import { ThemeState } from '@fuzdev/fuz_ui/theme_state.svelte.ts';
 
-import { ThemeEditorState } from '$routes/theme_editor_state.svelte.ts';
-import { base_theme } from '$lib/themes/base.ts';
-import { neon_theme } from '$lib/themes/neon.ts';
-import { NEUTRAL_CHROMA, BORDER_CHROMA_MULTIPLIER } from '$lib/ramps.ts';
+import { ThemeEditorState } from '#routes/theme_editor_state.svelte.ts';
+import { base_theme } from '#lib/themes/base.ts';
+import { marquee_theme } from '#lib/themes/marquee.ts';
+import { NEUTRAL_CHROMA, BORDER_CHROMA_MULTIPLIER } from '#lib/ramps.ts';
 import ThemeEditorHarness from './ThemeEditorHarness.svelte';
-import { mount_component, unmount_component, set_input_value } from './component_test_helpers.ts';
+import {
+	create_mount_tracker,
+	install_match_media,
+	set_input_value
+} from './component_test_helpers.ts';
 
-let mounted: { instance: Record<string, any>; container: HTMLElement } | null = null;
+install_match_media();
 
-afterEach(async () => {
+const mount = create_mount_tracker();
+
+afterEach(() => {
 	vi.unstubAllGlobals();
-	if (mounted) {
-		await unmount_component(mounted.instance, mounted.container);
-		mounted = null;
-	}
 });
 
 const mount_editor = (): { editor: ThemeEditorState; container: HTMLElement } => {
-	const editor = new ThemeEditorState([base_theme, neon_theme]);
-	mounted = mount_component(ThemeEditorHarness as any, {
-		editor,
-		theme_state: new ThemeState()
-	});
-	flushSync();
-	return { editor, container: mounted.container };
+	const editor = new ThemeEditorState({ themes: [base_theme, marquee_theme] });
+	const container = mount(ThemeEditorHarness, { editor, theme_state: new ThemeState() });
+	return { editor, container };
 };
 
 const border_chroma_input = (container: HTMLElement): HTMLInputElement => {
@@ -50,7 +48,7 @@ describe('ThemeEditor', () => {
 	});
 
 	test('a derived knob renders its resolved value as placeholder with an empty input', () => {
-		// with no matchMedia in jsdom the 'auto' scheme deterministically edits light
+		// no `dark` class on the root, so edits target the light scheme
 		const { container } = mount_editor();
 		const input = border_chroma_input(container);
 		const expected = NEUTRAL_CHROMA.light * BORDER_CHROMA_MULTIPLIER.light;
@@ -85,14 +83,15 @@ describe('ThemeEditor', () => {
 		assert(based_on instanceof HTMLSelectElement);
 		const confirm = vi.fn(() => false);
 		vi.stubGlobal('confirm', confirm);
-		set_input_value(based_on, 'neon', 'change');
+		set_input_value(based_on, 'marquee', 'change');
 		flushSync();
 		assert.strictEqual(editor.based_on, 'base');
+		assert.strictEqual(based_on.value, 'base', 'the select shows the base it kept');
 		assert.strictEqual(confirm.mock.calls.length, 1);
 		confirm.mockReturnValue(true);
-		set_input_value(based_on, 'neon', 'change');
+		set_input_value(based_on, 'marquee', 'change');
 		flushSync();
-		assert.strictEqual(editor.based_on, 'neon');
+		assert.strictEqual(editor.based_on, 'marquee');
 		assert.strictEqual(editor.overrides.size, 0);
 	});
 });

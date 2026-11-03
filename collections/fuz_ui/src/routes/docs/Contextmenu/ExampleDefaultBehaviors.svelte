@@ -1,8 +1,8 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 	import { selected_contextmenu_root_component_context } from './selected_root_component.svelte.ts';
 
 	const selected = selected_contextmenu_root_component_context.get();

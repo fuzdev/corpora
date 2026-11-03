@@ -1,5 +1,5 @@
 /**
- * Pure geometry helpers behind `Sparkline` and `ProjectActivityChart`.
+ * Pure geometry helpers behind `Sparkline`.
  *
  * Computes polyline points, alpha-fade gradient stops, and the end-dot
  * position for a series of values, so components stay thin and the math is

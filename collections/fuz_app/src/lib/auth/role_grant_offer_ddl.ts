@@ -15,7 +15,7 @@
  * @module
  */
 
-import { qualify_columns } from '../db/sql_columns.ts';
+import { iso8601_timestamp_expr, qualify_columns } from '../db/sql_columns.ts';
 import type { RoleGrantOffer } from './role_grant_offer_schema.ts';
 
 /** Sentinel UUID used inside the partial unique indexes to collapse `scope_id IS NULL` into a comparable value. */
@@ -33,7 +33,9 @@ export const ROLE_GRANT_OFFER_SCOPE_KIND_GLOBAL_TOKEN = 'GLOBAL';
  * The full `role_grant_offer` column set, named explicitly so a row read
  * fails loud on schema drift (see `ACCOUNT_COLUMNS` in
  * `auth/account_queries.ts` for the outage class). Column order follows
- * `RoleGrantOffer` and `ROLE_GRANT_OFFER_SCHEMA` below.
+ * `RoleGrantOffer` and `ROLE_GRANT_OFFER_SCHEMA` below, with
+ * `expire_audited_at` last — the appended `role_grant_offer_expire_audited_at`
+ * migration adds it after the frozen `CREATE TABLE`.
  *
  * Lives here rather than in `auth/role_grant_offer_queries.ts` because two
  * query modules project this table — see the placement rule in
@@ -55,8 +57,29 @@ export const ROLE_GRANT_OFFER_COLUMNS = [
 	'decline_reason',
 	'retracted_at',
 	'superseded_at',
-	'resulting_role_grant_id'
+	'resulting_role_grant_id',
+	'expire_audited_at'
 ] as const satisfies ReadonlyArray<keyof RoleGrantOffer>;
+
+/**
+ * The `role_grant_offer` timestamp override, by row qualifier (`''` bare,
+ * `o` for the history JOIN, `u` for the `updated` CTE's outer select). Lives
+ * beside the const for the same reason the const does — both query modules
+ * that project this table need it.
+ *
+ * A cascade's inner `RETURNING` deliberately projects the *raw* columns: the
+ * outer select over the `updated` CTE applies this, and `to_char` over an
+ * already-formatted text column would fail.
+ */
+export const role_grant_offer_expr = iso8601_timestamp_expr(ROLE_GRANT_OFFER_COLUMNS, [
+	'created_at',
+	'expires_at',
+	'accepted_at',
+	'declined_at',
+	'retracted_at',
+	'superseded_at',
+	'expire_audited_at'
+]);
 
 /**
  * Outer `SELECT` over an `updated` CTE of `role_grant_offer` rows, joining
@@ -66,10 +89,17 @@ export const ROLE_GRANT_OFFER_COLUMNS = [
  * `auth/role_grant_offer_queries.ts`). The CTE must be named `updated` and
  * `RETURNING` the full offer row.
  */
-export const ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT = `SELECT ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'u')}, grantor.account_id AS from_account_id
+export const ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT = `SELECT ${qualify_columns(
+	ROLE_GRANT_OFFER_COLUMNS,
+	'u',
+	role_grant_offer_expr('u')
+)}, grantor.account_id AS from_account_id
 		FROM updated u
 		JOIN actor grantor ON grantor.id = u.from_actor_id`;
 
+// Frozen v1 body — `expire_audited_at` is added by the appended
+// `role_grant_offer_expire_audited_at` migration (with its partial sweep
+// index), so a fresh bootstrap and an old deployed DB converge on one shape.
 export const ROLE_GRANT_OFFER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS role_grant_offer (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -1,5 +1,6 @@
 <script lang="ts" generics="T">
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
+	import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
 	import type { Snippet } from 'svelte';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
@@ -20,7 +21,7 @@
 		key = (option: T): unknown => label(option),
 		children,
 		...rest
-	}: SvelteHTMLElements['menu'] & {
+	}: OmitStrict<SvelteHTMLElements['menu'], 'title' | 'children' | 'onselect'> & {
 		options: Array<T>;
 		/** The selected option, compared by identity; bindable. */
 		value: T;

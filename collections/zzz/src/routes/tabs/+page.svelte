@@ -1,19 +1,20 @@
 <script lang="ts">
 	import { icon_tab } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from '#lib/Icon.svelte';
 	import { Browser } from './browser.svelte.ts';
 	import { sample_tabs } from './sample_tabs.ts';
 	import BrowserView from './BrowserView.svelte';
-	import { frontend_context } from '$lib/frontend.svelte.ts';
-	import ExternalLink from '$lib/ExternalLink.svelte';
+	import { frontend_context } from '#lib/frontend.svelte.ts';
+	import ExternalLink from '#lib/ExternalLink.svelte';
+	import { create_detached } from '#lib/reactive_helpers.svelte.ts';
 
 	const app = frontend_context.get();
 
 	// TODO super hacky but w/e, inits app.browser to the global
-	const browser: Browser = ((app as any).browser ??= new Browser({
-		app,
-		json: { tabs: sample_tabs }
-	}));
+	// detached — it outlives this page (see `create_detached`)
+	const browser: Browser = ((app as any).browser ??= create_detached(
+		() => new Browser({ app, json: { tabs: sample_tabs } })
+	));
 </script>
 
 {#if browser.browserified}
@@ -27,7 +28,7 @@
 {/if}
 
 {#snippet content()}
-	<h1><Svg data={icon_tab} /> tabs</h1>
+	<h1><Icon data={icon_tab} /> tabs</h1>
 
 	<section class="width_atmost_md">
 		{#if browser.browserified}
@@ -46,7 +47,7 @@
 				onclick={() => (browser.browserified = !browser.browserified)}
 				class:palette_i={!browser.browserified}
 				class:palette_h={browser.browserified}
-				class="inline sm"
+				class="inline sized_sm"
 			>
 				{browser.browserified ? 'un' : ''}browserify!
 			</button>
@@ -57,7 +58,7 @@
 			<code>[backtick `]</code> to
 			<button
 				type="button"
-				class="inline sm"
+				class="inline sized_sm"
 				class:palette_d={app.ui.show_sidebar}
 				class:palette_f={!app.ui.show_sidebar}
 				onclick={() => {

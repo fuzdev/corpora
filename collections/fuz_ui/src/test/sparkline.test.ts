@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'vitest';
 
-import { sparkline_geometry } from '$lib/sparkline.ts';
+import { sparkline_geometry } from '#lib/sparkline.ts';
 
 const OPTIONS = { width: 100, height: 24, stroke_width: 2 };
 

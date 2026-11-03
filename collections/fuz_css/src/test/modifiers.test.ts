@@ -1,6 +1,6 @@
 import { test, assert, describe } from 'vitest';
 
-import { MODIFIERS } from '$lib/modifiers.ts';
+import { MODIFIERS } from '#lib/modifiers.ts';
 
 /**
  * Loads CSS selectors from @webref/css for validation.
@@ -68,24 +68,27 @@ describe('MODIFIERS', () => {
 	});
 
 	describe('CSS value format', () => {
-		test('media modifiers start with @media', () => {
+		test('media modifiers are media conditions, not wrapped', () => {
 			for (const m of MODIFIERS) {
 				if (m.type === 'media') {
-					assert.isTrue(
-						m.css.startsWith('@media '),
-						`media modifier "${m.name}" should start with "@media "`
-					);
+					assert.notInclude(m.css, '@media', `media modifier "${m.name}" is a bare condition`);
+					assert.match(m.css, /^(\(|print$)/, `media modifier "${m.name}" is a condition`);
 				}
 			}
 		});
 
-		test('ancestor modifiers start with :root.', () => {
+		test('width modifiers declare their bound', () => {
+			for (const m of MODIFIERS) {
+				if (m.type === 'media' && m.css.startsWith('(width')) {
+					assert.ok(m.width, `width modifier "${m.name}" declares its bound`);
+				}
+			}
+		});
+
+		test('ancestor modifiers name a color scheme', () => {
 			for (const m of MODIFIERS) {
 				if (m.type === 'ancestor') {
-					assert.isTrue(
-						m.css.startsWith(':root.'),
-						`ancestor modifier "${m.name}" should start with ":root."`
-					);
+					assert.include(['light', 'dark'], m.css, `ancestor modifier "${m.name}"`);
 				}
 			}
 		});

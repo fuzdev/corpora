@@ -50,7 +50,7 @@
  * tx atomicity + the `(namespace, name)` PK on `schema_version`: the
  * loser's INSERT hits a PK violation, the chain-tx rolls back, and the
  * next boot reads the committed state and proceeds cleanly. Environments
- * without `pg_advisory_lock` (some PGlite versions) silently fall through.
+ * without `pg_advisory_lock` (pglet) silently fall through.
  *
  * @module
  */
@@ -72,7 +72,9 @@ export interface Migration {
 /**
  * A named group of ordered migrations.
  *
- * Array index = position in the chain. Pre-stable: bodies, names, and
+ * A consumer builds one as a plain literal under a name of its own; the spine's
+ * namespaces (`reserved_migration_namespaces`) come from
+ * `create_spine_migration_namespace`. Array index = position in the chain. Pre-stable: bodies, names, and
  * positions can change between versions (consumers re-bootstrap on upgrade).
  */
 export interface MigrationNamespace {
@@ -94,9 +96,9 @@ export interface MigrationResult {
  * text is for operators, not control flow.
  */
 export type MigrationErrorKind =
+	| 'namespace-reserved'
 	| 'binary-older-than-db'
 	| 'name-divergence-at-N'
-	| 'old-tracker-shape'
 	| 'migration-failed'
 	| 'baseline-name-not-in-code'
 	| 'baseline-name-out-of-order'
@@ -131,6 +133,78 @@ export class MigrationError extends Error {
 	}
 }
 
+/**
+ * Migration namespace names reserved by the spine: auth (`fuz_auth`), cells
+ * (`fuz_cell`), and facts (`fuz_facts`) — the Rust spine's
+ * `RESERVED_NAMESPACES`. Only a namespace built by
+ * `create_spine_migration_namespace` runs under one: `run_migrations` and
+ * `baseline` refuse any other `MigrationNamespace` bearing one of these names,
+ * so a consumer can't mint tracker rows that collide with a spine chain's.
+ * Typed as `ReadonlyArray<string>` (not a literal tuple) so `.includes()`
+ * accepts any namespace string without a cast.
+ */
+export const reserved_migration_namespaces: ReadonlyArray<string> = [
+	'fuz_auth',
+	'fuz_cell',
+	'fuz_facts'
+];
+
+/** The namespace objects the spine built, the only ones admitted under a reserved name. */
+const spine_migration_namespaces: WeakSet<MigrationNamespace> = new WeakSet();
+
+/**
+ * Build a spine module's own migration namespace (auth, cells, facts) — the
+ * one form `run_migrations` and `baseline` admit under a
+ * `reserved_migration_namespaces` name. Admission is by object identity, so
+ * consumers splice the exported object itself (`CELL_MIGRATION_NS`), never a
+ * copy; consumer code builds a plain `MigrationNamespace` literal instead.
+ *
+ * @param namespace - one of `reserved_migration_namespaces`
+ * @param migrations - the chain, in execution order
+ * @returns the namespace, registered as the spine's
+ * @throws Error when `namespace` is not a reserved name
+ */
+export const create_spine_migration_namespace = (
+	namespace: string,
+	migrations: Array<Migration>
+): MigrationNamespace => {
+	if (!reserved_migration_namespaces.includes(namespace)) {
+		throw new Error(
+			`migration namespace "${namespace}" is built as a spine namespace but is not a reserved spine name; build a plain MigrationNamespace instead`
+		);
+	}
+	const ns: MigrationNamespace = { namespace, migrations };
+	spine_migration_namespaces.add(ns);
+	return ns;
+};
+
+/**
+ * Refuse a namespace bearing a `reserved_migration_namespaces` name unless the
+ * spine built it (`create_spine_migration_namespace`). `run_migrations` and
+ * `baseline` run this before touching the database; a server assembly can
+ * call it to refuse a bad chain earlier.
+ *
+ * @param namespaces - the chain to check
+ * @throws MigrationError with `kind` `namespace-reserved`, naming the first offending namespace
+ */
+export const assert_migration_namespaces = (
+	namespaces: ReadonlyArray<MigrationNamespace>
+): void => {
+	for (const ns of namespaces) {
+		if (
+			reserved_migration_namespaces.includes(ns.namespace) &&
+			!spine_migration_namespaces.has(ns)
+		) {
+			throw new MigrationError(
+				'namespace-reserved',
+				`migration namespace "${ns.namespace}" is reserved for the spine; a consumer namespace must choose a different name. ` +
+					`Hint: to run the spine's own chain, pass its exported namespace object, not a copy.`,
+				{ namespace: ns.namespace }
+			);
+		}
+	}
+};
+
 const SCHEMA_VERSION_DDL = `
 CREATE TABLE IF NOT EXISTS schema_version (
   namespace  TEXT        NOT NULL,
@@ -140,29 +214,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
   PRIMARY KEY (namespace, name),
   UNIQUE (namespace, sequence)
 )`;
-
-/**
- * Detect the pre-0.42 `schema_version` shape (`namespace`, `version`,
- * `applied_at`). The new-shape DDL uses `IF NOT EXISTS` and would silently
- * no-op against the old table, so this probe runs before DDL and before any
- * per-namespace lock.
- */
-const detect_old_tracker = async (db: Db): Promise<boolean> => {
-	const row = await db.query_one<{ exists: boolean }>(
-		`SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_schema = 'public'
-			  AND table_name = 'schema_version'
-			  AND column_name = 'version'
-		) as exists`
-	);
-	return row?.exists ?? false;
-};
-
-const OLD_TRACKER_HINT =
-	'Detected fuz_app < 0.42 tracker shape (schema_version.version column exists). ' +
-	'Hint: `DROP TABLE schema_version` and re-run, or call `baseline()` first if ' +
-	'preserving an existing schema.';
 
 /**
  * Compute a stable int32 advisory lock key from a namespace string.
@@ -181,7 +232,7 @@ const namespace_lock_key = (namespace: string): number => {
  * Run `fn` with the namespace's advisory lock held.
  *
  * Acquire / release are best-effort and silently fall through in
- * environments without `pg_advisory_lock` (some PGlite versions). The
+ * environments without `pg_advisory_lock` (pglet). The
  * `finally` ensures release on any throw from `fn`.
  */
 const with_namespace_lock = async <T>(
@@ -236,17 +287,15 @@ const with_namespace_lock = async <T>(
  * @returns one result per namespace where work happened (already-up-to-date
  *   namespaces are omitted)
  * @mutates schema_version - inserts one row per applied migration
- * @throws MigrationError with `kind` of `binary-older-than-db`,
- *   `name-divergence-at-N`, `old-tracker-shape`, or `migration-failed`
+ * @throws MigrationError with `kind` of `namespace-reserved` (before touching
+ *   the database), `binary-older-than-db`, `name-divergence-at-N`, or
+ *   `migration-failed`
  */
 export const run_migrations = async (
 	db: Db,
 	namespaces: Array<MigrationNamespace>
 ): Promise<Array<MigrationResult>> => {
-	if (await detect_old_tracker(db)) {
-		throw new MigrationError('old-tracker-shape', OLD_TRACKER_HINT);
-	}
-
+	assert_migration_namespaces(namespaces);
 	await db.query(SCHEMA_VERSION_DDL);
 
 	const results: Array<MigrationResult> = [];
@@ -292,10 +341,10 @@ export const run_migrations = async (
 				}
 			}
 
-			// Step 5: up-to-date case
+			// up-to-date case
 			if (applied.length === migrations.length) return;
 
-			// Step 6: run pending tail in a single chain-tx
+			// Step 5: run pending tail in a single chain-tx
 			let next_sequence = applied.length > 0 ? applied[applied.length - 1]!.sequence + 1 : 0;
 			const applied_names: Array<string> = [];
 
@@ -335,19 +384,15 @@ export const run_migrations = async (
  * Insert tracker rows for the named migrations of a namespace **without
  * executing them**.
  *
- * Used to promote an existing schema (e.g. produced by a pre-0.42 build,
- * preserved through a tracker-shape upgrade) into the new identity tracker.
+ * Used to promote an existing schema (e.g. produced by an out-of-band
+ * bootstrap, or a hand-applied DDL set) into the identity tracker.
  * `baseline()` trusts the operator-supplied list — it does not verify that
  * the schema actually matches what the named migrations would have produced.
  * Pair with a schema-assertion script post-baseline before re-enabling traffic.
  *
  * Contract:
- * - Probes for the pre-0.42 tracker shape; throws `old-tracker-shape` if
- *   found (DDL with `IF NOT EXISTS` would otherwise no-op against the old
- *   table and the INSERT would fail with a confusing column-not-found).
- * - Creates the new-shape `schema_version` table if missing — cutover
- *   scripts that just dropped the old-shape table can call `baseline()`
- *   directly with no separate DDL step.
+ * - Creates the `schema_version` table if missing — a promotion script can
+ *   call `baseline()` against a fresh tracker with no separate DDL step.
  * - Acquires the same per-namespace advisory lock as `run_migrations` (with
  *   the same try/catch fallback for environments lacking `pg_advisory_lock`).
  * - Refuses if any tracker rows already exist *for this namespace* — lets
@@ -363,19 +408,16 @@ export const run_migrations = async (
  * @param names - prefix of `ns.migrations[].name` to record as already-applied
  * @mutates schema_version - inserts tracker rows for `names` without running
  *   the corresponding migration bodies
- * @throws MigrationError with `kind` of `old-tracker-shape`,
- *   `baseline-name-not-in-code`, `baseline-name-out-of-order`, or
- *   `baseline-namespace-already-populated`
+ * @throws MigrationError with `kind` of `namespace-reserved` (before touching
+ *   the database), `baseline-name-not-in-code`, `baseline-name-out-of-order`,
+ *   or `baseline-namespace-already-populated`
  */
 export const baseline = async (
 	db: Db,
 	ns: MigrationNamespace,
 	names: ReadonlyArray<string>
 ): Promise<void> => {
-	if (await detect_old_tracker(db)) {
-		throw new MigrationError('old-tracker-shape', OLD_TRACKER_HINT, { namespace: ns.namespace });
-	}
-
+	assert_migration_namespaces([ns]);
 	await db.query(SCHEMA_VERSION_DDL);
 
 	const code_names = ns.migrations.map((m) => m.name);

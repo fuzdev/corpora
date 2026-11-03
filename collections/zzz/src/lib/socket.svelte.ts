@@ -1,21 +1,25 @@
 import { SvelteMap } from 'svelte/reactivity';
 import type { AsyncStatus } from '@fuzdev/fuz_util/async.ts';
 import {
+	DEFAULT_HEARTBEAT_INTERVAL,
+	DEFAULT_RECONNECT_DELAY,
+	DEFAULT_RECONNECT_DELAY_MAX,
 	FrontendWebsocketClient,
 	socket_status_to_async_status,
+	type FrontendWebsocketHeartbeatOptions,
 	type SocketMessageHandler,
 	type SocketErrorHandler
 } from '@fuzdev/fuz_app/actions/socket.svelte.ts';
 import type { WebsocketRpcConnection } from '@fuzdev/fuz_app/actions/transports_ws.ts';
 import type { JsonrpcRequestId } from '@fuzdev/fuz_app/http/jsonrpc.ts';
 import { UNKNOWN_ERROR_MESSAGE } from '@fuzdev/fuz_app/http/jsonrpc_errors.ts';
-import { create_uuid, type Uuid } from '@fuzdev/fuz_util/id.ts';
+import { create_uuid, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import {
-	DEFAULT_HEARTBEAT_INTERVAL,
-	DEFAULT_RECONNECT_DELAY,
-	DEFAULT_RECONNECT_DELAY_MAX,
-	DEFAULT_AUTO_RECONNECT
+	DEFAULT_AUTO_RECONNECT,
+	HEARTBEAT_INTERVAL_BOUNDS,
+	RECONNECT_DELAY_BOUNDS,
+	to_bounded_ms
 } from './socket_helpers.ts';
 import type { Frontend } from './frontend.svelte.ts';
 
@@ -46,9 +50,9 @@ export interface FailedMessage extends QueuedMessage {
  * delegate to the underlying `FrontendWebsocketClient`, keeping the
  * pending-request map in one canonical place.
  *
- * The bespoke heartbeat timer has been retired — fuz_app's
- * `FrontendWebsocketClient` now ships an activity-aware heartbeat that
- * sends the shared `heartbeat_action` at `heartbeat_interval` idle.
+ * fuz_app's `FrontendWebsocketClient` owns the activity-aware heartbeat,
+ * sending the shared `heartbeat_action` at `heartbeat_interval` idle, with a
+ * receive timeout it scales to the interval (`resolve_heartbeat_receive_timeout`).
  * Assigning `heartbeat_interval` pushes the new policy into the live
  * client immediately (the timer is restarted in place when connected).
  *
@@ -56,6 +60,10 @@ export interface FailedMessage extends QueuedMessage {
  * `auto_reconnect`) propagate to the underlying client on assignment
  * via `apply_reconnect_policy()` — in-flight waits are monotonically
  * shortened (never extended).
+ *
+ * The millisecond settings coerce and clamp on assignment
+ * (`HEARTBEAT_INTERVAL_BOUNDS`, `RECONNECT_DELAY_BOUNDS`) since form inputs
+ * can hand over strings or empty values; a non-numeric write is ignored.
  */
 export class Socket implements WebsocketRpcConnection {
 	readonly app: Frontend;
@@ -67,17 +75,19 @@ export class Socket implements WebsocketRpcConnection {
 	#auto_reconnect: boolean = $state.raw(DEFAULT_AUTO_RECONNECT);
 
 	/**
-	 * Heartbeat idle interval in ms. Writing pushes the new policy into the
-	 * underlying client immediately — when connected, the live timer is
-	 * restarted in place; when disconnected, the policy is stashed for the
-	 * next `connect()`.
+	 * Heartbeat idle interval in ms, clamped to `HEARTBEAT_INTERVAL_BOUNDS`.
+	 * Writing pushes the new policy into the underlying client immediately —
+	 * when connected, the live timer is restarted in place; when
+	 * disconnected, the policy is stashed for the next `connect()`.
 	 */
 	get heartbeat_interval(): number {
 		return this.#heartbeat_interval;
 	}
 	set heartbeat_interval(value: number) {
-		this.#heartbeat_interval = value;
-		this.#client?.set_heartbeat({ interval: value });
+		const interval = to_bounded_ms(value, HEARTBEAT_INTERVAL_BOUNDS);
+		if (interval === null) return;
+		this.#heartbeat_interval = interval;
+		this.#client?.set_heartbeat(this.#heartbeat_policy());
 	}
 
 	/**
@@ -89,14 +99,18 @@ export class Socket implements WebsocketRpcConnection {
 		return this.#reconnect_delay;
 	}
 	set reconnect_delay(value: number) {
-		this.#reconnect_delay = value;
+		const delay = to_bounded_ms(value, RECONNECT_DELAY_BOUNDS);
+		if (delay === null) return;
+		this.#reconnect_delay = delay;
 		this.apply_reconnect_policy();
 	}
 	get reconnect_delay_max(): number {
 		return this.#reconnect_delay_max;
 	}
 	set reconnect_delay_max(value: number) {
-		this.#reconnect_delay_max = value;
+		const delay_max = to_bounded_ms(value, RECONNECT_DELAY_BOUNDS);
+		if (delay_max === null) return;
+		this.#reconnect_delay_max = delay_max;
 		this.apply_reconnect_policy();
 	}
 	get auto_reconnect(): boolean {
@@ -108,14 +122,6 @@ export class Socket implements WebsocketRpcConnection {
 	}
 
 	#client: FrontendWebsocketClient | null = $state.raw(null);
-
-	/**
-	 * UI timestamps for the "last send" / "last receive" diagnostics in
-	 * `CapabilityWebsocket`. Not used for heartbeat scheduling —
-	 * fuz_app's client owns that.
-	 */
-	last_send_time: number | null = $state.raw(null);
-	last_receive_time: number | null = $state.raw(null);
 
 	#client_message_unsubscribe: (() => void) | null = null;
 	#client_error_unsubscribe: (() => void) | null = null;
@@ -132,17 +138,50 @@ export class Socket implements WebsocketRpcConnection {
 	readonly current_reconnect_delay: number = $derived(this.#client?.current_reconnect_delay ?? 0);
 	readonly last_connect_time: number | null = $derived(this.#client?.last_connect_time ?? null);
 	/**
+	 * Epoch ms of the current client's last frame sent — requests,
+	 * notifications, heartbeats, and cancels alike — for the "last send"
+	 * diagnostic in `CapabilityWebsocket`. `null` until the first send, and
+	 * again after `connect` replaces the client.
+	 */
+	readonly last_send_time: number | null = $derived(this.#client?.last_send_time ?? null);
+	/**
+	 * Epoch ms of the current client's last frame received — responses (error
+	 * responses and heartbeat replies included), notifications, and requests —
+	 * for the "last receive" diagnostic. `null` until the first receive, and
+	 * again after `connect` replaces the client.
+	 */
+	readonly last_receive_time: number | null = $derived(this.#client?.last_receive_time ?? null);
+	/**
 	 * Changes each time a close fires — used by the UI as an animation key so
 	 * each reconnect wait restarts the progress bar.
 	 */
 	readonly reconnect_attempt: number = $derived(this.#client?.last_close_time ?? 0);
 	readonly is_reconnect_pending: boolean = $derived(this.#client?.status === 'reconnecting');
 
+	/**
+	 * Whether the server closed the socket with `WS_CLOSE_SESSION_REVOKED` —
+	 * terminal for this client. Usually the session is gone, but not always
+	 * (see `reconnect_revoked`).
+	 */
+	readonly revoked: boolean = $derived(this.#client?.revoked ?? false);
+
+	/**
+	 * Whether the server closed the socket with `WS_CLOSE_CONNECTION_LIMIT`,
+	 * to admit a newer connection on the account. Closed until the next
+	 * `connect()` (`disconnect()` drops the client and the flag with it);
+	 * anything that reconnects on `initial` must check this first —
+	 * `status` reads `initial` here, and reconnecting unasked would close a
+	 * newer socket in turn.
+	 */
+	readonly superseded: boolean = $derived(this.#client?.superseded ?? false);
+
 	readonly status: AsyncStatus = $derived(
-		socket_status_to_async_status(this.#client?.status ?? 'initial', this.#client?.revoked ?? false)
+		socket_status_to_async_status(this.#client?.status ?? 'initial', this.revoked)
 	);
 
 	readonly connected: boolean = $derived(this.#client?.connected ?? false);
+	/** Whether the underlying client is opening on its own (`FrontendWebsocketClient.will_reconnect`). */
+	readonly will_reconnect: boolean = $derived(this.#client?.will_reconnect ?? false);
 	readonly open: boolean = $derived(this.connected);
 	readonly can_send: boolean = $derived(this.connected);
 	readonly has_queued_messages: boolean = $derived(this.message_queue.length > 0);
@@ -154,9 +193,13 @@ export class Socket implements WebsocketRpcConnection {
 			? Math.max(0, this.app.time.now_ms - this.last_connect_time)
 			: null
 	);
+	/**
+	 * `connection_duration` rounded down to the `Time` tick interval (a minute by
+	 * default), so it never overstates the time connected — `0` means less than one interval.
+	 */
 	readonly connection_duration_rounded: number | null = $derived.by(() =>
 		this.connection_duration !== null
-			? Math.round(this.connection_duration / this.app.time.interval) * this.app.time.interval
+			? Math.floor(this.connection_duration / this.app.time.interval) * this.app.time.interval
 			: null
 	);
 
@@ -183,11 +226,10 @@ export class Socket implements WebsocketRpcConnection {
 						delay_max: this.reconnect_delay_max
 					}
 				: false,
-			heartbeat: { interval: this.heartbeat_interval }
+			heartbeat: this.#heartbeat_policy()
 		});
 
 		this.#client_message_unsubscribe = client.add_message_handler((event) => {
-			this.last_receive_time = Date.now();
 			for (const handler of this.#message_handlers) {
 				handler(event);
 			}
@@ -204,6 +246,21 @@ export class Socket implements WebsocketRpcConnection {
 
 	disconnect(): void {
 		this.#teardown_client();
+	}
+
+	/**
+	 * Reconnect after the server closed the socket as revoked — a revoked
+	 * client never reconnects on its own, so this replaces it with a fresh
+	 * one. Call only once a session recheck finds the session still valid:
+	 * some revocations close every socket of the account while ending only
+	 * another session (another tab's logout, an API-token revoke-all).
+	 *
+	 * @returns whether a reconnect started (`false` unless revoked)
+	 */
+	reconnect_revoked(): boolean {
+		if (!this.revoked) return false;
+		this.connect();
+		return true;
 	}
 
 	#teardown_client(): void {
@@ -234,14 +291,15 @@ export class Socket implements WebsocketRpcConnection {
 		return client.request(method, params, options);
 	}
 
+	/**
+	 * Fire-and-forget send, queued for retry when it can't go out now. With
+	 * `auto_reconnect` on, queueing connects an idle socket (`status` `initial`)
+	 * — except a `superseded` one.
+	 */
 	send(data: object): boolean {
 		if (this.can_send && this.#client) {
 			try {
-				const sent = this.#client.send(data);
-				if (sent) {
-					this.last_send_time = Date.now();
-					return true;
-				}
+				if (this.#client.send(data)) return true;
 				this.#queue_message(data);
 				return false;
 			} catch (error) {
@@ -282,6 +340,11 @@ export class Socket implements WebsocketRpcConnection {
 		this.#client?.cancel_reconnect();
 	}
 
+	#heartbeat_policy(): FrontendWebsocketHeartbeatOptions {
+		// the client raises its default receive timeout to fit the interval
+		return { interval: this.#heartbeat_interval };
+	}
+
 	/**
 	 * Push the current `auto_reconnect` / `reconnect_delay` /
 	 * `reconnect_delay_max` fields to the underlying client. No-op when
@@ -313,7 +376,8 @@ export class Socket implements WebsocketRpcConnection {
 		};
 		this.message_queue.push(message);
 
-		if (this.status === 'initial' && this.auto_reconnect && this.url_input) {
+		// a superseded socket reads `initial` too, and only the user reopens it
+		if (this.status === 'initial' && !this.superseded && this.auto_reconnect && this.url_input) {
 			this.connect();
 		}
 	}
@@ -325,10 +389,7 @@ export class Socket implements WebsocketRpcConnection {
 		}
 
 		try {
-			const sent = this.#client.send(message.data);
-			if (sent) {
-				this.last_send_time = Date.now();
-			} else {
+			if (!this.#client.send(message.data)) {
 				this.#fail_message(message, this.#client.last_send_error?.message ?? 'send returned false');
 			}
 		} catch (error) {

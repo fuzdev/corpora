@@ -4,7 +4,7 @@
 	import type { PartUnion } from './part.svelte.ts';
 	import XmlAttributeEditor from './XmlAttributeEditor.svelte';
 	import { icon_add } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import { format_placeholder } from './helpers.ts';
 
 	const {
@@ -24,7 +24,7 @@
 				part.xml_tag_name_default}'"
 		>
 			<input
-				class="plain sm"
+				class="plain sized_sm"
 				type="checkbox"
 				bind:checked={
 					() => part.has_xml_tag,
@@ -37,7 +37,7 @@
 			<small>xml tag</small>
 		</label>
 		<input
-			class="plain flex:1 sm"
+			class="plain flex:1 sized_sm"
 			class:dormant={!part.has_xml_tag}
 			placeholder={part.has_xml_tag ? format_placeholder(part.xml_tag_name_default) : undefined}
 			bind:value={part.xml_tag_name}
@@ -45,11 +45,11 @@
 		/>
 		<button
 			type="button"
-			class="plain sm"
+			class="plain sized_sm"
 			title="add xml attribute"
 			onclick={() => part.add_attribute()}
 		>
-			<Svg data={icon_add} />
+			<Icon data={icon_add} />
 		</button>
 	</div>
 

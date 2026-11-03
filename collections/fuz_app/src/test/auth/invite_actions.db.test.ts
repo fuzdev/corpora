@@ -4,7 +4,7 @@
  * `error_schemas.test.ts` asserts the `ERROR_INVITE_*` constants are exported
  * with the right string values, but does not fire them through the dispatcher.
  * These tests round-trip each denial path through a real RPC call against a
- * PGlite-backed admin surface and assert `error.data.reason`.
+ * database-backed admin surface and assert `error.data.reason`.
  *
  * Unlike `admin_actions.failure_audit.db.test.ts`, the invite handlers do not
  * emit `outcome: 'failure'` audit rows on denial paths — so only the JSON-RPC
@@ -18,24 +18,20 @@ import { describe, test, assert } from 'vitest';
 import {
 	invite_create_action_spec,
 	invite_delete_action_spec
-} from '$lib/auth/admin_action_specs.ts';
+} from '#lib/auth/admin_action_specs.ts';
 import {
 	ERROR_INVITE_ACCOUNT_EXISTS_USERNAME,
 	ERROR_INVITE_ACCOUNT_EXISTS_EMAIL,
 	ERROR_INVITE_DUPLICATE,
 	ERROR_INVITE_NOT_FOUND
-} from '$lib/http/error_schemas.ts';
-import { query_create_account_with_actor } from '$lib/auth/account_queries.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import {
-	RPC_PATH,
-	create_admin_route_specs,
-	describe_db,
-	session_options
-} from './admin_rpc_test_helpers.ts';
+} from '#lib/http/error_schemas.ts';
+import { query_create_account_with_actor } from '#lib/auth/account_queries.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { RPC_PATH, create_admin_route_specs, session_options } from './admin_rpc_test_helpers.ts';
 
 // Valid v4 UUID that won't collide with any real invite row.
 const missing_invite_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' as Uuid;

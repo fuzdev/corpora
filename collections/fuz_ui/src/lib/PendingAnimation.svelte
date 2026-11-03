@@ -1,3 +1,12 @@
+<!--
+@component
+
+@cssprop --font_size - size of the dots, inherited by default
+@cssprop --scale_x - horizontal scale of a dot at rest, growing to 1 mid-cycle
+@cssprop --scale_y - vertical scale of a dot at rest, growing to 1 mid-cycle
+@cssprop --scale_z - depth scale of a dot at rest, growing to 1 mid-cycle
+@cssprop --animation_duration - length of one animation cycle
+-->
 <script lang="ts">
 	import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
 	import type { Snippet } from 'svelte';

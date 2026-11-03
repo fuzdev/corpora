@@ -1,4 +1,5 @@
-import { color_schemes, type ColorScheme, type Theme } from '@fuzdev/fuz_css/theme.ts';
+import { color_schemes, type ColorScheme } from '@fuzdev/fuz_css/theme.ts';
+import { parse_theme, type Theme } from '@fuzdev/fuz_css/variable.ts';
 import { default_themes } from '@fuzdev/fuz_css/themes.ts';
 import { BROWSER } from 'esm-env';
 
@@ -64,7 +65,7 @@ export const save_theme = (theme: Theme | null, key = THEME_STORAGE_KEY): void =
 };
 
 export const load_theme = (fallback: Theme = default_themes[0]!, key = THEME_STORAGE_KEY): Theme =>
-	load_from_storage<Theme>(key, true) ?? fallback; // TODO use `parse_theme` from fuz_css
+	load_from_storage(key, true, parse_theme) ?? fallback;
 
 // TODO move to fuz_css
 const parse_color_scheme = (value: unknown): ColorScheme | null =>

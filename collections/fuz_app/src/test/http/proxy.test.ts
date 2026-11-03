@@ -20,8 +20,13 @@ import {
 	create_proxy_middleware,
 	create_proxy_middleware_spec,
 	type ParsedProxy
-} from '$lib/http/proxy.ts';
-import { get_client_ip } from '$lib/http/client_ip.ts';
+} from '#lib/http/proxy.ts';
+import { get_client_ip } from '#lib/http/client_ip.ts';
+
+// A `/0` built directly — `parse_proxy_entry` refuses one, so the matcher
+// tests that cover the wildcard prefix construct it.
+const IPV4_SLASH_ZERO: ParsedProxy = { type: 'cidr', network: 0n, prefix: 0, address_type: 'IPv4' };
+const IPV6_SLASH_ZERO: ParsedProxy = { type: 'cidr', network: 0n, prefix: 0, address_type: 'IPv6' };
 
 // --- normalize_ip ---
 
@@ -221,13 +226,22 @@ describe('parse_proxy_entry', () => {
 		}
 	});
 
-	test('parses IPv6 /0 as CIDR', () => {
-		const result = parse_proxy_entry('::/0');
-		assert.strictEqual(result.type, 'cidr');
-		if (result.type === 'cidr') {
-			assert.strictEqual(result.prefix, 0);
-			assert.strictEqual(result.address_type, 'IPv6');
+	test('refuses a /0 prefix for either family, naming the entry', () => {
+		// a /0 trusts every client as a proxy — the client's own XFF would pick
+		// every per-IP bucket — so it fails at parse time, aligned or not
+		for (const entry of ['0.0.0.0/0', '::/0', '10.0.0.0/0', 'fe80::/0', '::ffff:0.0.0.0/0']) {
+			assert.throws(
+				() => parse_proxy_entry(entry),
+				`CIDR prefix 0 trusts every address as a proxy: ${entry}`
+			);
 		}
+		// the narrowest real ranges still parse
+		for (const entry of ['0.0.0.0/1', '::/1']) {
+			const result = parse_proxy_entry(entry);
+			assert.strictEqual(result.type === 'cidr' && result.prefix, 1, entry);
+		}
+		// shape errors still come first
+		assert.throws(() => parse_proxy_entry('hello/0'), /Invalid proxy CIDR/);
 	});
 
 	test('throws on non-network-aligned IPv4 CIDR', () => {
@@ -341,7 +355,8 @@ describe('is_trusted_ip', () => {
 	});
 
 	test('matches IPv4 CIDR /0 (all)', () => {
-		const proxies = [parse_proxy_entry('0.0.0.0/0')];
+		// constructed directly — the parser refuses a /0; this pins the matcher alone
+		const proxies: Array<ParsedProxy> = [IPV4_SLASH_ZERO];
 		assert.ok(is_trusted_ip('1.2.3.4', proxies));
 		assert.ok(is_trusted_ip('255.255.255.255', proxies));
 	});
@@ -378,7 +393,7 @@ describe('is_trusted_ip', () => {
 	});
 
 	test('matches IPv6 CIDR /0 (all)', () => {
-		const proxies = [parse_proxy_entry('::/0')];
+		const proxies: Array<ParsedProxy> = [IPV6_SLASH_ZERO];
 		assert.ok(is_trusted_ip('fe80::1', proxies));
 		assert.ok(is_trusted_ip('2001:db8::1', proxies));
 		assert.ok(is_trusted_ip('::1', proxies));
@@ -459,14 +474,14 @@ describe('is_trusted_ip', () => {
 
 	test('IPv4 /0 CIDR does not match IPv6 addresses', () => {
 		// 0.0.0.0/0 is "all IPv4" — the cross-family guard must hold even for wildcard prefixes
-		const proxies = [parse_proxy_entry('0.0.0.0/0')];
+		const proxies: Array<ParsedProxy> = [IPV4_SLASH_ZERO];
 		assert.ok(!is_trusted_ip('::1', proxies));
 		assert.ok(!is_trusted_ip('fe80::1', proxies));
 	});
 
 	test('IPv6 /0 CIDR does not match IPv4 addresses', () => {
 		// ::/0 is "all IPv6" — must not bleed into IPv4 space
-		const proxies = [parse_proxy_entry('::/0')];
+		const proxies: Array<ParsedProxy> = [IPV6_SLASH_ZERO];
 		assert.ok(!is_trusted_ip('127.0.0.1', proxies));
 		assert.ok(!is_trusted_ip('10.0.0.1', proxies));
 	});
@@ -553,17 +568,16 @@ describe('resolve_client_ip', () => {
 		assert.strictEqual(resolve_client_ip(' , , ', localhost), undefined);
 	});
 
-	test('port-suffixed XFF entry is skipped during right-to-left walk', () => {
+	test('port-suffixed XFF entry stops the right-to-left walk', () => {
 		// Non-standard proxies may include ports (e.g. 203.0.113.1:8080).
 		// Hono's `distinctRemoteAddr` lazily classifies anything-with-colons
 		// as IPv6, but `validate_ip_strict` round-trips through
 		// `convertIPv*ToBinary` which throws on this entry — so the strict
-		// check rejects it. Walk continues past the port-suffixed entry and
-		// returns the next untrusted, strictly-valid entry.
-		// Walk: 127.0.0.1 (trusted, skip) → 203.0.113.1:8080 (malformed, skip)
-		// → 198.51.100.7 (strictly-valid, untrusted) → return.
+		// check rejects it, and the walk stops there: 198.51.100.7, left of
+		// it, was written before any trusted hop vouched for it.
+		// Walk: 127.0.0.1 (trusted, skip) → 203.0.113.1:8080 (malformed, stop).
 		const result = resolve_client_ip('198.51.100.7, 203.0.113.1:8080, 127.0.0.1', localhost);
-		assert.strictEqual(result, '198.51.100.7');
+		assert.strictEqual(result, undefined);
 	});
 
 	test('colon-injection bypass is blocked — attacker:controlled is rejected', () => {
@@ -571,16 +585,15 @@ describe('resolve_client_ip', () => {
 		// IPv6 (any-string-with-colons). A naive `!distinctRemoteAddr` skip
 		// would let this through. The strict round-trip through
 		// `convertIPv6ToBinary` throws (NaN→BigInt), so `validate_ip_strict`
-		// rejects it and the walk skips. Falls through to the trusted-only
-		// branch and returns the trusted proxy as leftmost-valid.
+		// rejects it and the walk stops — the middleware uses the connection IP.
 		const result = resolve_client_ip('attacker:controlled, 127.0.0.1', localhost);
-		assert.strictEqual(result, '127.0.0.1');
+		assert.strictEqual(result, undefined);
 	});
 
-	test('bracketed IPv6 with port is skipped (not a valid IP form here)', () => {
+	test('bracketed IPv6 with port stops the walk (not a valid IP form here)', () => {
 		// `[::1]:8080` and `[2001:db8::1]:8080` are URL-style host:port forms,
 		// not valid bare IPs. validate_ip_strict rejects them.
-		assert.strictEqual(resolve_client_ip('[::1]:8080, 127.0.0.1', localhost), '127.0.0.1');
+		assert.strictEqual(resolve_client_ip('[::1]:8080, 127.0.0.1', localhost), undefined);
 	});
 
 	test('normalizes XFF entries with ::ffff: prefix', () => {
@@ -599,37 +612,60 @@ describe('resolve_client_ip', () => {
 		assert.strictEqual(resolve_client_ip('203.0.113.1,,127.0.0.1', localhost), '203.0.113.1');
 	});
 
-	test('malformed non-IP entry in chain is skipped', () => {
+	test('malformed non-IP entry in chain stops the walk', () => {
 		// Malformed entry can't be returned as the client IP — that would let
-		// an attacker controlling XFF poison the rate-limit key. With only a
-		// trusted-proxy entry left after the skip, the walk falls through and
-		// returns undefined; the middleware then falls back to the connection IP.
-		assert.strictEqual(resolve_client_ip('not-an-ip, 127.0.0.1', localhost), '127.0.0.1');
-	});
-
-	test('rightmost malformed entry is skipped, walk continues to untrusted-valid', () => {
-		// Companion to the malformed-then-trusted case above: when the
-		// rightmost entry fails `validate_ip_strict` but a leftmost entry is
-		// strictly-valid + untrusted, the walker skips the garbage and returns
-		// the valid entry. Without an explicit case, an attacker-controlled
-		// rightmost garbage entry that suppressed the walk (returning undefined
-		// or the garbage value) would slip past — but only the multi-entry
-		// trusted-malformed-fallback path tests the skip on the trusted side.
-		assert.strictEqual(resolve_client_ip('203.0.113.1, garbage', localhost), '203.0.113.1');
-		// And with a port-suffix malformed rightmost (the legitimate non-standard
-		// proxy case the JSDoc tradeoff documents).
+		// an attacker controlling XFF poison the rate-limit key — and the walk
+		// goes no further left; the middleware falls back to the connection IP.
+		assert.strictEqual(resolve_client_ip('not-an-ip, 127.0.0.1', localhost), undefined);
 		assert.strictEqual(
-			resolve_client_ip('203.0.113.1, 198.51.100.7:8080', localhost),
-			'203.0.113.1'
+			resolve_client_ip('198.51.100.7, attacker-controlled, 127.0.0.1', localhost),
+			undefined
 		);
 	});
 
-	test('multiple malformed entries are all skipped', () => {
-		// Both garbage entries skipped, only 127.0.0.1 remains (trusted) — the
-		// "every entry trusted (or malformed)" branch returns the leftmost
-		// well-formed entry, which is the trusted proxy itself. Middleware
-		// logs a misconfiguration warn on this path.
-		assert.strictEqual(resolve_client_ip('garbage, also-bad, 127.0.0.1', localhost), '127.0.0.1');
+	test('rightmost malformed entry stops the walk — the client-written entry left of it is never returned', () => {
+		// A trusted hop that appends a non-bare-IP token (`ip:port` from an
+		// Azure App Gateway or IIS ARR, `unknown` from Squid, `unix:` from
+		// nginx on a unix socket) leaves the client's own `X-Forwarded-For`
+		// value as the entry to its left. Skipping the token and walking on
+		// would hand the rate-limit key to the client: a fresh bucket on every
+		// request.
+		for (const appended of [
+			'garbage',
+			'198.51.100.7:8080',
+			'[2001:db8::1]:8080',
+			'unknown',
+			'unix:'
+		]) {
+			assert.strictEqual(
+				resolve_client_ip(`203.0.113.1, ${appended}`, localhost),
+				undefined,
+				appended
+			);
+		}
+	});
+
+	test('an untrusted entry right of a malformed one is returned before the walk meets it', () => {
+		assert.strictEqual(
+			resolve_client_ip('garbage, 198.51.100.7, 127.0.0.1', localhost),
+			'198.51.100.7'
+		);
+	});
+
+	test('a malformed entry left of only trusted ones stops the walk', () => {
+		// Formerly the "every entry trusted (or malformed)" branch returned the
+		// leftmost well-formed (trusted) entry; the walk now stops at the
+		// malformed one and the middleware falls back to the connection IP.
+		assert.strictEqual(resolve_client_ip('garbage, also-bad, 127.0.0.1', localhost), undefined);
+	});
+
+	test('the entry trim is JS `trim`: U+00A0 is trimmed, U+0085 is not', () => {
+		// the Rust spine trims the same set (`fuz_http::trim_js_whitespace`)
+		assert.strictEqual(
+			resolve_client_ip('198.51.100.7, \u00a0203.0.113.6\u00a0', localhost),
+			'203.0.113.6'
+		);
+		assert.strictEqual(resolve_client_ip('198.51.100.7, 203.0.113.6\u0085', localhost), undefined);
 	});
 
 	test('all-malformed XFF returns undefined (middleware falls back to connection IP)', () => {
@@ -897,26 +933,27 @@ describe('create_proxy_middleware', () => {
 		assert.strictEqual(body.ip, '127.0.0.1');
 	});
 
-	test('malformed XFF entry is skipped — attacker cannot poison rate-limit key', async () => {
-		// `resolve_client_ip` skips entries that fail `distinctRemoteAddr`
-		// during the right-to-left walk so an attacker who controls XFF
-		// cannot rotate non-IP strings as fresh per-IP rate-limit buckets.
-		// The walk falls through to the leftmost well-formed entry (here
-		// the trusted proxy itself, which triggers the "All XFF entries are
-		// trusted" misconfiguration warn), and the middleware then exposes
-		// `client_ip` as that resolved value.
+	test('malformed XFF entry stops the walk — the request keys on the connection IP', async () => {
+		// A malformed entry is never the client IP (an attacker who controls
+		// XFF would rotate non-IP strings as fresh per-IP rate-limit buckets),
+		// and neither is the client-written entry left of it: the walk stops
+		// and the middleware falls back to the connection IP.
 		//
 		// Tradeoff: legitimate non-standard proxies that include ports in
-		// XFF entries (e.g. `203.0.113.1:8080`) also fail `distinctRemoteAddr`
-		// and lose per-client distinction in rate limiting. nginx + cloud
-		// LBs don't include ports — the regression is bounded by operator
-		// configuration. See `resolve_client_ip` JSDoc.
+		// XFF entries (e.g. `203.0.113.1:8080`) lose per-client distinction in
+		// rate limiting. nginx + cloud LBs append bare IPs — the regression is
+		// bounded by operator configuration. See `resolve_client_ip` TSDoc.
 		const app = create_test_app(['127.0.0.1']);
-		const res = await app.request('/ip', {
-			headers: { 'X-Forwarded-For': 'attacker-controlled, 127.0.0.1' }
-		});
-		const body = await res.json();
-		assert.strictEqual(body.ip, '127.0.0.1');
+		for (const header of [
+			'198.51.100.7, attacker-controlled',
+			'198.51.100.7, 203.0.113.9:5555',
+			'198.51.100.7, unknown, 127.0.0.1',
+			'garbage, also-bad'
+		]) {
+			const res = await app.request('/ip', { headers: { 'X-Forwarded-For': header } });
+			const body = await res.json();
+			assert.strictEqual(body.ip, '127.0.0.1', header);
+		}
 	});
 
 	test('handles multiple XFF headers (Hono concatenation)', async () => {
@@ -993,13 +1030,14 @@ describe('CIDR boundary IPs', () => {
 			cidr: '10.0.0.0/24',
 			expected: false
 		},
-		{ name: '0.0.0.0 is in 0.0.0.0/0', ip: '0.0.0.0', cidr: '0.0.0.0/0', expected: true },
+		{ name: '0.0.0.0 is in 0.0.0.0/1', ip: '0.0.0.0', cidr: '0.0.0.0/1', expected: true },
 		{
-			name: '255.255.255.255 is in 0.0.0.0/0',
-			ip: '255.255.255.255',
-			cidr: '0.0.0.0/0',
+			name: '127.255.255.255 is in 0.0.0.0/1',
+			ip: '127.255.255.255',
+			cidr: '0.0.0.0/1',
 			expected: true
 		},
+		{ name: '128.0.0.0 is outside 0.0.0.0/1', ip: '128.0.0.0', cidr: '0.0.0.0/1', expected: false },
 		{ name: '/32 matches only the exact IP', ip: '10.0.0.1', cidr: '10.0.0.1/32', expected: true },
 		{ name: '/32 rejects adjacent IP', ip: '10.0.0.2', cidr: '10.0.0.1/32', expected: false }
 	];

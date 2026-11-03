@@ -40,6 +40,7 @@
     grid = false,
     ticks,
     tickSpacing,
+    tickOcclusion = false,
     tickMultiline = false,
     tickLength = 4,
     tickMarks = true,
@@ -51,9 +52,11 @@
     transitionIn,
     transitionInParams,
     scale,
+    domain,
     classes = {},
     class: className,
     tickLabel,
+    facetAll,
     ...restProps
   }: AxisBaseProps<T> = $props();
 
@@ -68,6 +71,7 @@
         grid,
         ticks,
         tickSpacing,
+        tickOcclusion,
         tickMultiline,
         tickLength,
         tickMarks,
@@ -77,87 +81,120 @@
         fill,
         motion,
         scale,
+        domain,
         classes,
+        facetAll,
       }) as AxisProps
   );
 </script>
 
-<Group
-  {...restProps}
-  data-placement={placement}
-  class={cls('lc-axis', `placement-${placement}`, classes.root, className)}
->
-  {#if rule !== false}
-    <Rule
-      x={placement === 'left' ? '$left' : placement === 'right' ? '$right' : placement === 'angle'}
-      y={placement === 'top' ? '$top' : placement === 'bottom' ? '$bottom' : placement === 'radius'}
-      {stroke}
-      {motion}
-      {...extractLayerProps(rule, 'lc-axis-rule', classes.rule ?? '')}
-    />
-  {/if}
-
-  {#if typeof label === 'function'}
-    {@render label({ props: c.resolvedLabelProps })}
-  {:else if label}
-    <Text {...c.resolvedLabelProps} />
-  {/if}
-
-  {#each c.tickItems as item, index (item.key)}
-    <Group {transitionIn} {transitionInParams} class="lc-axis-tick-group">
-      {#if grid !== false}
-        <Rule
-          x={c.orientation === 'horizontal' || c.orientation === 'angle' ? item.tick : false}
-          y={c.orientation === 'vertical' || c.orientation === 'radius' ? item.tick : false}
+{#if c.visible}
+  <Group
+    {...restProps}
+    data-placement={placement}
+    class={cls('lc-axis', `placement-${placement}`, classes.root, className)}
+  >
+    {#if rule !== false && placement === 'back'}
+      {#if c.back}
+        <Line
+          x1={c.back.corner.x}
+          y1={c.back.corner.y}
+          x2={c.back.top.x}
+          y2={c.back.top.y}
           {stroke}
-          {motion}
-          {...extractLayerProps(grid, 'lc-axis-grid', classes.rule ?? '')}
+          {...extractLayerProps(rule, 'lc-axis-rule', classes.rule ?? '')}
         />
       {/if}
+    {:else if rule !== false}
+      <Rule
+        x={placement === 'left'
+          ? '$left'
+          : placement === 'right'
+            ? '$right'
+            : placement === 'angle'}
+        y={placement === 'top'
+          ? '$top'
+          : placement === 'bottom'
+            ? '$bottom'
+            : placement === 'radius'}
+        {stroke}
+        {motion}
+        {...extractLayerProps(rule, 'lc-axis-rule', classes.rule ?? '')}
+      />
+    {/if}
 
-      {#if tickMarks}
-        {@const tickClasses = cls('lc-axis-tick', classes.tick)}
-        {#if c.orientation === 'horizontal'}
-          <Line
-            x1={item.tickCoordsX}
-            y1={item.tickCoordsY}
-            x2={item.tickCoordsX}
-            y2={item.tickCoordsY + (placement === 'top' ? -tickLength : tickLength)}
+    {#if typeof label === 'function'}
+      {@render label({ props: c.resolvedLabelProps })}
+    {:else if label}
+      <Text {...c.resolvedLabelProps} />
+    {/if}
+
+    {#each c.tickItems as item, index (item.key)}
+      <Group {transitionIn} {transitionInParams} class="lc-axis-tick-group">
+        {#if grid !== false && c.orientation !== 'back'}
+          <Rule
+            x={c.orientation === 'horizontal' || c.orientation === 'angle' ? item.tick : false}
+            y={c.orientation === 'vertical' || c.orientation === 'radius' ? item.tick : false}
             {stroke}
             {motion}
-            class={tickClasses}
-          />
-        {:else if c.orientation === 'vertical'}
-          <Line
-            x1={item.tickCoordsX}
-            y1={item.tickCoordsY}
-            x2={item.tickCoordsX + (placement === 'left' ? -tickLength : tickLength)}
-            y2={item.tickCoordsY}
-            {stroke}
-            {motion}
-            class={tickClasses}
-          />
-        {:else if c.orientation === 'angle'}
-          <Line
-            x1={item.radialTickCoordsX}
-            y1={item.radialTickCoordsY}
-            x2={item.radialTickMarkCoordsX}
-            y2={item.radialTickMarkCoordsY}
-            {stroke}
-            {motion}
-            class={tickClasses}
+            {...extractLayerProps(grid, 'lc-axis-grid', classes.rule ?? '')}
           />
         {/if}
-      {/if}
 
-      {#if tickLabel}
-        {@render tickLabel({ props: item.tickLabelProps, index })}
-      {:else}
-        <Text {...item.tickLabelProps} />
-      {/if}
-    </Group>
-  {/each}
-</Group>
+        {#if tickMarks}
+          {@const tickClasses = cls('lc-axis-tick', classes.tick)}
+          {#if c.orientation === 'horizontal'}
+            <Line
+              x1={item.tickCoordsX}
+              y1={item.tickCoordsY}
+              x2={item.tickCoordsX}
+              y2={item.tickCoordsY + (placement === 'top' ? -tickLength : tickLength)}
+              {stroke}
+              {motion}
+              class={tickClasses}
+            />
+          {:else if c.orientation === 'vertical'}
+            <Line
+              x1={item.tickCoordsX}
+              y1={item.tickCoordsY}
+              x2={item.tickCoordsX + (placement === 'left' ? -tickLength : tickLength)}
+              y2={item.tickCoordsY}
+              {stroke}
+              {motion}
+              class={tickClasses}
+            />
+          {:else if c.orientation === 'back' && c.back}
+            <Line
+              x1={item.tickCoordsX}
+              y1={item.tickCoordsY}
+              x2={item.tickCoordsX + c.back.left.x * tickLength}
+              y2={item.tickCoordsY + c.back.left.y * tickLength}
+              {stroke}
+              {motion}
+              class={tickClasses}
+            />
+          {:else if c.orientation === 'angle'}
+            <Line
+              x1={item.radialTickCoordsX}
+              y1={item.radialTickCoordsY}
+              x2={item.radialTickMarkCoordsX}
+              y2={item.radialTickMarkCoordsY}
+              {stroke}
+              {motion}
+              class={tickClasses}
+            />
+          {/if}
+        {/if}
+
+        {#if tickLabel}
+          {@render tickLabel({ props: item.tickLabelProps, index })}
+        {:else}
+          <Text {...item.tickLabelProps} />
+        {/if}
+      </Group>
+    {/each}
+  </Group>
+{/if}
 
 <style>
   @layer components {

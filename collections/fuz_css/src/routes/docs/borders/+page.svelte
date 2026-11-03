@@ -17,16 +17,14 @@
 		alpha_variants,
 		intensity_variants,
 		type IntensityVariant
-	} from '$lib/variable_data.ts';
-	import UnfinishedImplementationWarning from '$routes/docs/UnfinishedImplementationWarning.svelte';
+	} from '#lib/variable_data.ts';
+	import UnfinishedImplementationWarning from '#routes/docs/UnfinishedImplementationWarning.svelte';
 	import ResolvedColorCode from './ResolvedColorCode.svelte';
+	import ResolvedLength from '#routes/docs/ResolvedLength.svelte';
 
 	const LIBRARY_ITEM_NAME = 'borders';
 
 	const tome = tome_get_by_slug(LIBRARY_ITEM_NAME);
-
-	const computed_styles =
-		typeof window === 'undefined' ? null : window.getComputedStyle(document.documentElement);
 
 	const border_radius_classes = [
 		'border-radius:0',
@@ -56,7 +54,6 @@
 	<!-- <div>border_color</div> -->
 	<!-- <div>border_width</div> -->
 	<!-- <div>outline_width</div> -->
-	<!-- <div>outline_style</div> -->
 	<!-- <div>outline_color</div> -->
 
 	<section>
@@ -71,28 +68,23 @@
 		<p>
 			<code>--border_style</code> is global - asides, blockquotes, and form fields all read it.
 			Buttons take <code>--button_border_style</code> instead (defaulting to
-			<code>var(--border_style)</code>), and swap to
-			<code>--button_border_style_active</code>
-			while pressed. Buttons are the only element with a raised/pressed affordance, so the split
-			lands there rather than as a general state variable.
+			<code>var(--border_style)</code>), and swap to <code>--button_border_style_active</code> while
+			pressed. Buttons are the only element with a pressed state, so only they get the pair.
 		</p>
 		<p>
-			That pair is what makes beveled chrome expressible, since
-			<MdnLink path="Web/CSS/border-style" />'s <code>inset</code> and <code>outset</code> derive
-			their light and dark edges from the border color - raised buttons that press in, over sunken
-			fields:
+			That pair makes beveled chrome expressible, since <MdnLink path="Web/CSS/border-style" />'s
+			<code>inset</code> and <code>outset</code> derive their light and dark edges from the border
+			color. Raised buttons that press in, over sunken fields:
 		</p>
 		<Code
 			lang="ts"
 			content={`variables: [
-	{name: 'border_style', light: 'inset'}, // sunken fields
-	{name: 'button_border_style', light: 'outset'}, // raised buttons
-	{name: 'button_border_style_active', light: 'inset'} // that press in
+	{name: 'border_style', base: 'inset'}, // sunken fields
+	{name: 'button_border_style', base: 'outset'}, // raised buttons
+	{name: 'button_border_style_active', base: 'inset'} // that press in
 ]`}
 		/>
-		<p>
-			The <TomeLink slug="themes">nineties</TomeLink> exemplar theme is built on exactly this.
-		</p>
+		<p>The <TomeLink slug="themes">guestbook</TomeLink> theme is built on exactly this.</p>
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="Tinted alpha borders" />
@@ -124,7 +116,8 @@
 		<TomeSection>
 			<TomeSectionHeader text="Opaque borders with shades" tag="h4" />
 			<UnfinishedImplementationWarning>
-				We may want to add <code>border_shade_NN</code> utility classes for opaque borders.
+				There are no utility classes for opaque borders yet, like a <code>border_shade_NN</code>
+				family.
 			</UnfinishedImplementationWarning>
 			<p>
 				For opaque borders, use <TomeLink slug="shading">shade</TomeLink> variables directly. This
@@ -146,19 +139,19 @@ border-color: var(--shade_30);
 	<TomeSection>
 		<TomeSectionHeader text="Border colors" />
 		<p>
-			Use palette variables like <code>palette_a_{selected_intensity}</code> for colored borders.
-			The intensity controls the color's prominence.
+			Classes like <code>.border_a_{selected_intensity}</code> apply the palette variables
+			(<code>--palette_a_{selected_intensity}</code>) to borders. The intensity controls the color's
+			prominence.
 		</p>
 		<form class="intensity_selector">
 			<fieldset class="row mb_0">
 				{#each intensity_variants as intensity (intensity)}
-					<label class="box gap_xs mb_0 px_xs4" class:selected={selected_intensity === intensity}>
+					<label class="box gap_xs px_xs4" class:selected={selected_intensity === intensity}>
 						<input
 							type="radio"
 							name="intensity"
 							value={intensity}
 							bind:group={selected_intensity}
-							class="screen_reader_only"
 						/>
 						{intensity}
 					</label>
@@ -195,7 +188,6 @@ border-color: var(--shade_30);
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="Border widths" />
-		<UnfinishedImplementationWarning />
 		<div class="border_examples border_widths">
 			{#each border_width_variants as border_width_variant (border_width_variant)}
 				{@const name = 'border_width_' + border_width_variant}
@@ -203,9 +195,7 @@ border-color: var(--shade_30);
 					<div class="border_example border_width" style:border-width="var(--{name})">
 						<StyleVariableButton {name} />
 					</div>
-					<span class="pl_sm pr_sm">=</span><code>
-						{computed_styles?.getPropertyValue('--' + name)}
-					</code>
+					<span class="pl_sm pr_sm">=</span><code><ResolvedLength {name} /></code>
 				</div>
 			{/each}
 		</div>
@@ -213,9 +203,11 @@ border-color: var(--shade_30);
 	<TomeSection>
 		<TomeSectionHeader text="Outlines" />
 		<p>
-			Each border utility class has a corresponding outline variant using the same border variables
-			(like <code>outline_b_50</code>, <code>outline_width_4</code>, and
-			<code>outline-style:solid</code>), and there are also two special outline variables:
+			Each border utility class has a corresponding outline variant (like <code>outline_b_50</code>,
+			<code>outline_width_4</code>, and <code>outline-style:solid</code>). The letterless classes
+			differ, though: <code>border_color_50</code> is the translucent border ramp, while
+			<code>outline_color_50</code> is the opaque shade ramp. There are also two special outline
+			variables:
 		</p>
 		<div class="border_examples outline_widths">
 			{#each outline_width_variants as outline_width_variant (outline_width_variant)}
@@ -224,17 +216,23 @@ border-color: var(--shade_30);
 					<div class="border_example {name} outline-style:solid outline_color_30">
 						<StyleVariableButton {name} />
 					</div>
-					<span class="pl_sm pr_sm">=</span><code>
-						{computed_styles?.getPropertyValue('--' + name)}
-					</code>
+					<span class="pl_sm pr_sm">=</span><code><ResolvedLength {name} /></code>
 				</div>
 			{/each}
 		</div>
+		<p>
+			Focus rings draw with <code>--outline_style</code> (default <code>solid</code>), so a theme
+			can dot or dash every ring at once.
+		</p>
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="Border radius" />
 		<p>
-			Border variables with <TomeLink slug="classes" hash="Token-classes">token classes</TomeLink>:
+			Border variables with <TomeLink slug="classes" hash="Token-classes">token classes</TomeLink>.
+			Each tier is the base radius times <code>--radius_scale</code>, floored at
+			<code>--border_radius_min</code>. Buttons and form fields other than checkboxes read
+			<code>--control_radius</code> (the <code>sm</code> tier by default), so a theme can round its
+			controls apart from its panels:
 		</p>
 		<div class="border_examples border_radii">
 			{#each border_radius_variants as radius (radius)}
@@ -243,9 +241,7 @@ border-color: var(--shade_30);
 					<div class="border_example border_radius" style:border-radius="var(--{name})">
 						<StyleVariableButton {name} />
 					</div>
-					<span class="pl_sm pr_sm">=</span><code>
-						{computed_styles?.getPropertyValue('--' + name)}
-					</code>
+					<span class="pl_sm pr_sm">=</span><code><ResolvedLength {name} /></code>
 				</div>
 			{/each}
 		</div>
@@ -343,11 +339,6 @@ border-color: var(--shade_30);
 	.border_width {
 		border-color: var(--shade_50);
 		border-style: solid;
-	}
-
-	.outline_width {
-		outline-color: var(--outline_color);
-		outline-style: solid;
 	}
 
 	.border_radii .border_example {

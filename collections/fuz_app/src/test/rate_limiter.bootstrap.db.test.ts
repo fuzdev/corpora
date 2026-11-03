@@ -1,9 +1,10 @@
 /**
  * Integration tests for rate limiting through bootstrap HTTP handlers.
  *
- * Uses real in-memory PGlite so `bootstrap_account` runs fully.
+ * Uses a real in-memory database so `bootstrap_account` runs fully.
  * Focuses on verifying that the bootstrap handler correctly integrates
- * with the RateLimiter.
+ * with the RateLimiter, plus the handler's validation, callback, and
+ * success-audit behaviour.
  *
  * @module
  */
@@ -11,80 +12,75 @@
 import { describe, test, assert, vi, afterEach, beforeAll } from 'vitest';
 import { Hono } from 'hono';
 
-import { RateLimiter } from '$lib/rate_limiter.ts';
-import { create_proxy_middleware } from '$lib/http/proxy.ts';
-import { create_bootstrap_route_specs } from '$lib/auth/bootstrap_routes.ts';
-import { BootstrapOutput } from '$lib/auth/bootstrap_route_schema.ts';
-import { apply_route_specs } from '$lib/http/route_spec.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { create_keyring } from '$lib/auth/keyring.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { PASSWORD_LENGTH_MAX } from '$lib/auth/password.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_pglite_factory } from '$lib/testing/db.ts';
-import { create_test_audit_emitter } from '$lib/testing/stubs.ts';
+import { RateLimiter } from '#lib/rate_limiter.ts';
+import { create_bootstrap_route_specs } from '#lib/auth/bootstrap_routes.ts';
+import { BootstrapOutput } from '#lib/auth/bootstrap_route_schema.ts';
+import { apply_route_specs } from '#lib/http/route_spec.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { PASSWORD_LENGTH_MAX } from '#lib/auth/password.ts';
+import { run_migrations } from '#lib/db/migrate.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { create_default_db_factory } from '#lib/testing/db.ts';
+import { create_test_audit_emitter } from '#lib/testing/stubs.ts';
+import { create_audit_emitter, type AuditEmitter } from '#lib/auth/audit_emitter.ts';
+import type { Db } from '#lib/db/db.ts';
 import {
 	ERROR_RATE_LIMIT_EXCEEDED,
 	ERROR_ALREADY_BOOTSTRAPPED,
 	ERROR_TOKEN_FILE_MISSING
-} from '$lib/http/error_schemas.ts';
+} from '#lib/http/error_schemas.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
+import { create_realtime_closer } from '#lib/actions/connection_closer.ts';
+import {
+	create_test_limiter,
+	TEST_CONNECTION_IP,
+	TEST_LIMITER_MAX_ATTEMPTS,
+	test_proxy_middleware
+} from './rate_limiter_test_helpers.ts';
+import { create_test_keyring } from './auth/session_test_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 
 // --- Shared fixtures ---
 
-/** Simulated connection IP for all test requests. */
-const TEST_CONNECTION_IP = '127.0.0.1';
-
-/**
- * Proxy middleware for tests: trusts the simulated connection IP
- * so that `X-Forwarded-For` headers are honored in test requests.
- */
-const test_proxy_middleware = create_proxy_middleware({
-	trusted_proxies: [TEST_CONNECTION_IP],
-	get_connection_ip: () => TEST_CONNECTION_IP
-});
-
-const WINDOW_MS = 60_000;
-const MAX_ATTEMPTS = 3;
-
-const create_test_limiter = (): RateLimiter =>
-	new RateLimiter({ max_attempts: MAX_ATTEMPTS, window_ms: WINDOW_MS, cleanup_interval_ms: 0 });
-
-const keyring = create_keyring('integration_test_key_a')!;
+const keyring = create_test_keyring('integration-test-key-at-least-32-chars');
 const session_options = create_session_config('test_session');
 
 // --- Bootstrap helpers ---
 
 interface BootstrapTestApp {
 	app: Hono;
+	db: Db;
 	bootstrap_status: { available: boolean; token_path: string | null };
 	read_secure_file: ReturnType<typeof vi.fn>;
 }
 
-// Cached PGlite factory for bootstrap tests — single WASM init, reset between calls.
-const bootstrap_factory = create_pglite_factory(async (db) => {
-	await run_migrations(db, [auth_migration_ns]);
+// Cached default-driver factory for bootstrap tests — single WASM init, reset between calls.
+const bootstrap_factory = create_default_db_factory(async (db) => {
+	await run_migrations(db, [AUTH_MIGRATION_NS]);
 });
 
 /**
- * Create a bootstrap test app backed by a real in-memory PGlite.
+ * Create a bootstrap test app backed by a real in-memory database.
  *
- * Uses a cached PGlite instance (via `create_pglite_factory`) to avoid
+ * Uses a cached WASM database instance (via `create_default_db_factory`) to avoid
  * repeated WASM cold-start overhead. The schema is reset between calls.
  *
  * @param rate_limiter - Rate limiter to wire in (null to disable)
- * @param read_secure_file - Override for the token file read. Defaults to returning 'wrong_token'
+ * @param read_secure_file - Override for the token file read. Defaults to returning 'wrong_token_wrong_token_wrong_token'
  *   so bootstrap always fails with `invalid_token` (status 401) in most tests.
  */
 const create_bootstrap_app = async (
 	bootstrap_ip_rate_limiter: RateLimiter | null,
-	read_secure_file = vi.fn(() => Promise.resolve(new TextEncoder().encode('wrong_token'))),
+	read_secure_file = vi.fn(() =>
+		Promise.resolve(new TextEncoder().encode('wrong_token_wrong_token_wrong_token'))
+	),
 	extra?: {
 		on_bootstrap?: (result: any, c: any) => Promise<void>;
 		delete_file?: (path: string) => Promise<void>;
+		/** Build the audit emitter over the test db. Default a no-op emitter. */
+		create_audit?: (db: Db) => AuditEmitter;
 	}
 ): Promise<BootstrapTestApp> => {
 	const db = await bootstrap_factory.create();
@@ -102,7 +98,8 @@ const create_bootstrap_app = async (
 			},
 			read_secure_file,
 			delete_file: extra?.delete_file ?? vi.fn(() => Promise.resolve(undefined)),
-			audit: create_test_audit_emitter()
+			audit: extra?.create_audit?.(db) ?? create_test_audit_emitter(),
+			connection_closer: create_realtime_closer()
 		},
 		{
 			session_options,
@@ -121,7 +118,7 @@ const create_bootstrap_app = async (
 	app.use('*', test_proxy_middleware);
 	apply_route_specs(app, route_specs, fuz_auth_guard_resolver, log, db);
 
-	return { app, bootstrap_status, read_secure_file };
+	return { app, db, bootstrap_status, read_secure_file };
 };
 
 const bootstrap_request = (
@@ -132,7 +129,7 @@ const bootstrap_request = (
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json', ...headers },
 		body: JSON.stringify({
-			token: 'test_token',
+			token: 'test_token_test_token_test_token_32',
 			username: 'admin',
 			password: 'secure_password_123'
 		})
@@ -140,7 +137,7 @@ const bootstrap_request = (
 
 // --- Tests ---
 
-// Warm up PGlite WASM before tests so the cold-start cost is outside individual test timers.
+// Warm up the database WASM before tests so the cold-start cost is outside individual test timers.
 beforeAll(async () => {
 	await bootstrap_factory.create();
 });
@@ -150,13 +147,13 @@ afterEach(() => {
 });
 
 describe('bootstrap handler rate limiting', () => {
-	// Bootstrap failure: read_secure_file returns 'wrong_token', request sends 'test_token' → token mismatch → 401
+	// Bootstrap failure: read_secure_file returns 'wrong_token_wrong_token_wrong_token', request sends 'test_token_test_token_test_token_32' → token mismatch → 401
 	test('returns 429 when limit exhausted', async () => {
 		const limiter = create_test_limiter();
 		const { app } = await create_bootstrap_app(limiter);
 
 		// Exhaust the limit (token mismatch → 401)
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			const res = await bootstrap_request(app);
 			assert.strictEqual(res.status, 401);
 		}
@@ -175,7 +172,7 @@ describe('bootstrap handler rate limiting', () => {
 		const limiter = create_test_limiter();
 		const { app } = await create_bootstrap_app(limiter);
 
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await bootstrap_request(app);
 		}
 
@@ -193,7 +190,7 @@ describe('bootstrap handler rate limiting', () => {
 		const limiter = create_test_limiter();
 		const { app, read_secure_file } = await create_bootstrap_app(limiter);
 
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await bootstrap_request(app);
 		}
 
@@ -211,12 +208,33 @@ describe('bootstrap handler rate limiting', () => {
 		limiter.dispose();
 	});
 
+	test('a concurrent burst of wrong tokens gets at most the cap past the limiter', async () => {
+		// Every request of the burst would pass a check made before the token
+		// read; the reservation counts each one in flight, so exactly the cap
+		// gets through.
+		const limiter = create_test_limiter();
+		const { app } = await create_bootstrap_app(limiter);
+
+		const responses = await Promise.all(
+			Array.from({ length: TEST_LIMITER_MAX_ATTEMPTS * 2 }, async () => bootstrap_request(app))
+		);
+
+		const statuses = responses.map((r) => r.status).sort((a, b) => a - b);
+		assert.deepStrictEqual(statuses, [
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(401),
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(429)
+		]);
+		assert.strictEqual(limiter.check(TEST_CONNECTION_IP).remaining, 0);
+
+		limiter.dispose();
+	});
+
 	test('failed bootstrap records an attempt', async () => {
 		const limiter = create_test_limiter();
 		const { app } = await create_bootstrap_app(limiter);
 
 		await bootstrap_request(app);
-		assert.strictEqual(limiter.check(TEST_CONNECTION_IP).remaining, MAX_ATTEMPTS - 1);
+		assert.strictEqual(limiter.check(TEST_CONNECTION_IP).remaining, TEST_LIMITER_MAX_ATTEMPTS - 1);
 
 		limiter.dispose();
 	});
@@ -227,9 +245,9 @@ describe('bootstrap handler rate limiting', () => {
 		// read_secure_file fails first 2 calls (wrong token), succeeds on 3rd (matching token)
 		const read_secure_file = vi
 			.fn()
-			.mockResolvedValueOnce(new TextEncoder().encode('wrong_token'))
-			.mockResolvedValueOnce(new TextEncoder().encode('wrong_token'))
-			.mockResolvedValue(new TextEncoder().encode('test_token'));
+			.mockResolvedValueOnce(new TextEncoder().encode('wrong_token_wrong_token_wrong_token'))
+			.mockResolvedValueOnce(new TextEncoder().encode('wrong_token_wrong_token_wrong_token'))
+			.mockResolvedValue(new TextEncoder().encode('test_token_test_token_test_token_32'));
 
 		const { app, bootstrap_status } = await create_bootstrap_app(limiter, read_secure_file);
 
@@ -274,8 +292,8 @@ describe('bootstrap handler rate limiting', () => {
 	test('rate_limiter null allows unlimited failed attempts', async () => {
 		const { app } = await create_bootstrap_app(null);
 
-		// Well beyond MAX_ATTEMPTS — should never see 429
-		for (let i = 0; i < MAX_ATTEMPTS + 5; i++) {
+		// Well beyond TEST_LIMITER_MAX_ATTEMPTS — should never see 429
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS + 5; i++) {
 			const res = await bootstrap_request(app);
 			assert.strictEqual(res.status, 401, `request ${i + 1} should be 401, not 429`);
 		}
@@ -286,7 +304,7 @@ describe('bootstrap handler rate limiting', () => {
 		const { app } = await create_bootstrap_app(limiter);
 
 		// Exhaust limit for 10.0.0.1
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await bootstrap_request(app, { 'X-Forwarded-For': '10.0.0.1' });
 		}
 
@@ -299,6 +317,28 @@ describe('bootstrap handler rate limiting', () => {
 		// 10.0.0.2 unaffected — different rate limit bucket
 		assert.strictEqual(
 			(await bootstrap_request(app, { 'X-Forwarded-For': '10.0.0.2' })).status,
+			401
+		);
+
+		limiter.dispose();
+	});
+
+	test('an IPv6 client buckets with its /64', async () => {
+		const limiter = create_test_limiter();
+		const { app } = await create_bootstrap_app(limiter);
+
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
+			await bootstrap_request(app, { 'X-Forwarded-For': '2001:db8:1:2::1' });
+		}
+
+		// another address in the same /64 draws the same budget
+		assert.strictEqual(
+			(await bootstrap_request(app, { 'X-Forwarded-For': '2001:db8:1:2:8000::2' })).status,
+			429
+		);
+		// the next /64 has its own
+		assert.strictEqual(
+			(await bootstrap_request(app, { 'X-Forwarded-For': '2001:db8:1:3::1' })).status,
 			401
 		);
 
@@ -342,7 +382,11 @@ describe('password max length validation', () => {
 		const res = await app.request('/bootstrap', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ token: 'test_token', username: 'admin', password: oversized_password })
+			body: JSON.stringify({
+				token: 'test_token_test_token_test_token_32',
+				username: 'admin',
+				password: oversized_password
+			})
 		});
 		assert.strictEqual(res.status, 400);
 	});
@@ -366,7 +410,11 @@ describe('username validation', () => {
 		const res = await app.request('/bootstrap', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ token: 'test_token', username: 'ab', password: 'secure_password_123' })
+			body: JSON.stringify({
+				token: 'test_token_test_token_test_token_32',
+				username: 'ab',
+				password: 'secure_password_123'
+			})
 		});
 		assert.strictEqual(res.status, 400);
 	});
@@ -377,7 +425,7 @@ describe('username validation', () => {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				token: 'test_token',
+				token: 'test_token_test_token_test_token_32',
 				username: '1admin',
 				password: 'secure_password_123'
 			})
@@ -391,7 +439,7 @@ describe('username validation', () => {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				token: 'test_token',
+				token: 'test_token_test_token_test_token_32',
 				username: 'admin@test',
 				password: 'secure_password_123'
 			})
@@ -400,9 +448,51 @@ describe('username validation', () => {
 	});
 });
 
+describe('bootstrap success audit', () => {
+	test('a successful bootstrap writes one success audit row for the new account', async () => {
+		const read_secure_file = vi
+			.fn()
+			.mockResolvedValue(new TextEncoder().encode('test_token_test_token_test_token_32'));
+		let audit: AuditEmitter | undefined;
+		const { app, db } = await create_bootstrap_app(null, read_secure_file, {
+			create_audit: (audit_db) =>
+				(audit = create_audit_emitter({ db: audit_db, log, track_inflight: true }))
+		});
+
+		const res = await bootstrap_request(app);
+		assert.strictEqual(res.status, 200);
+		const body = BootstrapOutput.parse(await res.json());
+		assert.strictEqual(body.ok, true);
+		assert.strictEqual(body.account.username, 'admin');
+
+		assert.ok(audit);
+		await audit.drain_inflight();
+		const rows = await db.query<{
+			event_type: string;
+			outcome: string;
+			actor_id: string | null;
+			account_id: string | null;
+			ip: string | null;
+			metadata: unknown;
+		}>(
+			"SELECT event_type, outcome, actor_id, account_id, ip, metadata FROM audit_log WHERE event_type = 'bootstrap'"
+		);
+		assert.strictEqual(rows.length, 1);
+		const [row] = rows;
+		assert.ok(row);
+		assert.strictEqual(row.outcome, 'success');
+		assert.strictEqual(row.account_id, body.account.id);
+		assert.strictEqual(row.actor_id, body.actor.id);
+		assert.strictEqual(row.ip, TEST_CONNECTION_IP);
+		assert.strictEqual(row.metadata, null);
+	});
+});
+
 describe('on_bootstrap callback error handling', () => {
 	test('on_bootstrap failure does not prevent success response', async () => {
-		const read_secure_file = vi.fn().mockResolvedValue(new TextEncoder().encode('test_token'));
+		const read_secure_file = vi
+			.fn()
+			.mockResolvedValue(new TextEncoder().encode('test_token_test_token_test_token_32'));
 		const on_bootstrap = vi.fn(async () => {
 			throw new Error('callback failed');
 		});
@@ -417,7 +507,9 @@ describe('on_bootstrap callback error handling', () => {
 
 describe('token file deletion failure', () => {
 	test('returns 500 when token file deletion fails', async () => {
-		const read_secure_file = vi.fn().mockResolvedValue(new TextEncoder().encode('test_token'));
+		const read_secure_file = vi
+			.fn()
+			.mockResolvedValue(new TextEncoder().encode('test_token_test_token_test_token_32'));
 		const delete_file = vi.fn().mockRejectedValue(new Error('EPERM'));
 
 		const { app } = await create_bootstrap_app(null, read_secure_file, { delete_file });

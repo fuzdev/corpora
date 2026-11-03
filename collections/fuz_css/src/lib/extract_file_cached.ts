@@ -1,11 +1,11 @@
 /**
- * Cache-aware single-file class extraction shared by the Gro generator and the
- * Vite plugin. Returns extraction sourced from cache when the content hash
- * matches, else freshly parsed, plus the cache path to write on a miss.
+ * Cache-aware single-file class extraction for the Vite plugin's transform
+ * hook and dev pre-scan. Returns extraction sourced from cache when the content hash and
+ * the configuration key match, else freshly parsed, plus the cache path to
+ * write on a miss.
  *
  * Callers own everything around this - in-memory hash short-circuits, the Vite
- * deletion-race guard, diagnostic logging, stats counting, and how/when to
- * write the cache (fire-and-forget vs. batched).
+ * deletion-race guard, diagnostic logging, and how/when to write the cache.
  *
  * @module
  */
@@ -16,6 +16,7 @@ import {
 	type AcornPlugin
 } from './css_class_extractor.ts';
 import { load_cached_extraction, from_cached_extraction } from './css_cache.ts';
+import { is_css_file } from './file_filter.ts';
 import type { CacheDeps } from './deps.ts';
 
 export interface ExtractFileCachedOptions {
@@ -24,6 +25,8 @@ export interface ExtractFileCachedOptions {
 	content: string;
 	/** Content hash to validate the cache against. */
 	content_hash: string;
+	/** The configuration part of the key, from `to_extraction_cache_key`. */
+	extraction_key: string | null;
 	/** Cache file path, or null to skip the cache (CI or caching disabled). */
 	cache_path: string | null;
 	/** File path, for parser selection and diagnostic locations. */
@@ -40,18 +43,23 @@ export interface ExtractFileCachedResult {
 }
 
 /**
- * Loads the cached extraction when its content hash matches, otherwise extracts
+ * Loads the cached extraction when its content hash and configuration key match, otherwise extracts
  * fresh. On a miss with caching enabled, `cache_path_to_write` carries the path
  * the caller should write.
  */
 export const extract_file_cached = async (
 	options: ExtractFileCachedOptions
 ): Promise<ExtractFileCachedResult> => {
-	const { deps, content, content_hash, cache_path, filename, acorn_plugins } = options;
+	const { deps, content, content_hash, extraction_key, filename, acorn_plugins } = options;
+	// a stylesheet extracts nothing, so there's nothing worth caching
+	const cache_path = is_css_file(filename) ? null : options.cache_path;
 
 	if (cache_path) {
 		const cached = await load_cached_extraction(deps, cache_path);
-		if (cached?.content_hash === content_hash) {
+		if (
+			cached?.content_hash === content_hash &&
+			(cached.extraction_key ?? null) === extraction_key
+		) {
 			return {
 				extraction: from_cached_extraction(cached),
 				from_cache: true,

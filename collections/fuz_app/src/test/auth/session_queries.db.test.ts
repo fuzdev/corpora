@@ -6,7 +6,7 @@
 
 import { describe, assert, test } from 'vitest';
 
-import { query_purge_account } from '$lib/auth/account_queries.ts';
+import { query_purge_account } from '#lib/auth/account_queries.ts';
 import {
 	query_create_session,
 	query_session_get_valid,
@@ -20,9 +20,9 @@ import {
 	hash_session_token,
 	generate_session_token,
 	AUTH_SESSION_LIFETIME_MS
-} from '$lib/auth/session_queries.ts';
-import type { Db } from '$lib/db/db.ts';
-import { create_test_account_with_actor } from '$lib/testing/db_entities.ts';
+} from '#lib/auth/session_queries.ts';
+import type { Db } from '#lib/db/db.ts';
+import { create_test_account_with_actor } from '#lib/testing/db_entities.ts';
 
 import { describe_db } from '../db_fixture.ts';
 
@@ -238,25 +238,35 @@ describe_db('AuthSessionQueries', (get_db) => {
 		assert.ok(before);
 		const again = await query_session_get_valid(deps, token_hash);
 		assert.ok(again);
-		// The whole row, so a future mutable column can't dodge the assertion.
-		assert.deepEqual(again, before);
+		// The whole row, so a future mutable column can't dodge the assertion —
+		// less the time left, which the read computes and which only shrinks.
+		const { expires_in_ms: before_left, ...before_row } = before;
+		const { expires_in_ms: again_left, ...again_row } = again;
+		assert.deepEqual(again_row, before_row);
+		assert.ok(again_left <= before_left, 'the time left never grows');
 	});
 
-	test('cleanup_expired removes expired sessions', async () => {
+	test('cleanup_expired removes expired sessions and returns their ids', async () => {
 		const db = get_db();
 		const deps = { db };
 		const { account_id } = await create_test_account(db, 'grace');
 		const past = new Date(Date.now() - 1000);
 		const future = new Date(Date.now() + AUTH_SESSION_LIFETIME_MS);
-		await query_create_session(deps, hash_session_token('expired1'), account_id, past);
-		await query_create_session(deps, hash_session_token('expired2'), account_id, past);
+		const expired_1 = hash_session_token('expired1');
+		const expired_2 = hash_session_token('expired2');
+		await query_create_session(deps, expired_1, account_id, past);
+		await query_create_session(deps, expired_2, account_id, past);
 		await query_create_session(deps, hash_session_token('active'), account_id, future);
 
-		const count = await query_session_cleanup_expired(deps);
-		assert.strictEqual(count, 2);
+		// the ids are the token hashes a caller closes connections by; the
+		// delete returns them in no order worth pinning
+		const swept = await query_session_cleanup_expired(deps);
+		assert.deepEqual([...swept].sort(), [expired_1, expired_2].sort());
 
 		const list = await query_session_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 1);
+
+		assert.deepEqual(await query_session_cleanup_expired(deps), []);
 	});
 
 	test('revoke_for_account succeeds for own session', async () => {
@@ -335,7 +345,7 @@ describe_db('AuthSessionQueries', (get_db) => {
 		await query_create_session(deps, hash_session_token('s2'), account_id, expires);
 
 		const evicted = await query_session_enforce_limit(deps, account_id, 5);
-		assert.strictEqual(evicted, 0);
+		assert.strictEqual(evicted.length, 0);
 
 		const list = await query_session_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 2);
@@ -361,7 +371,11 @@ describe_db('AuthSessionQueries', (get_db) => {
 		}
 
 		const evicted = await query_session_enforce_limit(deps, account_id, 2);
-		assert.strictEqual(evicted, 2);
+		// the evicted sessions' ids — what the caller closes connections by
+		assert.deepStrictEqual(
+			[...evicted].sort(),
+			[hash_session_token('oldest'), hash_session_token('old')].sort()
+		);
 
 		const list = await query_session_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 2);
@@ -389,7 +403,7 @@ describe_db('AuthSessionQueries', (get_db) => {
 		}
 
 		const evicted = await query_session_enforce_limit(deps, account_id, 1);
-		assert.strictEqual(evicted, 2);
+		assert.strictEqual(evicted.length, 2);
 
 		const list = await query_session_list_for_account(deps, account_id);
 		assert.strictEqual(list.length, 1);
@@ -440,7 +454,7 @@ describe_db('AuthSessionQueries', (get_db) => {
 			}
 
 			const evicted = await query_session_enforce_limit(deps, account_id, limit);
-			assert.strictEqual(evicted, expected_evictions);
+			assert.strictEqual(evicted.length, expected_evictions);
 
 			const remaining = await query_session_list_for_account(deps, account_id);
 			assert.strictEqual(remaining.length, session_count - expected_evictions);
@@ -500,7 +514,7 @@ describe_db('AuthSessionQueries', (get_db) => {
 
 		// max 3 — no eviction because expired sessions count toward the total
 		const evicted = await query_session_enforce_limit(deps, account_id, 3);
-		assert.strictEqual(evicted, 0);
+		assert.strictEqual(evicted.length, 0);
 
 		// all 3 still in the table (expired ones not cleaned up by enforce)
 		const all = await db.query<{ id: string }>(

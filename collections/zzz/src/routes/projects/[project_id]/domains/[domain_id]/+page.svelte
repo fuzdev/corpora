@@ -1,14 +1,14 @@
 <script lang="ts">
 	// @slop Claude Opus 4
 
-	import { projects_context } from '$routes/projects/projects.svelte.ts';
-	import ProjectSidebar from '$routes/projects/ProjectSidebar.svelte';
-	import SectionSidebar from '$routes/projects/SectionSidebar.svelte';
-	import DomainsSidebar from '$routes/projects/DomainsSidebar.svelte';
+	import { projects_context } from '#routes/projects/projects.svelte.ts';
+	import ProjectSidebar from '#routes/projects/ProjectSidebar.svelte';
+	import SectionSidebar from '#routes/projects/SectionSidebar.svelte';
+	import DomainsSidebar from '#routes/projects/DomainsSidebar.svelte';
 	import { icon_delete } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
-	import ExternalLink from '$lib/ExternalLink.svelte';
-	import ProjectNotFound from '$routes/projects/ProjectNotFound.svelte';
+	import Icon from '#lib/Icon.svelte';
+	import ExternalLink from '#lib/ExternalLink.svelte';
+	import ProjectNotFound from '#routes/projects/ProjectNotFound.svelte';
 
 	const projects = projects_context.get();
 
@@ -52,7 +52,7 @@
 								<h3 class="mt_0 mb_sm">domain name</h3>
 								<input type="text" bind:value={domains_viewmodel.domain_name} class="width:100%" />
 							</label>
-							<p>enter the full domain name, like zzz.software or blog.zzz.software</p>
+							<p>enter the full domain name, like fuz.dev or blog.fuz.dev</p>
 						</div>
 
 						{#if domains_viewmodel.domain}
@@ -135,7 +135,7 @@
 									class="palette_c"
 									onclick={() => domains_viewmodel.remove_domain()}
 								>
-									<Svg data={icon_delete} />&nbsp; delete domain
+									<Icon data={icon_delete} />&nbsp; delete domain
 								</button>
 							{/if}
 						</div>

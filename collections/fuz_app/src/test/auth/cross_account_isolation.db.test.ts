@@ -18,26 +18,25 @@ import {
 	query_session_get_valid,
 	hash_session_token,
 	AUTH_SESSION_LIFETIME_MS
-} from '$lib/auth/session_queries.ts';
+} from '#lib/auth/session_queries.ts';
 import {
 	query_create_api_token,
 	query_api_token_list_for_account,
 	query_revoke_api_token_for_account,
 	query_revoke_all_api_tokens_for_account,
 	query_validate_api_token
-} from '$lib/auth/api_token_queries.ts';
-import { generate_api_token } from '$lib/auth/api_token.ts';
+} from '#lib/auth/api_token_queries.ts';
+import { generate_api_token } from '#lib/auth/api_token.ts';
 import {
 	query_create_role_grant,
 	query_revoke_role_grant,
-	query_role_grant_list_for_actor,
 	query_role_grant_find_active_for_actor
-} from '$lib/auth/role_grant_queries.ts';
-import { query_audit_log, query_audit_log_list } from '$lib/auth/audit_log_queries.ts';
-import { ROLE_ADMIN, ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import type { Db } from '$lib/db/db.ts';
-import { create_test_account_with_actor } from '$lib/testing/db_entities.ts';
+} from '#lib/auth/role_grant_queries.ts';
+import { query_audit_log, query_audit_log_list } from '#lib/auth/audit_log_queries.ts';
+import { ROLE_ADMIN, ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import type { Db } from '#lib/db/db.ts';
+import { create_test_account_with_actor } from '#lib/testing/db_entities.ts';
 
 import { describe_db } from '../db_fixture.ts';
 import { token_scope_full } from '../../lib/auth/token_scope.ts';
@@ -266,12 +265,6 @@ describe_db('CrossAccountIsolation', (get_db) => {
 		assert.strictEqual(alice_active[0]!.role, ROLE_ADMIN);
 		assert.strictEqual(bob_active.length, 1);
 		assert.strictEqual(bob_active[0]!.role, ROLE_KEEPER);
-
-		// list includes revoked too
-		const alice_all = await query_role_grant_list_for_actor(deps, alice.actor_id);
-		for (const p of alice_all) {
-			assert.strictEqual(p.actor_id, alice.actor_id);
-		}
 	});
 
 	// -- Audit log isolation --

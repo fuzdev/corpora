@@ -4,7 +4,7 @@
  * Runs `describe_account_lifecycle_cross_tests` against the in-process Hono
  * app (no process boundary), so the soft-delete → undelete → purge wire
  * contract + keeper guard are verified under a plain `gro test` — the
- * cross-process leg (`account_lifecycle.cross.test.ts`) additionally drives
+ * cross-process leg (`spine_suites.cross.test.ts`) additionally drives
  * the TS spine binary + Rust `testing_spine_stub` over real HTTP behind
  * `FUZ_TEST_CROSS_BACKEND=1`.
  *
@@ -15,32 +15,40 @@
  * @module
  */
 
-import { default_in_process_setup } from '$lib/testing/cross_backend/in_process_setup.ts';
-import { in_process_capabilities } from '$lib/testing/cross_backend/capabilities.ts';
-import { describe_account_lifecycle_cross_tests } from '$lib/testing/cross_backend/account_lifecycle.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
-import { create_testing_drain_effects_action } from '$lib/testing/cross_backend/testing_reset_actions.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { ROLE_ADMIN, ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+import { default_in_process_setup } from '#lib/testing/cross_backend/in_process_setup.ts';
+import { in_process_capabilities } from '#lib/testing/cross_backend/capabilities.ts';
+import { describe_account_lifecycle_cross_tests } from '#lib/testing/cross_backend/account_lifecycle.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
+import { create_testing_drain_effects_action } from '#lib/testing/cross_backend/testing_reset_actions.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_audit_emitter } from '#lib/auth/audit_emitter.ts';
+import { ROLE_ADMIN, ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
 
 const RPC_PATH = '/api/rpc';
 const session_options = create_session_config('test_session');
 
 const setup_test = default_in_process_setup({
+	reject_unknown_audit_metadata_keys: true,
 	session_options,
 	// Keeper is also admin (matches the cross-process fresh keeper) so its
 	// session reaches the admin-gated delete/undelete verbs.
 	roles: [ROLE_KEEPER, ROLE_ADMIN],
+	// tracked so `_testing_drain_effects` awaits the emitter, as on the binaries
+	audit_factory: ({ db, log }) => create_audit_emitter({ db, log, track_inflight: true }),
 	create_route_specs: (ctx: AppServerContext): Array<RouteSpec> =>
 		create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: RPC_PATH,
 			// `_testing_drain_effects` so the shared suite body can call the
-			// barrier in-process too (satisfied-by-construction: `create_test_app`
-			// runs `await_pending_effects: true`).
-			actions: [...create_standard_rpc_actions(ctx.deps), create_testing_drain_effects_action()],
+			// barrier in-process too
+			actions: [
+				...create_standard_rpc_actions(ctx.deps),
+				create_testing_drain_effects_action(ctx.deps.audit)
+			],
 			log: ctx.deps.log
 		})
 });

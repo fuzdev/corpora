@@ -1,10 +1,19 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, test, vi, afterEach, assert } from 'vitest';
-import { DEFAULT_CLOSE_CODE } from '@fuzdev/fuz_app/actions/socket.svelte.ts';
+import {
+	DEFAULT_CLOSE_CODE,
+	DEFAULT_HEARTBEAT_INTERVAL
+} from '@fuzdev/fuz_app/actions/socket.svelte.ts';
+import {
+	WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT,
+	WS_CLOSE_CONNECTION_LIMIT,
+	WS_CLOSE_SESSION_REVOKED
+} from '@fuzdev/fuz_app/actions/transports.ts';
 
-import { Socket } from '$lib/socket.svelte.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
+import { Socket } from '#lib/socket.svelte.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
+import { HEARTBEAT_INTERVAL_BOUNDS, RECONNECT_DELAY_BOUNDS } from '#lib/socket_helpers.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -76,8 +85,8 @@ class Mocket {
 }
 
 const TEST_URLS = {
-	BASE: 'ws://test.zzz.software',
-	ALTERNATE: 'ws://alternate.zzz.software'
+	BASE: 'ws://test.fuz.dev',
+	ALTERNATE: 'ws://alternate.fuz.dev'
 };
 
 const TEST_MESSAGE = {
@@ -120,7 +129,7 @@ describe('Socket', () => {
 		MockWebSocket.OPEN = Mocket.OPEN;
 		MockWebSocket.CLOSING = Mocket.CLOSING;
 		MockWebSocket.CLOSED = Mocket.CLOSED;
-		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		globalThis.WebSocket = MockWebSocket;
 
 		vi.useFakeTimers();
 	});
@@ -286,6 +295,329 @@ describe('Socket', () => {
 
 			vi.advanceTimersByTime(1000);
 			assert.strictEqual((globalThis.WebSocket as any).mock.calls.length, 2);
+		});
+	});
+
+	describe('Heartbeat', () => {
+		/** Advance `total` ms in half-interval steps, answering each heartbeat as it goes out. */
+		const idle_answering_heartbeats = async (total: number, step: number): Promise<void> => {
+			let answered = 0;
+			for (let elapsed = 0; elapsed < total; elapsed += step) {
+				await vi.advanceTimersByTimeAsync(step);
+				const frames = mock_socket.sent_messages.map((m) => JSON.parse(m));
+				for (const frame of frames.slice(answered)) {
+					if (frame.method === 'heartbeat') {
+						mock_socket.dispatchEvent('message', {
+							data: JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: {} })
+						});
+					}
+				}
+				answered = frames.length;
+			}
+		};
+
+		test('defaults to fuz_app interval', () => {
+			const socket = new Socket({ app });
+			assert.strictEqual(socket.heartbeat_interval, DEFAULT_HEARTBEAT_INTERVAL);
+		});
+
+		test('an idle socket stays open while heartbeats are answered', async () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+
+			await idle_answering_heartbeats(10 * 60_000, DEFAULT_HEARTBEAT_INTERVAL / 2);
+
+			assert.isNull(mock_socket.close_code);
+			assert.ok(socket.connected);
+			assert.ok(mock_socket.sent_messages.length > 0, 'heartbeats were sent');
+		});
+
+		test('a long interval scales the receive timeout instead of closing idle sockets', async () => {
+			const socket = new Socket({ app });
+			socket.heartbeat_interval = HEARTBEAT_INTERVAL_BOUNDS.max;
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+
+			await idle_answering_heartbeats(
+				4 * HEARTBEAT_INTERVAL_BOUNDS.max,
+				HEARTBEAT_INTERVAL_BOUNDS.max / 2
+			);
+
+			assert.isNull(mock_socket.close_code);
+			assert.ok(socket.connected);
+		});
+
+		test('an unanswered heartbeat still closes a dead socket', () => {
+			const socket = new Socket({ app });
+			socket.auto_reconnect = false;
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+
+			vi.advanceTimersByTime(3 * DEFAULT_HEARTBEAT_INTERVAL);
+
+			assert.strictEqual(mock_socket.close_code, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT);
+		});
+	});
+
+	describe('Settings coercion', () => {
+		test('numeric strings are coerced', () => {
+			const socket = new Socket({ app });
+			socket.heartbeat_interval = '45000' as unknown as number;
+			socket.reconnect_delay = '2500' as unknown as number;
+			socket.reconnect_delay_max = '20000' as unknown as number;
+			assert.strictEqual(socket.heartbeat_interval, 45_000);
+			assert.strictEqual(socket.reconnect_delay, 2500);
+			assert.strictEqual(socket.reconnect_delay_max, 20_000);
+		});
+
+		test('empty, null, and NaN writes keep the current value', () => {
+			const socket = new Socket({ app });
+			socket.heartbeat_interval = 45_000;
+			socket.reconnect_delay = 2500;
+			for (const bad of ['', null, undefined, NaN, 'abc', Infinity]) {
+				socket.heartbeat_interval = bad as unknown as number;
+				socket.reconnect_delay = bad as unknown as number;
+				socket.reconnect_delay_max = bad as unknown as number;
+			}
+			assert.strictEqual(socket.heartbeat_interval, 45_000);
+			assert.strictEqual(socket.reconnect_delay, 2500);
+		});
+
+		test('out-of-range writes are clamped', () => {
+			const socket = new Socket({ app });
+			socket.heartbeat_interval = 0;
+			socket.reconnect_delay = 0;
+			socket.reconnect_delay_max = -5;
+			assert.strictEqual(socket.heartbeat_interval, HEARTBEAT_INTERVAL_BOUNDS.min);
+			assert.strictEqual(socket.reconnect_delay, RECONNECT_DELAY_BOUNDS.min);
+			assert.strictEqual(socket.reconnect_delay_max, RECONNECT_DELAY_BOUNDS.min);
+			socket.heartbeat_interval = 1e12;
+			socket.reconnect_delay = 1e12;
+			assert.strictEqual(socket.heartbeat_interval, HEARTBEAT_INTERVAL_BOUNDS.max);
+			assert.strictEqual(socket.reconnect_delay, RECONNECT_DELAY_BOUNDS.max);
+		});
+
+		test('a zero reconnect delay cannot spin a reconnect loop', () => {
+			const socket = new Socket({ app });
+			socket.reconnect_delay = '' as unknown as number;
+			socket.reconnect_delay = 0;
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			mock_socket.dispatchEvent('close', { code: 1006 });
+
+			vi.advanceTimersByTime(RECONNECT_DELAY_BOUNDS.min - 1);
+			assert.strictEqual((globalThis.WebSocket as any).mock.calls.length, 1);
+			vi.advanceTimersByTime(1);
+			assert.strictEqual((globalThis.WebSocket as any).mock.calls.length, 2);
+		});
+	});
+
+	describe('Traffic timestamps', () => {
+		test('an RPC request stamps last send, and its response last receive', async () => {
+			vi.setSystemTime(1_000);
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			assert.isNull(socket.last_send_time);
+
+			const pending = socket.request('workspace_list', {}, { id: 'req-1' });
+			assert.strictEqual(socket.last_send_time, 1_000);
+			assert.isNull(socket.last_receive_time);
+
+			vi.setSystemTime(2_000);
+			mock_socket.dispatchEvent('message', {
+				data: JSON.stringify({ jsonrpc: '2.0', id: 'req-1', result: { workspaces: [] } })
+			});
+			await pending;
+			assert.strictEqual(socket.last_receive_time, 2_000);
+		});
+
+		test('a heartbeat stamps last send, and a notification last receive', () => {
+			vi.setSystemTime(1_000);
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+
+			vi.setSystemTime(1_000 + DEFAULT_HEARTBEAT_INTERVAL);
+			vi.advanceTimersByTime(DEFAULT_HEARTBEAT_INTERVAL);
+			assert.ok(
+				mock_socket.sent_messages.some((m) => JSON.parse(m).method === 'heartbeat'),
+				'a heartbeat went out'
+			);
+			assert.isNotNull(socket.last_send_time);
+			assert.isAtLeast(socket.last_send_time, 1_000 + DEFAULT_HEARTBEAT_INTERVAL);
+
+			vi.setSystemTime(500_000);
+			mock_socket.dispatchEvent('message', {
+				data: JSON.stringify({ jsonrpc: '2.0', method: 'filer_change', params: {} })
+			});
+			assert.strictEqual(socket.last_receive_time, 500_000);
+		});
+
+		test('an error response stamps last receive', async () => {
+			vi.setSystemTime(1_000);
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			const pending = socket.request('workspace_list', {}, { id: 'req-err' });
+
+			vi.setSystemTime(3_000);
+			mock_socket.dispatchEvent('message', {
+				data: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 'req-err',
+					error: { code: -32603, message: 'boom' }
+				})
+			});
+			await pending.catch(() => {});
+			assert.strictEqual(socket.last_receive_time, 3_000);
+		});
+
+		test('a request queued while disconnected does not stamp last send', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			void socket.request('workspace_list', {}, { id: 'req-2' }).catch(() => {});
+			assert.isNull(socket.last_send_time);
+		});
+	});
+
+	describe('Connection duration', () => {
+		/** Connects at `connected_at`, then reads the duration with `Time` at `now_ms`. */
+		const duration_rounded_at = (connected_at: number, now_ms: number): number | null => {
+			vi.setSystemTime(connected_at);
+			(app as any).time = { now_ms, interval: 60_000 };
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			assert.strictEqual(socket.last_connect_time, connected_at);
+			return socket.connection_duration_rounded;
+		};
+
+		test('under one interval rounds down to 0, not up to a minute', () => {
+			assert.strictEqual(duration_rounded_at(1_000, 1_000 + 59_999), 0);
+		});
+
+		test('rounds down, never overstating the time connected', () => {
+			assert.strictEqual(duration_rounded_at(1_000, 1_000 + 119_999), 60_000);
+			assert.strictEqual(duration_rounded_at(1_000, 1_000 + 120_000), 120_000);
+		});
+
+		test('is null while disconnected', () => {
+			(app as any).time = { now_ms: 10_000, interval: 60_000 };
+			const socket = new Socket({ app });
+			assert.isNull(socket.connection_duration_rounded);
+		});
+	});
+
+	describe('Revocation', () => {
+		test('revoked reflects a session-revoked close', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			assert.ok(!socket.revoked);
+
+			mock_socket.dispatchEvent('close', { code: WS_CLOSE_SESSION_REVOKED });
+
+			assert.ok(socket.revoked);
+			assert.strictEqual(socket.status, 'failure');
+		});
+
+		test('reconnect_revoked replaces a revoked client with a fresh connection', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			const constructed = () =>
+				(globalThis.WebSocket as unknown as { mock: { calls: Array<unknown> } }).mock.calls.length;
+			assert.strictEqual(constructed(), 1);
+
+			// not revoked — nothing to do
+			assert.ok(!socket.reconnect_revoked());
+			assert.strictEqual(constructed(), 1);
+
+			mock_socket.dispatchEvent('close', { code: WS_CLOSE_SESSION_REVOKED });
+			assert.ok(socket.revoked);
+			// a revoked client never reconnects on its own
+			vi.advanceTimersByTime(60_000);
+			assert.strictEqual(constructed(), 1);
+
+			assert.ok(socket.reconnect_revoked());
+			assert.strictEqual(constructed(), 2, 'a new WebSocket to the same URL');
+			assert.strictEqual(mock_socket.url, TEST_URLS.BASE);
+			assert.ok(!socket.revoked);
+			mock_socket.connect();
+			assert.ok(socket.connected);
+		});
+	});
+
+	describe('Connection limit', () => {
+		const constructed = (): number =>
+			(globalThis.WebSocket as unknown as { mock: { calls: Array<unknown> } }).mock.calls.length;
+
+		test('superseded reflects a connection-limit close', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			assert.ok(!socket.superseded);
+
+			mock_socket.dispatchEvent('close', { code: WS_CLOSE_CONNECTION_LIMIT });
+
+			assert.ok(socket.superseded);
+			assert.ok(!socket.revoked);
+			assert.ok(!socket.connected);
+			assert.ok(!socket.is_reconnect_pending);
+			// reads like a socket that was never connected — hence the `superseded` check
+			assert.strictEqual(socket.status, 'initial');
+		});
+
+		test('a superseded socket does not auto-reconnect', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			assert.ok(socket.auto_reconnect);
+			assert.strictEqual(constructed(), 1);
+
+			mock_socket.dispatchEvent('close', { code: WS_CLOSE_CONNECTION_LIMIT });
+			assert.ok(socket.superseded);
+
+			// no reconnect is scheduled
+			vi.advanceTimersByTime(60_000);
+			assert.strictEqual(constructed(), 1);
+
+			// and a fire-and-forget send queues without reopening the socket
+			assert.ok(!socket.send(TEST_MESSAGE.BASIC));
+			assert.strictEqual(socket.queued_message_count, 1);
+			assert.strictEqual(constructed(), 1);
+			assert.ok(socket.superseded);
+		});
+
+		test('a send still connects a disconnected socket that was not superseded', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			socket.disconnect();
+			assert.strictEqual(socket.status, 'initial');
+			assert.ok(!socket.superseded);
+			assert.strictEqual(constructed(), 1);
+
+			assert.ok(!socket.send(TEST_MESSAGE.BASIC));
+			assert.strictEqual(constructed(), 2);
+		});
+
+		test('connect reopens a superseded socket', () => {
+			const socket = new Socket({ app });
+			socket.connect(TEST_URLS.BASE);
+			mock_socket.connect();
+			mock_socket.dispatchEvent('close', { code: WS_CLOSE_CONNECTION_LIMIT });
+			assert.ok(socket.superseded);
+
+			socket.connect();
+
+			assert.strictEqual(constructed(), 2, 'a new WebSocket to the same URL');
+			assert.strictEqual(mock_socket.url, TEST_URLS.BASE);
+			assert.ok(!socket.superseded);
+			mock_socket.connect();
+			assert.ok(socket.connected);
 		});
 	});
 });

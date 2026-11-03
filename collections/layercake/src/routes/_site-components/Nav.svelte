@@ -6,32 +6,19 @@
 	import examples from '../_examples.js';
 	import examplesSsr from '../_examples_ssr.js';
 
+	/** @type {{ sections: import('../../_modules/getSections.js').GuideSection[] }} */
 	let { sections } = $props();
 
-	// let slug = '';
-	let path = $state();
-	// let type;
-
-	// I was getting a weird artifact of a service-worker.js
-	// being requested. it's fixed now but keep this for
-	// good measure
-	let isServiceWorker = $derived(page.url.pathname === '/service-worker.js');
-
+	// The dropdown's value. It is its own state because the <select> binds to
+	// it, so it's synced from the URL after every navigation.
 	let segment = $state('');
-
 	$effect(() => {
-		if (!isServiceWorker) {
-			path = page.url.pathname;
-			// type = path.split('/')[1];
-			segment = `/${path.replace('/', '')}`;
-			// segment = `/${path.replace('/', '').replace(/\$/, '')}`;
-			// slug = path.replace(/\/$/, '').split('/').pop();
-		}
+		segment = page.url.pathname;
 	});
 
-	// let basePath = '/';
 	let open = $state(false);
 
+	/** @type {HTMLElement | undefined} */
 	let nav = $state();
 
 	const slimName = /** @param {string} d */ d => d.split(' (')[0];
@@ -43,18 +30,16 @@
 	}
 
 	function toggleOpen() {
-		// if the menu is closing, scroll back to the top *after* it
-		// shuts. otherwise, scroll back to the top immediately
-		// (just in case the user reopened before it happened).
-		// The reason we don't just do it when the menu opens is
-		// that the scrollbar visibly flashes
+		// If the menu is closing, scroll to the top after it has shut. Otherwise
+		// scroll right away, in case the user reopened it before that happened.
+		// Scrolling when the menu opens would make the scrollbar visibly flash.
 		if (open) {
 			setTimeout(() => {
-				if (!open) {
+				if (!open && nav) {
 					nav.scrollTop = 0;
 				}
 			}, 350);
-		} else {
+		} else if (nav) {
 			nav.scrollTop = 0;
 		}
 		open = !open;

@@ -234,13 +234,13 @@
 			stroke-width 120ms ease;
 	}
 	/* `out` = hovered module's dependencies; `in` = its dependents. Distinct hues
-	   (blue/orange — a colorblind-safe pair) read the direction at a glance. */
+	   (blue/orange, a colorblind-safe pair) read the direction at a glance. */
 	.edge.out {
-		stroke: var(--color_a_50);
+		stroke: var(--palette_a_50);
 		stroke-width: 2;
 	}
 	.edge.in {
-		stroke: var(--color_f_50);
+		stroke: var(--palette_h_50);
 		stroke-width: 2;
 	}
 	.has-hover .edge.dim {
@@ -248,7 +248,7 @@
 	}
 
 	.node rect {
-		fill: var(--bg_10);
+		fill: var(--paper_10);
 		stroke: var(--border_color_50);
 		stroke-width: 1;
 		transition:
@@ -257,7 +257,7 @@
 			stroke-width 120ms ease;
 	}
 	.node .label {
-		fill: var(--fg_80);
+		fill: var(--ink_80);
 		font-family: var(--font_family_mono, ui-monospace, monospace);
 		font-size: 14px;
 		font-weight: 500;
@@ -269,7 +269,7 @@
 		outline: none;
 	}
 	a:focus-visible .node rect {
-		stroke: var(--color_a_50);
+		stroke: var(--palette_a_50);
 		stroke-width: 2;
 	}
 
@@ -278,13 +278,13 @@
 	.node:hover rect,
 	.node.self rect,
 	.node.out rect {
-		fill: var(--bg_20);
-		stroke: var(--color_a_50);
+		fill: var(--paper_20);
+		stroke: var(--palette_a_50);
 		stroke-width: 2;
 	}
 	.node.in rect {
-		fill: var(--bg_20);
-		stroke: var(--color_f_50);
+		fill: var(--paper_20);
+		stroke: var(--palette_h_50);
 		stroke-width: 2;
 	}
 	.has-hover .node.dim rect {

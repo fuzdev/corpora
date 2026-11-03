@@ -1,7 +1,8 @@
-import { spawn } from '@fuzdev/fuz_util/process.ts';
+import { spawn, spawn_out } from '@fuzdev/fuz_util/process.ts';
 import { print_error } from '@fuzdev/fuz_util/print.ts';
 import { styleText as st } from 'node:util';
-import { z } from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 import { cp, mkdir, readdir, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fs_exists, fs_empty_dir } from '@fuzdev/fuz_util/fs.ts';
@@ -14,7 +15,7 @@ import {
 	GitBranch,
 	git_delete_local_branch,
 	git_push_to_create,
-	git_reset_branch_to_first_commit,
+	git_current_branch_first_commit_hash,
 	git_pull,
 	git_fetch,
 	git_check_setting_pull_rebase,
@@ -22,7 +23,7 @@ import {
 	git_current_branch_name
 } from '@fuzdev/fuz_util/git.ts';
 
-import { TaskError, type Task } from './task.ts';
+import { is_silent_error, TaskError, type Task } from './task.ts';
 import { print_path } from './paths.ts';
 import { GRO_DIRNAME, GIT_DIRNAME, SVELTEKIT_BUILD_DIRNAME } from './constants.ts';
 
@@ -40,56 +41,70 @@ const TARGET_BRANCH = 'deploy';
 const DANGEROUS_BRANCHES = [SOURCE_BRANCH, 'master'];
 
 /** @nodocs */
-export const Args = z.strictObject({
-	source: GitBranch.meta({ description: 'git source branch to build and deploy from' }).default(
+export const Args = s.object({
+	source: s.with_default(
+		meta(GitBranch, { description: 'git source branch to build and deploy from' }),
 		SOURCE_BRANCH
 	),
-	target: GitBranch.meta({ description: 'git target branch to deploy to' }).default(TARGET_BRANCH),
-	origin: GitOrigin.meta({ description: 'git origin to deploy to' }).default('origin'),
-	deploy_dir: z.string().meta({ description: 'the deploy output directory' }).default(DEPLOY_DIR),
-	build_dir: z
-		.string()
-		.meta({ description: 'the SvelteKit build directory' })
-		.default(SVELTEKIT_BUILD_DIRNAME),
-	dry: z
-		.boolean()
-		.meta({
+	target: s.with_default(
+		meta(GitBranch, { description: 'git target branch to deploy to' }),
+		TARGET_BRANCH
+	),
+	origin: s.with_default(meta(GitOrigin, { description: 'git origin to deploy to' }), 'origin'),
+	deploy_dir: s.with_default(
+		meta(s.string, { description: 'the deploy output directory' }),
+		DEPLOY_DIR
+	),
+	build_dir: s.with_default(
+		meta(s.string, { description: 'the SvelteKit build directory' }),
+		SVELTEKIT_BUILD_DIRNAME
+	),
+	dry: s.with_default(
+		meta(s.boolean, {
 			description: 'build and prepare to deploy without actually deploying'
-		})
-		.default(false),
-	force: z
-		.boolean()
-		.meta({ description: 'caution!! destroys the target branch both locally and remotely' })
-		.default(false),
-	dangerous: z
-		.boolean()
-		.meta({ description: 'caution!! enables destruction of branches like main and master' })
-		.default(false),
-	reset: z
-		.boolean()
-		.meta({
+		}),
+		false
+	),
+	force: s.with_default(
+		meta(s.boolean, {
+			description: 'caution!! destroys the target branch both locally and remotely'
+		}),
+		false
+	),
+	dangerous: s.with_default(
+		meta(s.boolean, {
+			description: 'caution!! enables destruction of branches like main and master'
+		}),
+		false
+	),
+	reset: s.with_default(
+		meta(s.boolean, {
 			description: 'if true, resets the target branch back to the first commit before deploying'
-		})
-		.default(false),
-	build: z.boolean().meta({ description: 'dual of no-build' }).default(true),
-	'no-build': z.boolean().meta({ description: 'opt out of building' }).default(false),
-	sync: z.boolean().meta({ description: 'dual of no-sync' }).default(true),
-	'no-sync': z.boolean().meta({ description: 'opt out of gro sync in build' }).default(false),
-	gen: z.boolean().meta({ description: 'dual of no-gen' }).default(true),
-	'no-gen': z.boolean().meta({ description: 'opt out of gro gen in build' }).default(false),
-	install: z.boolean().meta({ description: 'dual of no-install' }).default(true),
-	'no-install': z
-		.boolean()
-		.meta({ description: 'opt out of installing packages before building' })
-		.default(false),
-	force_build: z
-		.boolean()
-		.meta({ description: 'force a fresh build, ignoring the cache' })
-		.default(false),
-	pull: z.boolean().meta({ description: 'dual of no-pull' }).default(true),
-	'no-pull': z.boolean().meta({ description: 'opt out of git pull' }).default(false)
+		}),
+		false
+	),
+	build: s.with_default(meta(s.boolean, { description: 'dual of no-build' }), true),
+	'no-build': s.with_default(meta(s.boolean, { description: 'opt out of building' }), false),
+	sync: s.with_default(meta(s.boolean, { description: 'dual of no-sync' }), true),
+	'no-sync': s.with_default(
+		meta(s.boolean, { description: 'opt out of gro sync in build' }),
+		false
+	),
+	gen: s.with_default(meta(s.boolean, { description: 'dual of no-gen' }), true),
+	'no-gen': s.with_default(meta(s.boolean, { description: 'opt out of gro gen in build' }), false),
+	install: s.with_default(meta(s.boolean, { description: 'dual of no-install' }), true),
+	'no-install': s.with_default(
+		meta(s.boolean, { description: 'opt out of installing packages before building' }),
+		false
+	),
+	force_build: s.with_default(
+		meta(s.boolean, { description: 'force a fresh build, ignoring the cache' }),
+		false
+	),
+	pull: s.with_default(meta(s.boolean, { description: 'dual of no-pull' }), true),
+	'no-pull': s.with_default(meta(s.boolean, { description: 'opt out of git pull' }), false)
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
 /** @nodocs */
 export const task: Task<Args> = {
@@ -178,9 +193,19 @@ export const task: Task<Args> = {
 					// so delete the directory and continue as if it wasn't there.
 					await rm(resolved_deploy_dir, { recursive: true });
 				} else {
-					await spawn('git', ['reset', '--hard'], target_spawn_options); // in case it's dirty
-					// Skip pulling target branch when resetting (optimization - we reset after anyway)
-					if (!reset) {
+					// in case it's dirty
+					const reset_result = await spawn('git', ['reset', '--hard'], target_spawn_options);
+					if (!reset_result.ok) {
+						// We're in a bad state because the deploy dir can't be reset,
+						// so delete the directory and continue as if it wasn't there.
+						log.warn(
+							'`git reset --hard` failed in',
+							print_path(resolved_deploy_dir),
+							'- recreating it'
+						);
+						await rm(resolved_deploy_dir, { recursive: true });
+					} else if (!reset) {
+						// Skip pulling target branch when resetting (optimization - we reset after anyway)
 						await git_pull(origin, target, target_spawn_options);
 						if (await git_check_clean_workspace(target_spawn_options)) {
 							// We're in a bad state because the local branch lost continuity with the remote,
@@ -204,8 +229,21 @@ export const task: Task<Args> = {
 			}
 
 			// Local target branch is now synced with remote, but do we need to reset?
+			// The reset is local, so a dry deploy pushes nothing, and the final force push publishes it.
 			if (reset) {
-				await git_reset_branch_to_first_commit(origin, target, target_spawn_options);
+				const first_commit_hash = await git_current_branch_first_commit_hash(target_spawn_options);
+				const reset_result = await spawn(
+					'git',
+					['reset', '--hard', first_commit_hash],
+					target_spawn_options
+				);
+				if (!reset_result.ok) {
+					throw new TaskError(
+						`\`git reset --hard ${first_commit_hash}\` failed resetting the target branch '${target}'` +
+							` in ${print_path(resolved_deploy_dir)}, so nothing was pushed - see the output above,` +
+							' resolve the failure, then deploy again'
+					);
+				}
 			}
 		} else {
 			// Remote target branch does not exist, so start from scratch
@@ -224,13 +262,24 @@ export const task: Task<Args> = {
 			// Create the target branch locally and remotely.
 			// This is more complex to avoid churning the cwd.
 			await git_clone_locally(origin, source, dir, resolved_deploy_dir);
-			await spawn('git', ['checkout', '--orphan', target], target_spawn_options);
+			const spawn_init = async (command: string, command_args: Array<string>): Promise<void> => {
+				const result = await spawn(command, command_args, target_spawn_options);
+				if (!result.ok) {
+					throw new TaskError(
+						`\`${command} ${command_args.join(' ')}\` failed creating the target branch '${target}'` +
+							` in ${print_path(resolved_deploy_dir)}, so nothing was pushed - see the output above,` +
+							' resolve the failure, then deploy again'
+					);
+				}
+			};
+			await spawn_init('git', ['checkout', '--orphan', target]);
 			// TODO there's definitely a better way to do this
-			await spawn('git', ['rm', '-rf', '.'], target_spawn_options);
-			await spawn('touch', [INITIAL_FILE_PATH], target_spawn_options);
-			await spawn('git', ['add', INITIAL_FILE_PATH], target_spawn_options);
-			await spawn('git', ['commit', '-m', 'init'], target_spawn_options);
-			await git_push_to_create(origin, target, target_spawn_options);
+			await spawn_init('git', ['rm', '-rf', '.']);
+			await spawn_init('touch', [INITIAL_FILE_PATH]);
+			await spawn_init('git', ['add', INITIAL_FILE_PATH]);
+			await spawn_init('git', ['commit', '-m', 'init']);
+			// a dry deploy pushes nothing; a real one creates the remote branch here, with upstream tracking
+			if (!dry) await git_push_to_create(origin, target, target_spawn_options);
 			await git_delete_local_branch(source, target_spawn_options);
 		}
 
@@ -247,7 +296,8 @@ export const task: Task<Args> = {
 				st('red', 'build failed'),
 				'but',
 				st('green', 'no changes were made to git'),
-				print_error(error)
+				// a `SilentError` means the build's failure is already reported above
+				...(is_silent_error(error) ? [] : [print_error(error)])
 			);
 			if (dry) {
 				log.info(st('red', 'dry deploy failed'));
@@ -275,15 +325,60 @@ export const task: Task<Args> = {
 		}
 
 		// Commit and push
-		try {
-			await spawn('git', ['add', '.', '-f'], target_spawn_options);
-			await spawn('git', ['commit', '-m', 'deployment'], target_spawn_options);
-			await spawn('git', ['push', origin, target, '-f'], target_spawn_options); // force push because we may be resetting the branch, see the checks above to make this safer
-		} catch (error) {
-			log.error(st('red', 'updating git failed:'), print_error(error));
-			throw new TaskError(`Deploy failed in a bad state: built but not pushed, see error above.`);
+		const bad_state_message = (step: string): string =>
+			`Deploy failed in a bad state: built but not pushed: \`${step}\` failed` +
+			` in ${print_path(resolved_deploy_dir)} - see the output above,` +
+			` resolve the failure, then deploy again`;
+		// no `-f`: the deploy dir is its own clone, so only its own ignore rules apply -
+		// a `.gitignore` the build emits and the user's global excludes - and they're respected
+		const add_result = await spawn('git', ['add', '.'], target_spawn_options);
+		if (!add_result.ok) {
+			throw new TaskError(bad_state_message('git add'));
+		}
+		// fail loud on what the add skipped: without `--directory`, files in ignored directories
+		// are listed one by one, and `-z` keeps names unquoted
+		const ignored = await spawn_out(
+			'git',
+			['ls-files', '-z', '--others', '--ignored', '--exclude-standard'],
+			target_spawn_options
+		);
+		if (!ignored.result.ok) {
+			if (ignored.stderr) log.error(ignored.stderr.trimEnd());
+			throw new TaskError(bad_state_message('git ls-files --others --ignored'));
+		}
+		const ignored_paths = ignored.stdout?.split('\0').filter(Boolean) ?? [];
+		if (ignored_paths.length) {
+			log.warn(
+				st('yellow', 'not deploying files the deploy clone ignores') +
+					' (a `.gitignore` in the build output or your global git excludes):\n' +
+					ignored_paths.map((p) => '  ' + p).join('\n') +
+					'\nto deploy them, remove the matching rule' +
+					` - \`git check-ignore -v <path>\` in ${print_path(resolved_deploy_dir)} names it`
+			);
+		}
+		// `git diff --cached --quiet` exits 0 with nothing staged and 1 with changes,
+		// so a redeploy of an identical build commits nothing and still pushes
+		const diff_result = await spawn('git', ['diff', '--cached', '--quiet'], target_spawn_options);
+		const changed = !diff_result.ok;
+		if (changed && !(diff_result.kind === 'exited' && diff_result.code === 1)) {
+			throw new TaskError(bad_state_message('git diff --cached --quiet'));
+		}
+		if (changed) {
+			const commit_result = await spawn(
+				'git',
+				['commit', '-m', 'deployment'],
+				target_spawn_options
+			);
+			if (!commit_result.ok) {
+				throw new TaskError(bad_state_message('git commit'));
+			}
+		}
+		// force push because we may be resetting the branch, see the checks above to make this safer
+		const push_result = await spawn('git', ['push', origin, target, '-f'], target_spawn_options);
+		if (!push_result.ok) {
+			throw new TaskError(bad_state_message(`git push ${origin} ${target} -f`));
 		}
 
-		log.info(st('green', 'deployed')); // TODO log a different message if "Everything up-to-date"
+		log.info(st('green', changed ? 'deployed' : 'deployed with no changes'));
 	}
 };

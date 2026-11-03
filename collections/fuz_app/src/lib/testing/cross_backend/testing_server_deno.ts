@@ -3,8 +3,9 @@ import '../assert_dev_env.ts';
 /**
  * Deno runtime adapter for spawnable cross-process test server binaries.
  *
- * Binds `Deno.serve` and `hono/deno`'s module-level `upgradeWebSocket`. The
- * shared `testing/cross_backend/testing_server_core.ts` owns the rest. Counterpart to
+ * Binds `Deno.serve` and `@hono/deno`'s module-level `upgradeWebSocket` (the
+ * optional `@hono/deno` peer dep). The shared
+ * `testing/cross_backend/testing_server_core.ts` owns the rest. Counterpart to
  * `testing/cross_backend/testing_server_node.ts` — together they isolate the JS-runtime axis (Deno
  * vs Node V8) on identical TS surfaces, and the Rust spine binary covers the
  * cross-language axis.
@@ -16,7 +17,7 @@ import '../assert_dev_env.ts';
  * @module
  */
 
-import { upgradeWebSocket } from 'hono/deno';
+import { upgradeWebSocket } from '@hono/deno';
 
 import { create_deno_runtime } from '../../runtime/deno.ts';
 import type { ServeHandle, TestingServerAdapter } from './testing_server_core.ts';
@@ -34,16 +35,16 @@ declare const Deno: {
 	addSignalListener: (signal: string, handler: () => void) => void;
 };
 
-/** Build the Deno {@link TestingServerAdapter}. */
+/** Build the Deno `TestingServerAdapter`. */
 export const create_deno_testing_adapter = (): TestingServerAdapter => ({
 	runtime_label: 'Deno',
 	runtime: create_deno_runtime([]),
 	get_connection_ip: (c) =>
 		(c.env as { remoteAddr?: { hostname?: string } } | undefined)?.remoteAddr?.hostname,
 	// Deno's WS upgrade is module-level and stateless — no post-serve attach.
-	prepare_websocket: () => ({ upgrade_websocket: upgradeWebSocket }),
+	prepare_websocket: () => ({ create_upgrade_websocket: () => upgradeWebSocket }),
 	serve: ({ fetch, port, hostname }) => {
-		const server = Deno.serve({ port, hostname }, fetch as Parameters<typeof Deno.serve>[1]);
+		const server = Deno.serve({ port, hostname }, fetch);
 		const handle: ServeHandle = { shutdown: () => server.shutdown(), native: server };
 		return handle;
 	},

@@ -1,14 +1,31 @@
-import { timeYear, timeDay, type TimeInterval, timeTicks } from 'd3-time';
+import {
+  timeYear,
+  timeDay,
+  timeHour,
+  timeMillisecond,
+  timeMinute,
+  timeSecond,
+  type TimeInterval,
+  timeTicks,
+  utcDay,
+  utcHour,
+  utcMillisecond,
+  utcMinute,
+  utcSecond,
+  utcYear,
+} from 'd3-time';
 
 import {
   format,
   Duration,
   isLiteralObject,
+  PeriodType,
   type FormatType,
   type FormatConfig,
   DateToken,
 } from '@layerstack/utils';
-import { isScaleBand, isScaleTime, type AnyScale } from './scales.svelte.js';
+import { utcToLocalDate } from '@layerstack/utils/date';
+import { isScaleBand, isScaleTime, isScaleUtc, type AnyScale } from './scales.svelte.js';
 import type { AxisProps } from '$lib/components/Axis/Axis.svelte';
 
 export function getDurationFormat(
@@ -156,6 +173,52 @@ export function autoTickVals(scale: AnyScale, ticks?: TicksConfig, count?: numbe
   return [];
 }
 
+/**
+ * Keep only ticks that sit exactly on the boundary implied by the format type, so a day-formatted
+ * axis doesn't repeat the same label on sub-day ticks.
+ *
+ * `utc` must match the scale: a `scaleUtc()` produces UTC-midnight ticks, which *local* intervals
+ * never floor to (outside UTC itself) — filtering those with local intervals drops every tick.
+ */
+export function filterTicksByFormat<T>(
+  tickVals: T[],
+  formatType: FormatType | FormatConfig | undefined,
+  options: { utc?: boolean } = {}
+): T[] {
+  const utc = options.utc ?? false;
+  const type = isLiteralObject(formatType) ? (formatType as FormatConfig).type : formatType;
+
+  const yearInterval = utc ? utcYear : timeYear;
+  const dayInterval = utc ? utcDay : timeDay;
+  const hourInterval = utc ? utcHour : timeHour;
+  const minuteInterval = utc ? utcMinute : timeMinute;
+  const secondInterval = utc ? utcSecond : timeSecond;
+  const millisecondInterval = utc ? utcMillisecond : timeMillisecond;
+
+  const onBoundary = (interval: TimeInterval) => (val: any) => +interval.floor(val) === +val;
+
+  if (type === 'integer') {
+    return tickVals.filter(Number.isInteger as any);
+  } else if (type === 'year' || type === PeriodType.CalendarYear) {
+    return tickVals.filter(onBoundary(yearInterval));
+  } else if (type === 'month' || type === PeriodType.Month || type === PeriodType.MonthYear) {
+    // first week of the month
+    return tickVals.filter((val: any) => (utc ? val.getUTCDate() : val.getDate()) < 7);
+  } else if (type === 'day' || type === PeriodType.Day) {
+    return tickVals.filter(onBoundary(dayInterval));
+  } else if (type === 'hour' || type === PeriodType.Hour) {
+    return tickVals.filter(onBoundary(hourInterval));
+  } else if (type === 'minute' || type === PeriodType.Minute) {
+    return tickVals.filter(onBoundary(minuteInterval));
+  } else if (type === 'second' || type === PeriodType.Second) {
+    return tickVals.filter(onBoundary(secondInterval));
+  } else if (type === 'millisecond' || type === PeriodType.Millisecond) {
+    return tickVals.filter(onBoundary(millisecondInterval));
+  }
+
+  return tickVals;
+}
+
 export function autoTickFormat(options: {
   scale: AnyScale;
   ticks?: TicksConfig;
@@ -168,21 +231,39 @@ export function autoTickFormat(options: {
 
   // Explicit format
   if (formatType) {
+    // A UTC scale's ticks are UTC instants, so they have to be *rendered* in UTC too — otherwise
+    // a tick at UTC midnight prints the previous local day and silently sits under the wrong label.
+    if (isScaleUtc(scale)) {
+      const config: FormatConfig = isLiteralObject(formatType)
+        ? (formatType as FormatConfig)
+        : ({ type: formatType } as FormatConfig);
+
+      return (tick: any) =>
+        // @ts-expect-error - improve types
+        format(tick, { ...config, options: { ...config.options, utc: true } });
+    }
+
     // @ts-expect-error - improve types
     return (tick: any) => format(tick, formatType);
   }
 
   // Time scale
   if (isScaleTime(scale) && count) {
+    let durationFormat: ReturnType<typeof getDurationFormat>;
     if (isLiteralObject(ticks) && 'interval' in ticks && ticks.interval != null) {
       const start = ticks.interval.floor(new Date());
       const end = ticks.interval.ceil(new Date());
-      return getDurationFormat(new Duration({ start, end }), { multiline, placement });
+      durationFormat = getDurationFormat(new Duration({ start, end }), { multiline, placement });
     } else {
       // Compare first 2 ticks to determine duration between ticks for formatting
       const [start, end] = timeTicks(scale.domain()[0], scale.domain()[1], count);
-      return getDurationFormat(new Duration({ start, end }), { multiline, placement });
+      durationFormat = getDurationFormat(new Duration({ start, end }), { multiline, placement });
     }
+    // As with an explicit format, a UTC scale's ticks are rendered in UTC.  The duration format
+    // reads local fields throughout, so hand it the local date that shares the tick's UTC fields.
+    return isScaleUtc(scale)
+      ? (tick: Date, i: number) => durationFormat(utcToLocalDate(tick), i)
+      : durationFormat;
   }
 
   // Format from scale

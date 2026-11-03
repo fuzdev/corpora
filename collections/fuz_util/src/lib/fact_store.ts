@@ -1,14 +1,10 @@
 /**
  * `FactStore` interface.
  *
- * Backend-agnostic content-addressed byte store. Implementations vary by
- * context (filesystem, PG, federated composition later) but all share this
- * interface so callers don't care which. The interface lives in fuz_util
- * (zero backend deps) so build tools can use it; backend implementations
- * live downstream.
- *
- * Idempotent writes, verifiable reads, embedded vs referenced storage
- * abstracted — see the per-method contracts below.
+ * The shape of a backend-agnostic content-addressed byte store: idempotent
+ * writes keyed by the content hash, verifiable reads, and embedded vs external
+ * storage abstracted — see the per-method contracts below. It lives in
+ * fuz_util (zero backend deps), so it names no backend.
  *
  * @module
  */
@@ -16,14 +12,13 @@
 import type { FactHash } from './hash_schemas.ts';
 
 /**
- * Optional metadata + ref declarations on a `put` / `put_ref` call.
+ * Optional metadata + ref declarations on a `put` / `put_stream` call.
  *
  * `content_type` is advisory and not part of the hash. Omitting it
  * (`undefined`) reads back from `get_meta` as `null` — `undefined` means
- * "caller didn't specify," `null` means "no type stored." `refs` lets
- * callers declare references for binary content where text scanning isn't
- * sound; for JSON content, implementations may auto-extract refs from the
- * bytes when no explicit `refs` is supplied.
+ * "caller didn't specify," `null` means "no type stored." `refs` declares the
+ * fact's outgoing references; implementations record exactly these and never
+ * scan the bytes for more, whatever the content type. Omitting it records none.
  */
 export interface FactPutOptions {
 	content_type?: string;
@@ -31,30 +26,24 @@ export interface FactPutOptions {
 }
 
 /**
- * Outcome of a streaming `put_stream` — the finalized digests + byte count.
+ * Outcome of a streaming `put_stream` — the finalized hash + byte count.
  *
- * `hash` is the `blake3:`-prefixed fact hash (content address); `sha256` is the
- * bare-hex SHA-256 computed in the same pass, so a consumer can persist it
- * alongside the fact and let clients verify downloads with the ubiquitous
- * `sha256sum` (there is no universal shell BLAKE3 tool); `size` is the streamed
- * byte count. Mirrors the Rust `PutStreamOutcome`.
+ * `hash` is the `blake3:`-prefixed fact hash (content address); `size` is the
+ * streamed byte count. Mirrors the Rust `PutStreamOutcome`.
  */
 export interface PutStreamOutcome {
 	hash: FactHash;
-	sha256: string;
 	size: number;
 }
 
 /**
  * Per-fact metadata returned by `FactStore.get_meta`.
  *
- * `external` is `true` when the fact is stored as a URL reference rather
- * than embedded bytes — callers may use this to decide whether to stream
- * vs load fully. The external URL itself is intentionally *not* exposed
- * here: reads go through `get`, which fetches and verifies hash↔bytes
- * internally, so handing out a live URL would bypass the verifiable-reads
- * contract. The URL surfaces only from `delete`, where the caller must
- * unlink the external resource.
+ * `external` is `true` when the bytes are stored outside the row rather
+ * than embedded — callers may use this to decide whether to stream vs load
+ * fully. The storage location is intentionally *not* exposed here: reads go
+ * through `get`, which verifies hash↔bytes, so handing out a location would
+ * bypass the verifiable-reads contract. It surfaces only from `delete`.
  */
 export interface FactMeta {
 	content_type: string | null;
@@ -83,15 +72,16 @@ export interface FactStore {
 
 	/**
 	 * Stream bytes into the store with bounded memory, returning the finalized
-	 * digests + size. Hashes BLAKE3 (content address) **and** SHA-256 in a single
-	 * pass over the stream, buffers in memory only up to the embedded threshold,
+	 * hash + size. Hashes BLAKE3 (content address) in a single pass over the
+	 * stream, buffers in memory only up to the embedded threshold,
 	 * then spills to the disk CAS — so a multi-GB upload never buffers in RAM.
 	 *
 	 * Enforces `max_bytes` mid-stream: a body whose running byte count passes the
-	 * cap throws `PayloadTooLargeError` (the backstop for a chunked or
-	 * mis-declared `Content-Length`). A disk-full (`ENOSPC`) mid-stream throws
-	 * `StorageFullError`. Idempotent like `put` — identical bytes land on the same
-	 * content-addressed path and the underlying insert is `ON CONFLICT DO NOTHING`.
+	 * cap throws the implementation's payload-too-large error (the backstop for a
+	 * chunked or mis-declared `Content-Length`), and a disk-full (`ENOSPC`)
+	 * mid-stream throws its storage-full error. Idempotent like `put` — identical
+	 * bytes land on the same content-addressed path and the underlying insert is
+	 * `ON CONFLICT DO NOTHING`.
 	 *
 	 * The streaming twin of `put`; mirrors the Rust `FactStore::put_stream`.
 	 */
@@ -102,21 +92,9 @@ export interface FactStore {
 	) => Promise<PutStreamOutcome>;
 
 	/**
-	 * Store a reference to external content (large files). Hashes the content
-	 * at the URL (streaming) and records hash + URL + size.
-	 *
-	 * `size` is supplied by the caller (typically from the upload's
-	 * Content-Length); implementations may verify by counting bytes during
-	 * streaming and rejecting on mismatch. Implementations decide how to
-	 * fetch — production typically a signed URL into object storage, tests
-	 * inject a stub.
-	 */
-	put_ref: (url: string, size: number, options?: FactPutOptions) => Promise<FactHash>;
-
-	/**
-	 * Retrieve bytes by hash. Returns `null` when not found OR when fetching
-	 * external content failed integrity verification — both are treated as
-	 * unavailable from the caller's perspective.
+	 * Retrieve bytes by hash. Returns `null` when not found OR when externally
+	 * stored bytes could not be read or failed integrity verification — all
+	 * are treated as unavailable from the caller's perspective.
 	 */
 	get: (hash: FactHash) => Promise<Uint8Array | null>;
 
@@ -137,9 +115,9 @@ export interface FactStore {
 	/**
 	 * Drop a fact. Idempotent — deleting an absent hash returns `null`.
 	 * Returns the deleted fact's `size` and `external_url` so callers can
-	 * tally freed bytes and unlink any external resource (the store
-	 * doesn't know how to resolve `file:` / `s3:` / etc. URLs to a
-	 * deletable handle, mirroring the read-side fetcher split).
+	 * tally freed bytes and remove the externally stored bytes; the store
+	 * does not remove them itself. `external_url` is whatever the row held —
+	 * validate its shape before using it to address anything.
 	 *
 	 * Implementations do NOT verify the hash is unreferenced — that
 	 * policy lives one layer up (orphan-fact admin, GC walker).

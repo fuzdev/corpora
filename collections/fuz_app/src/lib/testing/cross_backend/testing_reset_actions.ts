@@ -3,40 +3,51 @@ import '../assert_dev_env.ts';
 /**
  * Test-binary RPC actions for cross-process integration tests.
  *
- * Six daemon-token-authed actions, bundled by `create_testing_actions`:
+ * The daemon-token-authed actions bundled by `create_testing_actions`:
  * **`_testing_reset`** (DB wipe + keeper re-seed), **`_testing_drain_effects`**
  * (audit barrier), **`_testing_mint_session`** (forge an
  * expired-by-construction server-side session for the expiry conformance
  * cases), **`_testing_put_fact`** (seed an embedded fact for the fact-serving
  * suite), **`_testing_schema_snapshot`** (introspect the live schema for
- * cross-impl parity diffing against a Rust backend's `fuz_db` snapshot), and
+ * cross-impl parity diffing against a Rust backend's `fuz_db` snapshot),
  * **`_testing_migration_tracker`** (dump the `schema_version` tracker rows for
  * cross-impl migration-identity parity — the provenance half the snapshot gate
- * excludes by design).
+ * excludes by design), and **`_testing_flood_notifications`** (queue a burst
+ * of notifications onto the caller's own WebSocket connection, to push its
+ * outbound queue past its byte budget).
  *
- * A further daemon-token action, **`_testing_action_manifest`** (dump the live
- * RPC registry for cross-impl method-set + auth-shape parity), lives here too
- * but is **not** bundled by `create_testing_actions` — it must enumerate
- * *every* mounted method, so it's appended at the full-mount layer
- * (`build_full_spine_rpc_actions`) where the complete list exists.
+ * Two further daemon-token actions live here but are **not** bundled by
+ * `create_testing_actions`, and are appended at the full-mount layer
+ * (`build_full_spine_rpc_actions`) instead: **`_testing_action_manifest`**
+ * (dump the live RPC registry for cross-impl method-set + auth-shape parity —
+ * it must enumerate *every* mounted method, so it goes where the complete list
+ * exists) and **`_testing_shorten_credential_expiry`** (pull an account's
+ * credential expiries in to seconds from now, shorten-only, for the
+ * credential-deadline cases) — the latter kept out of the bundle so a consumer
+ * whose Rust binary doesn't mount its mirror keeps a green manifest gate.
+ * `_testing_origin_check`, mounted the same way, lives in the hono-free
+ * `testing_origin_check.ts`.
  *
  * `_testing_reset` — full DB wipe + keeper re-seed + optional
  * secondary-account seeding. The
- * handler wipes every auth-namespace row (no keeper-preserve filter),
+ * handler first fires the consumer-supplied domain-state callback (domain
+ * rows depend on auth rows, so a domain table with a restricting FK to
+ * `actor` empties before the rows it references go), then wipes every
+ * auth-namespace row (no keeper-preserve filter),
  * flips `bootstrap_lock` back to its post-bootstrap shape, seeds a
  * fresh keeper account inline (reusing `create_test_account_with_credentials`
- * so cross-process matches in-process write semantics), seeds any
- * caller-requested `extra_accounts` (also direct-inserted at this
- * setup step), refreshes the daemon-token cache to point at the new
- * keeper, and fires the consumer-supplied domain-state callback. The
+ * so cross-process matches in-process write semantics), queues the
+ * daemon-token cache refresh to point at the new keeper once the reset
+ * commits, and seeds any caller-requested `extra_accounts` (also
+ * direct-inserted at this setup step). The
  * new keeper + secondary credentials return as the action output so
  * the per-test fixture closes over them.
  *
- * The redesign converges in-process and cross-process keeper
- * lifetimes: both modes now run against a freshly bootstrapped keeper
- * per test. Mutation-cascade tests (password change, revoke-all,
- * hardcoded-username signup uniqueness) and direct keeper-vs-admin
- * probes work uniformly cross-process.
+ * In-process and cross-process keeper lifetimes match: both modes run
+ * against a freshly bootstrapped keeper per test, so mutation-cascade
+ * tests (password change, revoke-all, hardcoded-username signup
+ * uniqueness) and direct keeper-vs-admin probes work uniformly
+ * cross-process.
  *
  * **Keeper ≠ admin.** The `keeper` and `admin` roles are independent.
  * Keeper authorizes daemon-token / bootstrap paths; admin authorizes
@@ -48,9 +59,8 @@ import '../assert_dev_env.ts';
  * via `extra_accounts: [{username, roles: [ROLE_KEEPER]}]` so the
  * account is seeded at this same bootstrap-equivalent step.
  *
- * **No free-form runtime bypass.** Earlier drafts considered a separate
- * `_testing_seed_role_grant` action for arbitrary direct grants; that
- * was rejected because a runtime bypass would let tests skip the
+ * **No free-form runtime bypass.** There is no action for arbitrary
+ * direct role grants: a runtime bypass would let tests skip the
  * production consent flow's side-effects (audit emit, WS fan-out) and
  * silently mask bugs in those paths. The bypass that does exist —
  * `extra_accounts` — is framed as bootstrap-time seeding, the same
@@ -71,21 +81,22 @@ import '../assert_dev_env.ts';
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, FactHashSchema } from '../../primitive_schemas.ts';
 import { fact_hash_bytes } from '@fuzdev/fuz_util/fact_hash.ts';
-import { FactHashSchema } from '@fuzdev/fuz_util/hash_schemas.ts';
 
-import { rpc_action, type RpcAction } from '../../actions/action_rpc.ts';
+import { rpc_action, type RpcAction } from '../../actions/action_types.ts';
+import { jsonrpc_errors } from '../../http/jsonrpc_errors.ts';
+import { emit_after_commit } from '../../http/pending_effects.ts';
 import { protocol_action_specs } from '../../actions/protocol.ts';
 import { query_put_fact } from '../../db/fact_queries.ts';
+import { query_put_fact_holder } from '../../db/fact_holder_queries.ts';
 import type { RequestResponseActionSpec } from '../../actions/action_spec.ts';
-import type { RouteAuth } from '../../http/auth_shape.ts';
 import type { AppDeps } from '../../auth/deps.ts';
+import type { AuditEmitter } from '../../auth/audit_emitter.ts';
 import type { SessionOptions } from '../../auth/session_cookie.ts';
 import type { DaemonTokenState } from '../../auth/daemon_token.ts';
 import type { Db } from '../../db/db.ts';
 import { ROLE_ADMIN, ROLE_KEEPER } from '../../auth/role_schema.ts';
-import { auth_integration_truncate_tables } from '../db.ts';
 import {
 	query_schema_snapshot,
 	SchemaSnapshot,
@@ -93,24 +104,10 @@ import {
 	MigrationTracker
 } from '../schema_introspect.ts';
 import { ActionManifest, build_action_manifest } from './action_manifest.ts';
-import { query_create_actor } from '../../auth/account_queries.ts';
+import { create_test_extra_actor } from '../db_entities.ts';
 import { create_test_account_with_credentials, mint_test_session } from '../app_server.ts';
 import { DEFAULT_TEST_PASSWORD } from '../test_credentials.ts';
-
-/**
- * Shared `auth` axis for every `_testing_*` action: keeper-only via the
- * daemon-token credential, no acting actor. This is the entire structural
- * fence on the backdoor surface (these actions run direct DB writes the
- * production wire never exposes), so all five specs reference this one const
- * rather than re-declaring it — a single source of truth the gate test
- * (`testing_actions_auth.test.ts`) pins. Mirrors the Rust `DAEMON_TOKEN_ONLY`
- * / shared `AuthSpec` in `fuz_testing`.
- */
-const TESTING_ACTION_AUTH = {
-	account: 'required',
-	actor: 'none',
-	credential_types: ['daemon_token']
-} as const satisfies RouteAuth;
+import { TESTING_ACTION_AUTH } from './spine_surface_constants.ts';
 
 /** Output shape for an individual seeded account (keeper or extra). */
 const SeededAccountShape = z.strictObject({
@@ -189,13 +186,26 @@ export const testing_reset_action_spec = {
  * the cross-backend conformance suite uses in place of a poll/sleep before
  * asserting on audit rows.
  *
- * On the TS spine the barrier is **satisfied by construction**: the test
- * binary runs `await_pending_effects: true`, so every mutation's fire-and-
- * forget audit emits are awaited before its response returns — by the time
- * a later drain call runs, prior emits are already durable. The action still
- * exists so the cross-backend test body calls the same method on every
- * backend; the Rust spine (whose audit writes are detached tokio tasks)
- * does the real await in `AuditEmitter::drain_inflight`.
+ * The handler awaits `AuditEmitter.drain_inflight`, which waits until no
+ * tracked `emit` write is outstanding — so the binary's emitter must be built
+ * with `track_inflight: true`, or the drain resolves at once and is no barrier.
+ * Tracking is what makes it a barrier whatever the transport: an **HTTP**
+ * mutation on a binary running `await_pending_effects: true` has its writes
+ * settled by the time it responds, but a **WS** mutation is answered before
+ * its effects flush (reply-then-close for a self-revocation), so its audit
+ * write can still be in flight when the caller reads the reply. The Rust
+ * spine does the same await in `AuditEmitter::drain_inflight`, over an
+ * emitter built with `new_with_inflight_tracking`.
+ *
+ * Covered: every `emit` that ran before the drain was dispatched, and any
+ * started while it waits. A write that starts after the drain resolves is
+ * not — nor are eager writes outside `emit` (session touch, token usage),
+ * which only the dispatching transport's own flush awaits.
+ *
+ * The output's `tracked` is `AuditEmitter.is_tracking_inflight` — whether the
+ * drain could wait on anything. `cross_drain_effects` refuses `tracked: false`,
+ * so a binary whose emitter was built without tracking fails its first audit
+ * read instead of racing it. The Rust twin answers the same shape.
  *
  * `auth` gates on the daemon-token credential, matching `_testing_reset`.
  */
@@ -206,7 +216,14 @@ export const testing_drain_effects_action_spec = {
 	auth: TESTING_ACTION_AUTH,
 	side_effects: false,
 	input: z.void(),
-	output: z.strictObject({ ok: z.boolean() }),
+	output: z.strictObject({
+		ok: z.boolean(),
+		tracked: z.boolean().meta({
+			description:
+				"Whether the backend's audit emitter tracks in-flight writes — false means the drain " +
+				'waited on nothing and is no barrier.'
+		})
+	}),
 	async: true,
 	description:
 		'Test-binary only — await in-flight fire-and-forget audit writes so a following audit_log_list read is authoritative.'
@@ -269,24 +286,36 @@ export const testing_mint_session_action_spec = {
 } as const satisfies RequestResponseActionSpec;
 
 /**
- * Build the standalone `_testing_drain_effects` action. No deps — on TS the
- * barrier is satisfied by `await_pending_effects` (see the spec doc), so the
- * handler just returns `{ok: true}`. Mount it on any test endpoint whose
- * suite asserts on audit rows (the spine binary bundles it via
- * `create_testing_actions`; in-process suites mount it directly).
+ * Build the standalone `_testing_drain_effects` action over `audit` — the
+ * emitter the backend's handlers emit through (`deps.audit`), built with
+ * `track_inflight: true` (see the spec doc). Mount it on any test endpoint
+ * whose suite asserts on audit rows (the spine binary bundles it via
+ * `create_testing_actions`; in-process suites mount it directly). Answers
+ * `{ok: true, tracked}`, `tracked` read from `audit.is_tracking_inflight()`.
+ *
+ * @param audit - the backend's emitter, whose in-flight writes the action awaits
  */
-export const create_testing_drain_effects_action = (): RpcAction =>
-	rpc_action(testing_drain_effects_action_spec, async () => ({ ok: true }));
+export const create_testing_drain_effects_action = (audit: AuditEmitter): RpcAction =>
+	rpc_action(testing_drain_effects_action_spec, async () => {
+		await audit.drain_inflight();
+		return { ok: true, tracked: audit.is_tracking_inflight() };
+	});
 
 /**
  * `_testing_put_fact` — seed an **embedded** fact (`fact.bytes`) for the
  * cross-process fact-serving suite, which drives over real HTTP and has no
  * `PgFactStore` to call. Hashes the UTF-8 `content` (blake3, via
  * `fact_hash_bytes` — the same hash the Rust `_testing_put_fact` computes),
- * inserts the row idempotently, and returns `{hash}`. The referencing cell is
- * seeded separately via the `cell_create` RPC. Embedded-only is enough for the
- * authz assertions (cell-scoped admit, cross-owner-no-leak, 404-mask, bare-hash
- * admin-only); external / X-Accel parity stays covered by the forge's own gate.
+ * inserts the row idempotently, and returns `{hash}`. `holder` names the actor
+ * the put is on behalf of — recorded in `fact_holder` (deduplicated puts
+ * included), as a real upload records its uploader, so the suites can drive
+ * cell ref admission; absent, the put is a system put with no holder. The
+ * referencing cell is seeded separately via the `cell_create` RPC. Embedded is
+ * enough for the authz assertions (cell-scoped admit, cross-owner-no-leak,
+ * 404-mask, bare-hash admin-only); external / X-Accel parity stays covered by
+ * the forge's own gate. `external_url`, when given, writes the row the way a
+ * writer past the store could — no bytes, that URL verbatim, unvalidated — so
+ * the suite can prove a serve refuses a URL that is not its hash's own address.
  *
  * `auth` gates on the daemon-token credential, matching `_testing_reset` — the
  * action does a direct `fact` insert the production wire never exposes. The
@@ -300,14 +329,125 @@ export const testing_put_fact_action_spec = {
 	side_effects: true,
 	input: z.strictObject({
 		content: z.string(),
-		content_type: z.string().optional()
+		content_type: z.string().optional(),
+		holder: Uuid.optional(),
+		external_url: z.string().optional()
 	}),
 	output: z.strictObject({ hash: FactHashSchema }),
 	async: true,
 	description:
-		'Test-binary only — seed an embedded fact (blake3 of the UTF-8 content) and return its hash, ' +
-		'so the cross-process fact-serving suite can store bytes without a DB handle.'
+		'Test-binary only — seed a fact row for the blake3 of the UTF-8 content (embedded, or with ' +
+		'external_url an external row naming that URL) and return its hash, so the cross-process ' +
+		'fact-serving suite can store facts without a DB handle.'
 } as const satisfies RequestResponseActionSpec;
+
+/** The wire method of each notification `_testing_flood_notifications` queues. */
+export const TESTING_FLOOD_NOTIFICATION_METHOD = '_testing_flood';
+
+/**
+ * The most notifications one `_testing_flood_notifications` call queues.
+ * Empty ones at this count are charged more than
+ * `DEFAULT_WS_OUTBOUND_QUEUE_BYTES` between them — each frame's envelope and
+ * its overhead — so a burst of tiny frames can overflow a connection on a
+ * default transport too. Same value as the Rust spine's.
+ */
+export const TESTING_FLOOD_MAX_COUNT = 65_536;
+
+/** The largest `payload` one `_testing_flood_notifications` call builds, in bytes. */
+export const TESTING_FLOOD_MAX_SIZE = 16 * 1024 * 1024;
+
+/**
+ * The most payload bytes one `_testing_flood_notifications` call builds across
+ * all its notifications — the bound on `count` × `size`. The handler
+ * serializes each notification without yielding, so the product is how long
+ * one call holds the event loop.
+ */
+export const TESTING_FLOOD_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+
+/** The `data.reason` of the refusal `_testing_flood_notifications` gives a call over HTTP. */
+export const ERROR_TESTING_FLOOD_NO_CONNECTION = 'no_connection';
+
+/**
+ * `_testing_flood_notifications` — queue a burst of notifications onto the
+ * **caller's own WebSocket connection**, all in one synchronous run, so a suite
+ * driving the server from outside can push a connection's outbound queue past
+ * its byte budget deterministically — without a second producer, and whether
+ * or not its client is reading: the connection's write pump gets no turn while
+ * the handler runs, so the burst waits at once. Past the budget the server
+ * closes the socket with `WS_CLOSE_OUTBOUND_OVERFLOW`.
+ *
+ * Each notification is
+ * `{"jsonrpc":"2.0","method":"_testing_flood","params":{"index":<i>,"payload":"<size × 'x'>"}}`
+ * with `index` counting from 0, so every frame is a little longer than `size`
+ * bytes and a client can tell which frames reached it.
+ *
+ * The result is `{queued: count}` — the number asked for, not the number that
+ * fit: when the burst overflows the queue the connection is closed and this
+ * response is never written. A burst that fits arrives in order, ahead of the
+ * response.
+ *
+ * A call past `TESTING_FLOOD_MAX_COUNT`, `TESTING_FLOOD_MAX_SIZE`, or
+ * `TESTING_FLOOD_MAX_TOTAL_BYTES` (`count` × `size`) is refused with
+ * `invalid_params` and queues nothing. Over HTTP there is no connection to
+ * queue onto, so the call is refused with `invalid_params`, reason
+ * `ERROR_TESTING_FLOOD_NO_CONNECTION`, rather than answering as though it had
+ * flooded something.
+ *
+ * `auth` gates on the daemon-token credential, matching `_testing_reset`. The
+ * Rust mirror is `fuz_testing::create_testing_flood_notifications_action_spec`.
+ */
+export const testing_flood_notifications_action_spec = {
+	method: '_testing_flood_notifications',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: TESTING_ACTION_AUTH,
+	side_effects: false,
+	input: z.strictObject({
+		count: z.number().int().min(0).max(TESTING_FLOOD_MAX_COUNT).meta({
+			description: 'How many notifications to queue.'
+		}),
+		size: z.number().int().min(0).max(TESTING_FLOOD_MAX_SIZE).meta({
+			description: "The byte length of each notification's `payload` string."
+		})
+	}),
+	output: z.strictObject({
+		queued: z.number().int().meta({
+			description: 'The number of notifications asked for — not the number that fit.'
+		})
+	}),
+	async: true,
+	error_reasons: [ERROR_TESTING_FLOOD_NO_CONNECTION],
+	description:
+		"Test-binary only — queue a burst of notifications onto the caller's own WebSocket " +
+		'connection in one synchronous run, to push its outbound queue past its byte budget.'
+} as const satisfies RequestResponseActionSpec;
+
+/**
+ * Build the standalone `_testing_flood_notifications` action (see the spec
+ * doc). The spine binary bundles it via `create_testing_actions`; mount it
+ * directly on an in-process WS endpoint whose suite drives an outbound
+ * overflow.
+ */
+export const create_testing_flood_notifications_action = (): RpcAction =>
+	// not `async`: the burst must be queued in one synchronous run
+	rpc_action(testing_flood_notifications_action_spec, ({ count, size }, ctx) => {
+		if (count * size > TESTING_FLOOD_MAX_TOTAL_BYTES) {
+			throw jsonrpc_errors.invalid_params(
+				`count * size must be at most ${TESTING_FLOOD_MAX_TOTAL_BYTES}`
+			);
+		}
+		if (ctx.connection_id === undefined) {
+			throw jsonrpc_errors.invalid_params(
+				'_testing_flood_notifications needs a WebSocket connection',
+				{ reason: ERROR_TESTING_FLOOD_NO_CONNECTION }
+			);
+		}
+		const payload = 'x'.repeat(size);
+		for (let index = 0; index < count; index++) {
+			ctx.notify(TESTING_FLOOD_NOTIFICATION_METHOD, { index, payload });
+		}
+		return { queued: count };
+	});
 
 /**
  * `_testing_schema_snapshot` — introspect the live database into a normalized
@@ -316,6 +456,11 @@ export const testing_put_fact_action_spec = {
  * results (a Rust backend answers from `fuz_db::query_schema_snapshot`; the
  * shapes match by design). Optional `exclude_tables` drops documented
  * divergences from both sides before comparison.
+ *
+ * A backend running on pglet (a TS backend config's `memory://` default)
+ * answers with an error when its schema holds an index: the snapshot exists
+ * to be compared, and pglet's index definitions omit the modifiers a
+ * comparison needs (`query_schema_snapshot`). Run the backend on PostgreSQL.
  *
  * `auth` gates on the daemon-token credential, matching `_testing_reset`.
  */
@@ -362,7 +507,7 @@ export const testing_migration_tracker_action_spec = {
 	initiator: 'frontend',
 	auth: TESTING_ACTION_AUTH,
 	side_effects: false,
-	input: z.strictObject({}),
+	input: z.void(),
 	output: MigrationTracker,
 	async: true,
 	description:
@@ -380,10 +525,98 @@ export const create_testing_migration_tracker_action = (): RpcAction =>
 		query_migration_tracker(ctx.db)
 	);
 
+/** The shortest expiry `_testing_shorten_credential_expiry` sets, in seconds from now. */
+export const TESTING_SHORTEN_CREDENTIAL_EXPIRY_MIN_SECONDS = 1;
+
+/**
+ * The longest expiry `_testing_shorten_credential_expiry` sets, in seconds
+ * from now — a minute: the action exists to make a deadline arrive inside a
+ * test.
+ */
+export const TESTING_SHORTEN_CREDENTIAL_EXPIRY_MAX_SECONDS = 60;
+
+/**
+ * The new expiry: `$2` seconds from now, unless the row is due sooner. The
+ * `COALESCE` gives an eternal token (`NULL`) the near expiry too.
+ */
+const SHORTEN_EXPIRES_AT_SQL =
+	"LEAST(COALESCE(expires_at, 'infinity'::timestamptz), NOW() + ($2::int4 * INTERVAL '1 second'))";
+
+/**
+ * `_testing_shorten_credential_expiry` — pull the expiry of an account's
+ * stored credentials (every `auth_session` and `api_token` row it owns) in to
+ * `seconds` from now, so the cross-backend credential-deadline suite can open
+ * a WebSocket or audit stream on a credential that expires a moment later and
+ * watch it close at the deadline (`ResolvedAuth.credential_deadline`) without
+ * waiting out a real lifetime.
+ *
+ * Applied **before the open**: it rewrites the stored rows, and a connection
+ * reads its deadline when its credential resolves, so only one opened
+ * afterwards sees the near deadline.
+ *
+ * **Shorten-only.** The new expiry is `LEAST(expires_at, NOW() + seconds)` —
+ * an eternal token gains one, and nothing already due sooner moves later, so
+ * the action can neither extend a credential's life nor revive an expired one;
+ * `seconds` is an integer from `TESTING_SHORTEN_CREDENTIAL_EXPIRY_MIN_SECONDS`
+ * to `TESTING_SHORTEN_CREDENTIAL_EXPIRY_MAX_SECONDS`. The Rust mirror is
+ * `fuz_testing::create_testing_shorten_credential_expiry_action_spec`.
+ *
+ * Like `_testing_origin_check`, it is **not** bundled by
+ * `create_testing_actions`: a consumer whose Rust binary doesn't mount the
+ * mirror would fail its action-manifest parity gate. The spine test binary
+ * appends it at the full-mount layer (`build_full_spine_rpc_actions`).
+ *
+ * `auth` gates on the daemon-token credential, matching `_testing_reset`.
+ */
+export const testing_shorten_credential_expiry_action_spec = {
+	method: '_testing_shorten_credential_expiry',
+	kind: 'request_response',
+	initiator: 'frontend',
+	auth: TESTING_ACTION_AUTH,
+	side_effects: true,
+	input: z.strictObject({
+		account_id: Uuid,
+		seconds: z
+			.number()
+			.int()
+			.min(TESTING_SHORTEN_CREDENTIAL_EXPIRY_MIN_SECONDS)
+			.max(TESTING_SHORTEN_CREDENTIAL_EXPIRY_MAX_SECONDS)
+			.meta({
+				description:
+					'Seconds from now the credentials expire, unless already due sooner — this ' +
+					'backdoor can only shorten a credential, never extend it.'
+			})
+	}),
+	output: z.strictObject({
+		sessions: z.number().int().min(0),
+		api_tokens: z.number().int().min(0)
+	}),
+	async: true,
+	description:
+		"Test-binary only — pull an account's session and API token expiries in to seconds from " +
+		'now (shorten-only), for the cross-impl credential-deadline cases.'
+} as const satisfies RequestResponseActionSpec;
+
+/** Build the standalone `_testing_shorten_credential_expiry` action (see the spec doc). */
+export const create_testing_shorten_credential_expiry_action = (): RpcAction =>
+	rpc_action(testing_shorten_credential_expiry_action_spec, async (input, ctx) => {
+		const params = [input.account_id, input.seconds];
+		const sessions = await ctx.db.query<{ id: string }>(
+			`UPDATE auth_session SET expires_at = ${SHORTEN_EXPIRES_AT_SQL} WHERE account_id = $1 RETURNING id`,
+			params
+		);
+		const api_tokens = await ctx.db.query<{ id: string }>(
+			`UPDATE api_token SET expires_at = ${SHORTEN_EXPIRES_AT_SQL} WHERE account_id = $1 RETURNING id`,
+			params
+		);
+		return { sessions: sessions.length, api_tokens: api_tokens.length };
+	});
+
 /**
  * `_testing_action_manifest` — dump the backend's live RPC method set as a
- * normalized `ActionManifest` (one entry per method: `{method, side_effects,
- * account, actor, roles, credential_types}`) for cross-impl parity diffing.
+ * normalized `ActionManifest` (one entry per method: `{method, input,
+ * side_effects, account, actor, roles, credential_types, rate_limit}`) for
+ * cross-impl parity diffing.
  * The action-surface twin of `_testing_schema_snapshot`: where that
  * introspects the live *database*, this introspects the live *RPC registry*.
  * The cross-backend harness calls it on each backend, then
@@ -407,37 +640,43 @@ export const testing_action_manifest_action_spec = {
 	initiator: 'frontend',
 	auth: TESTING_ACTION_AUTH,
 	side_effects: false,
-	input: z.strictObject({}),
+	input: z.void(),
 	output: ActionManifest,
 	async: true,
 	description:
-		'Test-binary only — dump the live RPC registry as a normalized {method, auth, side_effects} ' +
-		'manifest for cross-impl method-set + auth-shape parity diffing.'
+		'Test-binary only — dump the live RPC registry as a normalized ' +
+		'{method, input, auth, side_effects, rate_limit} manifest for cross-impl method-set + ' +
+		'auth-shape parity diffing.'
 } as const satisfies RequestResponseActionSpec;
 
 /**
- * Build the `_testing_action_manifest` action over a backend's full live RPC
- * mount. The handler closes over a manifest computed once at assembly time
- * from every `mounted` spec **plus this action's own spec** — the manifest
- * action is itself a live method, so it must appear in the dump it serves.
- * `mounted` excludes it (it's appended to the mount *after* the rest is
- * assembled, in `build_full_spine_rpc_actions`), so its static spec is folded
- * in here; the Rust mirror folds in its own descriptor the same way.
- *
- * Protocol actions (`heartbeat` / `cancel` / `peer/ping`) are filtered out of
- * the manifest here so the cross-impl diff stays apples-to-apples: the two
- * impls organize them differently (`peer/ping` is on the TS spine's WS **and**
- * HTTP-RPC endpoints; heartbeat/cancel WS-only; the Rust stub compiles one
- * shared registry serving both transports), so including them would be a
- * spurious divergence (see `action_manifest.ts` §Scope). The exclusion set is
- * the live `protocol_action_specs` bundle — kept in lockstep with the static
- * `PROTOCOL_ACTION_METHODS` by a drift-guard test — so this stays off the
- * heavyweight `action_codegen` module the spawned binary would otherwise pull in.
+ * The protocol methods (`heartbeat` / `cancel` / `peer/ping`) the
+ * `_testing_action_manifest` dump leaves out, so the cross-impl diff stays
+ * apples-to-apples: the two impls organize them differently (`peer/ping` is
+ * on the TS spine's WS **and** HTTP-RPC endpoints; heartbeat/cancel WS-only;
+ * the Rust stub compiles one shared registry serving both transports), so
+ * including them would be a spurious divergence (see `action_manifest.ts`
+ * §Scope). The exclusion set is the live `protocol_action_specs` bundle —
+ * kept in lockstep with the static `PROTOCOL_ACTION_METHODS` by a drift-guard
+ * test — so this stays off the heavyweight `action_codegen` module the spawned
+ * binary would otherwise pull in.
  */
 const PROTOCOL_METHODS: ReadonlySet<string> = new Set(
 	protocol_action_specs.map((spec) => spec.method)
 );
 
+/**
+ * Build the `_testing_action_manifest` action over a backend's full live RPC
+ * mount. The handler closes over a manifest computed once at assembly time
+ * from every `mounted` spec except the protocol methods (`PROTOCOL_METHODS`)
+ * **plus this action's own spec** — the manifest action is itself a live
+ * method, so it must appear in the dump it serves. `mounted` excludes it
+ * (it's appended to the mount *after* the rest is assembled, in
+ * `build_full_spine_rpc_actions`), so its static spec is folded in here; the
+ * Rust mirror folds in its own descriptor the same way.
+ *
+ * @param mounted - every other action on the backend's live RPC mount
+ */
 export const create_testing_action_manifest_action = (
 	mounted: ReadonlyArray<RpcAction>
 ): RpcAction => {
@@ -458,23 +697,30 @@ export interface CreateTestingActionsOptions {
 	 */
 	readonly session_options: SessionOptions<string>;
 	/**
-	 * Daemon-token runtime state — the reset action mutates
-	 * `state.keeper_account_id` to point at the freshly seeded keeper
-	 * after the old row is wiped. Pass the same `DaemonTokenState`
+	 * Daemon-token runtime state — the reset action points
+	 * `state.keeper_account_id` at the freshly seeded keeper once its
+	 * transaction commits (a post-commit effect, so a reset that rolls back
+	 * leaves the previous keeper cached). Pass the same `DaemonTokenState`
 	 * instance the daemon-token middleware reads.
 	 */
 	readonly daemon_token_state: DaemonTokenState;
 	/**
-	 * Consumer-supplied callback invoked after the auth-table reset, passed
-	 * the same transactional `Db` the auth wipes ran on. DB-domain consumers
+	 * Consumer-supplied callback invoked first, before the auth-table wipe and
+	 * keeper re-seed, passed the same transactional `Db` the auth wipes then
+	 * run on. It runs while the previous test's accounts and actors still
+	 * exist, so a domain table with a restricting FK to `actor` / `account`
+	 * empties before the auth wipe deletes what it references; it must not
+	 * depend on the fresh keeper, which doesn't exist yet. DB-domain consumers
 	 * (e.g. fuz_forge truncating its cell / fact / file tables) MUST use this
-	 * `db` rather than a separately-pooled connection — under PGlite's single
-	 * connection a second connection deadlocks against this still-open
-	 * transaction. `testing_zzz_server` clears in-memory workspace registry +
-	 * terminals + scoped-FS scratch (ignores `db`); `testing_spine_stub` has
-	 * no domain layer and omits the option. Runs inside the same RPC dispatch
-	 * as the auth-table writes, so a throw surfaces to the caller as a
-	 * JSON-RPC error and the per-test fixture short-circuits.
+	 * `db` rather than a separately-pooled connection — under the in-memory
+	 * drivers' single connection (pglet, PGlite) a second connection deadlocks
+	 * against this still-open transaction. `testing_zzz_server` clears
+	 * in-memory workspace registry + terminals + scoped-FS scratch (ignores
+	 * `db`); the spine binaries (`testing/cross_backend/full_spine_mount.ts` and
+	 * the Rust `testing_spine_stub`) empty the cell and fact tables. Runs inside
+	 * the same RPC dispatch as the auth-table writes, so a throw rolls the whole
+	 * reset back and surfaces to the caller as a JSON-RPC error and the per-test
+	 * fixture short-circuits.
 	 */
 	readonly reset_state?: (db: Db) => Promise<void> | void;
 }
@@ -482,9 +728,10 @@ export interface CreateTestingActionsOptions {
 /**
  * Build the testing RPC actions for a test binary's registry.
  *
- * Returns `_testing_reset` — the single privileged action test binaries
- * register. The test binary calls this at server-assembly time and
- * registers the result on its dispatcher.
+ * Returns the bundled `_testing_*` actions (module doc). The test binary
+ * calls this at server-assembly time and registers the result on its
+ * dispatcher. `_testing_drain_effects` drains `deps.audit`, so the binary's
+ * `audit_factory` builds the emitter with `track_inflight: true`.
  *
  * The reset action's table-wipe list mirrors
  * `auth_integration_truncate_tables` from `testing/db.ts` — the
@@ -501,9 +748,19 @@ export const create_testing_actions = (
 	const log = deps.log;
 	return [
 		rpc_action(testing_reset_action_spec, async (input, ctx) => {
-			log.info('[_testing_reset] resetting auth state + re-seeding keeper');
+			log.info('[_testing_reset] resetting domain + auth state + re-seeding keeper');
 
-			// 1. Wipe every auth-namespace row. No keeper-preserve filter —
+			// 1. Fire domain-state reset (zzz workspaces/terminals/scratch,
+			//    fuz_forge cell/fact/file truncation, the spine binaries' cell +
+			//    fact wipe) first: domain rows depend on auth rows, so a domain
+			//    table with a restricting FK to `actor` would make the auth wipe
+			//    below fail once it holds a row.
+			//    Pass the transactional `ctx.db` so DB-domain truncation runs
+			//    on the same connection — a separate pool connection deadlocks
+			//    against this open transaction under the in-memory drivers.
+			if (reset_state) await reset_state(ctx.db);
+
+			// 2. Wipe every auth-namespace row. No keeper-preserve filter —
 			//    the fresh-keeper-per-test contract means mutation-cascade
 			//    tests (password change, revoke-all) and hardcoded-username
 			//    signup-uniqueness tests can't leak between cases.
@@ -521,7 +778,7 @@ export const create_testing_actions = (
 			await ctx.db.query('DELETE FROM actor');
 			await ctx.db.query('DELETE FROM account');
 
-			// 2. Reset singleton `app_settings` to production defaults
+			// 3. Reset singleton `app_settings` to production defaults
 			//    (matches in-process `_build_test_backend` behavior in
 			//    `app_server.ts`). Tests that flipped `open_signup` mid-run
 			//    revert.
@@ -530,7 +787,7 @@ export const create_testing_actions = (
 					'WHERE open_signup = true OR updated_at IS NOT NULL'
 			);
 
-			// 3. Flip `bootstrap_lock` to its post-bootstrap shape. Production
+			// 4. Flip `bootstrap_lock` to its post-bootstrap shape. Production
 			//    `bootstrap_account` flips this to `true` on success; the
 			//    in-process `bootstrap_test_keeper` mirrors the flip. We're
 			//    about to seed the keeper here, so the final state needs to
@@ -539,7 +796,7 @@ export const create_testing_actions = (
 			//    UPDATE.
 			await ctx.db.query('UPDATE bootstrap_lock SET bootstrapped = true WHERE id = 1');
 
-			// 4. Seed the fresh keeper inline. Reuses the same primitive
+			// 5. Seed the fresh keeper inline. Reuses the same primitive
 			//    in-process tests use (`create_test_account_with_credentials`)
 			//    so cross-process and in-process write semantics stay in
 			//    parity — same hash, same account+actor+role_grants+
@@ -557,7 +814,20 @@ export const create_testing_actions = (
 				roles: [ROLE_KEEPER, ROLE_ADMIN, ...(input.extra_keeper_roles ?? [])]
 			});
 
-			// 5. Seed any caller-requested extras. These are bootstrap-time
+			// 6. Refresh the daemon-token cache so subsequent daemon-token
+			//    requests resolve to the freshly seeded keeper. The
+			//    middleware's lazy-refresh path only fires when the cached
+			//    id is null, so the reset sets it — after the commit, queued as
+			//    soon as the keeper exists, so a reset that rolls back after it
+			//    (a failing extra seed, a failed COMMIT) leaves the cache on the
+			//    keeper still in the database rather than one that never
+			//    landed, and the next reset can still authenticate.
+			const keeper_account_id = keeper.account.id;
+			emit_after_commit(ctx, () => {
+				daemon_token_state.keeper_account_id = keeper_account_id;
+			});
+
+			// 7. Seed any caller-requested extras. These are bootstrap-time
 			//    secondaries — the bypass exists in the same cradle the
 			//    keeper does, not as a free-form runtime action.
 			const extras: Array<Awaited<ReturnType<typeof create_test_account_with_credentials>>> = [];
@@ -574,30 +844,19 @@ export const create_testing_actions = (
 				extras.push(seeded);
 			}
 
-			// 5b. Seed any additional keeper actors. Same bootstrap-cradle
+			// 8. Seed any additional keeper actors. Same bootstrap-cradle
 			//    bypass as extra_accounts — no production wire path mints a
 			//    second actor, so the multi-actor `acting` branches need this
 			//    direct insert. Order-preserving so the fixture can address
-			//    them positionally.
+			//    them positionally, and seeded at the wall clock so they sort
+			//    after the keeper's bootstrap actor in insert order
+			//    (`create_test_extra_actor`), as on the Rust spine
+			//    (`query_create_actor_with_clock_timestamp`).
 			const extra_actors: Array<{ id: Uuid; name: string }> = [];
 			for (const name of input.extra_actors ?? []) {
-				const seeded_actor = await query_create_actor({ db: ctx.db }, keeper.account.id, name);
+				const seeded_actor = await create_test_extra_actor(ctx.db, keeper.account.id, name);
 				extra_actors.push({ id: seeded_actor.id, name: seeded_actor.name });
 			}
-
-			// 6. Refresh the daemon-token cache so subsequent daemon-token
-			//    requests resolve to the freshly seeded keeper. The
-			//    middleware's lazy-refresh path only fires when the cached
-			//    id is null; setting it directly here avoids one round-trip
-			//    of stale-id-then-refresh on the next call.
-			daemon_token_state.keeper_account_id = keeper.account.id;
-
-			// 7. Fire domain-state reset (zzz workspaces/terminals/scratch,
-			//    fuz_forge cell/fact/file truncation, or no-op for spine_stub).
-			//    Pass the transactional `ctx.db` so DB-domain truncation runs
-			//    on the same connection — a separate pool connection deadlocks
-			//    against this open transaction under PGlite.
-			if (reset_state) await reset_state(ctx.db);
 
 			return { ...keeper, extra_accounts: extras, extra_actors };
 		}),
@@ -618,19 +877,22 @@ export const create_testing_actions = (
 				{ db: ctx.db },
 				{
 					hash,
-					bytes,
-					external_url: null,
+					bytes: input.external_url === undefined ? bytes : null,
+					external_url: input.external_url ?? null,
 					content_type: input.content_type ?? null,
 					size: bytes.length
 				}
 			);
+			// the holder row, on a dedup hit too (`PgFactStore`'s put records it the
+			// same way); an unknown actor fails the FK
+			if (input.holder !== undefined) {
+				await query_put_fact_holder({ db: ctx.db }, input.holder, hash);
+			}
 			return { hash };
 		}),
-		create_testing_drain_effects_action(),
+		create_testing_drain_effects_action(deps.audit),
+		create_testing_flood_notifications_action(),
 		create_testing_schema_snapshot_action(),
 		create_testing_migration_tracker_action()
 	];
 };
-
-/** Set of auth-namespace tables `_testing_reset` wipes. Mirrored by the coverage test. */
-export const testing_reset_wiped_tables = auth_integration_truncate_tables;

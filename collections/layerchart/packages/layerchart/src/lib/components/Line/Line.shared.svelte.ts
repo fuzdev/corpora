@@ -3,15 +3,12 @@ import type { SVGAttributes } from 'svelte/elements';
 
 import type { Without } from '$lib/utils/types.js';
 import type { DataProp, DataDrivenStyleProps } from '$lib/utils/dataProp.js';
-import {
-  hasAnyDataProp,
-  resolveDataProp,
-  resolveGeoDataPair,
-} from '$lib/utils/dataProp.js';
-import { chartDataArray } from '$lib/utils/common.js';
+import { hasAnyDataProp, resolveDataProp, resolveGeoDataPair } from '$lib/utils/dataProp.js';
 import { parseDashArray } from '$lib/utils/path.js';
 import { createMotion, createDataMotionMap, type MotionProp } from '$lib/utils/motion.svelte.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
@@ -67,6 +64,17 @@ export type LinePropsWithoutHTML = {
    */
   y2: DataProp;
 
+  /**
+   * On an `isometric` chart, the height of the line's start: a data property or accessor (through
+   * zScale), or pixels.
+   *
+   * @default 0
+   */
+  z1?: DataProp;
+
+  /** The height of the line's end on an `isometric` chart (see `z1`).  @default 0 */
+  z2?: DataProp;
+
   /** The initial y-coordinate of the line's ending point (pixel mode only). @default y2 */
   initialY2?: number;
 
@@ -118,17 +126,9 @@ export function lineMarkInfo(props: LineProps, dataMode: boolean) {
   return {
     data: props.data,
     x:
-      typeof props.x1 === 'string'
-        ? props.x1
-        : typeof props.x2 === 'string'
-          ? props.x2
-          : undefined,
+      typeof props.x1 === 'string' ? props.x1 : typeof props.x2 === 'string' ? props.x2 : undefined,
     y:
-      typeof props.y1 === 'string'
-        ? props.y1
-        : typeof props.y2 === 'string'
-          ? props.y2
-          : undefined,
+      typeof props.y1 === 'string' ? props.y1 : typeof props.y2 === 'string' ? props.y2 : undefined,
     color:
       typeof props.stroke === 'string'
         ? props.stroke
@@ -144,27 +144,28 @@ export function lineMarkInfo(props: LineProps, dataMode: boolean) {
 export class LineState {
   #getProps: () => LineProps = () => ({}) as LineProps;
 
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: LineProps = $derived(this.#getProps());
+
   // Contexts
   chartCtx: ChartState = getChartContext();
+  markData = getMarkData();
   geo: GeoState = getGeoContext();
 
   // Data mode detection
   dataMode = $derived(
-    hasAnyDataProp(
-      this.#getProps().x1,
-      this.#getProps().y1,
-      this.#getProps().x2,
-      this.#getProps().y2
-    )
+    hasAnyDataProp(this.#props.x1, this.#props.y1, this.#props.x2, this.#props.y2)
   );
 
-  #resolvedData: any[] = $derived(
-    this.dataMode ? (this.#getProps().data ?? chartDataArray(this.chartCtx.data)) : []
-  );
+  #resolvedData: any[] = $derived(this.dataMode ? this.markData(this.#props.data) : []);
 
   resolvedItems = $derived.by(() => {
     if (!this.dataMode) return [];
-    const props = this.#getProps();
+    const props = this.#props;
     const keyFn = props.key ?? defaultKey;
     return this.#resolvedData.map((d, i) => {
       const key = keyFn(d, i);
@@ -181,8 +182,38 @@ export class LineState {
     });
   });
 
+  #layerIsometric = getLayerIsometric();
+
+  /** Where raising an end one pixel moves it on the flat plot, when either end has a height */
+  #lift = $derived.by(() => {
+    if (this.#props.z1 == null && this.#props.z2 == null) return null;
+    if (!this.#layerIsometric()) return null;
+    return this.chartCtx.isometricLift;
+  });
+
+  /** An end's height off the floor, in pixels */
+  #height(z: DataProp | undefined, d?: any) {
+    if (z == null) return 0;
+    if (!this.dataMode) return typeof z === 'number' ? z : 0;
+    return resolveDataProp(z, d, this.chartCtx.zScale, 0);
+  }
+
   #resolveLine(d: any): { x1: number; y1: number; x2: number; y2: number } {
-    const props = this.#getProps();
+    const flat = this.#resolveFlatLine(d);
+    const lift = this.#lift;
+    if (!lift) return flat;
+    const h1 = this.#height(this.#props.z1, d);
+    const h2 = this.#height(this.#props.z2, d);
+    return {
+      x1: flat.x1 + lift.x * h1,
+      y1: flat.y1 + lift.y * h1,
+      x2: flat.x2 + lift.x * h2,
+      y2: flat.y2 + lift.y * h2,
+    };
+  }
+
+  #resolveFlatLine(d: any): { x1: number; y1: number; x2: number; y2: number } {
+    const props = this.#props;
     if (this.geo.projection) {
       const [projX1, projY1] = resolveGeoDataPair(props.x1, props.y1, d, this.geo.projection);
       const [projX2, projY2] = resolveGeoDataPair(props.x2, props.y2, d, this.geo.projection);
@@ -197,7 +228,7 @@ export class LineState {
   }
 
   // Dash array
-  dashArrayResolved = $derived(parseDashArray(this.#getProps().dashArray));
+  dashArrayResolved = $derived(parseDashArray(this.#props.dashArray));
   dashArrayAttr = $derived(this.dashArrayResolved ? this.dashArrayResolved.join(' ') : undefined);
 
   // Pixel-mode motion sources
@@ -207,49 +238,42 @@ export class LineState {
   #motionX2!: ReturnType<typeof createMotion<number>>;
   #motionY2!: ReturnType<typeof createMotion<number>>;
 
+  // Pixel mode: each end raised by its height
   get motionX1() {
-    return this.#motionX1.current;
+    return this.#motionX1.current + (this.#lift?.x ?? 0) * this.#height(this.#props.z1);
   }
   get motionY1() {
-    return this.#motionY1.current;
+    return this.#motionY1.current + (this.#lift?.y ?? 0) * this.#height(this.#props.z1);
   }
   get motionX2() {
-    return this.#motionX2.current;
+    return this.#motionX2.current + (this.#lift?.x ?? 0) * this.#height(this.#props.z2);
   }
   get motionY2() {
-    return this.#motionY2.current;
+    return this.#motionY2.current + (this.#lift?.y ?? 0) * this.#height(this.#props.z2);
   }
 
   // Static (non-data-driven) values for SVG/HTML pixel mode
   staticFill = $derived(
-    typeof this.#getProps().fill === 'string' ? (this.#getProps().fill as string) : undefined
+    typeof this.#props.fill === 'string' ? (this.#props.fill as string) : undefined
   );
   staticFillOpacity = $derived(
-    typeof this.#getProps().fillOpacity === 'number'
-      ? (this.#getProps().fillOpacity as number)
-      : undefined
+    typeof this.#props.fillOpacity === 'number' ? (this.#props.fillOpacity as number) : undefined
   );
   staticStroke = $derived(
-    typeof this.#getProps().stroke === 'string' ? (this.#getProps().stroke as string) : undefined
+    typeof this.#props.stroke === 'string' ? (this.#props.stroke as string) : undefined
   );
   staticStrokeWidth = $derived(
-    typeof this.#getProps().strokeWidth === 'number'
-      ? (this.#getProps().strokeWidth as number)
-      : undefined
+    typeof this.#props.strokeWidth === 'number' ? (this.#props.strokeWidth as number) : undefined
   );
   staticOpacity = $derived(
-    typeof this.#getProps().opacity === 'number'
-      ? (this.#getProps().opacity as number)
-      : undefined
+    typeof this.#props.opacity === 'number' ? (this.#props.opacity as number) : undefined
   );
   staticClassName = $derived(
-    typeof this.#getProps().class === 'string' ? (this.#getProps().class as string) : undefined
+    typeof this.#props.class === 'string' ? (this.#props.class as string) : undefined
   );
   // For HTML rendering: stroke-width fallback as div height
   staticHeight = $derived(
-    typeof this.#getProps().strokeWidth === 'number'
-      ? `${this.#getProps().strokeWidth}px`
-      : '1px'
+    typeof this.#props.strokeWidth === 'number' ? `${this.#props.strokeWidth}px` : '1px'
   );
 
   constructor(getProps: () => LineProps) {
@@ -263,22 +287,22 @@ export class LineState {
 
     this.#motionX1 = createMotion(
       initialX1,
-      () => (typeof getProps().x1 === 'number' ? (getProps().x1 as number) : 0),
+      () => (typeof this.#props.x1 === 'number' ? (this.#props.x1 as number) : 0),
       initial.motion
     );
     this.#motionY1 = createMotion(
       initialY1,
-      () => (typeof getProps().y1 === 'number' ? (getProps().y1 as number) : 0),
+      () => (typeof this.#props.y1 === 'number' ? (this.#props.y1 as number) : 0),
       initial.motion
     );
     this.#motionX2 = createMotion(
       initialX2,
-      () => (typeof getProps().x2 === 'number' ? (getProps().x2 as number) : 0),
+      () => (typeof this.#props.x2 === 'number' ? (this.#props.x2 as number) : 0),
       initial.motion
     );
     this.#motionY2 = createMotion(
       initialY2,
-      () => (typeof getProps().y2 === 'number' ? (getProps().y2 as number) : 0),
+      () => (typeof this.#props.y2 === 'number' ? (this.#props.y2 as number) : 0),
       initial.motion
     );
 
@@ -287,7 +311,7 @@ export class LineState {
       const motionMap = this.#dataMotionMap;
       $effect(() => {
         if (!this.dataMode) return;
-        const props = getProps();
+        const props = this.#props;
         const keyFn = props.key ?? defaultKey;
         const activeKeys = new Set<any>();
         for (let i = 0; i < this.#resolvedData.length; i++) {

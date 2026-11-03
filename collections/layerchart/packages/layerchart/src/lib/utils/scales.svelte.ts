@@ -48,9 +48,52 @@ export function isScaleBand(scale: AnyScale<any, any>): scale is ScaleBand<any> 
   return typeof scale.bandwidth === 'function';
 }
 
+/**
+ * Whether the scale maps discrete values, so it can't be re-domained to a continuous extent.
+ *
+ * d3 ordinal scales (including band and point) interpolate nothing — `.copy().domain([min, max])`
+ * on one maps those two values and recycles the range for everything else.  Marks that build a
+ * color ramp check this before adopting `ctx.cScale`, which defaults to an ordinal lookup of the
+ * `series` colors.
+ */
+export function isScaleOrdinal(scale: AnyScale<any, any>): boolean {
+  // Ordinal scales carry `unknown()`; continuous ones interpolate instead
+  return (
+    typeof (scale as any).unknown === 'function' &&
+    typeof (scale as any).interpolate !== 'function' &&
+    typeof (scale as any).interpolator !== 'function'
+  );
+}
+
 export function isScaleTime(scale: AnyScale<any, any>): scale is ScaleTime<any, any> {
   const domain = scale.domain();
   return domain[0] instanceof Date || domain[1] instanceof Date;
+}
+
+/**
+ * Whether a time scale floors on UTC boundaries (`scaleUtc()`) rather than local ones
+ * (`scaleTime()`).
+ *
+ * d3 exposes no marker distinguishing the two, so probe the scale's own tick generator: ask a
+ * copy for daily ticks over a fixed multi-day window and check whether they land on UTC
+ * midnight. A local scale returns local midnights, which are only UTC midnight when the
+ * ambient offset is 0 — and there the distinction doesn't matter anyway.
+ */
+export function isScaleUtc(scale: AnyScale<any, any>): boolean {
+  if (!isScaleTime(scale)) return false;
+  if (typeof scale.ticks !== 'function' || typeof scale.copy !== 'function') return false;
+
+  const probe = scale
+    .copy()
+    .domain([new Date(Date.UTC(2024, 0, 1)), new Date(Date.UTC(2024, 0, 4))]);
+  const ticks: Date[] = probe.ticks(3);
+
+  return (
+    ticks.length > 0 &&
+    ticks.every(
+      (tick) => tick.getUTCHours() === 0 && tick.getUTCMinutes() === 0 && tick.getUTCSeconds() === 0
+    )
+  );
 }
 
 export function isScaleNumeric(scale: AnyScale<any, any>): scale is ScaleTime<any, any> {

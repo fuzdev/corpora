@@ -6,46 +6,48 @@
 
 import { describe, assert, test, vi, afterEach } from 'vitest';
 import { Hono } from 'hono';
+import { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import {
-	has_role,
 	has_scoped_role,
 	has_any_scoped_role,
 	require_auth,
 	require_role,
 	create_request_context_middleware,
 	REQUEST_CONTEXT_KEY
-} from '$lib/auth/request_context.ts';
+} from '#lib/auth/request_context.ts';
 import {
-	ACCOUNT_ID_KEY,
-	AUTH_API_TOKEN_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
 	TEST_CONTEXT_PRESET_KEY
-} from '$lib/hono_context.ts';
-import type { Account, Actor, RoleGrant } from '$lib/auth/account_schema.ts';
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import { get_resolved_auth } from '#lib/auth/resolved_auth.ts';
+import type { Account, Actor, RoleGrant } from '#lib/auth/account_schema.ts';
+import { to_iso8601_seconds } from '#lib/timestamp.ts';
 import {
 	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_INSUFFICIENT_PERMISSIONS
-} from '$lib/http/error_schemas.ts';
+} from '#lib/http/error_schemas.ts';
 import {
 	create_test_account,
 	create_test_actor,
 	create_test_role_grant,
 	create_test_context
-} from '$lib/testing/entities.ts';
-import type { QueryDeps } from '$lib/db/query_deps.ts';
-import { query_session_get_valid } from '$lib/auth/session_queries.ts';
+} from '#lib/testing/entities.ts';
+import type { QueryDeps } from '#lib/db/query_deps.ts';
+import { hash_session_token, query_session_get_valid } from '#lib/auth/session_queries.ts';
 import {
 	query_account_by_id,
 	query_actor_by_id,
 	query_active_actors_by_account
-} from '$lib/auth/account_queries.ts';
-import { query_role_grant_find_active_for_actor } from '$lib/auth/role_grant_queries.ts';
+} from '#lib/auth/account_queries.ts';
+import { query_role_grant_find_active_for_actor } from '#lib/auth/role_grant_queries.ts';
 
 const mock_deps: QueryDeps = { db: {} as any };
 
-vi.mock('$lib/auth/session_queries.js', async (import_original) => {
-	const original = await import_original<typeof import('$lib/auth/session_queries.ts')>();
+vi.mock('#lib/auth/session_queries.ts', async (import_original) => {
+	const original = await import_original<typeof import('#lib/auth/session_queries.ts')>();
 	return {
 		...original,
 		// Keep hash_session_token real (pure function)
@@ -54,13 +56,13 @@ vi.mock('$lib/auth/session_queries.js', async (import_original) => {
 	};
 });
 
-vi.mock('$lib/auth/account_queries.js', () => ({
+vi.mock('#lib/auth/account_queries.ts', () => ({
 	query_account_by_id: vi.fn(),
 	query_actor_by_id: vi.fn(),
 	query_active_actors_by_account: vi.fn()
 }));
 
-vi.mock('$lib/auth/role_grant_queries.js', () => ({
+vi.mock('#lib/auth/role_grant_queries.ts', () => ({
 	query_role_grant_find_active_for_actor: vi.fn()
 }));
 
@@ -68,88 +70,91 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-describe('has_role', () => {
+describe('has_scoped_role — global grants', () => {
 	test('null ctx returns false', () => {
-		assert.strictEqual(has_role(null, 'admin'), false);
-		assert.strictEqual(has_role(null, 'keeper'), false);
+		assert.strictEqual(has_scoped_role(null, 'admin', null), false);
+		assert.strictEqual(has_scoped_role(null, 'keeper', null), false);
 	});
 
 	test('returns true for matching active role_grant', () => {
 		const ctx = create_test_context([{ role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 
 	test('returns false for missing role', () => {
 		const ctx = create_test_context([{ role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'keeper'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'keeper', null), false);
 	});
 
 	test('returns false for revoked role_grant', () => {
 		const ctx = create_test_context([{ role: 'admin', revoked_at: '2024-01-02T00:00:00Z' }]);
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('returns false for expired role_grant', () => {
-		const past = new Date(Date.now() - 60000).toISOString();
+		const past = to_iso8601_seconds(new Date(Date.now() - 60000));
 		const ctx = create_test_context([{ role: 'admin', expires_at: past }]);
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('returns true for non-expired role_grant', () => {
-		const future = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+		const future = to_iso8601_seconds(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000));
 		const ctx = create_test_context([{ role: 'admin', expires_at: future }]);
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 
 	test('returns true when one of multiple role_grants matches', () => {
 		const ctx = create_test_context([{ role: 'keeper' }, { role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 
 	test('returns false with empty role_grants', () => {
 		const ctx = create_test_context([]);
 		ctx.role_grants = [];
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('role check is case-sensitive — "Admin" does not match "admin"', () => {
 		const ctx = create_test_context([{ role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'Admin'), false);
-		assert.strictEqual(has_role(ctx, 'ADMIN'), false);
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'Admin', null), false);
+		assert.strictEqual(has_scoped_role(ctx, 'ADMIN', null), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 
 	test('role check is exact — "admin " (trailing space) does not match "admin"', () => {
 		const ctx = create_test_context([{ role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'admin '), false);
-		assert.strictEqual(has_role(ctx, ' admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin ', null), false);
+		assert.strictEqual(has_scoped_role(ctx, ' admin', null), false);
 	});
 
 	test('returns true for role_grant with null expires_at (no expiry)', () => {
 		const ctx = create_test_context([{ role: 'keeper', expires_at: null }]);
-		assert.strictEqual(has_role(ctx, 'keeper'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'keeper', null), true);
 	});
 
 	test('rejects role_grant that expires between context load and role check', () => {
 		vi.useFakeTimers();
 		try {
 			const now = Date.now();
-			const soon = new Date(now + 5000).toISOString();
+			const soon = to_iso8601_seconds(new Date(now + 5000));
 			const ctx = create_test_context([{ role: 'admin', expires_at: soon }]);
-			assert.strictEqual(has_role(ctx, 'admin'), true);
-			vi.advanceTimersByTime(6000);
-			assert.strictEqual(has_role(ctx, 'admin'), false);
+			assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
+			// `is_role_grant_active` admits through the end of the second the
+			// (truncated) stamp names, so clear the window by more than that 1 s
+			// slack — advancing to exactly `expires_at` would still read active
+			vi.advanceTimersByTime(7000);
+			assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 		} finally {
 			vi.useRealTimers();
 		}
 	});
 
 	test('rejects revoked role_grant even with future expires_at', () => {
-		const future = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+		const future = to_iso8601_seconds(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000));
 		const ctx = create_test_context([
 			{ role: 'admin', revoked_at: '2024-06-01T00:00:00Z', expires_at: future }
 		]);
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('returns false when role matches but all role_grants for that role are revoked', () => {
@@ -157,22 +162,22 @@ describe('has_role', () => {
 			{ role: 'admin', revoked_at: '2024-06-01T00:00:00Z' },
 			{ role: 'admin', revoked_at: '2024-07-01T00:00:00Z' }
 		]);
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('handles role_grant with expires_at at Unix epoch boundary', () => {
 		const ctx = create_test_context([{ role: 'admin', expires_at: '1970-01-01T00:00:00Z' }]);
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 	});
 
 	test('returns true when same role has one revoked and one active role_grant', () => {
-		const future = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+		const future = to_iso8601_seconds(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000));
 		const ctx = create_test_context([
 			{ role: 'admin', revoked_at: '2024-06-01T00:00:00Z', expires_at: future },
 			{ role: 'admin', revoked_at: null, expires_at: future }
 		]);
 		// some() finds the active role_grant even when another is revoked
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 });
 
@@ -215,7 +220,7 @@ describe('has_scoped_role', () => {
 	});
 
 	test('expired role_grant excluded', () => {
-		const past = new Date(Date.now() - 1000).toISOString();
+		const past = to_iso8601_seconds(new Date(Date.now() - 1000));
 		const ctx = create_test_context([
 			{ role: 'classroom_teacher', scope_id: 'scope-X', expires_at: past }
 		]);
@@ -282,7 +287,7 @@ describe('has_any_scoped_role', () => {
 	});
 
 	test('expired role_grant excluded', () => {
-		const past = new Date(Date.now() - 1000).toISOString();
+		const past = to_iso8601_seconds(new Date(Date.now() - 1000));
 		const ctx = create_test_context([
 			{ role: 'classroom_student', scope_id: 'scope-X', expires_at: past }
 		]);
@@ -307,9 +312,12 @@ describe('require_auth', () => {
 		const app = new Hono();
 		// set context before require_auth
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_auth);
@@ -338,9 +346,12 @@ describe('require_role', () => {
 		const ctx = create_test_context([{ role: 'user' }]);
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_role(['admin']));
@@ -357,9 +368,12 @@ describe('require_role', () => {
 		const ctx = create_test_context([{ role: 'admin' }]);
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_role(['admin']));
@@ -375,9 +389,12 @@ describe('require_role', () => {
 		const ctx = create_test_context([{ role: 'user' }]);
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_role(['keeper']));
@@ -391,13 +408,16 @@ describe('require_role', () => {
 	});
 
 	test('expired role_grant causes 403 even if role matches', async () => {
-		const past = new Date(Date.now() - 60000).toISOString();
+		const past = to_iso8601_seconds(new Date(Date.now() - 60000));
 		const ctx = create_test_context([{ role: 'admin', expires_at: past }]);
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_role(['admin']));
@@ -414,9 +434,12 @@ describe('require_role', () => {
 		const ctx = create_test_context([{ role: 'admin', revoked_at: '2024-01-01T00:00:00Z' }]);
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
-			c.set(ACCOUNT_ID_KEY, ctx.account.id);
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			c.set(REQUEST_CONTEXT_KEY, ctx);
-			c.set(TEST_CONTEXT_PRESET_KEY, true);
+			c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		app.use('/*', require_role(['admin']));
@@ -429,22 +452,22 @@ describe('require_role', () => {
 	});
 });
 
-describe('has_role — TOCTOU snapshot behavior', () => {
+describe('has_scoped_role — TOCTOU snapshot behavior', () => {
 	test('context snapshot is immune to external role_grant changes', () => {
 		// simulates: role_grant loaded in middleware, then "revoked" externally before handler checks
 		const ctx = create_test_context([{ role: 'admin' }]);
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 
 		// external mutation: clear role_grants (simulating DB revoke happening after middleware)
 		// the snapshot model means this mutation requires explicit refresh_role_grants() call
 		const snapshot_role_grants = ctx.role_grants;
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 		// only explicit mutation changes the result
 		ctx.role_grants = [];
-		assert.strictEqual(has_role(ctx, 'admin'), false);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 		// restore to demonstrate the snapshot was independent
 		ctx.role_grants = snapshot_role_grants;
-		assert.strictEqual(has_role(ctx, 'admin'), true);
+		assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 	});
 
 	test('expiry-based TOCTOU: role_grant expires between middleware and handler', () => {
@@ -452,15 +475,15 @@ describe('has_role — TOCTOU snapshot behavior', () => {
 		try {
 			const now = Date.now();
 			// role_grant expires in 2 seconds
-			const soon = new Date(now + 2000).toISOString();
+			const soon = to_iso8601_seconds(new Date(now + 2000));
 			const ctx = create_test_context([{ role: 'admin', expires_at: soon }]);
 
 			// middleware time: role_grant is active
-			assert.strictEqual(has_role(ctx, 'admin'), true);
+			assert.strictEqual(has_scoped_role(ctx, 'admin', null), true);
 
 			// handler time: 3 seconds later, role_grant has expired
 			vi.advanceTimersByTime(3000);
-			assert.strictEqual(has_role(ctx, 'admin'), false);
+			assert.strictEqual(has_scoped_role(ctx, 'admin', null), false);
 		} finally {
 			vi.useRealTimers();
 		}
@@ -516,14 +539,12 @@ describe('create_request_context_middleware', () => {
 		});
 		app.use('/*', create_request_context_middleware(mock_deps));
 		app.get('/test', (c) => {
-			const account_id = c.get(ACCOUNT_ID_KEY);
-			const credential_type = c.get(CREDENTIAL_TYPE_KEY);
-			const api_token_id = c.get(AUTH_API_TOKEN_ID_KEY);
+			const auth = get_resolved_auth(c);
 			const context = c.get(REQUEST_CONTEXT_KEY);
 			return c.json({
-				account_id: account_id ?? null,
-				credential_type: credential_type ?? null,
-				api_token_id: api_token_id ?? null,
+				resolved: auth,
+				account_id: auth?.account_id ?? null,
+				credential_type: auth?.credential_type ?? null,
 				context: context ?? null
 			});
 		});
@@ -536,9 +557,7 @@ describe('create_request_context_middleware', () => {
 
 		const res = await app.request('/test');
 		const body = await res.json();
-		assert.strictEqual(body.account_id, null);
-		assert.strictEqual(body.credential_type, null);
-		assert.strictEqual(body.api_token_id, null);
+		assert.strictEqual(body.resolved, null);
 		assert.strictEqual(body.context, null);
 	});
 
@@ -548,9 +567,7 @@ describe('create_request_context_middleware', () => {
 
 		const res = await app.request('/test');
 		const body = await res.json();
-		assert.strictEqual(body.account_id, null);
-		assert.strictEqual(body.credential_type, null);
-		assert.strictEqual(body.api_token_id, null);
+		assert.strictEqual(body.resolved, null);
 		assert.strictEqual(body.context, null);
 	});
 
@@ -560,13 +577,72 @@ describe('create_request_context_middleware', () => {
 
 		const res = await app.request('/test');
 		const body = await res.json();
-		assert.strictEqual(body.account_id, 'acct-1');
-		assert.strictEqual(body.credential_type, 'session');
-		assert.strictEqual(body.api_token_id, null);
+		// the session arm, with nothing of another credential's
+		assert.deepStrictEqual(body.resolved, {
+			credential_type: 'session',
+			account_id: 'acct-1',
+			session_hash: hash_session_token('test-token'),
+			credential_deadline: null
+		});
 		// Middleware does not build the request context — that is the
 		// dispatcher's authorization phase. `REQUEST_CONTEXT_KEY` stays null
 		// after authentication.
 		assert.strictEqual(body.context, null);
+	});
+
+	test('skips when an earlier leg resolved the request, never reading the session', async () => {
+		configure_mocks();
+		vi.mocked(query_session_get_valid).mockClear();
+		const daemon = create_test_resolved_auth({
+			credential_type: 'daemon_token',
+			account_id: 'acct-keeper'
+		});
+		const app = new Hono();
+		app.use('/*', async (c, next) => {
+			// what the daemon-token leg sets, ahead of a cookie sent beside it
+			c.set(RESOLVED_AUTH_KEY, daemon);
+			c.set('auth_session_id', 'test-token');
+			await next();
+		});
+		// behind the daemon leg, which starts the chain in its place
+		const log = new Logger('test', { level: 'off' });
+		const debug = vi.spyOn(log, 'debug');
+		app.use('/*', create_request_context_middleware(mock_deps, { starts_chain: false, log }));
+		app.get('/test', (c) => c.json({ resolved: get_resolved_auth(c) }));
+
+		const res = await app.request('/test');
+		assert.deepStrictEqual((await res.json()).resolved, daemon);
+		assert.strictEqual(vi.mocked(query_session_get_valid).mock.calls.length, 0);
+		// a leg behind the chain's start clears nothing, so it has nothing to log
+		assert.strictEqual(debug.mock.calls.length, 0);
+	});
+
+	test('starting the chain, it clears a credential set before it', async () => {
+		configure_mocks({ session: undefined });
+		vi.mocked(query_session_get_valid).mockClear();
+		const app = new Hono();
+		app.use('/*', async (c, next) => {
+			// a layer mounted before the credential legs, with a cookie that fails
+			c.set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'api_token', account_id: 'acct-preset' })
+			);
+			c.set('auth_session_id', 'test-token');
+			await next();
+		});
+		const log = new Logger('test', { level: 'off' });
+		const debug = vi.spyOn(log, 'debug');
+		app.use('/*', create_request_context_middleware(mock_deps, { log }));
+		app.get('/test', (c) => c.json({ resolved: get_resolved_auth(c) }));
+
+		const res = await app.request('/test');
+		assert.strictEqual((await res.json()).resolved, null);
+		// cleared, not skipped past: the session leg still ran its lookup
+		assert.strictEqual(vi.mocked(query_session_get_valid).mock.calls.length, 1);
+		// the clear is logged, naming the credential type and nothing secret
+		assert.strictEqual(debug.mock.calls.length, 1);
+		const [message] = debug.mock.calls[0]!;
+		assert.include(String(message), 'cleared a credential (api_token)');
 	});
 
 	test('always calls next() regardless of auth state', async () => {

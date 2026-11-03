@@ -1,5 +1,6 @@
 <script lang="ts" generics="FEATURE extends Feature = Feature">
-  import maplibre, { type LngLatLike, type PointLike } from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
+  import type { LngLatLike, PointLike } from 'maplibre-gl';
   import type { Snippet } from 'svelte';
   import { Box, getMapContext, setLngLatContext, updatedMarkerContext } from './context.svelte.js';
   import type {
@@ -13,10 +14,10 @@
 
   interface Props {
     /** The Marker instance which was added to the map */
-    marker?: maplibre.Marker | undefined;
+    marker?: maplibregl.Marker | undefined;
     lngLat: LngLatLike;
     class?: string | undefined;
-    anchor?: maplibre.PositionAnchor;
+    anchor?: maplibregl.PositionAnchor;
     /** Handle mouse events */
     interactive?: boolean;
     /** Make markers tabbable and add the button role. */
@@ -33,7 +34,7 @@
     rotation?: number;
     /** The opacity of the marker */
     opacity?: number;
-    children?: Snippet<[{ marker: maplibre.Marker }]>;
+    children?: Snippet<[{ marker: maplibregl.Marker }]>;
 
     ondrag?: (e: MarkerClickInfo<MarkerClickInfoFeature>) => void;
     ondragstart?: (e: MarkerClickInfo<MarkerClickInfoFeature>) => void;
@@ -80,7 +81,7 @@
     $effect.pre(() => {
       if (!map || marker.value) return;
 
-      marker.value = new maplibre.Marker({
+      marker.value = new maplibregl.Marker({
         element: node,
         rotation,
         draggable,
@@ -238,6 +239,14 @@
     cb?.(data);
   }
 </script>
+
+<!-- @component
+Show a marker on the map at `lngLat`. The children of this component become the marker element, so you can use any HTML as the marker.
+
+Set `draggable` to let the user move the marker. `lngLat` is bindable, and it updates when the user drags the marker. `draggable` and `anchor` are applied only when the marker is created. `lngLat`, `offset`, `rotation`, `opacity`, and `class` update the existing marker.
+
+The marker sends click, mouse, and drag events. Set `interactive` to `false` to stop them. Set `asButton` to make the marker tabbable with a `button` role. Put a `Popup` inside the children to attach a popup to the marker.
+-->
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div

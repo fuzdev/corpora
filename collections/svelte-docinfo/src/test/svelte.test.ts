@@ -11,12 +11,12 @@ import {
 	extractSvelteModuleComment,
 	extractHtmlModuleComment,
 	synthesizeSnippetTypeSignature
-} from '$lib/svelte.ts';
-import { type Diagnostic, hasErrors, hasWarnings, warningsOf } from '$lib/diagnostics.ts';
-import { AnalyzeResultJson } from '$lib/analyze-core.ts';
-import type { ModuleAnalysis } from '$lib/declaration-build.ts';
-import type { SourceFileInfo } from '$lib/source.ts';
-import type { ModuleSourceOptions } from '$lib/source-config.ts';
+} from '#lib/svelte.ts';
+import { type Diagnostic, hasErrors, hasWarnings, warningsOf } from '#lib/diagnostics.ts';
+import { parseAnalyzeResult } from '#lib/analyze-core.ts';
+import type { ModuleAnalysis } from '#lib/declaration-build.ts';
+import type { SourceFileInfo } from '#lib/source.ts';
+import type { ModuleSourceOptions } from '#lib/source-config.ts';
 
 import {
 	buildSvelteFixtureRegistry,
@@ -26,8 +26,15 @@ import {
 	analyzeSvelteFixtureModules
 } from './fixtures/svelte/svelte-test-helpers.ts';
 import { validateModuleFixture, type ModuleFixture } from './fixtures/module-fixture-helpers.ts';
-import { normalizeJson, FIXTURES_SVELTE_DIR } from './test-helpers.ts';
 import {
+	assertHasProps,
+	findComponent,
+	normalizeJson,
+	FIXTURES_SVELTE_DIR
+} from './test-helpers.ts';
+import {
+	analyzeDoctored,
+	analyzeTestProject,
 	testSourceOptions,
 	createTestSourceOptions,
 	createCachedAnalysisProgram,
@@ -109,7 +116,7 @@ describe('svelte component analyzer (fixture-based)', () => {
 				// entry module carries the fixture's own component (component
 				// re-export aliases may sit beside it as further component
 				// declarations, so "exactly one" would be wrong here).
-				const parsed = AnalyzeResultJson.parse(fixture.expected);
+				const parsed = parseAnalyzeResult(fixture.expected);
 				const name = fixtureNameToComponentName(fixture.name);
 				const entryModule = parsed.modules.find((m) => m.path === svelteFixtureEntryPath(name));
 				assert.ok(entryModule, `Missing entry module for fixture "${fixture.name}"`);
@@ -474,8 +481,8 @@ describe('extractScriptContent', () => {
 <p>Content</p>`;
 
 		const result = extractScriptContent(svelteSource);
-		// exact equality — the old regex ended the opening tag at the arrow's
-		// `>`, prefixing the content with the tag remainder (` void">`)
+		// exact equality — a quote-unaware scan would end the opening tag at the
+		// arrow's `>`, prefixing the content with the tag remainder (` void">`)
 		assert.strictEqual(result, '\n\tlet {callback}: {callback: T} = $props();\n');
 	});
 
@@ -585,6 +592,33 @@ describe('extractScriptContent', () => {
 		const result = extractScriptContent(svelteSource);
 		assert.isUndefined(result, 'code sample inside a comment is not a script element');
 	});
+
+	test('skips a script nested in the template ahead of the instance script', () => {
+		const svelteSource = `<svelte:head>
+	<script>
+		const nested = 1;
+	</script>
+</svelte:head>
+<script lang="ts">
+	const foo = 'bar';
+</script>
+<p>Content</p>`;
+
+		const result = extractScriptContent(svelteSource);
+		assert.ok(result);
+		assert.include(result, "const foo = 'bar'");
+		assert.notInclude(result, 'nested');
+	});
+
+	test('returns undefined when the only script is nested in the template', () => {
+		const svelteSource = `<div>
+	<script>
+		const nested = 1;
+	</script>
+</div>`;
+
+		assert.isUndefined(extractScriptContent(svelteSource));
+	});
 });
 
 describe('extractModuleScriptContent', () => {
@@ -678,6 +712,32 @@ describe('extractModuleScriptContent', () => {
 		assert.ok(result);
 		assert.include(result, 'shared');
 	});
+
+	test('skips a module script nested in the template', () => {
+		const svelteSource = `<svelte:head>
+	<script module>
+		export const nested = 1;
+	</script>
+</svelte:head>
+<script module>
+	export const shared = 'value';
+</script>
+<p>Content</p>`;
+
+		const result = extractModuleScriptContent(svelteSource);
+		assert.ok(result);
+		assert.include(result, 'shared');
+		assert.notInclude(result, 'nested');
+	});
+
+	test('returns undefined when the only module script is nested in the template', () => {
+		const svelteSource = `<div><script module>export const nested = 1;</script></div>
+<script>
+	const foo = 'bar';
+</script>`;
+
+		assert.isUndefined(extractModuleScriptContent(svelteSource));
+	});
 });
 
 describe('transformSvelteSource script-kind detection', () => {
@@ -726,6 +786,18 @@ describe('transformSvelteSource script-kind detection', () => {
 		assert.strictEqual(kind, ts.ScriptKind.JS);
 	});
 
+	test('a module script with no lang leaves the decision to the instance script', () => {
+		// the first tag carrying a `lang` decides, not the first tag
+		const kind = scriptKindOf(`<script module>
+	export const a = 1;
+</script>
+<script lang="ts">
+	let {b}: {b: string} = $props();
+</script>
+<div>{b}</div>`);
+		assert.strictEqual(kind, ts.ScriptKind.TS);
+	});
+
 	test('whitespace around the lang = sign is a Svelte parse error', () => {
 		// requiring a literal `lang=` costs nothing — Svelte's parser rejects
 		// the spaced spelling, so svelte2tsx throws before kind could matter
@@ -749,12 +821,71 @@ describe('transformSvelteSource script-kind detection', () => {
 		assert.strictEqual(kind, ts.ScriptKind.JS);
 	});
 
+	test('lang="ts" on a script nested in the template does not flip a JS component to TS', () => {
+		const kind = scriptKindOf(`<svelte:head>
+	<script lang="ts">
+		const nested: number = 1;
+	</script>
+</svelte:head>
+<script>
+	let {a} = $props();
+</script>
+<div>{a}</div>`);
+		assert.strictEqual(kind, ts.ScriptKind.JS);
+	});
+
+	test('the virtual carries the located script tags, nested ones left out', () => {
+		const result = transformSvelteSource({
+			id: '/project/src/lib/Comp.svelte',
+			content: `<script module lang="ts">
+	export const shared: string = 'value';
+</script>
+<script lang="ts">
+	let {a}: {a: string} = $props();
+</script>
+<div><script>const nested = 1;</script></div>
+<div>{a}</div>`
+		});
+		assert.ok(result.virtual?.scriptTags);
+		assert.deepStrictEqual(
+			result.virtual.scriptTags.map((tag) => tag.attributes.has('module')),
+			[true, false]
+		);
+		assert.include(result.virtual.scriptTags[1]!.content, '$props()');
+	});
+
 	test('lang="ts" on the module script counts', () => {
 		const kind = scriptKindOf(`<script module lang="ts">
 	export const shared: string = 'value';
 </script>
 <div>hi</div>`);
 		assert.strictEqual(kind, ts.ScriptKind.TS);
+	});
+});
+
+describe('analyzeSvelteModule script tags on the virtual', () => {
+	const SOURCE = `<script lang="ts">
+	export let a: string;
+</script>
+<div>{a}</div>
+`;
+
+	test('analysis reads the tags the virtual carries, without locating them again', () => {
+		// a virtual that says the component has no script: the source's
+		// `export let` is never scanned
+		const { component } = analyzeDoctored('ScriptTagsProbe', SOURCE, {
+			virtual: (virtual) => ({ ...virtual, scriptTags: [] })
+		});
+		assert.ok(component);
+		assert.strictEqual(component.props, undefined);
+	});
+
+	test('a virtual that carries none has them located in the source', () => {
+		const { component } = analyzeDoctored('ScriptTagsProbe', SOURCE, {
+			virtual: ({ scriptTags: _, ...virtual }) => virtual
+		});
+		assert.ok(component);
+		assertHasProps(component, ['a']);
 	});
 });
 
@@ -773,7 +904,7 @@ import {something} from './somewhere.js';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.ok(result);
 		assert.include(result, 'This is a module-level comment');
 		assert.include(result, 'It describes the entire module');
@@ -792,7 +923,7 @@ import {something} from './somewhere.js';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.ok(result);
 		assert.include(result, 'Module comment after imports');
 	});
@@ -807,7 +938,7 @@ const foo = 'bar';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.isUndefined(result);
 	});
 
@@ -817,7 +948,7 @@ const foo = 'bar';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.isUndefined(result);
 	});
 
@@ -833,7 +964,7 @@ import {a} from './a.js';
 import {b} from './b.js';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.ok(result);
 		assert.include(result, 'Module with only imports');
 	});
@@ -845,7 +976,7 @@ import {b} from './b.js';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.isUndefined(result);
 	});
 
@@ -874,7 +1005,7 @@ const foo = 'bar';
 const foo = 'bar';
 `;
 
-		const result = extractSvelteModuleComment(scriptContent);
+		const result = extractSvelteModuleComment(scriptContent)?.text;
 		assert.ok(result);
 		assert.include(result, 'First module comment');
 		assert.notInclude(result, 'Second comment');
@@ -893,9 +1024,9 @@ const foo = 'bar';
 
 		const result = extractSvelteModuleComment(scriptContent);
 		assert.ok(result);
-		assert.include(result, '@see https://fuz.dev');
-		// @module tag should be stripped from output
-		assert.notInclude(result, '@module');
+		// tags parse into fields, leaving no prose; the @module line is dropped
+		assert.strictEqual(result.text, '');
+		assert.deepStrictEqual(result.seeAlso, ['https://fuz.dev']);
 	});
 });
 
@@ -923,8 +1054,8 @@ let {name}: {name: string} = $props();
 
 		assert.ok(componentDecl);
 		assert.strictEqual(componentDecl.declaration.name, 'Greeting');
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'This component displays a greeting message');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'This component displays a greeting message');
 	});
 
 	test('returns undefined moduleComment when not present', () => {
@@ -939,7 +1070,7 @@ let {name}: {name: string} = $props();
 			[] as Array<Diagnostic>
 		);
 
-		assert.isUndefined(result.moduleComment);
+		assert.isUndefined(result.moduleDoc?.text);
 	});
 
 	test('distinguishes module comment from component comment', () => {
@@ -964,9 +1095,9 @@ let {name}: {name: string} = $props();
 			(d) => d.declaration.kind === 'component'
 		)!.declaration;
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module-level documentation');
-		assert.notInclude(result.moduleComment, 'Component documentation');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module-level documentation');
+		assert.notInclude(result.moduleDoc?.text, 'Component documentation');
 
 		// Component doc should be separate
 		assert.ok(declaration.docComment);
@@ -996,8 +1127,8 @@ void tick;
 			diagnostics
 		);
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module docs attached to the import');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module docs attached to the import');
 		const duplicates = diagnostics.filter((d) => d.kind === 'duplicate_comment');
 		assert.strictEqual(duplicates.length, 0);
 	});
@@ -1019,8 +1150,8 @@ export const shared = 1;
 			diagnostics
 		);
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module docs from the module script');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module docs from the module script');
 		assert.strictEqual(diagnostics.filter((d) => d.kind === 'duplicate_comment').length, 0);
 	});
 
@@ -1050,8 +1181,8 @@ let {name}: {name: string} = $props();
 		);
 
 		// Instance comment wins per the documented priority
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'From the instance script');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'From the instance script');
 
 		const duplicates = diagnostics.filter(
 			(d) => d.kind === 'duplicate_comment' && d.commentType === 'module_comment'
@@ -1102,6 +1233,43 @@ Module docs.
 		const fromHtml = htmlDiagnostics.filter((d) => d.kind === 'misplaced_tag');
 		assert.strictEqual(fromHtml.length, 1);
 		assert.strictEqual(fromHtml[0]!.tagName, 'nodocs');
+	});
+
+	test('a losing module comment still warns its misplaced tags; the winner supplies the fields', () => {
+		const svelteContent = `<!--
+@module
+HTML docs.
+
+@returns a
+@see https://fuz.dev/html
+-->
+<script lang="ts">
+/**
+ * Script docs.
+ *
+ * @param a - b
+ * @since 1.0.0
+ * @module
+ */
+let {x}: {x: string} = $props();
+</script>
+<p>{x}</p>`;
+
+		const diagnostics: Array<Diagnostic> = [];
+		const result = analyzeSvelteTestIntegration(
+			{ id: '/fake/path/Test.svelte', content: svelteContent },
+			'Test.svelte',
+			diagnostics
+		);
+		assert.ok(result.moduleDoc);
+		assert.strictEqual(result.moduleDoc.text, 'Script docs.');
+		assert.strictEqual(result.moduleDoc.since, '1.0.0');
+		assert.isUndefined(result.moduleDoc.seeAlso);
+		assert.deepStrictEqual(
+			diagnostics.filter((d) => d.kind === 'misplaced_tag').map((d) => d.tagName),
+			['param', 'returns']
+		);
+		assert.strictEqual(diagnostics.filter((d) => d.kind === 'duplicate_comment').length, 1);
 	});
 });
 
@@ -1161,7 +1329,7 @@ let {name, count}: {name: string; count: number} = $props();
 		assert.strictEqual(componentDecl.name, 'NoScript');
 		assert.strictEqual(componentDecl.kind, 'component');
 		// No script means no module comment
-		assert.isUndefined(result.moduleComment);
+		assert.isUndefined(result.moduleDoc);
 	});
 
 	test('handles component with module context only', () => {
@@ -1514,7 +1682,7 @@ describe('extractHtmlModuleComment', () => {
 -->
 <div>content</div>`;
 
-		const result = extractHtmlModuleComment(source);
+		const result = extractHtmlModuleComment(source)?.text;
 		assert.ok(result);
 		assert.include(result, 'Module docs from HTML.');
 		assert.include(result, 'Additional details.');
@@ -1548,7 +1716,7 @@ describe('extractHtmlModuleComment', () => {
 -->
 <div>content</div>`;
 
-		const result = extractHtmlModuleComment(source);
+		const result = extractHtmlModuleComment(source)?.text;
 		assert.ok(result);
 		assert.include(result, 'Second comment module docs.');
 	});
@@ -1564,7 +1732,7 @@ describe('extractHtmlModuleComment', () => {
 -->
 <div>content</div>`;
 
-		const result = extractHtmlModuleComment(source);
+		const result = extractHtmlModuleComment(source)?.text;
 		assert.ok(result);
 		assert.include(result, 'Module description.');
 		assert.notInclude(result, 'Component description.');
@@ -1577,7 +1745,7 @@ describe('extractHtmlModuleComment', () => {
 -->
 <div>Static content</div>`;
 
-		const result = extractHtmlModuleComment(source);
+		const result = extractHtmlModuleComment(source)?.text;
 		assert.ok(result);
 		assert.include(result, 'A template-only component.');
 	});
@@ -1605,8 +1773,8 @@ let {x}: {x: string} = $props();
 			[] as Array<Diagnostic>
 		);
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module docs from HTML.');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module docs from HTML.');
 	});
 
 	test('JSDoc @module in <script> takes priority over HTML @module', () => {
@@ -1631,9 +1799,9 @@ let {x}: {x: string} = $props();
 			diagnostics
 		);
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'JSDoc module docs.');
-		assert.notInclude(result.moduleComment, 'HTML module docs.');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'JSDoc module docs.');
+		assert.notInclude(result.moduleDoc?.text, 'HTML module docs.');
 
 		// Should emit duplicate warning
 		assert.ok(hasWarnings(diagnostics));
@@ -1654,8 +1822,8 @@ let {x}: {x: string} = $props();
 			[] as Array<Diagnostic>
 		);
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'A template-only component.');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'A template-only component.');
 	});
 
 	test('both @component and @module as HTML comments', () => {
@@ -1684,8 +1852,8 @@ let {x}: {x: string} = $props();
 
 		assert.ok(declaration.docComment);
 		assert.include(declaration.docComment, 'Component description from HTML.');
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module description from HTML.');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module description from HTML.');
 		// No duplicate warnings — different comment types
 		assert.strictEqual(hasWarnings(diagnostics), false);
 	});
@@ -1710,8 +1878,8 @@ let {prop1}: {prop1: string} = $props();
 			(d) => d.declaration.kind === 'component'
 		)!.declaration;
 
-		assert.ok(result.moduleComment);
-		assert.include(result.moduleComment, 'Module description.');
+		assert.ok(result.moduleDoc?.text);
+		assert.include(result.moduleDoc?.text, 'Module description.');
 		// @module JSDoc should NOT leak into component docComment
 		assert.isUndefined(declaration.docComment);
 	});
@@ -1873,6 +2041,42 @@ let open = $state(false);
 		assert.ok(declaration.docComment);
 		assert.include(declaration.docComment, 'HTML component description.');
 		assert.strictEqual(hasWarnings(diagnostics), false);
+	});
+});
+
+describe('svelte propless runes component docComment', () => {
+	test('a documented local cannot claim the component doc slot', async () => {
+		const { modules, diagnostics } = await analyzeTestProject({
+			'src/lib/Comp.svelte': `<script lang="ts">
+	/** Description 1 */
+	let a = $state(0);
+</script>
+<div>{a}</div>
+`
+		});
+
+		const component = findComponent(modules);
+		assert.strictEqual(component.docComment, undefined);
+		assert.deepStrictEqual(component.props, []);
+		assert.deepStrictEqual(diagnostics, []);
+	});
+
+	test('the HTML @component comment still documents an anchorless component', async () => {
+		const { modules, diagnostics } = await analyzeTestProject({
+			'src/lib/Comp.svelte': `<!--
+@component
+Description.
+-->
+<script lang="ts">
+	/** Description 1 */
+	let a = $state(0);
+</script>
+<div>{a}</div>
+`
+		});
+
+		assert.strictEqual(findComponent(modules).docComment, 'Description.');
+		assert.deepStrictEqual(diagnostics, []);
 	});
 });
 
@@ -2127,7 +2331,7 @@ describe('svelte acceptsChildren detection', () => {
 		);
 
 		assert.strictEqual(result.acceptsChildren, true);
-		// Props are undefined (not []) because analyzeTestComponent returns pre-Zod build objects
+		// Props are undefined (not []) because analyzeTestComponent returns unparsed build objects
 		assert.ok(!result.props || result.props.length === 0, 'Expected no props');
 	});
 

@@ -1,7 +1,6 @@
 import { z } from 'zod';
-import { zod_get_field_schema, zod_get_schema_keys } from '@fuzdev/fuz_util/zod.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now, type Datetime } from '@fuzdev/fuz_util/datetime.ts';
+import { zod_get_field_schema, zod_get_schema_keys } from '@fuzdev/fuz_app/zod.ts';
+import { type Datetime, get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import type { Frontend } from './frontend.svelte.ts';
 import {
@@ -33,7 +32,6 @@ export interface CellOptions<TSchema extends z.ZodType> {
  * This may cause issues based on how data gets queried, but at least it's stable once loaded.
  * However we may need to revisit this if it causes problems.
  */
-export const get_global_cell_count = (): number => global_cell_count;
 let global_cell_count = 0;
 
 /**

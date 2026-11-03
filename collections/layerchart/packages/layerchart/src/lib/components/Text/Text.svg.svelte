@@ -1,20 +1,11 @@
 <script lang="ts" module>
-  export type {
-    TextProps,
-    TextPropsWithoutHTML,
-    TextSegment,
-  } from './Text.shared.svelte.js';
+  export type { TextProps, TextPropsWithoutHTML, TextSegment } from './Text.shared.svelte.js';
 </script>
 
 <script lang="ts">
   import { resolveColorProp, resolveStyleProp } from '$lib/utils/dataProp.js';
   import { createId } from '$lib/utils/createId.js';
-  import {
-    TextState,
-    textMarkInfo,
-    getPixelValue,
-    type TextProps,
-  } from './Text.shared.svelte.js';
+  import { TextState, textMarkInfo, getPixelValue, type TextProps } from './Text.shared.svelte.js';
 
   const uid = $props.id();
 
@@ -33,10 +24,13 @@
     // `fontSize` is a typed prop (drives `capHeight` defaults), but on the
     // DOM it must be rendered as the kebab-case `font-size` attribute.
     fontSize,
+    // Not SVG attributes — consumed by `TextState`
+    viewport,
+    z,
     ...rest
   }: TextProps = $props();
 
-  const c = new TextState(() => ({ rotate, dx, dy, fontSize, ...rest } as TextProps));
+  const c = new TextState(() => ({ rotate, dx, dy, fontSize, viewport, z, ...rest }) as TextProps);
 
   let ref = $state<SVGTextElement>();
   let svgRef = $state<SVGElement>();
@@ -65,20 +59,18 @@
     {@const resolvedStrokeWidth = resolveStyleProp(rest.strokeWidth, item.d)}
     {@const resolvedOpacity = resolveStyleProp(rest.opacity, item.d)}
     {@const resolvedClass = resolveStyleProp(rest.class, item.d)}
-    {@const dataRotateTransform = rotate
-      ? `rotate(${rotate}, ${item.x}, ${item.y})`
-      : ''}
-    <svg
-      x={dx ?? 0}
-      y={dy ?? 0}
-      {...rest.svgProps}
-      class={['lc-text-svg', rest.svgProps?.class]}
-    >
+    {@const dataRotateTransform = rotate ? `rotate(${rotate}, ${item.x}, ${item.y})` : ''}
+    <svg x={dx ?? 0} y={dy ?? 0} {...rest.svgProps} class={['lc-text-svg', rest.svgProps?.class]}>
       <text
         {...rest as any}
         x={item.x}
         y={item.y}
-        transform={(rest.transform as string | undefined) ?? dataRotateTransform}
+        transform={[
+          c.viewportTransform(item.x, item.y),
+          (rest.transform as string | undefined) ?? dataRotateTransform,
+        ]
+          .filter(Boolean)
+          .join(' ') || undefined}
         text-anchor={rest.textAnchor ?? 'start'}
         dominant-baseline={rest.dominantBaseline ?? 'auto'}
         font-size={fontSize}
@@ -142,7 +134,9 @@
         bind:this={ref}
         x={c.motionX}
         y={c.motionY}
-        transform={c.transform}
+        transform={[c.viewportTransform(c.motionX, c.motionY), c.transform]
+          .filter(Boolean)
+          .join(' ')}
         text-anchor={rest.textAnchor ?? 'start'}
         dominant-baseline={rest.dominantBaseline ?? 'auto'}
         font-size={fontSize}

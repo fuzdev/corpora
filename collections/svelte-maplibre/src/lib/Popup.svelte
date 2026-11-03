@@ -1,10 +1,7 @@
 <script lang="ts" generics="DATA = Feature">
   import type { Feature } from 'geojson';
-  import maplibregl, {
-    type MapMouseEvent,
-    type MapLayerMouseEvent,
-    type MapLayerTouchEvent,
-  } from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
+  import type { MapMouseEvent, MapLayerMouseEvent, MapLayerTouchEvent } from 'maplibre-gl';
   import { onDestroy, onMount, type Snippet } from 'svelte';
   import {
     getMapContext,
@@ -63,7 +60,6 @@
 
     onopen?: (popup: maplibregl.Popup) => void;
     onclose?: (popup: maplibregl.Popup) => void;
-    onhover?: (popup: maplibregl.Popup) => void;
   }
 
   let {
@@ -86,7 +82,6 @@
 
     onopen = undefined,
     onclose = undefined,
-    onhover = undefined,
   }: Props = $props();
 
   let inheritedLngLat = getLngLatContext();
@@ -353,12 +348,6 @@
         open = false;
         onclose?.(popup!);
       });
-
-      if (onhover) {
-        popup.on('hover', () => {
-          onhover?.(popup!);
-        });
-      }
     }
   });
 
@@ -425,6 +414,14 @@
     }
   });
 </script>
+
+<!-- @component
+Show a popup on the map. Put it inside a layer or marker component to open it on events from that layer or marker. You can also put it directly inside `MapLibre` and control it with `open` and `lngLat`.
+
+`openOn` sets when the popup opens: `click` (the default), `dblclick`, `contextmenu`, `hover`, or `manual`. The children receive the `features` from the event, `data` (the first feature), `map`, `close`, and `isOpen`. If there are no children, the popup shows `html`.
+
+`open` and `lngLat` are bindable. Use `canOpen` to stop the popup from opening for some features. By default the popup opens only when its layer is the top-most layer at the event location (`openIfTopMost`). It closes when the user clicks outside it (`closeOnClickOutside`).
+-->
 
 {#if children}
   <div bind:this={popupEl} class="sv-popup">

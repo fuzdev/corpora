@@ -3,10 +3,11 @@
   import Layer from './Layer.svelte';
   import type { Feature } from 'geojson';
   import type { CommonLayerProps } from './types.js';
+  import type { FillExtrusionLayerSpecification } from 'maplibre-gl';
 
   interface Props extends CommonLayerProps<FEATURE> {
-    paint: maplibregl.FillExtrusionLayerSpecification['paint'];
-    layout?: maplibregl.FillExtrusionLayerSpecification['layout'] | undefined;
+    paint: FillExtrusionLayerSpecification['paint'];
+    layout?: FillExtrusionLayerSpecification['layout'] | undefined;
   }
 
   let {
@@ -35,6 +36,14 @@
     onmouseleave = undefined,
   }: Props = $props();
 </script>
+
+<!-- @component
+Add a MapLibre `fill-extrusion` layer to the map. It shows polygon features as 3D shapes with a height.
+
+This is a thin wrapper around `Layer` with `type` set to `fill-extrusion`. Place it inside a source component such as `GeoJSON`, or set the `source` prop.
+
+Set `manageHoverState` to set the `hover` feature state on the feature under the mouse. Bind to `hovered` to get that feature.
+-->
 
 <Layer
   {id}

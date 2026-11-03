@@ -5,6 +5,7 @@ import * as acorn from 'acorn';
 import { walk } from 'zimmerframe';
 import { tsPlugin } from '@sveltejs/acorn-typescript';
 import * as e from '../../errors.js';
+import { locator } from '../../state.js';
 
 const JSParser = acorn.Parser;
 const TSParser = JSParser.extend(tsPlugin());
@@ -59,7 +60,7 @@ export function parse(source, comments, typescript, is_script) {
 
 		return /** @type {Program} */ (ast);
 	} catch (err) {
-		// TODO the `return` in necessary for TS<7 due to a bug; otherwise
+		// TODO the `return` is necessary for TS<7 due to a bug; otherwise
 		// the `finally` block is regarded as unreachable
 		return handle_parse_error(err);
 	} finally {
@@ -87,7 +88,8 @@ export function parse_expression_at(parser, source, index) {
 			sourceType: 'module',
 			ecmaVersion: 16,
 			locations: true,
-			preserveParens: true
+			preserveParens: true,
+			startLocation: start_location(parser, index)
 		});
 
 		add_comments(ast);
@@ -112,7 +114,13 @@ export function parse_statement_at(parser, source, index) {
 	try {
 		// This is like parseExpressionAt but for statements
 		const p = new acorn(
-			{ onComment, sourceType: 'module', ecmaVersion: 16, locations: true },
+			{
+				onComment,
+				sourceType: 'module',
+				ecmaVersion: 16,
+				locations: true,
+				startLocation: start_location(parser, index)
+			},
 			source,
 			index
 		);
@@ -126,6 +134,32 @@ export function parse_statement_at(parser, source, index) {
 		if (/** @type {any} */ (err).pos === source.length) e.unexpected_eof(source.length);
 		handle_parse_error(err);
 	}
+}
+
+const regex_non_lf_line_break = /\r(?!\n)|[\u2028\u2029]/;
+
+let last_template = '';
+let lf_only = true;
+
+/**
+ * Without `startLocation`, acorn counts the lines before `index` on every call
+ * @param {Parser} parser
+ * @param {number} index
+ */
+function start_location(parser, index) {
+	return has_lf_line_breaks_only(parser) ? locator(index) : undefined;
+}
+
+/**
+ * acorn breaks lines on bare `\r`, `\u2028` and `\u2029`, which the locator doesn't
+ * @param {Parser} parser
+ */
+export function has_lf_line_breaks_only(parser) {
+	if (parser.template !== last_template) {
+		last_template = parser.template;
+		lf_only = !regex_non_lf_line_break.test(last_template);
+	}
+	return lf_only;
 }
 
 const regex_position_indicator = / \(\d+:\d+\)$/;
@@ -227,15 +261,12 @@ function get_comment_handlers(source, comments, index = 0) {
 							if (is_last_in_body) {
 								// Special case: There can be multiple trailing comments after the last node in a block,
 								// and they can be separated by newlines
-								let end = node.end;
-
 								while (comments.length) {
 									const comment = comments[0];
 									if (parent && comment.start >= parent.end) break;
 
 									(node.trailingComments ||= []).push(comment);
 									comments.shift();
-									end = comment.end;
 								}
 							} else if (node.end <= comments[0].start && /^[,) \t]*$/.test(slice)) {
 								node.trailingComments = [/** @type {CommentWithLocation} */ (comments.shift())];

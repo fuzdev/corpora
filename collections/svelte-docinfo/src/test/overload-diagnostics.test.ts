@@ -9,21 +9,20 @@
  *
  * - `unknown_param` — `@param` key that doesn't reference a real parameter on
  *   the signature being documented. Catches typos (`@param argz` for `args`)
- *   and stale doc after a rename. The description is dropped (status quo);
- *   the diagnostic surfaces the drop without halting analysis.
+ *   and stale doc after a rename. The description is dropped; the diagnostic
+ *   surfaces the drop without halting analysis.
  *
- * Also locks in the fold-in fix: per-overload `@param` descriptions now flow
- * through to that overload's `parameters[i].description` (they were silently
- * dropped before this work).
+ * Also locks that per-overload `@param` descriptions flow through to that
+ * overload's `parameters[i].description`.
  */
 
 import { join } from 'node:path';
 import { describe, test, assert } from 'vitest';
 
-import { analyze } from '$lib/analyze.ts';
-import { byKind, type Diagnostic } from '$lib/diagnostics.ts';
-import type { SourceFileInfo } from '$lib/source.ts';
-import { createSourceOptions } from '$lib/source-config.ts';
+import { analyze } from '#lib/analyze.ts';
+import { byKind, type Diagnostic } from '#lib/diagnostics.ts';
+import type { SourceFileInfo } from '#lib/source.ts';
+import { createSourceOptions } from '#lib/source-config.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -99,7 +98,7 @@ export function fn(a: string | number): string | number { return a; }
 
 				// Output: parent has no @example/@since (the misplaced tags didn't reach it),
 				// and overloads[1] doesn't carry them either (signature-distinct fields only).
-				// Note: examples is `.default([])` in the schema, so absence parses as `[]`.
+				// Note: examples defaults to `[]` in the schema, so absence parses as `[]`.
 				const fn = modules.find((m) => m.path === 'fn.ts')?.declarations[0];
 				assert.ok(fn && fn.kind === 'function');
 				assert.deepStrictEqual(fn.examples, []);

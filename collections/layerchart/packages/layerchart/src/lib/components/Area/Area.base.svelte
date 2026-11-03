@@ -22,12 +22,18 @@
     defined,
     fill,
     stroke = 'none',
+    opacity,
+    // Pulled out of `restProps` so the resolved values win over the raw props
+    class: className,
     line = false,
     pathData,
     motion,
     x,
     y0,
     y1,
+    // Each point's height, not `Path`'s, which would raise the whole area
+    z,
+    g,
     seriesKey,
     ...restProps
   }: AreaBaseProps = $props();
@@ -40,34 +46,84 @@
         defined,
         fill,
         stroke,
+        opacity,
+        class: className,
         line,
         pathData,
         motion,
         x,
         y0,
         y1,
+        z,
+        g,
         seriesKey,
       }) as AreaProps
   );
+
+  /**
+   * The props that describe the mark as a whole rather than one of its paths.
+   *
+   * An `<Area line>` draws two paths — the filled body and the top curve — so anything that
+   * clips or filters "the area" has to reach both, or a reveal mask wipes the fill in while
+   * the curve appears instantly.  Only these are forwarded: `id` and event handlers stay on
+   * the fill path alone, so nothing is duplicated and the pointer fires once.  Whatever
+   * `line={{ ... }}` sets wins, since it is spread after.
+   */
+  const sharedLineProps = $derived({
+    mask: restProps.mask,
+    filter: restProps.filter,
+    'clip-path': restProps['clip-path'],
+  });
 </script>
 
-{#if line}
-  <Spline
-    data={data ?? c.seriesData}
-    {x}
-    y={c.lineYAccessor}
-    {seriesKey}
-    {curve}
-    {defined}
-    {motion}
-    {...extractLayerProps(line, 'lc-area-line')}
+{#if c.areas}
+  <!-- Grouped by `g` — one area (and line) per group, from this one mark -->
+  {#each c.areas as area, i (i)}
+    {#if line}
+      <Spline
+        data={area.data}
+        {x}
+        y={c.lineYAccessor}
+        {z}
+        {seriesKey}
+        {curve}
+        {defined}
+        stroke={area.fill}
+        {motion}
+        {...sharedLineProps}
+        {...extractLayerProps(line, 'lc-area-line')}
+      />
+    {/if}
+
+    <Path
+      pathData={area.d}
+      fill={area.fill}
+      stroke={area.stroke}
+      opacity={area.opacity ?? c.pathOpacity}
+      {...extractLayerProps(restProps, 'lc-area-path', area.class ?? '')}
+    />
+  {/each}
+{:else}
+  {#if line}
+    <Spline
+      data={data ?? c.seriesData}
+      {x}
+      y={c.lineYAccessor}
+      {z}
+      {seriesKey}
+      {curve}
+      {defined}
+      {motion}
+      {...sharedLineProps}
+      {...extractLayerProps(line, 'lc-area-line')}
+    />
+  {/if}
+
+  <Path
+    pathData={c.tweenedPath}
+    fill={c.resolvedFill}
+    stroke={c.resolvedStroke}
+    opacity={c.resolvedOpacity ?? c.pathOpacity}
+    {...extractLayerProps(restProps, 'lc-area-path', c.resolvedClass ?? '')}
   />
 {/if}
-
-<Path
-  pathData={c.tweenedPath}
-  fill={fill ?? c.series?.color}
-  {stroke}
-  opacity={c.pathOpacity}
-  {...extractLayerProps(restProps, 'lc-area-path')}
-/>

@@ -5,8 +5,12 @@
  * Drop into any SvelteKit frontend as the underlying connection for
  * `FrontendWebsocketTransport`. Handles auto-reconnect with exponential
  * backoff, respects `WS_CLOSE_SESSION_REVOKED` (no reconnect loop after the
- * server revokes auth), exposes reactive status for UI indicators, and ships
- * three correctness primitives default-on:
+ * server revokes auth), `WS_CLOSE_CONNECTION_LIMIT` (no reconnect after the
+ * server closes this socket to admit a newer one — closed until the user
+ * acts), and `WS_CLOSE_PERMISSION_REVOKED` (no reconnect after the account
+ * lost the role the endpoint requires — closed until the user acts), exposes
+ * reactive status for UI indicators, and ships three
+ * correctness primitives default-on:
  *
  * - `FrontendWebsocketClient.request` — promise-based JSON-RPC with
  *   auto-assigned ids and a pending-id map. Intercepts responses on the
@@ -16,10 +20,11 @@
  *   to `DEFAULT_QUEUE_MAX_SIZE` requests and flush on reopen. Overflow
  *   rejects with `queue_overflow`. Raw `FrontendWebsocketClient.send`
  *   is drop-on-disconnect (fire-and-forget notifications want that).
- * - **Activity-aware heartbeat** — idles fire a shared `heartbeat` request;
- *   receive-silence past `DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT` closes
- *   with `WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT` and lets auto-reconnect
- *   pick back up.
+ * - **Activity-aware heartbeat** — a shared `heartbeat` request fires when
+ *   either direction has been idle for the interval; receive-silence past
+ *   the receive timeout (`DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT`, never less
+ *   than `HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR` × the interval) closes with
+ *   `WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT` and lets auto-reconnect pick back up.
  *
  * @module
  */
@@ -28,9 +33,20 @@ import { BROWSER } from 'esm-env';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 import type { AsyncStatus } from '@fuzdev/fuz_util/async.ts';
 
-import { JSONRPC_VERSION, type JsonrpcErrorCode, type JsonrpcRequestId } from '../http/jsonrpc.ts';
+import {
+	JSONRPC_VERSION,
+	is_jsonrpc_error_code,
+	type JsonrpcErrorCode,
+	type JsonrpcRequestId
+} from '../http/jsonrpc.ts';
 import { JSONRPC_ERROR_CODES, ThrownJsonrpcError, jsonrpc_errors } from '../http/jsonrpc_errors.ts';
-import { WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT, WS_CLOSE_SESSION_REVOKED } from './transports.ts';
+import {
+	WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT,
+	WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT_REASON,
+	WS_CLOSE_CONNECTION_LIMIT,
+	WS_CLOSE_PERMISSION_REVOKED,
+	WS_CLOSE_SESSION_REVOKED
+} from './transports.ts';
 import { cancel_action_spec } from './cancel.ts';
 import { heartbeat_action_spec } from './heartbeat.ts';
 import type { WebsocketConnection } from './transports_ws.ts';
@@ -45,8 +61,35 @@ export const DEFAULT_RECONNECT_DELAY_MAX = 10000;
 export const DEFAULT_BACKOFF_FACTOR = 1.5;
 /** Idle interval before sending a heartbeat (ms). */
 export const DEFAULT_HEARTBEAT_INTERVAL = 30_000;
-/** Max receive silence before closing with `WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT` (ms). */
+/**
+ * Max receive silence before closing with `WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT`
+ * (ms), for intervals up to half of it — see `resolve_heartbeat_receive_timeout`.
+ */
 export const DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT = 60_000;
+/**
+ * Minimum ratio of the heartbeat receive timeout to the heartbeat interval.
+ *
+ * A heartbeat goes out once a direction has been idle for `interval`, and the
+ * check runs every `interval / 2`, so on an idle socket it can leave up to
+ * 1.5 × `interval` after the last receive — and its response needs a round
+ * trip on top. A receive timeout under 2 × `interval` can close a healthy
+ * idle socket before its heartbeat is answered, so it's clamped up to this.
+ */
+export const HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR = 2;
+
+/**
+ * Resolve the effective heartbeat receive timeout for `interval`: the given
+ * `receive_timeout` (or `DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT`), raised to at
+ * least `HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR` × `interval`.
+ *
+ * @param interval - heartbeat idle interval in ms
+ * @param receive_timeout - requested receive timeout in ms
+ * @returns the receive timeout in ms the client enforces
+ */
+export const resolve_heartbeat_receive_timeout = (
+	interval: number,
+	receive_timeout: number = DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT
+): number => Math.max(receive_timeout, interval * HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR);
 /** Default bound on buffered requests while disconnected. Overflow rejects. */
 export const DEFAULT_QUEUE_MAX_SIZE = 100;
 
@@ -57,8 +100,9 @@ export const DEFAULT_QUEUE_MAX_SIZE = 100;
  * - `connecting` — WebSocket `readyState === CONNECTING`.
  * - `connected` — WebSocket `readyState === OPEN`.
  * - `reconnecting` — close fired; waiting out backoff before next attempt.
- * - `closed` — socket is not open. Terminal only when `revoked` is `true`
- *   or auto-reconnect is disabled; otherwise `connect()` reopens.
+ * - `closed` — socket is not open, and nothing is scheduled to reopen it.
+ *   Terminal only when `revoked` is `true`; otherwise `connect()` reopens,
+ *   including after a `superseded` or permission-revoked close.
  */
 export type SocketStatus = 'initial' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -76,16 +120,20 @@ export interface FrontendWebsocketReconnectOptions {
 
 export interface FrontendWebsocketHeartbeatOptions {
 	/**
-	 * Idle duration (ms) after which a heartbeat is sent. Reset by any send or
-	 * receive — chatty clients never emit extras. Defaults to
+	 * Idle duration (ms) after which a heartbeat is sent — when either nothing
+	 * has been sent or nothing has been received for this long, so both ends'
+	 * silence detectors stay fed. Traffic in both directions defers it, so
+	 * chatty connections never emit extras. Defaults to
 	 * `DEFAULT_HEARTBEAT_INTERVAL`.
 	 */
 	interval?: number;
 	/**
 	 * Receive-silence (ms) after which the client closes the socket with
 	 * `WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT`, letting auto-reconnect kick
-	 * in. Should be a comfortable multiple of `interval`. Defaults to
-	 * `DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT`.
+	 * in. Defaults to `DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT`; either way it's
+	 * raised to at least `HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR` × `interval`
+	 * (see `resolve_heartbeat_receive_timeout`), so a long `interval` alone
+	 * is safe.
 	 */
 	receive_timeout?: number;
 }
@@ -134,7 +182,7 @@ interface PendingRequest {
 /** Internal — tracks a request whose frame hasn't been written to the socket yet. */
 interface QueuedRequest extends PendingRequest {
 	id: JsonrpcRequestId;
-	frame: { jsonrpc: string; id: JsonrpcRequestId; method: string; params: unknown };
+	frame: { jsonrpc: string; id: JsonrpcRequestId; method: string; params?: unknown };
 }
 
 /**
@@ -147,6 +195,18 @@ interface QueuedRequest extends PendingRequest {
  *
  * Session-revocation close codes (`WS_CLOSE_SESSION_REVOKED`) put the client
  * in a permanently-closed state; reconnecting would just loop on 401.
+ *
+ * A connection-limit close (`WS_CLOSE_CONNECTION_LIMIT`) leaves the client
+ * closed with `superseded` set and no reconnect scheduled — the server closed
+ * this socket to admit a newer one on the same account, and reconnecting
+ * would close that one in turn. An explicit `connect()` reopens.
+ *
+ * A permission-revoked close (`WS_CLOSE_PERMISSION_REVOKED`) leaves the client
+ * closed with no reconnect scheduled, and neither `revoked` nor `superseded`
+ * set: the credential is still good, but the account lost the role the
+ * endpoint requires, so a reconnect would be refused at its role gate. Pending
+ * and queued requests reject `forbidden`. `last_close_code` says why; an
+ * explicit `connect()` reopens, for when the role has been granted again.
  */
 export class FrontendWebsocketClient implements WebsocketConnection, Disposable {
 	readonly #url: string;
@@ -169,10 +229,12 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	#queue: Array<QueuedRequest> = [];
 
 	#heartbeat_timer: ReturnType<typeof setInterval> | null = null;
-	/** Epoch ms of the last outgoing send — used by the heartbeat activity check. */
-	#last_send_time: number | null = null;
-	/** Epoch ms of the last incoming message — used by the heartbeat activity check. */
-	#last_receive_time: number | null = null;
+	/** Whether a heartbeat request is awaiting its response — at most one is outstanding. */
+	#heartbeat_in_flight = false;
+	/** Epoch ms of the last outgoing send, reset on open — the heartbeat activity baseline. */
+	#heartbeat_send_mark: number | null = null;
+	/** Epoch ms of the last incoming message, reset on open — the heartbeat activity baseline. */
+	#heartbeat_receive_mark: number | null = null;
 
 	ws: WebSocket | null = $state.raw(null);
 	status: SocketStatus = $state.raw('initial');
@@ -188,6 +250,17 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	/** Reason string from the most recent close event (may be empty). */
 	last_close_reason: string | null = $state.raw(null);
 	/**
+	 * Epoch ms of the most recent frame written to the socket — requests,
+	 * notifications, heartbeats, and cancels alike. `null` until the first send.
+	 */
+	last_send_time: number | null = $state.raw(null);
+	/**
+	 * Epoch ms of the most recent frame received — responses (including ones
+	 * `request` consumes), notifications, and requests alike. `null` until the
+	 * first receive.
+	 */
+	last_receive_time: number | null = $state.raw(null);
+	/**
 	 * The error thrown by the most recent attempted `send()`, or `null` if the
 	 * most recent attempt succeeded or none has been attempted yet. Populated
 	 * when the underlying `ws.send` throws (e.g., buffer full, serialization
@@ -201,11 +274,24 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	#reconnect_timeout: ReturnType<typeof setTimeout> | null = null;
 	#reconnect_scheduled_at: number | null = null;
 	#revoked: boolean = $state.raw(false);
+	#superseded: boolean = $state.raw(false);
 
 	#message_handlers: Set<SocketMessageHandler> = new Set();
 	#error_handlers: Set<SocketErrorHandler> = new Set();
 
 	readonly connected: boolean = $derived(this.status === 'connected');
+
+	/**
+	 * Whether the socket is down but opening on its own — `connecting`, or
+	 * `reconnecting` (waiting out a scheduled reconnect) — so a request queued
+	 * now is sent without anyone calling `connect()`. `false` when connected,
+	 * and when `closed` or `initial`: after a close that schedules no reconnect
+	 * (`superseded`, permission revoked, `revoked`, auto-reconnect off),
+	 * `disconnect()`, or `cancel_reconnect()`.
+	 */
+	readonly will_reconnect: boolean = $derived(
+		this.status === 'connecting' || this.status === 'reconnecting'
+	);
 
 	constructor(url: string, options: FrontendWebsocketClientOptions = {}) {
 		this.#url = url;
@@ -220,8 +306,10 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 		this.#heartbeat_enabled = heartbeat !== false;
 		const heartbeat_config = typeof heartbeat === 'object' && heartbeat !== null ? heartbeat : {};
 		this.#heartbeat_interval = heartbeat_config.interval ?? DEFAULT_HEARTBEAT_INTERVAL;
-		this.#heartbeat_receive_timeout =
-			heartbeat_config.receive_timeout ?? DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT;
+		this.#heartbeat_receive_timeout = resolve_heartbeat_receive_timeout(
+			this.#heartbeat_interval,
+			heartbeat_config.receive_timeout
+		);
 
 		const queue = options.queue;
 		this.#queue_enabled = queue !== false;
@@ -316,7 +404,10 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 		this.#heartbeat_enabled = heartbeat !== false;
 		const config = typeof heartbeat === 'object' && heartbeat !== null ? heartbeat : {};
 		this.#heartbeat_interval = config.interval ?? DEFAULT_HEARTBEAT_INTERVAL;
-		this.#heartbeat_receive_timeout = config.receive_timeout ?? DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT;
+		this.#heartbeat_receive_timeout = resolve_heartbeat_receive_timeout(
+			this.#heartbeat_interval,
+			config.receive_timeout
+		);
 
 		if (this.connected) {
 			this.#start_heartbeat();
@@ -362,19 +453,44 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	}
 
 	/**
+	 * Whether the server closed this client's socket to admit a newer
+	 * connection on the same account (`WS_CLOSE_CONNECTION_LIMIT`) and it
+	 * hasn't been reopened since. While `true` the client is `closed` and
+	 * schedules no reconnect — reconnecting on its own would supersede a newer
+	 * socket in turn, and clients past the cap would close each other in a loop.
+	 *
+	 * Unlike `revoked` this is not terminal: the credential is still good, and
+	 * the next `connect()` clears it and reopens — only `connect()` does;
+	 * `disconnect()` leaves it set. Requests in flight or queued at the close
+	 * reject with `service_unavailable`; ones made afterwards buffer in the
+	 * durable queue like any other call on a closed client. Reactive, so UI can
+	 * say why the connection is closed and offer the reconnect.
+	 *
+	 * `socket_status_to_async_status` reads a superseded client as `initial`,
+	 * the same as one that was never connected. An app that connects on its
+	 * own when its status reads `initial` must also check `superseded`, or it
+	 * rebuilds the loop.
+	 */
+	get superseded(): boolean {
+		return this.#superseded;
+	}
+
+	/**
 	 * Open the WebSocket. No-op on SSR, or if the session has been revoked.
 	 * Cancels any pending reconnect and tears down any existing connection first;
-	 * an open prior socket is closed with a normal-closure code.
+	 * an open prior socket is closed with a normal-closure code. Reopens after
+	 * a `superseded` close, clearing the flag.
 	 *
-	 * @mutates this - replaces `ws`, sets `status` to `connecting` (or
-	 *   `closed` on construction failure), and on construction failure may
-	 *   schedule a reconnect (mutating `reconnect_count` /
+	 * @mutates this - replaces `ws`, clears `superseded`, sets `status` to
+	 *   `connecting` (or `closed` on construction failure), and on construction
+	 *   failure may schedule a reconnect (mutating `reconnect_count` /
 	 *   `current_reconnect_delay`)
 	 */
 	connect(): void {
 		if (!BROWSER) return;
 		if (this.#revoked) return;
 
+		this.#superseded = false;
 		this.#cancel_reconnect();
 		this.#teardown(DEFAULT_CLOSE_CODE);
 
@@ -426,7 +542,9 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 		try {
 			this.ws.send(JSON.stringify(data));
 			this.last_send_error = null;
-			this.#last_send_time = Date.now();
+			const now = Date.now();
+			this.#heartbeat_send_mark = now;
+			this.last_send_time = now;
 			return true;
 		} catch (error) {
 			this.#log?.error('[socket] send failed:', error);
@@ -441,6 +559,10 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	 * `FrontendWebsocketTransport` which delegates to this method and has its
 	 * own peer-minted UUID), tracks the pending promise, and resolves when the
 	 * server sends a matching response.
+	 *
+	 * An `undefined` `params` is omitted from the frame rather than sent as
+	 * `{}` — the absent form is the parameterless call every server admits
+	 * for a `z.void()` input, including servers that refuse `{}`.
 	 *
 	 * Callers supplying an explicit `options.id` are responsible for
 	 * uniqueness — the pending map is keyed by id, and a duplicate silently
@@ -462,20 +584,22 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	 *
 	 * @mutates this - inserts the new pending entry into `#pending` (or
 	 *   buffers into `#queue` when disconnected) and may bump
-	 *   `#next_request_id`, `#last_send_time`, `last_send_error`
+	 *   `#next_request_id`, `last_send_time`, `last_send_error`
 	 * @throws ThrownJsonrpcError on the returned promise — never thrown
 	 *   synchronously. Rejection codes:
 	 *   - `unauthenticated` — session revoked (entry check or close code)
 	 *   - `request_cancelled` — caller's `AbortSignal` fired
 	 *   - `queue_overflow` — durable queue full
 	 *   - `service_unavailable` — socket not connected / closed / torn down
-	 *     mid-flight
+	 *     mid-flight, including a `superseded` close
+	 *   - `forbidden` — in flight or queued at a `WS_CLOSE_PERMISSION_REVOKED`
+	 *     close
 	 *   - `internal_error` — `ws.send` threw (serialization, buffer full)
 	 *   - server's wire code verbatim — JSON-RPC error frame from peer
 	 */
 	request<R = unknown>(
 		method: string,
-		params: unknown = {},
+		params?: unknown,
 		options: { signal?: AbortSignal; queue?: boolean; id?: JsonrpcRequestId } = {}
 	): Promise<R> {
 		return new Promise<R>((resolve, reject) => {
@@ -494,7 +618,14 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 			}
 
 			const id = options.id ?? ++this.#next_request_id;
-			const frame = { jsonrpc: JSONRPC_VERSION, id, method, params };
+			// an `undefined` `params` is omitted, never defaulted to `{}` — the
+			// absent form is JSON-RPC 2.0 §4.2's parameterless call and the one
+			// shape every server admits for a `z.void()` input, including
+			// servers that refuse `{}`
+			const frame: QueuedRequest['frame'] =
+				params === undefined
+					? { jsonrpc: JSONRPC_VERSION, id, method }
+					: { jsonrpc: JSONRPC_VERSION, id, method, params };
 
 			// Bind the signal listener up-front so `#detach_signal` can find it by
 			// reference regardless of which settlement path runs (inline send,
@@ -663,8 +794,8 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 		this.#cancel_heartbeat();
 		if (!this.#heartbeat_enabled) return;
 		const now = Date.now();
-		this.#last_send_time = now;
-		this.#last_receive_time = now;
+		this.#heartbeat_send_mark = now;
+		this.#heartbeat_receive_mark = now;
 		// Run the check at half the interval so any event-loop blockage pauses
 		// the timer itself; a dead-because-blocked socket is close enough to
 		// dead-because-unresponsive that closing is arguably correct.
@@ -682,7 +813,7 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	#heartbeat_tick(): void {
 		if (!this.connected || !this.ws) return;
 		const now = Date.now();
-		const last_receive = this.#last_receive_time ?? now;
+		const last_receive = this.#heartbeat_receive_mark ?? now;
 		if (now - last_receive >= this.#heartbeat_receive_timeout) {
 			this.#log?.info(
 				`[socket] receive timeout (${now - last_receive}ms) — closing ${
@@ -690,21 +821,34 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 				}`
 			);
 			try {
-				this.ws.close(WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT, 'client heartbeat timeout');
+				this.ws.close(WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT_REASON);
 			} catch (error) {
 				this.#log?.error('[socket] heartbeat timeout close failed:', error);
 			}
 			return;
 		}
-		const last_activity = Math.max(this.#last_send_time ?? 0, last_receive);
-		if (now - last_activity >= this.#heartbeat_interval) {
+		// Heartbeat when either direction has gone quiet: receive-only silence
+		// would trip this client's receive timeout, send-only silence the
+		// server's. Traffic both ways keeps both fed.
+		// One outstanding heartbeat at a time — its response feeds the receive
+		// side, and if it never comes the receive timeout above closes the socket.
+		const last_send = this.#heartbeat_send_mark ?? now;
+		if (
+			!this.#heartbeat_in_flight &&
+			now - Math.min(last_send, last_receive) >= this.#heartbeat_interval
+		) {
 			// Fire-and-forget the heartbeat. If it fails (network, serialization),
 			// receive-silence detection above will close the socket on the next
 			// tick. No queue — the heartbeat is the thing that tells us the
 			// queue needs flushing, it must not fight the queue for the slot.
-			void this.request(heartbeat_action_spec.method, {}, { queue: false }).catch((error) => {
-				this.#log?.debug('[socket] heartbeat request failed:', error);
-			});
+			this.#heartbeat_in_flight = true;
+			void this.request(heartbeat_action_spec.method, undefined, { queue: false })
+				.catch((error: unknown) => {
+					this.#log?.debug('[socket] heartbeat request failed:', error);
+				})
+				.finally(() => {
+					this.#heartbeat_in_flight = false;
+				});
 		}
 	}
 
@@ -802,6 +946,32 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 			this.#reject_all('session revoked', jsonrpc_errors.unauthenticated);
 			return;
 		}
+		// The server closed this socket to admit a newer one on the same account.
+		// Reconnecting would supersede that one in turn — two clients past the cap
+		// would close each other in a loop — so stay closed until `connect()` is
+		// called. Not a revocation: the credential is still good. Nothing will
+		// reopen the socket on its own, so the queue is rejected with the pending
+		// requests, as when auto-reconnect is off.
+		if (event.code === WS_CLOSE_CONNECTION_LIMIT) {
+			this.#superseded = true;
+			this.status = 'closed';
+			this.#cancel_reconnect();
+			this.#reset_reconnect_counters();
+			this.#reject_all('connection superseded', jsonrpc_errors.service_unavailable);
+			return;
+		}
+		// The account lost a role the endpoint requires. Reconnecting would be
+		// refused at the role gate, so stay closed until `connect()` is called.
+		// Not a revocation: the credential is still good, and nothing will
+		// reopen the socket on its own, so the queue is rejected with the pending
+		// requests.
+		if (event.code === WS_CLOSE_PERMISSION_REVOKED) {
+			this.status = 'closed';
+			this.#cancel_reconnect();
+			this.#reset_reconnect_counters();
+			this.#reject_all('permission revoked', jsonrpc_errors.forbidden);
+			return;
+		}
 		// Pending in-flight requests can't be correlated post-reconnect; reject
 		// them. Queue stays so the flush on reopen replays unsent work.
 		this.#reject_pending_only(
@@ -834,7 +1004,9 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 	};
 
 	#handle_message = (event: MessageEvent): void => {
-		this.#last_receive_time = Date.now();
+		const now = Date.now();
+		this.#heartbeat_receive_mark = now;
+		this.last_receive_time = now;
 
 		// Intercept JSON-RPC responses for pending `request()` calls. Parse
 		// defensively — if the frame isn't valid JSON or isn't a response, fall
@@ -863,11 +1035,12 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
 							.error;
 						// Preserve the server's wire code verbatim so the transport's
 						// catch block re-emits the same code in its envelope. Fall
-						// back to `internal_error` only when the frame is malformed.
-						const wire_code =
-							typeof err.code === 'number'
-								? (err.code as JsonrpcErrorCode)
-								: JSONRPC_ERROR_CODES.internal_error;
+						// back to `internal_error` only when the frame is malformed —
+						// a code missing or outside the JSON-RPC set, which no
+						// `ThrownJsonrpcError` may carry.
+						const wire_code: JsonrpcErrorCode = is_jsonrpc_error_code(err.code)
+							? err.code
+							: JSONRPC_ERROR_CODES.internal_error;
 						const wire_message =
 							typeof err.message === 'string' && err.message.length > 0
 								? err.message
@@ -898,6 +1071,15 @@ export class FrontendWebsocketClient implements WebsocketConnection, Disposable 
  * `failure` (UI shows "lost, retrying") and splits `closed` by `revoked` so
  * a terminal session-revocation read as `failure` while a clean client-
  * initiated close reads as `initial` (the "not connected, not trying" state).
+ * A `superseded` close reads as `initial` too — the client is not trying and
+ * an explicit `connect()` reopens it; read `FrontendWebsocketClient.superseded`
+ * to tell the user why, and before connecting on an `initial` status without
+ * the user asking (connecting a superseded client on its own closes a newer
+ * socket in turn, which is the loop the close code exists to stop). A
+ * `WS_CLOSE_PERMISSION_REVOKED` close reads as `initial` the same way, with
+ * neither flag set: check `FrontendWebsocketClient.last_close_code` before
+ * connecting on your own, since without the role the upgrade is refused at
+ * the gate.
  *
  * @param revoked - whether the session has been permanently revoked
  *   (typically `FrontendWebsocketClient.revoked`)

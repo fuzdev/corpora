@@ -1,8 +1,7 @@
 /**
  * Tests for the shared plugin options interface.
  *
- * Verifies that the shared options work correctly with both
- * the Gro generator and Vite plugin.
+ * Verifies that the shared options compose into the Vite plugin's options.
  *
  * @module
  */
@@ -16,9 +15,8 @@ import type {
 	CssOutputOptions,
 	CssDiagnosticsOptions,
 	CssCacheOptions
-} from '$lib/css_plugin_options.ts';
-import type { GenFuzCssOptions } from '$lib/gen_fuz_css.ts';
-import type { VitePluginFuzCssOptions } from '$lib/vite_plugin_fuz_css.ts';
+} from '#lib/css_plugin_options.ts';
+import type { VitePluginFuzCssOptions } from '#lib/vite_plugin_fuz_css.ts';
 
 describe('shared options interface', () => {
 	test('CssGeneratorBaseOptions includes all expected interfaces', () => {
@@ -29,7 +27,6 @@ describe('shared options interface', () => {
 			acorn_plugins: [],
 			// CssClassOptions
 			class_definitions: {},
-			include_default_classes: true,
 			class_interpreters: [],
 			exclude_classes: ['hidden'],
 			// CssOutputOptions
@@ -48,26 +45,6 @@ describe('shared options interface', () => {
 		};
 
 		assert.isDefined(base_options);
-	});
-
-	test('GenFuzCssOptions extends CssGeneratorBaseOptions', () => {
-		// Type-level test: GenFuzCssOptions should accept all base options plus Gro-specific ones
-		const gro_options: GenFuzCssOptions = {
-			// Base options
-			filter_file: () => true,
-			base_css: undefined,
-			variables: undefined,
-			on_error: 'throw',
-			// Gro-specific options
-			include_stats: true,
-			project_root: '/path/to/project',
-			concurrency: 4,
-			cache_io_concurrency: 100
-		};
-
-		assert.isDefined(gro_options);
-		assert.isTrue(gro_options.include_stats);
-		assert.strictEqual(gro_options.project_root, '/path/to/project');
 	});
 
 	test('VitePluginFuzCssOptions extends CssGeneratorBaseOptions', () => {
@@ -92,7 +69,8 @@ describe('shared options interface', () => {
 		};
 
 		const class_opts: CssClassOptions = {
-			include_default_classes: true
+			class_definitions: (defaults) => defaults,
+			class_interpreters: (defaults) => defaults
 		};
 
 		const output: CssOutputOptions = {
@@ -147,7 +125,7 @@ describe('shared options interface', () => {
 
 		// Test array (custom variables)
 		const custom_opts: CssOutputOptions = {
-			variables: [{ name: 'my_var', light: 'blue', dark: 'lightblue' }]
+			variables: [{ name: 'my_var', base: 'blue', dark: 'lightblue' }]
 		};
 		assert.isTrue(Array.isArray(custom_opts.variables));
 
@@ -164,13 +142,5 @@ describe('options default behavior', () => {
 		// Empty object should be valid - all options are optional
 		const minimal: CssGeneratorBaseOptions = {};
 		assert.isDefined(minimal);
-	});
-
-	test('include_default_classes defaults to true conceptually', () => {
-		// When undefined, generators should treat include_default_classes as true
-		// This test documents the expected behavior
-		const opts: CssClassOptions = {};
-		assert.isUndefined(opts.include_default_classes);
-		// Actual default is applied in gen_fuz_css.ts and vite_plugin_fuz_css.ts
 	});
 });

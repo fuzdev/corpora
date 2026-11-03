@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getMapContext } from './context.svelte.js';
-  import maplibregl from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
   import { onDestroy } from 'svelte';
 
   const { map, loaded } = $derived(getMapContext());
@@ -33,3 +33,9 @@
     }
   });
 </script>
+
+<!-- @component
+Add the MapLibre navigation control to the map. This control shows zoom buttons and a compass.
+
+Put it inside the `MapLibre` component. The component uses the props only when it creates the control. Changes to the props after that have no effect. The component removes the control when it is destroyed.
+-->

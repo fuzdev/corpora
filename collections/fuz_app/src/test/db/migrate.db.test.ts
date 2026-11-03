@@ -1,7 +1,7 @@
 /**
  * Tests for the migration runner in isolation.
  *
- * Uses `create_pglite_factory` (not `describe_db`) to test runner behavior directly.
+ * Uses `create_default_db_factory` (not `describe_db`) to test runner behavior directly.
  *
  * @module
  */
@@ -9,18 +9,24 @@
 import { describe, assert, test, beforeAll, beforeEach } from 'vitest';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 
-import type { Db } from '$lib/db/db.ts';
+import type { Db } from '#lib/db/db.ts';
 import {
+	assert_migration_namespaces,
 	baseline,
+	create_spine_migration_namespace,
+	reserved_migration_namespaces,
 	run_migrations,
 	MigrationError,
 	type Migration,
 	type MigrationNamespace
-} from '$lib/db/migrate.ts';
-import { create_pglite_factory, reset_pglite } from '$lib/testing/db.ts';
+} from '#lib/db/migrate.ts';
+import { create_default_db_factory, reset_public_schema } from '#lib/testing/db.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { CELL_MIGRATION_NS } from '#lib/db/cell_ddl.ts';
+import { FACT_MIGRATION_NS } from '#lib/db/fact_ddl.ts';
 
 const noop_init = async (_db: Db): Promise<void> => {};
-const factory = create_pglite_factory(noop_init);
+const factory = create_default_db_factory(noop_init);
 let db: Db;
 
 beforeAll(async () => {
@@ -28,20 +34,10 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-	await reset_pglite(db);
+	await reset_public_schema(db);
 });
 
 const named = (name: string, up: Migration['up'] = async () => {}): Migration => ({ name, up });
-
-const create_old_tracker = async (): Promise<void> => {
-	await db.query(`
-		CREATE TABLE schema_version (
-		  namespace TEXT PRIMARY KEY,
-		  version INTEGER NOT NULL DEFAULT 0,
-		  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)
-	`);
-};
 
 const seed_applied_row = async (
 	namespace: string,
@@ -189,14 +185,6 @@ describe('run_migrations', () => {
 		const err = assert_migration_error(await assert_rejects(() => run_migrations(db, [ns])));
 		assert.strictEqual(err.kind, 'binary-older-than-db');
 		assert.deepStrictEqual([...(err.unknown_names ?? [])], ['m3_unknown']);
-	});
-
-	test('old-tracker-shape detected before any DDL or per-namespace work', async () => {
-		await create_old_tracker();
-		const ns: MigrationNamespace = { namespace: 'irrelevant', migrations: [named('m0')] };
-
-		const err = assert_migration_error(await assert_rejects(() => run_migrations(db, [ns])));
-		assert.strictEqual(err.kind, 'old-tracker-shape');
 	});
 
 	test('any failure rolls back the whole pending chain', async () => {
@@ -387,8 +375,10 @@ describe('run_migrations', () => {
 		];
 		const ns: MigrationNamespace = { namespace: 'concurrent_ns', migrations };
 
-		// With advisory locks (real PG), one waits and finds version applied.
-		// Without (PGlite), both may apply (UNIQUE on name prevents duplicates).
+		// With advisory locks held on separate sessions (Postgres), one waits and
+		// finds the version applied. On PGlite both runs share one session, where
+		// the lock is re-entrant, and pglet has no advisory locks: there the
+		// (namespace, name) PK is what prevents duplicates.
 		const settled = await Promise.allSettled([run_migrations(db, [ns]), run_migrations(db, [ns])]);
 
 		// At least one must succeed; the other either succeeds or fails on the
@@ -409,11 +399,12 @@ describe('run_migrations', () => {
 		assert.strictEqual(tables.length, 1);
 	});
 
-	test('advisory-lock-unsupported path (PGlite) — runner proceeds without serialization', async () => {
-		// PGlite does not expose pg_advisory_lock. The runner's try/catch around
-		// the lock acquire/release calls swallows the error and proceeds. This
-		// test asserts the no-regression contract: a vanilla run_migrations
-		// against PGlite completes without throwing.
+	test('advisory-lock-unsupported path (pglet) — runner proceeds without serialization', async () => {
+		// pglet, the default test database, has no pg_advisory_lock. The
+		// runner's try/catch around the lock acquire/release calls swallows the
+		// error and proceeds. This test asserts the no-regression contract: a
+		// vanilla run_migrations completes without throwing — on pglet through
+		// that fallback, on a driver with advisory locks through the lock.
 		const migrations: Array<Migration> = [named('lk_0'), named('lk_1')];
 		const ns: MigrationNamespace = { namespace: 'lock_unsupported_ns', migrations };
 
@@ -558,7 +549,7 @@ describe('baseline', () => {
 	});
 
 	test('happy path on a fresh DB creates the new-shape tracker table', async () => {
-		// reset_pglite already ran in beforeEach — schema_version doesn't exist
+		// reset_public_schema already ran in beforeEach — schema_version doesn't exist
 		const ns: MigrationNamespace = {
 			namespace: 'fresh_baseline_ns',
 			migrations: [named('a'), named('b')]
@@ -670,15 +661,7 @@ describe('baseline', () => {
 		assert.strictEqual(rows_b.length, 1);
 	});
 
-	test('old-tracker-shape detected by baseline before any work', async () => {
-		await create_old_tracker();
-		const ns: MigrationNamespace = { namespace: 'irrelevant', migrations: [named('m0')] };
-
-		const err = assert_migration_error(await assert_rejects(() => baseline(db, ns, ['m0'])));
-		assert.strictEqual(err.kind, 'old-tracker-shape');
-	});
-
-	test('advisory-lock-unsupported path (PGlite) — baseline proceeds without serialization', async () => {
+	test('advisory-lock-unsupported path (pglet) — baseline proceeds without serialization', async () => {
 		const ns: MigrationNamespace = {
 			namespace: 'baseline_lock_unsupported_ns',
 			migrations: [named('a'), named('b')]
@@ -692,6 +675,57 @@ describe('baseline', () => {
 		assert.deepStrictEqual(
 			rows.map((r) => r.name),
 			['a', 'b']
+		);
+	});
+});
+
+describe('reserved spine namespaces', () => {
+	const schema_version_exists = async (): Promise<boolean> => {
+		const rows = await db.query(
+			`SELECT 1 FROM information_schema.tables
+			 WHERE table_schema = 'public' AND table_name = 'schema_version'`
+		);
+		return rows.length > 0;
+	};
+
+	test('run_migrations refuses a consumer namespace under a reserved name before touching the db', async () => {
+		for (const namespace of reserved_migration_namespaces) {
+			const err = assert_migration_error(
+				await assert_rejects(() => run_migrations(db, [{ namespace, migrations: [] }]))
+			);
+			assert.strictEqual(err.kind, 'namespace-reserved');
+			assert.strictEqual(err.namespace, namespace);
+			assert.ok(err.message.includes(`"${namespace}"`), err.message);
+		}
+		assert.strictEqual(await schema_version_exists(), false);
+	});
+
+	test('a copy of a spine namespace is refused; the spine object itself is admitted', async () => {
+		for (const ns of [AUTH_MIGRATION_NS, CELL_MIGRATION_NS, FACT_MIGRATION_NS]) {
+			const err = assert_migration_error(
+				await assert_rejects(() => run_migrations(db, [AUTH_MIGRATION_NS, { ...ns }]))
+			);
+			assert.strictEqual(err.kind, 'namespace-reserved');
+		}
+		// the refusal covers the whole list, so even the leading auth chain didn't run
+		assert.strictEqual(await schema_version_exists(), false);
+		assert.doesNotThrow(() =>
+			assert_migration_namespaces([AUTH_MIGRATION_NS, CELL_MIGRATION_NS, FACT_MIGRATION_NS])
+		);
+	});
+
+	test('baseline refuses a consumer namespace under a reserved name', async () => {
+		const err = assert_migration_error(
+			await assert_rejects(() => baseline(db, { ...CELL_MIGRATION_NS }, []))
+		);
+		assert.strictEqual(err.kind, 'namespace-reserved');
+		assert.strictEqual(await schema_version_exists(), false);
+	});
+
+	test('create_spine_migration_namespace refuses an unreserved name', () => {
+		assert.throws(
+			() => create_spine_migration_namespace('my_app', []),
+			/"my_app" is built as a spine namespace but is not a reserved spine name/
 		);
 	});
 });

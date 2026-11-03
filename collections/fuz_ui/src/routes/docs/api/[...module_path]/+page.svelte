@@ -1,5 +1,5 @@
 <script lang="ts">
-	import ApiModule from '$lib/ApiModule.svelte';
+	import ApiModule from '#lib/ApiModule.svelte';
 
 	const { params } = $props();
 

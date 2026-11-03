@@ -1,23 +1,24 @@
-import { z } from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 
 import type { Task } from './task.ts';
 import { Plugins, to_plugin_context, type PluginContext } from './plugin.ts';
 import { clean_fs } from './clean_fs.ts';
 
 /** @nodocs */
-export const Args = z.strictObject({
-	watch: z.boolean().meta({ description: 'dual of no-watch' }).default(true),
-	'no-watch': z
-		.boolean()
-		.meta({
+export const Args = s.object({
+	watch: s.with_default(meta(s.boolean, { description: 'dual of no-watch' }), true),
+	'no-watch': s.with_default(
+		meta(s.boolean, {
 			description: 'opt out of running a long-lived process to watch files and rebuild on changes'
-		})
-		.default(false),
-	sync: z.boolean().meta({ description: 'dual of no-sync' }).default(true),
-	'no-sync': z.boolean().meta({ description: 'opt out of gro sync' }).default(false),
-	install: z.boolean().meta({ description: 'opt into installing packages' }).default(false)
+		}),
+		false
+	),
+	sync: s.with_default(meta(s.boolean, { description: 'dual of no-sync' }), true),
+	'no-sync': s.with_default(meta(s.boolean, { description: 'opt out of gro sync' }), false),
+	install: s.with_default(meta(s.boolean, { description: 'opt into installing packages' }), false)
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
 export type DevTaskContext = PluginContext<Args>;
 
@@ -43,9 +44,9 @@ export const task: Task<Args> = {
 		} else {
 			// TODO maybe redesign for this API to be explicitly cancelable?
 			// Keep the task running indefinitely in watch mode.
-			// This prevents invoke_task from calling finish() and closing the filer.
+			// This keeps invoke_task from closing the graph and watcher it created.
 			await new Promise(() => {
-				// Never resolves - keeps filer and listeners alive.
+				// Never resolves - keeps the graph, watcher, and listeners alive.
 			});
 		}
 	}

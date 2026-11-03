@@ -1,6 +1,6 @@
 import { describe, test, assert, beforeEach } from 'vitest';
 
-import { EntryState, RootMenuState } from '$lib/contextmenu_state.svelte.ts';
+import { EntryState, RootMenuState } from '#lib/contextmenu_state.svelte.ts';
 
 /**
  * Direct tests for `ContextmenuItemsState` (via the concrete `RootMenuState`),

@@ -1,10 +1,10 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import Redirect from '$lib/Redirect.svelte';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import Redirect from '#lib/Redirect.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
 
 	const TOME_SLUG = 'Redirect';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -15,10 +15,8 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			Adds a redirect for a page using <MdnLink path="Web/HTTP/Redirections#html_redirections">
-				a meta tag
-			</MdnLink>
-			with
+			Adds a redirect for a page using
+			<MdnLink path="Web/HTTP/Redirections#html_redirections">a meta tag</MdnLink> with
 			<MdnLink path="Web/HTML/Element/meta#http-equiv">
 				the <span class="font_family_mono">refresh</span> header
 			</MdnLink>. Includes a rendered link and JS navigation fallback.

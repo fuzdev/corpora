@@ -15,29 +15,40 @@ import {
 	prefix_route_specs,
 	get_route_query,
 	type RouteSpec
-} from '$lib/http/route_spec.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
-import type { MiddlewareSpec } from '$lib/http/middleware_spec.ts';
-import { generate_app_surface, events_to_surface } from '$lib/http/surface.ts';
-import { middleware_applies, schema_to_surface } from '$lib/http/schema_helpers.ts';
-import type { EventSpec } from '$lib/realtime/sse.ts';
-import { REQUEST_CONTEXT_KEY } from '$lib/auth/request_context.ts';
+} from '#lib/http/route_spec.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
+import type { MiddlewareSpec } from '#lib/http/middleware_spec.ts';
+import { generate_app_surface, events_to_surface } from '#lib/http/surface.ts';
+import {
+	middleware_applies,
+	middleware_paths_overlap,
+	schema_to_surface
+} from '#lib/http/schema_helpers.ts';
+import type { EventSpec } from '#lib/realtime/sse.ts';
+import { REQUEST_CONTEXT_KEY } from '#lib/auth/request_context.ts';
 import {
 	token_scope_full,
 	token_scope_methods,
 	token_scope_denied_body,
 	type TokenScope
-} from '$lib/auth/token_scope.ts';
-import { ACCOUNT_ID_KEY, TEST_CONTEXT_PRESET_KEY, TOKEN_SCOPE_KEY } from '$lib/hono_context.ts';
-import { create_test_request_context } from '$lib/testing/auth_apps.ts';
-import { ApiError, RateLimitError } from '$lib/http/error_schemas.ts';
-import { create_stub_db } from '$lib/testing/stubs.ts';
+} from '#lib/auth/token_scope.ts';
+import {
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import { create_test_request_context } from '#lib/testing/auth_apps.ts';
+import { ApiError, RateLimitError } from '#lib/http/error_schemas.ts';
+import { create_stub_db } from '#lib/testing/stubs.ts';
+import { DbCheckoutError } from '#lib/db/db_checkout_error.ts';
 import {
 	ThrownJsonrpcError,
 	JSONRPC_ERROR_CODES,
 	jsonrpc_errors
-} from '$lib/http/jsonrpc_errors.ts';
+} from '#lib/http/jsonrpc_errors.ts';
+import { ForeignRpcError, SecondCopyThrownJsonrpcError } from './thrown_jsonrpc_error_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 const db = create_stub_db();
@@ -79,7 +90,10 @@ describe('apply_route_specs', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/create', { method: 'POST' });
+		const res = await app.request('/create', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 200);
 	});
 
@@ -126,9 +140,12 @@ describe('apply_route_specs', () => {
 		// Set request context before the route
 		app.use('/*', async (c, next) => {
 			const ctx = create_test_request_context();
-			(c as any).set(ACCOUNT_ID_KEY, ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, ctx);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		const specs: Array<RouteSpec> = [
@@ -164,7 +181,10 @@ describe('apply_route_specs', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 401);
 	});
 
@@ -172,9 +192,12 @@ describe('apply_route_specs', () => {
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
 			const ctx = create_test_request_context('viewer');
-			(c as any).set(ACCOUNT_ID_KEY, ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, ctx);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		const specs: Array<RouteSpec> = [
@@ -191,7 +214,10 @@ describe('apply_route_specs', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 403);
 	});
 
@@ -199,9 +225,12 @@ describe('apply_route_specs', () => {
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
 			const ctx = create_test_request_context('admin');
-			(c as any).set(ACCOUNT_ID_KEY, ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({ credential_type: 'session', account_id: ctx.account.id })
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, ctx);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		const specs: Array<RouteSpec> = [
@@ -218,7 +247,10 @@ describe('apply_route_specs', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 200);
 	});
 });
@@ -236,10 +268,16 @@ describe('auth.required_scope', () => {
 		const app = new Hono();
 		app.use('/*', async (c, next) => {
 			const ctx = create_test_request_context(role);
-			(c as any).set(ACCOUNT_ID_KEY, ctx.account.id);
+			(c as any).set(
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({
+					credential_type: 'api_token',
+					account_id: ctx.account.id,
+					scope
+				})
+			);
 			(c as any).set(REQUEST_CONTEXT_KEY, ctx);
-			(c as any).set(TOKEN_SCOPE_KEY, scope);
-			(c as any).set(TEST_CONTEXT_PRESET_KEY, true);
+			(c as any).set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 			await next();
 		});
 		const specs: Array<RouteSpec> = [
@@ -293,35 +331,26 @@ describe('auth.required_scope', () => {
 	});
 
 	/**
-	 * The `rpc:` arm — what `create_action_route_spec` declares on a bridged
-	 * route, whose handler never reaches the dispatcher's per-method gate. The
-	 * two arms of the vocabulary answer different questions of the same scope,
-	 * so this pins that a listed method passes where rule 3 would have refused.
+	 * The `rpc:` arm is refused at registration. A route never reaches the
+	 * dispatcher's per-method gate, so `rpc:<method>` on a route would put a
+	 * method name in front of a REST handler no method gate guards — and a
+	 * narrowed token listing that method would walk onto a non-RPC surface.
 	 */
-	test('an rpc capability admits a narrowed token that lists the method', async () => {
-		const admitted = await build_app(
-			'admin',
-			token_scope_methods(['thing_create']),
-			'rpc:thing_create'
-		).request('/stream');
-		assert.strictEqual(admitted.status, 200);
-
-		const refused = await build_app(
-			'admin',
-			token_scope_methods(['cell_get']),
-			'rpc:thing_create'
-		).request('/stream');
-		assert.strictEqual(refused.status, 403);
-		assert.deepStrictEqual(await refused.json(), token_scope_denied_body('rpc:thing_create'));
+	test('an rpc capability is refused on a route', () => {
+		for (const capability of ['rpc:thing_create', 'rpc:peer/ping']) {
+			assert.throws(
+				() => build_app('admin', token_scope_full(), capability),
+				/not a valid token-scope capability for a route/u,
+				`expected "${capability}" to be refused at registration`
+			);
+		}
 	});
 
 	/**
 	 * The vocabulary is open on the identifier and closed on the prefix. A
 	 * consumer names its own surface without registering it — the name decides
 	 * nothing, since rule 3 is all-or-nothing — but an unknown section would
-	 * put an unreadable capability on the wire, and letting a route mint an
-	 * `rpc:`-shaped capability out of a surface gate would name a method in
-	 * front of a whole-surface refusal.
+	 * put an unreadable capability on the wire.
 	 */
 	test('a consumer surface name is admitted, a malformed capability is not', async () => {
 		const res = await build_app(
@@ -704,6 +733,36 @@ describe('middleware_applies', () => {
 	test('bare star matches everything', () => {
 		assert.strictEqual(middleware_applies('*', '/anything'), true);
 		assert.strictEqual(middleware_applies('*', '/api/deep/path'), true);
+	});
+});
+
+describe('middleware_paths_overlap', () => {
+	test('overlapping pairs, either order', () => {
+		for (const [a, b] of [
+			['/api/*', '/api/*'],
+			['/api/*', '/api/account/*'],
+			['/api/*', '/api/account/login'],
+			['/api/*', '/api'],
+			['/api/*', '/*'],
+			['/api/*', '*'],
+			['/health', '/health']
+		] as const) {
+			assert.strictEqual(middleware_paths_overlap(a, b), true, `${a} ${b}`);
+			assert.strictEqual(middleware_paths_overlap(b, a), true, `${b} ${a}`);
+		}
+	});
+
+	test('disjoint pairs, either order', () => {
+		for (const [a, b] of [
+			['/api/*', '/apix/*'],
+			['/api/*', '/apis'],
+			['/api/*', '/hooks/*'],
+			['/api/*', '/'],
+			['/health', '/healthz']
+		] as const) {
+			assert.strictEqual(middleware_paths_overlap(a, b), false, `${a} ${b}`);
+			assert.strictEqual(middleware_paths_overlap(b, a), false, `${b} ${a}`);
+		}
 	});
 });
 
@@ -1258,6 +1317,31 @@ describe('events_to_surface', () => {
 });
 
 describe('error catch layer', () => {
+	test('a failed pool checkout answers the flat 503, no message', async () => {
+		const app = new Hono();
+		const specs: Array<RouteSpec> = [
+			{
+				method: 'GET',
+				path: '/test',
+				auth: { account: 'none', actor: 'none' },
+				handler: () => {
+					throw new DbCheckoutError({
+						cause: new Error('timeout exceeded when trying to connect')
+					});
+				},
+				description: 'Test',
+				input: z.null(),
+				output: z.null()
+			}
+		];
+		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
+
+		const res = await app.request('/test');
+		assert.strictEqual(res.status, 503);
+		assert.strictEqual(res.headers.get('content-type'), 'application/json');
+		assert.strictEqual(await res.text(), '{"error":"service_unavailable"}');
+	});
+
 	test('handler that throws ThrownJsonrpcError returns correct status and body', async () => {
 		const app = new Hono();
 		const specs: Array<RouteSpec> = [
@@ -1303,7 +1387,10 @@ describe('error catch layer', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/test', { method: 'POST' });
+		const res = await app.request('/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 409);
 		const body = await res.json();
 		assert.strictEqual(body.error, 'conflict');
@@ -1363,7 +1450,10 @@ describe('error catch layer', () => {
 		];
 		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
 
-		const res = await app.request('/test', { method: 'POST' });
+		const res = await app.request('/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 		assert.strictEqual(res.status, 409);
 		const body = await res.json();
 		assert.strictEqual(body.error, 'role_grant_offer_terminal');
@@ -1371,6 +1461,85 @@ describe('error catch layer', () => {
 		assert.strictEqual(body.offer_id, 'offer-1');
 		// `reason` is consumed into `error` and not duplicated.
 		assert.strictEqual(body.reason, undefined);
+	});
+
+	test('a ThrownJsonrpcError from a second fuz_app copy maps by its brand', async () => {
+		// two resolved copies of fuz_app in one process: the handler's error is
+		// another class, so `instanceof` would miss it and answer 500
+		const app = new Hono();
+		const specs: Array<RouteSpec> = [
+			{
+				method: 'POST',
+				path: '/test',
+				auth: { account: 'none', actor: 'none' },
+				handler: () => {
+					throw new SecondCopyThrownJsonrpcError(JSONRPC_ERROR_CODES.conflict, 'taken', {
+						reason: 'name_taken',
+						name: 'x'
+					});
+				},
+				description: 'Test',
+				input: z.null(),
+				output: z.null()
+			}
+		];
+		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
+
+		const res = await app.request('/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
+		assert.strictEqual(res.status, 409);
+		assert.deepStrictEqual(await res.json(), { error: 'name_taken', name: 'x', message: 'taken' });
+	});
+
+	test('a foreign error class carrying a JSON-RPC code is an internal error', async () => {
+		// another library's RPC error (MCP, viem): its code, message, and data
+		// are no part of fuz_app's wire contract
+		const app = new Hono();
+		const specs: Array<RouteSpec> = [
+			{
+				method: 'GET',
+				path: '/test',
+				auth: { account: 'none', actor: 'none' },
+				handler: () => {
+					throw new ForeignRpcError(JSONRPC_ERROR_CODES.invalid_params, 'bad', {
+						reason: 'leaked_reason'
+					});
+				},
+				description: 'Test',
+				input: z.null(),
+				output: z.null()
+			}
+		];
+		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
+
+		const res = await app.request('/test');
+		assert.strictEqual(res.status, 500);
+		// DEV is true in vitest — the message rides along, the foreign data never
+		assert.deepStrictEqual(await res.json(), { error: 'internal_error', message: 'bad' });
+	});
+
+	test('an Error whose numeric code is not a JSON-RPC one is an internal error', async () => {
+		const app = new Hono();
+		const specs: Array<RouteSpec> = [
+			{
+				method: 'GET',
+				path: '/test',
+				auth: { account: 'none', actor: 'none' },
+				handler: () => {
+					throw new DOMException('The operation was aborted.', 'AbortError');
+				},
+				description: 'Test',
+				input: z.null(),
+				output: z.null()
+			}
+		];
+		apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
+
+		const res = await app.request('/test');
+		assert.strictEqual(res.status, 500);
+		assert.strictEqual((await res.json()).error, 'internal_error');
 	});
 
 	test('generic Error maps to internal_error 500 with message in DEV', async () => {
@@ -1461,5 +1630,104 @@ describe('error catch layer', () => {
 			const res = await app.request('/test');
 			assert.strictEqual(res.status, expected_status, `${name} should return ${expected_status}`);
 		}
+	});
+});
+
+describe('apply_route_specs content type', () => {
+	const post_route = (overrides: Partial<RouteSpec> = {}): RouteSpec => ({
+		method: 'POST',
+		path: '/test',
+		auth: { account: 'none', actor: 'none' },
+		handler: (c) => c.json({ ok: true }),
+		description: 'Test route',
+		input: z.null(),
+		output: z.strictObject({ ok: z.boolean() }),
+		...overrides
+	});
+
+	test('a POST requires application/json, bodyless or not', async () => {
+		const app = new Hono();
+		apply_route_specs(app, [post_route()], fuz_auth_guard_resolver, log, db);
+		const typed_or_not: Array<Record<string, string>> = [
+			{},
+			{ 'content-type': 'application/octet-stream' }
+		];
+		for (const headers of typed_or_not) {
+			const res = await app.request('/test', { method: 'POST', headers });
+			assert.strictEqual(res.status, 415);
+			assert.deepStrictEqual(await res.json(), { error: 'unsupported_content_type' });
+		}
+		const res = await app.request('/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json; charset=utf-8' }
+		});
+		assert.strictEqual(res.status, 200);
+	});
+
+	test('the content type is checked before auth', async () => {
+		const app = new Hono();
+		apply_route_specs(
+			app,
+			[post_route({ auth: { account: 'required', actor: 'none' } })],
+			fuz_auth_guard_resolver,
+			log,
+			db
+		);
+		const res = await app.request('/test', { method: 'POST' });
+		assert.strictEqual(res.status, 415);
+	});
+
+	test('a raw_body POST takes any type', async () => {
+		const app = new Hono();
+		apply_route_specs(app, [post_route({ raw_body: true })], fuz_auth_guard_resolver, log, db);
+		const res = await app.request('/test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/octet-stream' },
+			body: new Uint8Array([1, 2, 3])
+		});
+		assert.strictEqual(res.status, 200);
+	});
+
+	test('a raw_body POST refuses what a browser sends without a preflight', async () => {
+		const app = new Hono();
+		apply_route_specs(app, [post_route({ raw_body: true })], fuz_auth_guard_resolver, log, db);
+		for (const content_type of [undefined, 'text/plain', 'multipart/form-data; boundary=x']) {
+			const res = await app.request('/test', {
+				method: 'POST',
+				headers: content_type ? { 'content-type': content_type } : {},
+				body: new Uint8Array([1, 2, 3])
+			});
+			assert.strictEqual(res.status, 415, String(content_type));
+		}
+	});
+
+	test('other methods are not checked', async () => {
+		const app = new Hono();
+		apply_route_specs(
+			app,
+			[post_route({ method: 'PUT' }), post_route({ method: 'DELETE' })],
+			fuz_auth_guard_resolver,
+			log,
+			db
+		);
+		for (const method of ['PUT', 'DELETE']) {
+			const res = await app.request('/test', { method });
+			assert.strictEqual(res.status, 200, method);
+		}
+	});
+
+	test('the derived error schemas declare 415 on POSTs only', () => {
+		const surface = generate_app_surface({
+			route_specs: [
+				post_route(),
+				post_route({ path: '/raw', raw_body: true }),
+				post_route({ method: 'PUT', path: '/put' })
+			],
+			middleware_specs: []
+		});
+		const errors_of = (path: string) => surface.routes.find((r) => r.path === path)?.error_schemas;
+		assert.property(errors_of('/test'), '415');
+		assert.property(errors_of('/raw'), '415');
+		assert.notProperty(errors_of('/put') ?? {}, '415');
 	});
 });

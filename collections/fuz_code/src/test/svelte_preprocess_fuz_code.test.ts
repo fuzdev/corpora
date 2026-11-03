@@ -2,8 +2,8 @@ import { test, assert, describe } from 'vitest';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import { preprocess, parse } from 'svelte/compiler';
 
-import { svelte_preprocess_fuz_code } from '$lib/svelte_preprocess_fuz_code.ts';
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
+import { svelte_preprocess_fuz_code } from '#lib/svelte_preprocess_fuz_code.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
 
 const run = async (input: string): Promise<string> => {
 	const result = await preprocess(input, [svelte_preprocess_fuz_code()], {
@@ -95,7 +95,7 @@ describe('svelte_preprocess_fuz_code', () => {
 			);
 		});
 
-		test('skips empty string content (no highlighting benefit)', async () => {
+		test('skips empty string content (no styling benefit)', async () => {
 			const input = `<script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 </script>
@@ -162,7 +162,7 @@ const y = 2;" lang="ts" />`;
 	});
 
 	describe('escaping', () => {
-		test('escapes single quotes in highlighted source', async () => {
+		test('escapes single quotes in styled source', async () => {
 			const input = `<script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 </script>
@@ -178,7 +178,7 @@ const y = 2;" lang="ts" />`;
 			assert.strictEqual(raw_html, syntax_styler_global.stylize("const x = 'hello';", 'ts'));
 		});
 
-		test('escapes backslashes in highlighted source', async () => {
+		test('escapes backslashes in styled source', async () => {
 			const input = String.raw`<script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 </script>
@@ -653,7 +653,7 @@ const y = 2;" lang="ts" />`;
 
 		test('respects custom component_imports', async () => {
 			const input = `<script lang="ts">
-	import Code from '$lib/MyCode.svelte';
+	import Code from '#lib/MyCode.svelte';
 </script>
 
 <Code content="const x = 1;" lang="ts" />`;
@@ -661,7 +661,7 @@ const y = 2;" lang="ts" />`;
 				input,
 				[
 					svelte_preprocess_fuz_code({
-						component_imports: ['$lib/MyCode.svelte']
+						component_imports: ['#lib/MyCode.svelte']
 					})
 				],
 				{ filename: 'Test.svelte' }
@@ -672,7 +672,7 @@ const y = 2;" lang="ts" />`;
 
 		test('custom component_imports with path not containing "Code"', async () => {
 			const input = `<script lang="ts">
-	import Highlighter from '$lib/Highlighter.svelte';
+	import Highlighter from '#lib/Highlighter.svelte';
 </script>
 
 <Highlighter content="const x = 1;" lang="ts" />`;
@@ -680,7 +680,7 @@ const y = 2;" lang="ts" />`;
 				input,
 				[
 					svelte_preprocess_fuz_code({
-						component_imports: ['$lib/Highlighter.svelte']
+						component_imports: ['#lib/Highlighter.svelte']
 					})
 				],
 				{ filename: 'Test.svelte' }

@@ -7,11 +7,15 @@ import type Bar from '../Bar/Bar.svelte';
 import type Circle from '../Circle/Circle.svelte';
 import type Line from '../Line/Line.svelte';
 import type Rect from '../Rect/Rect.svelte';
-import { accessor, type Accessor } from '$lib/utils/common.js';
+import { accessor, chartDataArray, isEqualValue, type Accessor } from '$lib/utils/common.js';
 import { isScaleBand, isScaleTime } from '$lib/utils/scales.svelte.js';
+import { isSinglePointMode, panelDatum } from '$lib/utils/tooltip.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getFacetPanel } from '$lib/contexts/facet.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { MotionProp } from '$lib/utils/motion.svelte.js';
+import type { CommonStyleProps } from '$lib/utils/types.js';
 
 export type HighlightPointData = { x: any; y: any };
 export type HighlightPoint = {
@@ -34,6 +38,11 @@ export type HighlightPropsWithoutHTML = {
   /** Override `y` from context */
   y?: Accessor;
   /**
+   * Override `z` from context.  On an `isometric` chart, points float at the row's height;
+   * `z={() => 0}` puts them on the floor beneath instead.
+   */
+  z?: Accessor;
+  /**
    * Use the chart's radius scale for highlight point size.
    * When `true`, uses the `r` config from the chart context.
    * When an accessor is provided, uses it to read the radius value from the data.
@@ -41,6 +50,15 @@ export type HighlightPropsWithoutHTML = {
   r?: boolean | Accessor;
 
   axis?: 'x' | 'y' | 'both' | 'none';
+
+  /**
+   * In a faceted chart, also mark the hovered position in the panels that don't hold the hovered
+   * row — each resolving it against its own rows, the way a `ChartGroup` member resolves another
+   * chart's pointer.  Panels with nothing at that position draw nothing.
+   *
+   * @default false
+   */
+  facetAll?: boolean;
 
   /**
    * Show points and pass props to Circles
@@ -72,13 +90,17 @@ export type HighlightPropsWithoutHTML = {
     | Snippet<[{ lines: HighlightLineSegment[] }]>;
 
   /**
+   * On an `isometric` chart with a `z`, mark the point's position on the floor and each back wall.
+   * Pass props to style them, and `r` for their size.
+   * @default false
+   */
+  shadows?: boolean | (CommonStyleProps & { class?: string; r?: number });
+
+  /**
    * Show area and pass props to Rect
    * @default false
    */
-  area?:
-    | boolean
-    | Partial<ComponentProps<typeof Rect>>
-    | Snippet<[{ area: HighlightArea }]>;
+  area?: boolean | Partial<ComponentProps<typeof Rect>> | Snippet<[{ area: HighlightArea }]>;
 
   /**
    * Show bar and pass props to Rect
@@ -114,16 +136,52 @@ export type HighlightProps = HighlightPropsWithoutHTML;
  */
 export class HighlightState {
   #getProps: () => HighlightProps = () => ({}) as HighlightProps;
+
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: HighlightProps = $derived(this.#getProps());
+
   ctx: ChartState = getChartContext();
+  #facetPanel = getFacetPanel();
 
   constructor(getProps: () => HighlightProps) {
     this.#getProps = getProps;
   }
 
-  x = $derived(accessor(this.#getProps().x ?? this.ctx.x));
-  y = $derived(accessor(this.#getProps().y ?? this.ctx.y));
+  x = $derived(accessor(this.#props.x ?? this.ctx.x));
+  y = $derived(accessor(this.#props.y ?? this.ctx.y));
 
-  highlightData = $derived(this.#getProps().data ?? this.ctx.tooltip.data);
+  highlightData = $derived(this.#props.data ?? this.ctx.tooltip.data);
+
+  #layerIsometric = getLayerIsometric();
+
+  /** The highlight's rise to the row's `z`, as an offset on the flat plot, or `null` */
+  lift = $derived.by(() => {
+    const lift = this.ctx.isometricLift;
+    const height = this.#height;
+    if (!lift || height == null) return null;
+    return { x: lift.x * height, y: lift.y * height };
+  });
+
+  /** The hovered row's height off an `isometric` floor in pixels, or `null` without one */
+  #height = $derived.by(() => {
+    const z = this.#props.z ?? this.ctx.props.z;
+    if (!this.#layerIsometric() || !this.ctx.isometricLift || z == null) return null;
+    if (this.highlightData == null) return null;
+    const own = this.#props.z;
+    return this.ctx.heightOf(this.highlightData, own == null ? undefined : accessor(own))[1];
+  });
+
+  /**
+   * Whether the highlighted row belongs to the panel this is rendering into.
+   *
+   * Everything is confined to that panel unless `facetAll` asks for the hovered position to be
+   * marked in all of them.
+   */
+  inPanel = $derived(this.#facetPanel?.().has(this.highlightData) ?? true);
 
   xValue = $derived(this.x(this.highlightData));
   xCoord = $derived(
@@ -156,7 +214,7 @@ export class HighlightState {
   );
 
   axis = $derived.by(() => {
-    const axisProp = this.#getProps().axis;
+    const axisProp = this.#props.axis;
     return axisProp == null
       ? isScaleBand(this.ctx.yScale) || isScaleTime(this.ctx.yScale) || this.ctx.valueAxis === 'x'
         ? 'y'
@@ -166,7 +224,7 @@ export class HighlightState {
 
   /** Resolve radius for a data item using the chart's rScale */
   getPointRadius(d: any): number | undefined {
-    const rProp = this.#getProps().r;
+    const rProp = this.#props.r;
     if (!rProp || !d) return undefined;
     if (rProp === true) {
       return this.ctx.config.r ? this.ctx.rGet(d) : undefined;
@@ -175,9 +233,53 @@ export class HighlightState {
     return value != null ? this.ctx.rScale(value) : undefined;
   }
 
+  /**
+   * The row's position traced on the grid: across the plot at its `x` / `y`, and on an `isometric`
+   * chart with a `z`, also up and across each back wall.
+   */
   lines = $derived.by<HighlightLineSegment[]>(() => {
+    const floor = this.#flatLines;
+    const at = this.#isometricAt;
+    return at ? [...floor, ...this.ctx.isometric!.highlightWallLines(at, this.axis)] : floor;
+  });
+
+  /**
+   * For `shadows`: a circle of radius `r` on the floor beneath the point and on each back wall (see
+   * `highlightShadows`)
+   */
+  shadows = $derived.by(() => {
+    const at = this.#isometricAt;
+    if (!at) return [];
+    const shadowsProp = this.#props.shadows;
+    const r = (typeof shadowsProp === 'object' ? shadowsProp.r : undefined) ?? 6;
+    return this.ctx.isometric!.highlightShadows(at, r);
+  });
+
+  /** Where the row sits on an `isometric` floor with walls, or `null` */
+  #isometricAt = $derived.by(() => {
+    const m = this.#layerIsometric();
+    const lift = this.ctx.isometricLift;
+    const height = this.#height;
+    const depth = this.ctx.zDepth;
+    if (!m || !lift || height == null || depth <= 0) return null;
+    if (this.xCoordScalar == null || this.yCoordScalar == null) return null;
+    return {
+      x: (this.xCoordScalar as number) + this.xOffset,
+      y: (this.yCoordScalar as number) + this.yOffset,
+      height,
+      depth,
+      lift,
+      floor: { width: this.ctx.width, height: this.ctx.height },
+      m,
+    };
+  });
+
+  #flatLines = $derived.by<HighlightLineSegment[]>(() => {
     let tmpLines: HighlightLineSegment[] = [];
     if (!this.highlightData) return tmpLines;
+    // The crosshair marks a position rather than a row, so `facetAll` draws it in every panel —
+    // including ones with nothing there, which `points` skips
+    if (!this.inPanel && !this.#props.facetAll) return tmpLines;
     const axis = this.axis;
     if (axis === 'x' || axis === 'both') {
       if (Array.isArray(this.xCoord)) {
@@ -241,6 +343,19 @@ export class HighlightState {
   area = $derived.by<HighlightArea>(() => {
     const tmpArea: HighlightArea = { x: 0, y: 0, width: 0, height: 0 };
     if (!this.highlightData) return tmpArea;
+
+    // The panel is the band when faceting groups a band scale, so the whole panel is marked
+    // rather than the one bar the pointer landed on.  `inPanel` already keeps this to the
+    // hovered panel.
+    if (this.ctx.facetBand) {
+      return {
+        x: min(this.ctx.xRange) as number,
+        y: min(this.ctx.yRange) as number,
+        width: (max(this.ctx.xRange) - min(this.ctx.xRange)) as number,
+        height: (max(this.ctx.yRange) - min(this.ctx.yRange)) as number,
+      };
+    }
+
     const axis = this.axis;
 
     if (axis === 'x' || axis === 'both') {
@@ -310,12 +425,109 @@ export class HighlightState {
     return tmpArea;
   });
 
+  /**
+   * The colour for a point on `seriesInfo`'s series.
+   *
+   * A series carries its own colour, and that's what the point takes.  The exception is the
+   * default series, which stands in for a chart that has none — there `c` is what colours the
+   * marks, so a point taking the series colour would sit on a line of a different colour.  It's
+   * the rule the `facetAll` copies and the series-less path already follow.
+   */
+  #pointFill(seriesInfo: { color?: string | null }) {
+    if (this.ctx.cChannel && this.ctx.series.isDefaultSeries) {
+      return (this.ctx.cGet(this.highlightData) as string) ?? seriesInfo.color ?? '';
+    }
+    return seriesInfo.color ?? '';
+  }
+
+  /**
+   * The row this panel marks when the hovered one belongs to another — `facetAll` only.
+   *
+   * Resolved by position rather than copied, so each panel shows *its* value there, and a panel
+   * with no row at that position shows nothing.
+   */
+  #facetMatch = $derived.by(() => {
+    const panel = this.#facetPanel?.();
+    if (!this.#props.facetAll || !panel || !this.highlightData) return null;
+
+    const match = panelDatum(this.ctx, panel, this.highlightData);
+    if (match == null) return null;
+
+    const x = this.x(match);
+    const y = this.y(match);
+
+    return {
+      x: (this.ctx.xScale(x) as number) + this.xOffset,
+      y: (this.ctx.yScale(y) as number) + this.yOffset,
+      fill: (this.ctx.cChannel ? this.ctx.cGet(match) : null) as string,
+      data: { x, y },
+      seriesKey: undefined,
+    } satisfies HighlightPoint;
+  });
+
   points = $derived.by<HighlightPoint[]>(() => {
     let tmpPoints: HighlightPoint[] = [];
     if (!this.highlightData) return tmpPoints;
-    const props = this.#getProps();
+    if (!this.inPanel) return this.#facetMatch ? [this.#facetMatch] : tmpPoints;
+    const props = this.#props;
 
-    if (props.data === undefined && this.ctx.tooltip.series.length > 0) {
+    // Long data grouped by `c` draws a line per category from one implicit series, so the tooltip's
+    // series list names only the row the pointer resolved to — one point, on whichever category
+    // happened to be last.  Point every category at this position instead, as the tooltip lists
+    // them.
+    //
+    // Only where the pointer resolved to a *position*, though.  `quadtree` and `voronoi` resolve
+    // to one row by proximity in both axes — a scatter, where the rows sharing an x are unrelated
+    // points rather than a category's line, and pointing all of them marks places nothing was
+    // hovered.
+    // Along `valueAxis="z"` the value is a height, not a position on the plot: the row's own point
+    // (below), raised to the top of its segment, is the one to mark
+    const valueIsPosition = this.ctx.valueAxis !== 'z';
+    if (
+      valueIsPosition &&
+      props.data === undefined &&
+      this.ctx.cGroups &&
+      this.ctx.series.isDefaultSeries &&
+      !isSinglePointMode(this.ctx.tooltip.mode)
+    ) {
+      const value = this.ctx.valueAxis === 'y' ? this.ctx.y : this.ctx.x;
+      // Within a facet, only that panel's rows — the same category appears in every panel, and
+      // pointing all of them would put the other panels' values in this one.  Outside one it's
+      // `flatData`, which is what the tooltip resolves against and what the accessors are written
+      // for: a chart whose `data` is nested (a `stack()`, say) passes its rows as `flatData`, and
+      // iterating `data` there would hand the accessors a series rather than a row.
+      const source = this.#facetPanel?.().data ?? chartDataArray(this.ctx.flatData);
+      const rows = source.filter((d: any) => isEqualValue(this.x(d), this.xValue));
+
+      // A multi-value accessor (`y={[0, 1]}`, as a stack's bands use) gives a category a span
+      // rather than a position, so there is no single point to put on it.  Those belong to the
+      // series path below, which points each of the values.
+      const spans = rows.some((row: any) => Array.isArray(value(row)));
+
+      // No visibility filter needed — rows of a `c` category the legend has hidden are already
+      // gone from `ctx.data`, which is what keeps the scales in step with the legend
+      if (!spans)
+        return rows
+          .map((row: any) => {
+            const seriesValue = value(row);
+            return {
+              x:
+                this.ctx.valueAxis === 'x'
+                  ? this.ctx.xScale(seriesValue) + this.xOffset
+                  : (this.xCoordScalar as number) + this.xOffset,
+              y:
+                this.ctx.valueAxis === 'x'
+                  ? (this.yCoordScalar as number) + this.yOffset
+                  : this.ctx.yScale(seriesValue) + this.yOffset,
+              fill: this.ctx.cChannel ? this.ctx.cGet(row) : null,
+              data: { x: this.xValue, y: seriesValue },
+              seriesKey: this.ctx.cKey(row) ?? undefined,
+            };
+          })
+          .filter(notNull) as HighlightPoint[];
+    }
+
+    if (valueIsPosition && props.data === undefined && this.ctx.tooltip.series.length > 0) {
       tmpPoints = this.ctx.tooltip.series
         .flatMap((seriesInfo) => {
           if (!seriesInfo.visible) return [];
@@ -325,7 +537,9 @@ export class HighlightState {
           let dataX: any;
           let dataY: any;
 
-          if (this.ctx.series.isStacked) {
+          // Follow what the marks drew, not what the layout resolved to — an inferred stack the
+          // marks declined would put the point somewhere nothing is drawn
+          if (this.ctx.isStacked) {
             const matchingData = this.ctx.flatData.find((d) => this.x(d) === this.xValue);
             const stackValue = matchingData
               ? this.ctx.series.getStackValue(seriesInfo.key, matchingData)
@@ -359,7 +573,7 @@ export class HighlightState {
                 return seriesValue.map((sv) => ({
                   x: this.ctx.xScale(sv) + this.xOffset,
                   y: (this.yCoordScalar as number) + this.yOffset,
-                  fill: seriesInfo.color ?? '',
+                  fill: this.#pointFill(seriesInfo),
                   data: { x: sv, y: this.yValue },
                   seriesKey: seriesInfo.key,
                 }));
@@ -367,7 +581,7 @@ export class HighlightState {
                 return seriesValue.map((sv) => ({
                   x: (this.xCoordScalar as number) + this.xOffset,
                   y: this.ctx.yScale(sv) + this.yOffset,
-                  fill: seriesInfo.color ?? '',
+                  fill: this.#pointFill(seriesInfo),
                   data: { x: this.xValue, y: sv },
                   seriesKey: seriesInfo.key,
                 }));
@@ -390,7 +604,7 @@ export class HighlightState {
           return {
             x: pointX,
             y: pointY,
-            fill: seriesInfo.color ?? '',
+            fill: this.#pointFill(seriesInfo),
             data: { x: dataX, y: dataY },
             seriesKey: seriesInfo.key,
           };
@@ -409,7 +623,7 @@ export class HighlightState {
 
           tmpPoints = seriesPointsData
             .map((seriesPoint) => {
-              const fill = this.ctx.config.c ? this.ctx.cGet(seriesPoint.series) : null;
+              const fill = this.ctx.cChannel ? this.ctx.cGet(seriesPoint.series) : null;
               return {
                 x: this.ctx.xScale(seriesPoint.point[1]) + this.xOffset,
                 y: (this.yCoordScalar as number) + this.yOffset,
@@ -427,7 +641,7 @@ export class HighlightState {
             // @ts-expect-error - TODO: fix type
             const _key = this.ctx.config.x?.[i];
 
-            const fill = this.ctx.config.c
+            const fill = this.ctx.cChannel
               ? this.ctx.cGet({ ...this.highlightData, $key: _key })
               : null;
 
@@ -454,7 +668,7 @@ export class HighlightState {
 
           tmpPoints = seriesPointsData
             .map((seriesPoint) => {
-              const fill = this.ctx.config.c ? this.ctx.cGet(seriesPoint.series) : null;
+              const fill = this.ctx.cChannel ? this.ctx.cGet(seriesPoint.series) : null;
               return {
                 x: (this.xCoord as number) + this.xOffset,
                 y: this.ctx.yScale(seriesPoint.point[1]) + this.yOffset,
@@ -472,7 +686,7 @@ export class HighlightState {
             // @ts-expect-error - TODO: fix type
             const _key = this.ctx.config.y[i];
 
-            const fill = this.ctx.config.c
+            const fill = this.ctx.cChannel
               ? this.ctx.cGet({ ...this.highlightData, $key: _key })
               : null;
 
@@ -487,7 +701,7 @@ export class HighlightState {
           .filter(notNull) as HighlightPoint[];
       }
     } else if (this.xCoord != null && this.yCoord != null) {
-      const fill = this.ctx.config.c ? this.ctx.cGet(this.highlightData) : null;
+      const fill = this.ctx.cChannel ? this.ctx.cGet(this.highlightData) : null;
       tmpPoints = [
         {
           x: (this.xCoord as number) + this.xOffset,
@@ -513,6 +727,11 @@ export class HighlightState {
       if (pointR != null) {
         tmpPoints = tmpPoints.map((p) => ({ ...p, r: pointR }));
       }
+    }
+
+    const lift = this.lift;
+    if (lift) {
+      tmpPoints = tmpPoints.map((p) => ({ ...p, x: p.x + lift.x, y: p.y + lift.y }));
     }
 
     return tmpPoints;

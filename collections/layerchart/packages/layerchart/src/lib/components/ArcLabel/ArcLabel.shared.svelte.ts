@@ -1,4 +1,5 @@
 import { radiansToDegrees } from '$lib/utils/math.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
 import type { PathProps } from '../Path/Path.shared.svelte.js';
 import type { TextProps } from '../Text/Text.shared.svelte.js';
 import type { GetArcTextProps, ArcTextOptions } from '$lib/utils/arcText.svelte.js';
@@ -33,8 +34,13 @@ export type ArcLabelConfig = {
   line?: Omit<PathProps, 'pathData'>;
   /** Radial offset for the label, interpreted per-placement. @default 0 */
   offset?: number;
+  /**
+   * On an `isometric` chart, the height of the labelled slice, so the label sits on top of it.  A
+   * callout on a slice facing the viewer hangs below the pie instead, clear of its sides.
+   */
+  z?: number;
 } & ArcTextOptions &
-  Omit<TextProps, 'path'>;
+  Omit<TextProps, 'path' | 'z'>;
 
 export type ArcLabelProps = {
   /** Function from `Arc` children snippet for `inner`/`middle`/`outer` placements. */
@@ -65,17 +71,36 @@ export type ArcLabelCalloutGeometry = {
 export class ArcLabelState {
   #getProps: () => ArcLabelProps = () => ({}) as ArcLabelProps;
 
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: ArcLabelProps = $derived(this.#getProps());
+
+  #layerIsometric = getLayerIsometric();
+
+  /** The label's height: the slice's top, or the floor for a callout on a slice facing the viewer */
+  labelHeight = $derived.by(() => {
+    const { z, placement } = this.#props;
+    if (z == null) return undefined;
+    const m = this.#layerIsometric();
+    if (!m || placement !== 'callout') return z;
+    const angle = this.midAngle - Math.PI / 2;
+    return m.b * Math.cos(angle) + m.d * Math.sin(angle) > 0 ? 0 : z;
+  });
+
   constructor(getProps: () => ArcLabelProps) {
     this.#getProps = getProps;
   }
 
   midAngle = $derived.by(() => {
-    const { startAngle, endAngle } = this.#getProps();
+    const { startAngle, endAngle } = this.#props;
     return startAngle != null && endAngle != null ? (startAngle + endAngle) / 2 : 0;
   });
 
   offsetCentroid = $derived.by<[number, number] | undefined>(() => {
-    const { centroid, offset = 0, startAngle, endAngle } = this.#getProps();
+    const { centroid, offset = 0, startAngle, endAngle } = this.#props;
     if (!centroid) return centroid;
     if (!offset || startAngle == null || endAngle == null) return centroid;
     const angle = this.midAngle - Math.PI / 2;
@@ -83,7 +108,7 @@ export class ArcLabelState {
   });
 
   effectiveOuterPadding = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     const base = props.outerPadding ?? 0;
     if (props.placement === 'outer' || props.placement === 'middle') {
       return base + (props.offset ?? 0);
@@ -92,17 +117,17 @@ export class ArcLabelState {
   });
 
   effectiveInnerPadding = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     if (props.placement === 'inner' || props.placement === 'middle') return props.offset ?? 0;
     return 0;
   });
 
   effectiveCalloutLineLength = $derived(
-    (this.#getProps().calloutLineLength ?? 16) + (this.#getProps().offset ?? 0)
+    (this.#props.calloutLineLength ?? 16) + (this.#props.offset ?? 0)
   );
 
   centroidRotation = $derived.by(() => {
-    const { startAngle, endAngle, placement } = this.#getProps();
+    const { startAngle, endAngle, placement } = this.#props;
     if (startAngle == null || endAngle == null) return 0;
     let deg = radiansToDegrees(this.midAngle);
     if (placement === 'centroid-radial') {
@@ -124,7 +149,7 @@ export class ArcLabelState {
       outerRadius,
       calloutLabelOffset = 12,
       calloutPadding = 4,
-    } = this.#getProps();
+    } = this.#props;
     if (placement !== 'callout' || startAngle == null || endAngle == null || outerRadius == null) {
       return null;
     }
@@ -140,20 +165,26 @@ export class ArcLabelState {
     const x1 = cos * bendRadius;
     const y1 = sin * bendRadius;
 
-    const onRightSide = cos >= 0;
-    const x2 = x1 + (onRightSide ? calloutLabelOffset : -calloutLabelOffset);
-    const y2 = y1;
+    // On an isometric floor, the callout's side and level run follow the screen: `level` is the
+    // flat vector that lands one pixel rightwards on screen
+    const m = this.#layerIsometric();
+    const det = m ? m.a * m.d - m.b * m.c : 1;
+    const level = m && det ? { x: m.d / det, y: -m.b / det } : { x: 1, y: 0 };
+    const onRightSide = m ? m.a * cos + m.c * sin >= 0 : cos >= 0;
+    const side = onRightSide ? 1 : -1;
+    const x2 = x1 + level.x * calloutLabelOffset * side;
+    const y2 = y1 + level.y * calloutLabelOffset * side;
 
     return {
       pathData: `M${x0},${y0}L${x1},${y1}L${x2},${y2}`,
-      labelX: x2 + (onRightSide ? calloutPadding : -calloutPadding),
-      labelY: y2,
+      labelX: x2 + level.x * calloutPadding * side,
+      labelY: y2 + level.y * calloutPadding * side,
       textAnchor: onRightSide ? 'start' : 'end',
     };
   });
 
   arcTextProps = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     const { placement = 'centroid', startOffset, outerPadding, getArcTextProps } = props;
 
     if (placement === 'centroid') {

@@ -5,7 +5,7 @@
 	import { frontend_context } from './frontend.svelte.ts';
 	import ProviderLink from './ProviderLink.svelte';
 	import { icon_provider } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import ErrorMessage from './ErrorMessage.svelte';
 	import ExternalLink from './ExternalLink.svelte';
 
@@ -35,19 +35,24 @@
 				: 'SECRET_GOOGLE_API_KEY'
 	);
 
-	onMount(() => {
-		void capabilities.providers[provider_name].init_check();
+	// the provider check is skipped until a ping has shown the backend is up
+	onMount(async () => {
+		await capabilities.init_backend_check();
+		await capabilities.providers[provider_name].init_check();
 	});
+
+	// a failed reload, shown until the provider status refreshes some other way
+	let reload_failure: { message: string; updated: number | null } | null = $state.raw(null);
+	const reload_error = $derived.by(() =>
+		reload_failure?.updated === capability.updated ? reload_failure.message : null
+	);
 
 	const reload_status = async () => {
 		checking = true;
-		try {
-			await app.api.provider_load_status({ provider_name });
-		} catch (error) {
-			console.error(`Failed to check ${provider_name} connection:`, error);
-		} finally {
-			checking = false;
-		}
+		reload_failure = null;
+		const result = await app.api.provider_load_status({ provider_name });
+		checking = false;
+		if (!result.ok) reload_failure = { message: result.error.message, updated: capability.updated };
 	};
 </script>
 
@@ -57,9 +62,9 @@
 			<form class="flex:1">
 				<div
 					class="width:100% chip plain flex:1 flex-direction:column mb_lg"
-					style:display="display:flex !important"
-					style:align-items="flex-start !important"
-					style:font-weight="400 !important"
+					style:display="inline-flex"
+					style:align-items="flex-start"
+					style:font-weight="400"
 					class:palette_b={capability.status === 'success'}
 					class:palette_c={capability.status === 'failure'}
 					class:palette_d={capability.status === 'pending' || checking}
@@ -80,7 +85,9 @@
 							{/if}
 						</div>
 						<span class="font_family_mono font_size_sm">
-							{#if capability.error_message}
+							{#if reload_error}
+								failed to reload: {reload_error}
+							{:else if capability.error_message}
 								{capability.error_message}
 							{:else if capability.status === 'success'}
 								available
@@ -98,12 +105,7 @@
 						set <code>{env_var_name}</code> in the server's environment and restart
 					</p>
 					<div class="display:flex justify-content:space-between gap_xs">
-						<button
-							type="button"
-							class="flex:1"
-							disabled={checking || !capabilities.backend_available}
-							onclick={reload_status}
-						>
+						<button type="button" class="flex:1" disabled={checking} onclick={reload_status}>
 							reload
 						</button>
 					</div>
@@ -115,7 +117,7 @@
 					<div>
 						<ProviderLink {provider}>
 							<span class="white-space:nowrap">
-								<Svg data={icon_provider} />
+								<Icon data={icon_provider} />
 								{provider.title}
 							</span> provider
 						</ProviderLink>

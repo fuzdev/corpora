@@ -1,7 +1,7 @@
 <script lang="ts">
-	import ContextmenuEntry from '$lib/ContextmenuEntry.svelte';
-	import ContextmenuSubmenu from '$lib/ContextmenuSubmenu.svelte';
-	import ContextmenuSeparator from '$lib/ContextmenuSeparator.svelte';
+	import ContextmenuEntry from '#lib/ContextmenuEntry.svelte';
+	import ContextmenuSubmenu from '#lib/ContextmenuSubmenu.svelte';
+	import ContextmenuSeparator from '#lib/ContextmenuSeparator.svelte';
 	import { type HistoryItem, type Cat, to_cats_label } from './helpers.ts';
 	import CatContextmenu from './CatContextmenu.svelte';
 

@@ -29,10 +29,11 @@ import type { AppServerContext } from '../server/app_server_context.ts';
 import type { RouteSpec } from '../http/route_spec.ts';
 import { RateLimiter } from '../rate_limiter.ts';
 import { RateLimitError } from '../http/error_schemas.ts';
-import { auth_migration_ns } from '../auth/migrations.ts';
+import { AUTH_MIGRATION_NS } from '../auth/migrations.ts';
 import { create_test_app, type SuiteAppOptions } from './app_server.ts';
+import { create_test_request_headers } from './test_origin.ts';
 import {
-	create_pglite_factory,
+	create_default_db_factory,
 	create_describe_db,
 	auth_integration_truncate_tables,
 	type DbFactory
@@ -53,7 +54,8 @@ export interface RateLimitingTestOptions {
 	/** Optional overrides for `AppServerOptions`. */
 	app_options?: SuiteAppOptions;
 	/**
-	 * Database factories to run tests against. Default: pglite only.
+	 * Database factories to run tests against. Default: the default factory
+	 * (`create_default_db_factory`) only.
 	 */
 	db_factories?: Array<DbFactory>;
 	/**
@@ -92,9 +94,9 @@ export interface RateLimitingTestOptions {
 export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): void => {
 	const max_attempts = options.max_attempts ?? 2;
 	const init_schema = async (db: Db): Promise<void> => {
-		await run_migrations(db, [auth_migration_ns]);
+		await run_migrations(db, [AUTH_MIGRATION_NS]);
 	};
-	const factories = options.db_factories ?? [create_pglite_factory(init_schema)];
+	const factories = options.db_factories ?? [create_default_db_factory(init_schema)];
 	const describe_db = create_describe_db(factories, auth_integration_truncate_tables);
 
 	/** Create a tight rate limiter for testing — low attempt count, long window. */
@@ -130,11 +132,9 @@ export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): 
 					for (let i = 0; i < max_attempts; i++) {
 						const res = await test_app.app.request(login_route.path, {
 							method: 'POST',
-							headers: {
-								host: 'localhost',
-								origin: 'http://localhost:5173',
+							headers: create_test_request_headers({
 								'content-type': 'application/json'
-							},
+							}),
 							body: JSON.stringify({ username: 'nonexistent', password: 'wrong' })
 						});
 						assert.notStrictEqual(
@@ -147,11 +147,9 @@ export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): 
 					// The next request should be rate limited
 					const blocked_res = await test_app.app.request(login_route.path, {
 						method: 'POST',
-						headers: {
-							host: 'localhost',
-							origin: 'http://localhost:5173',
+						headers: create_test_request_headers({
 							'content-type': 'application/json'
-						},
+						}),
 						body: JSON.stringify({ username: 'nonexistent', password: 'wrong' })
 					});
 					assert.strictEqual(blocked_res.status, 429);
@@ -200,11 +198,9 @@ export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): 
 					for (let i = 0; i < max_attempts; i++) {
 						const res = await test_app.app.request(login_route.path, {
 							method: 'POST',
-							headers: {
-								host: 'localhost',
-								origin: 'http://localhost:5173',
+							headers: create_test_request_headers({
 								'content-type': 'application/json'
-							},
+							}),
 							body: JSON.stringify({ username: target_username, password: 'wrong' })
 						});
 						assert.notStrictEqual(
@@ -217,11 +213,9 @@ export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): 
 					// The next request for the same username should be rate limited
 					const blocked_res = await test_app.app.request(login_route.path, {
 						method: 'POST',
-						headers: {
-							host: 'localhost',
-							origin: 'http://localhost:5173',
+						headers: create_test_request_headers({
 							'content-type': 'application/json'
-						},
+						}),
 						body: JSON.stringify({ username: target_username, password: 'wrong' })
 					});
 					assert.strictEqual(blocked_res.status, 429);
@@ -236,11 +230,9 @@ export const describe_rate_limiting_tests = (options: RateLimitingTestOptions): 
 					// A different username should NOT be rate limited
 					const other_res = await test_app.app.request(login_route.path, {
 						method: 'POST',
-						headers: {
-							host: 'localhost',
-							origin: 'http://localhost:5173',
+						headers: create_test_request_headers({
 							'content-type': 'application/json'
-						},
+						}),
 						body: JSON.stringify({ username: 'different_user', password: 'wrong' })
 					});
 					assert.notStrictEqual(

@@ -2,13 +2,17 @@
 
 import { test, vi, beforeEach, assert } from 'vitest';
 import { z } from 'zod';
-import { create_uuid, UuidWithDefault } from '@fuzdev/fuz_util/id.ts';
-import { DatetimeNow, get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import {
+	create_uuid,
+	DatetimeNow,
+	get_datetime_now,
+	UuidWithDefault
+} from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Cell, type CellOptions } from '$lib/cell.svelte.ts';
-import { CellJson } from '$lib/cell_types.ts';
-import { HANDLED } from '$lib/cell_helpers.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
+import { Cell, type CellOptions } from '#lib/cell.svelte.ts';
+import { CellJson } from '#lib/cell_types.ts';
+import { HANDLED } from '#lib/cell_helpers.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 

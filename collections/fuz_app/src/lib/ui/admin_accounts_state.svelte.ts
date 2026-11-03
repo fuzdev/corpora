@@ -14,17 +14,21 @@
  */
 
 import { create_context } from '@fuzdev/fuz_ui/context_helpers.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import { AsyncSlot } from './async_slot.svelte.ts';
 import { KeyedAsyncSlot } from './keyed_async_slot.svelte.ts';
-import type { AdminAccountEntryJson } from '../auth/account_schema.ts';
+import { type AdminAccountEntryJson, has_global_role } from '../auth/account_schema.ts';
 import type { RoleName } from '../auth/role_schema.ts';
 import type { RoleGrantOfferJson } from '../auth/role_grant_offer_schema.ts';
 import type {
+	AdminAccountListInput,
 	AdminAccountListOutput,
+	AccountDeleteInput,
 	AccountDeleteOutput,
+	AccountUndeleteInput,
 	AccountUndeleteOutput,
+	AdminSessionListInput,
 	AdminSessionListOutput,
 	AdminSessionRevokeAllInput,
 	AdminSessionRevokeAllOutput,
@@ -34,7 +38,8 @@ import type {
 import type {
 	RoleGrantOfferCreateInput,
 	RoleGrantOfferCreateOutput,
-	RoleGrantOfferOkOutput,
+	RoleGrantOfferRetractInput,
+	RoleGrantOfferRetractOutput,
 	RoleGrantRevokeInput,
 	RoleGrantRevokeOutput
 } from '../auth/role_grant_offer_action_specs.ts';
@@ -51,19 +56,24 @@ import type {
  * actions, and the session / token revoke-all mutations reuse
  * `admin_session_revoke_all` and `admin_token_revoke_all`.
  *
- * Method signatures track the underlying action specs — `Uuid`-branded ids
+ * Every method takes its action's input as one params object, typed from the
+ * action specs (or nothing, for an input-less listing) — `Uuid`-branded ids
  * propagate from the wire through the state class to the components. The
  * adapter built by `create_admin_rpc_adapters` therefore needs zero casts
- * to bridge to the typed throwing Proxy.
+ * to bridge to the typed throwing Proxy. `delete_account` is the one narrowing:
+ * `account_delete`'s input defaults to `{}`, which deletes the caller, so the
+ * adapter requires `account_id` as a `Uuid` — never omitted, never `null`.
  */
 export interface AdminAccountsRpc {
-	list_accounts: (include_deleted?: boolean) => Promise<AdminAccountListOutput>;
-	delete_account: (account_id: Uuid) => Promise<AccountDeleteOutput>;
-	undelete_account: (account_id: Uuid) => Promise<AccountUndeleteOutput>;
-	list_sessions: () => Promise<AdminSessionListOutput>;
+	list_accounts: (params?: AdminAccountListInput) => Promise<AdminAccountListOutput>;
+	delete_account: (
+		params: AccountDeleteInput & { account_id: Uuid }
+	) => Promise<AccountDeleteOutput>;
+	undelete_account: (params: AccountUndeleteInput) => Promise<AccountUndeleteOutput>;
+	list_sessions: (params?: AdminSessionListInput) => Promise<AdminSessionListOutput>;
 	create_role_grant: (params: RoleGrantOfferCreateInput) => Promise<RoleGrantOfferCreateOutput>;
 	revoke_role_grant: (params: RoleGrantRevokeInput) => Promise<RoleGrantRevokeOutput>;
-	retract_offer: (offer_id: Uuid) => Promise<RoleGrantOfferOkOutput>;
+	retract_offer: (params: RoleGrantOfferRetractInput) => Promise<RoleGrantOfferRetractOutput>;
 	session_revoke_all: (params: AdminSessionRevokeAllInput) => Promise<AdminSessionRevokeAllOutput>;
 	token_revoke_all: (params: AdminTokenRevokeAllInput) => Promise<AdminTokenRevokeAllOutput>;
 }
@@ -98,6 +108,27 @@ export interface AdminAccountsStateOptions {
 export const grant_key = (account_id: Uuid, role: RoleName, to_actor_id?: Uuid | null): string =>
 	to_actor_id ? `${account_id}:${role}:${to_actor_id}` : `${account_id}:${role}`;
 
+/**
+ * Whether a listing row can be offered a global grant of `role` — the test
+ * behind `AdminAccounts`' `+ role` button, which `submit_grant` backs with an
+ * unscoped offer. Only what the offer would duplicate rules it out: a global
+ * grant of the role, or a pending global offer of it. A grant or offer scoped
+ * to one resource is a different grant, so it doesn't.
+ *
+ * @param entry - the account's listing row
+ * @param role - the role the button would offer
+ * @param now - current time for the grant-expiry check (defaults to `new Date()`,
+ *   pass for testability); pending offers are taken as listed — the listing
+ *   returns only unexpired ones
+ */
+export const can_offer_global_role = (
+	entry: Pick<AdminAccountEntryJson, 'role_grants' | 'pending_offers'>,
+	role: string,
+	now: Date = new Date()
+): boolean =>
+	!has_global_role(entry.role_grants, role, now) &&
+	!entry.pending_offers.some((o) => o.role === role && o.scope_id === null);
+
 export class AdminAccountsState {
 	readonly #get_rpc: () => AdminAccountsRpc;
 
@@ -125,7 +156,9 @@ export class AdminAccountsState {
 
 	async fetch(): Promise<void> {
 		await this.list.run(async () => {
-			const { accounts, grantable_roles } = await this.#get_rpc().list_accounts(this.show_deleted);
+			const { accounts, grantable_roles } = await this.#get_rpc().list_accounts({
+				include_deleted: this.show_deleted
+			});
 			this.accounts = accounts;
 			this.grantable_roles = grantable_roles;
 		});
@@ -150,7 +183,7 @@ export class AdminAccountsState {
 	 */
 	async submit_delete(account_id: Uuid): Promise<void> {
 		await this.soft_delete.run(account_id, async () => {
-			await this.#get_rpc().delete_account(account_id);
+			await this.#get_rpc().delete_account({ account_id });
 		});
 		if (this.soft_delete.succeeded(account_id)) await this.fetch();
 	}
@@ -162,7 +195,7 @@ export class AdminAccountsState {
 	 */
 	async submit_undelete(account_id: Uuid): Promise<void> {
 		await this.undelete.run(account_id, async () => {
-			await this.#get_rpc().undelete_account(account_id);
+			await this.#get_rpc().undelete_account({ account_id });
 		});
 		if (this.undelete.succeeded(account_id)) await this.fetch();
 	}
@@ -232,7 +265,7 @@ export class AdminAccountsState {
 	 */
 	async submit_retract(offer_id: Uuid): Promise<void> {
 		await this.retract.run(offer_id, async () => {
-			await this.#get_rpc().retract_offer(offer_id);
+			await this.#get_rpc().retract_offer({ offer_id });
 		});
 		if (this.retract.succeeded(offer_id)) await this.fetch();
 	}

@@ -14,8 +14,91 @@ import { describe, test, assert } from 'vitest';
 import {
 	canonicalize_ip,
 	ipv6_bigint_to_canonical,
-	IP_LITERAL_CHARS
-} from '$lib/http/ip_canonical.ts';
+	IP_LITERAL_CHARS,
+	parse_ipv4_bits,
+	parse_ipv6_bits,
+	rate_limit_ip_key
+} from '#lib/http/ip_canonical.ts';
+
+// --- parse_ipv4_bits / parse_ipv6_bits — the grammar of Rust's `IpAddr::from_str` ---
+
+describe('parse_ipv4_bits', () => {
+	test('accepts dotted quads', () => {
+		assert.strictEqual(parse_ipv4_bits('0.0.0.0'), 0);
+		assert.strictEqual(parse_ipv4_bits('127.0.0.1'), 0x7f000001);
+		assert.strictEqual(parse_ipv4_bits('255.255.255.255'), 0xffffffff);
+	});
+
+	test('refuses malformed quads', () => {
+		for (const ip of [
+			'',
+			'1.2.3',
+			'1.2.3.4.5',
+			'256.0.0.1',
+			'01.2.3.4',
+			'1.2.3.00',
+			'1..2.3',
+			'1.2.3.4.',
+			'a.2.3.4',
+			'1.2.3.4 '
+		]) {
+			assert.strictEqual(parse_ipv4_bits(ip), null, ip);
+		}
+	});
+});
+
+describe('parse_ipv6_bits', () => {
+	const ones = (1n << 128n) - 1n;
+
+	test('accepts the full and compressed forms', () => {
+		assert.strictEqual(parse_ipv6_bits('::'), 0n);
+		assert.strictEqual(parse_ipv6_bits('::1'), 1n);
+		assert.strictEqual(parse_ipv6_bits('1::'), 1n << 112n);
+		assert.strictEqual(parse_ipv6_bits('0:0:0:0:0:0:0:1'), 1n);
+		assert.strictEqual(parse_ipv6_bits('FFFF:ffff:FfFf:ffff:ffff:ffff:ffff:ffff'), ones);
+	});
+
+	test('`::` may stand for a single zero group', () => {
+		assert.strictEqual(parse_ipv6_bits('1:2:3:4:5:6:7::'), parse_ipv6_bits('1:2:3:4:5:6:7:0'));
+		assert.strictEqual(parse_ipv6_bits('::2:3:4:5:6:7:8'), parse_ipv6_bits('0:2:3:4:5:6:7:8'));
+	});
+
+	test('accepts a dotted-quad tail in the last two groups', () => {
+		assert.strictEqual(parse_ipv6_bits('::ffff:127.0.0.1'), 0xffff7f000001n);
+		assert.strictEqual(parse_ipv6_bits('::1.2.3.4'), 0x01020304n);
+		assert.strictEqual(
+			parse_ipv6_bits('1:2:3:4:5:6:1.2.3.4'),
+			parse_ipv6_bits('1:2:3:4:5:6:102:304')
+		);
+	});
+
+	test('refuses malformed forms', () => {
+		for (const ip of [
+			'',
+			':',
+			':::',
+			'1:2:3:4:5:6:7',
+			'1:2:3:4:5:6:7:8:9',
+			'::1:2:3:4:5:6:7:8',
+			'1::2::3',
+			':1:2:3:4:5:6:7',
+			'1:2:3:4:5:6:7:',
+			'1:',
+			'00000::1',
+			'::g',
+			'1.2.3.4',
+			'1.2.3.4::',
+			'::1.2.3.4:5',
+			'1:2:3:4:5:6:7:1.2.3.4',
+			'::01.2.3.4',
+			'::256.0.0.1',
+			'fe80::1%eth0',
+			'[::1]'
+		]) {
+			assert.strictEqual(parse_ipv6_bits(ip), null, ip);
+		}
+	});
+});
 
 // --- ipv6_bigint_to_canonical — pure helper ---
 
@@ -257,9 +340,8 @@ describe('canonicalize_ip', () => {
 
 		test('collapses uppercase full-hex IPv4-mapped form to plain IPv4', () => {
 			// Same as the full-hex collapse test above, but with the
-			// uppercase hex form. Confirms the lowercase prelude flows into
-			// the IPv6 parser uniformly — without it, `distinctRemoteAddr`
-			// might branch differently on case and the strip would miss.
+			// uppercase hex form. Confirms the lowercase prelude and the
+			// parser agree on case, so the strip doesn't miss.
 			// 0:0:0:0:0:FFFF:7F00:1 = ::ffff:127.0.0.1 = 127.0.0.1
 			assert.strictEqual(canonicalize_ip('0:0:0:0:0:FFFF:7F00:1'), '127.0.0.1');
 			assert.strictEqual(canonicalize_ip('0:0:0:0:0:FFFF:0A00:0001'), '10.0.0.1');
@@ -357,18 +439,16 @@ describe('canonicalize_ip', () => {
 		});
 
 		test('colon-injected garbage passes through (char-set rejects)', () => {
-			// Hono's distinctRemoteAddr would misclassify these as IPv6;
-			// the char-set filter `IP_LITERAL_CHARS` catches the letters
-			// g-z first so the parser never sees the malformed input.
+			// the char-set filter `IP_LITERAL_CHARS` catches the letters g-z
+			// first, so the parser never sees the malformed input
 			assert.strictEqual(canonicalize_ip('attacker:controlled'), 'attacker:controlled');
 			assert.strictEqual(canonicalize_ip('host:port'), 'host:port');
 		});
 
-		test('port-suffixed forms pass through (char-set rejects)', () => {
+		test('port-suffixed forms pass through (parser rejects)', () => {
 			// 203.0.113.1:8080 contains only [0-9a-fA-F.:], so the char-set
-			// accepts it. `distinctRemoteAddr` then classifies it as IPv6
-			// (any-string-with-colons), and Hono's `convertIPv6ToBinary`
-			// throws on it — caught and the input passes through.
+			// accepts it; neither parser does (an IPv4 tail must end the
+			// address), so the input passes through
 			assert.strictEqual(canonicalize_ip('203.0.113.1:8080'), '203.0.113.1:8080');
 		});
 
@@ -409,42 +489,105 @@ describe('canonicalize_ip', () => {
 			assert.strictEqual(canonicalize_ip('NOT-AN-IP'), 'not-an-ip');
 		});
 
-		test('passes through char-set-valid forms that crash the IPv6 parser', () => {
-			// Closes the `catch { return lowered; }` branch in `canonicalize_ip`'s
-			// IPv6 arm. The trigger shape is "IPv4-style dotted-quad followed by
-			// a colon-suffix" — Hono's `convertIPv6ToBinary` reads the trailing
-			// `:NNN` as if it were a hex group's worth of digits, then trips
-			// `NaN.toBigInt()` deep in the parser and throws. Without the catch,
-			// an attacker who controls XFF could induce a 500 from the proxy
-			// middleware by rotating these forms; with the catch, they pass
-			// through verbatim and downstream `validate_ip_strict` rejects them
-			// at the walker.
-			//
-			// `'203.0.113.1:8080'` above (the port-suffix passthrough test) is
-			// the canonical case; these belt-and-suspenders forms guard against
-			// a refactor that narrowed the catch (e.g. matched only on `Error`
-			// subtype) and let the throw escape.
-			//
-			// Pure-shape errors like `'1:2:3:4:5:6:7:8:9'`, `':::'`, `'::ffff:'`,
-			// `'1::2::3'` do NOT throw — Hono parses them as garbage bigints —
-			// so they're not catch-branch coverage and aren't listed here.
-			assert.strictEqual(canonicalize_ip('10.0.0.1:80'), '10.0.0.1:80');
-			assert.strictEqual(canonicalize_ip('1.2.3.4:5'), '1.2.3.4:5');
+		test('passes through char-set-valid forms neither parser accepts', () => {
+			// a dotted quad followed by a colon suffix — an IPv4 tail must end
+			// the address — and the group-count, `::`, and empty-piece shapes the
+			// IPv6 grammar refuses; each passes through verbatim for downstream
+			// `validate_ip_strict` to reject, never throwing out of the proxy
+			// middleware an attacker's XFF reaches
+			for (const ip of [
+				'10.0.0.1:80',
+				'1.2.3.4:5',
+				'1:2:3:4:5:6:7:8:9',
+				':::',
+				'::ffff:',
+				'::ffff:::1.2.3.4',
+				'1::2::3'
+			]) {
+				assert.strictEqual(canonicalize_ip(ip), ip);
+			}
 		});
 
 		test('IPv4-shaped but out-of-range octets pass through', () => {
 			// JSDoc claim: `'999.999.999.999'` and similar IPv4-shaped malformed
 			// inputs pass through unchanged so `validate_ip_strict` can reject
-			// them downstream. The char-set filter accepts `[0-9.]`, but Hono's
-			// `distinctRemoteAddr` returns `undefined` (not `'IPv4'`) on these
-			// — the function falls through past both the IPv4 and IPv6 branches
-			// to the final `return lowered`. If Hono ever tightened
-			// `distinctRemoteAddr` to throw or to misclassify, this test would
-			// surface the change.
+			// them downstream. The char-set filter accepts `[0-9.]`, but
+			// `parse_ipv4_bits` refuses an octet past 255 or a fifth octet, and
+			// `parse_ipv6_bits` a string with no colon, so both return `null`.
 			assert.strictEqual(canonicalize_ip('999.999.999.999'), '999.999.999.999');
 			assert.strictEqual(canonicalize_ip('300.0.0.1'), '300.0.0.1');
 			assert.strictEqual(canonicalize_ip('1.2.3.256'), '1.2.3.256');
 			assert.strictEqual(canonicalize_ip('1.2.3.4.5'), '1.2.3.4.5');
 		});
+	});
+});
+
+// --- rate_limit_ip_key ---
+
+/**
+ * The key table, kept identical with the Rust spine's
+ * `fuz_http::ip_canonical` tests — the twins must bucket alike.
+ */
+const RATE_LIMIT_IP_KEY_CASES: ReadonlyArray<readonly [string, string]> = [
+	// IPv6 keys its /64
+	['2001:db8:1:2::1', '2001:db8:1:2::/64'],
+	['2001:db8:1:2:ffff:ffff:ffff:ffff', '2001:db8:1:2::/64'],
+	// the /65 bit is still inside the /64
+	['2001:db8:1:2:8000::', '2001:db8:1:2::/64'],
+	// the /64 bit is not
+	['2001:db8:1:3::', '2001:db8:1:3::/64'],
+	['2001:db8:1:3::1', '2001:db8:1:3::/64'],
+	// so is the /63 bit
+	['2001:db8:1:1::', '2001:db8:1:1::/64'],
+	// equivalent forms, uppercase, full width
+	['2001:0DB8:0001:0002:0000:0000:0000:0001', '2001:db8:1:2::/64'],
+	['2001:db8:0:0:1::', '2001:db8::/64'],
+	// the all-zero prefix
+	['::1', '::/64'],
+	['::', '::/64'],
+	// canonical compression of the prefix: longest zero run, first on a tie
+	['2001:0:0:1:abcd::', '2001:0:0:1::/64'],
+	['1:0:0:0::5', '1::/64'],
+	['fe80::1', 'fe80::/64'],
+	// a zone is dropped
+	['fe80::1%eth0', 'fe80::/64'],
+	['FE80::ABCD%25', 'fe80::/64'],
+	// IPv4 unchanged, no /32
+	['203.0.113.7', '203.0.113.7'],
+	['127.0.0.1', '127.0.0.1'],
+	// IPv4-mapped IPv6 keys the IPv4 address
+	['::ffff:203.0.113.7', '203.0.113.7'],
+	['::ffff:cb00:7107', '203.0.113.7'],
+	// not an address: unchanged — not lowercased, the zone kept
+	['unknown', 'unknown'],
+	['UNKNOWN', 'UNKNOWN'],
+	['unknown%eth0', 'unknown%eth0'],
+	['', ''],
+	['attacker:controlled', 'attacker:controlled'],
+	['[::1]:8080', '[::1]:8080'],
+	// an unparseable mapped form keeps its `::ffff:` — stripped, `::1.2.3.4` would parse
+	['::ffff:::1.2.3.4', '::ffff:::1.2.3.4']
+];
+
+describe('rate_limit_ip_key', () => {
+	test('key table', () => {
+		for (const [ip, key] of RATE_LIMIT_IP_KEY_CASES) {
+			assert.strictEqual(rate_limit_ip_key(ip), key, ip);
+		}
+	});
+
+	test('shares a bucket within a /64 only', () => {
+		const a = rate_limit_ip_key('2001:db8:1:2::1');
+		assert.strictEqual(rate_limit_ip_key('2001:db8:1:2:8000::'), a);
+		assert.strictEqual(rate_limit_ip_key('2001:db8:1:2:dead:beef:0:1'), a);
+		assert.notStrictEqual(rate_limit_ip_key('2001:db8:1:3::'), a);
+		assert.notStrictEqual(rate_limit_ip_key('2001:db8:1:1:ffff:ffff:ffff:ffff'), a);
+	});
+
+	test('idempotent', () => {
+		for (const [ip] of RATE_LIMIT_IP_KEY_CASES) {
+			const once = rate_limit_ip_key(ip);
+			assert.strictEqual(rate_limit_ip_key(once), once, ip);
+		}
 	});
 });

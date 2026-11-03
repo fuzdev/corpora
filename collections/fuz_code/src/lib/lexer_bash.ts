@@ -8,12 +8,13 @@ import {
 	skip_space,
 	token_type,
 	words_map,
-	type Lexer,
+	WordIndex,
+	Lexer,
 	type SyntaxLang
 } from './lexer.ts';
 
 /**
- * Hand-written Bash/shell lexer.
+ * Bash/shell lexer.
  *
  * Emits: `shebang`, `comment`, `string` (double-quoted strings are containers
  * whose `$`-expansions nest as `variable`/`command_substitution`), `keyword`,
@@ -43,7 +44,7 @@ import {
  * arbitrarily deep input tokenizes fully without touching the JS call stack.
  *
  * Scope: the bash family — registered as `sh`, with `bash`/`shell` as
- * aliases. POSIX sh is a syntactic subset of bash for highlighting purposes
+ * aliases. POSIX sh is a syntactic subset of bash for styling purposes
  * (everything sh scripts use — `$(…)`, `$((…))`, backticks, heredocs, `${…}`
  * — is shared syntax), and bash-only forms don't occur in sh input. Shells
  * with their own syntax (fish, PowerShell) are out of scope.
@@ -93,6 +94,13 @@ const WORDS: Map<string, number> = words_map(
 	],
 	[K_BOOLEAN, 'true false']
 );
+
+// a word's value in `WORD_INDEX`: its kind in the low bits and flags above
+const KIND_MASK = 15;
+const F_FUNCTION = 16; // the `function` keyword — the next word names the function
+WORDS.set('function', K_KEYWORD | F_FUNCTION);
+
+const WORD_INDEX = new WordIndex(WORDS);
 
 // `$`-followed single-char special variables (`$@ $# $? $$ $! $* $-`); digits
 // are handled by the `$word` scan
@@ -656,6 +664,13 @@ const run_bash_window = (mac: BashMachine, frame: BashFrame): boolean => {
 		const fn = prev_function_kw;
 		prev_function_kw = false;
 
+		// a backslash outside quotes makes the next char literal (`\``, `\'`, `\"`,
+		// `\$`, `\#`), and before a newline continues the line
+		if (c === 92) {
+			i += 2;
+			continue;
+		}
+
 		// shebang / comments
 		if (c === 35) {
 			if (i === 0 && text.charCodeAt(1) === 33) {
@@ -761,11 +776,11 @@ const run_bash_window = (mac: BashMachine, frame: BashFrame): boolean => {
 				i = wend;
 				continue;
 			}
-			const word = text.slice(i, wend);
-			const kind = WORDS.get(word);
+			const word = WORD_INDEX.find(text, i, wend);
+			const kind = word & KIND_MASK;
 			if (kind === K_KEYWORD) {
 				l.leaf(T_KEYWORD, i, wend);
-				if (word === 'function') prev_function_kw = true;
+				if ((word & F_FUNCTION) !== 0) prev_function_kw = true;
 			} else if (kind === K_BUILTIN) {
 				l.leaf(T_BUILTIN, i, wend);
 			} else if (kind === K_BOOLEAN) {
@@ -985,18 +1000,28 @@ const run_bash = (mac: BashMachine): void => {
 	}
 };
 
+// machines kept between calls, frames and all (see `lexer_ts.ts`)
+const bash_machines: Array<BashMachine> = [];
+
 const lex_bash = (l: Lexer): void => {
-	const mac: BashMachine = { l, stack: [], sp: 0 };
+	const mac = bash_machines.pop() ?? { l, stack: [], sp: 0 };
+	mac.l = l;
+	mac.sp = 0;
 	mac_push_window(mac, l.pos, l.end, R_ROOT, 0, 0, 0);
 	run_bash(mac);
 	l.pos = l.end;
+	// let go of the lexer and its text before pooling: a heredoc delimiter is a
+	// slice of the text, which a long one keeps alive
+	mac.l = Lexer.shape_anchor;
+	for (const frame of mac.stack) frame.hd_delim = '';
+	bash_machines.push(mac);
 };
 
 /**
  * The shell (bash-family) language registration for the lexer engine.
  *
  * Registered as `sh`; `bash` and `shell` alias it: POSIX sh is a syntactic
- * subset of bash for highlighting purposes, and the bash-only constructs this
+ * subset of bash for styling purposes, and the bash-only constructs this
  * lexer additionally recognizes don't occur in sh input, so running it on sh
  * scripts is exact. There is no separate sh lexer.
  */

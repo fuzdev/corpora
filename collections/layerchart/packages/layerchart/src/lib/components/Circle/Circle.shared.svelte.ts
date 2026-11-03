@@ -4,16 +4,19 @@ import type { SVGAttributes } from 'svelte/elements';
 
 import type { Without } from '$lib/utils/types.js';
 import type { DataProp, DataDrivenStyleProps } from '$lib/utils/dataProp.js';
-import {
-  hasAnyDataProp,
-  resolveDataProp,
-  resolveGeoDataPair,
-} from '$lib/utils/dataProp.js';
-import { chartDataArray } from '$lib/utils/common.js';
+import { hasAnyDataProp, resolveDataProp, resolveGeoDataPair } from '$lib/utils/dataProp.js';
 import { parseDashArray } from '$lib/utils/path.js';
 import { createMotion, createDataMotionMap, type MotionProp } from '$lib/utils/motion.svelte.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import {
+  markLift,
+  matrixToString,
+  raiseItems,
+  viewportMatrix as cancelView,
+} from '$lib/utils/isometric.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
 
@@ -61,6 +64,22 @@ export type CirclePropsWithoutHTML = {
    * @default 1
    */
   r?: DataProp;
+
+  /**
+   * Height to raise the circle off an `isometric` floor, defaulting to the chart's `z` in data mode.
+   * - `string`: data property name, resolved via zScale
+   * - `function(d)`: accessor called per data item, result passed through zScale
+   * - `number`: pixel height (also in pixel mode)
+   */
+  z?: DataProp;
+
+  /**
+   * On an `isometric` chart, keep the circle facing the viewer (round) rather than lying on the
+   * floor as an ellipse.
+   *
+   * @default false
+   */
+  viewport?: boolean;
 
   /**
    * The initial radius of the circle (pixel mode only).
@@ -173,20 +192,33 @@ export class CircleState {
   // Contexts (must be read inside a Svelte component setup, which is where
   // CircleState is instantiated).
   chartCtx = getChartContext();
+  markData = getMarkData();
   geo = getGeoContext();
+  #layerIsometric = getLayerIsometric();
+
+  /** The chart's `isometricLift` when the circles float off the floor, else `null` */
+  #lift = $derived.by(() =>
+    markLift(this.chartCtx, this.#layerIsometric, this.#getProps().z, this.dataMode)
+  );
+
+  /** The `isometric` view to cancel about each circle for `viewport`, or `null` for none */
+  viewportMatrix = $derived(this.#getProps().viewport ? cancelView(this.#layerIsometric()) : null);
+
+  /** `viewportMatrix` applied about `(cx, cy)` as an SVG `transform`, or `''` */
+  viewportTransform(cx: number, cy: number) {
+    const m = this.viewportMatrix;
+    if (!m) return '';
+    return `translate(${cx},${cy}) ${matrixToString(m)} translate(${-cx},${-cy})`;
+  }
 
   // Reactive derivations
   dashArrayResolved = $derived(parseDashArray(this.#getProps().dashArray));
-  dashArrayAttr = $derived(
-    this.dashArrayResolved ? this.dashArrayResolved.join(' ') : undefined
-  );
+  dashArrayAttr = $derived(this.dashArrayResolved ? this.dashArrayResolved.join(' ') : undefined);
   dataMode = $derived(
     this.#getProps().data != null ||
       hasAnyDataProp(this.#getProps().cx, this.#getProps().cy, this.#getProps().r)
   );
-  #resolvedData: any[] = $derived(
-    this.dataMode ? (this.#getProps().data ?? chartDataArray(this.chartCtx.data)) : []
-  );
+  #resolvedData: any[] = $derived(this.dataMode ? this.markData(this.#getProps().data) : []);
 
   // Per-key motion tracking (only created when motion is configured)
   #dataMotionMap: ReturnType<typeof createDataMotionMap> = null;
@@ -195,7 +227,7 @@ export class CircleState {
     if (!this.dataMode) return [];
     const props = this.#getProps();
     const keyFn = props.key ?? defaultKey;
-    return this.#resolvedData.map((d, i) => {
+    const items = this.#resolvedData.map((d, i) => {
       const key = keyFn(d, i);
       const resolved = resolveCircle(d, props, this.chartCtx, this.geo);
       const animated = this.#dataMotionMap?.get(key);
@@ -207,6 +239,17 @@ export class CircleState {
         r: animated?.r ?? resolved.r,
       };
     });
+
+    const m = this.#layerIsometric();
+    const lift = this.#lift;
+    if (!m || !lift) return items;
+    return raiseItems(
+      items,
+      ['cx', 'cy'],
+      m,
+      lift,
+      (item) => this.chartCtx.heightOf(item.d, props.z)[1]
+    );
   });
 
   // Pixel-mode motion sources. Initial values are captured at construction;
@@ -233,9 +276,7 @@ export class CircleState {
       : undefined
   );
   staticOpacity = $derived(
-    typeof this.#getProps().opacity === 'number'
-      ? (this.#getProps().opacity as number)
-      : undefined
+    typeof this.#getProps().opacity === 'number' ? (this.#getProps().opacity as number) : undefined
   );
   staticClassName = $derived(
     typeof this.#getProps().class === 'string' ? (this.#getProps().class as string) : undefined
@@ -245,12 +286,9 @@ export class CircleState {
     this.#getProps = getProps;
 
     const initial = getProps();
-    const initialCx =
-      initial.initialCx ?? (typeof initial.cx === 'number' ? initial.cx : 0);
-    const initialCy =
-      initial.initialCy ?? (typeof initial.cy === 'number' ? initial.cy : 0);
-    const initialR =
-      initial.initialR ?? (typeof initial.r === 'number' ? initial.r : 1);
+    const initialCx = initial.initialCx ?? (typeof initial.cx === 'number' ? initial.cx : 0);
+    const initialCy = initial.initialCy ?? (typeof initial.cy === 'number' ? initial.cy : 0);
+    const initialR = initial.initialR ?? (typeof initial.r === 'number' ? initial.r : 1);
 
     this.#motionCx = createMotion(
       initialCx,
@@ -288,11 +326,17 @@ export class CircleState {
     }
   }
 
+  /** Pixel mode: raised by `z` on an `isometric` floor */
+  #raise(axis: 'x' | 'y') {
+    const z = this.#getProps().z;
+    return this.#lift && typeof z === 'number' ? this.#lift[axis] * z : 0;
+  }
+
   get motionCx() {
-    return this.#motionCx.current;
+    return this.#motionCx.current + this.#raise('x');
   }
   get motionCy() {
-    return this.#motionCy.current;
+    return this.#motionCy.current + this.#raise('y');
   }
   get motionR() {
     return this.#motionR.current;

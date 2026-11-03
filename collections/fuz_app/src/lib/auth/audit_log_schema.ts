@@ -10,10 +10,9 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, Email } from '../primitive_schemas.ts';
 
 import { AuthSessionJson, SessionId } from './account_schema.ts';
-import { Email } from '../primitive_schemas.ts';
 import { ApiTokenId } from './api_token.ts';
 import { BuiltinCredentialType } from './credential_type_schema.ts';
 
@@ -69,6 +68,123 @@ export const AUDIT_EVENT_TYPES = Object.freeze([
 /** Zod schema for audit event types. */
 export const AuditEventType = z.enum(AUDIT_EVENT_TYPES);
 export type AuditEventType = z.infer<typeof AuditEventType>;
+
+/**
+ * What a **successful** audit row invalidates — the axis the revocation
+ * listener (`create_revocation_guard`) dispatches on.
+ *
+ * - `none` — the row invalidates no live connection.
+ * - `session` — one session: the connections whose session-token hash equals
+ *   the row's `metadata.session_id`.
+ * - `token` — one API token: the connections whose `api_token.id` equals the
+ *   row's `metadata.token_id`.
+ * - `account` — every connection of `target_account_id ?? account_id`.
+ * - `role` — the target account's connections gated on the row's
+ *   `metadata.role`, when the revoked grant was global
+ *   (`to_global_role_revocation`).
+ *
+ * The scope says what the row invalidated; the listener acts on every scope
+ * alike, for every transport. On `role` that matters for the WebSocket too: per-message dispatch
+ * re-authorizes each request against its own action, but a socket admitted by
+ * a role gate also receives every server push its endpoint sends, which no
+ * dispatch ever re-checks — so a socket that lost the gating role is closed,
+ * like a stream.
+ *
+ * Twin of the Rust spine's `RevocationScope`.
+ */
+export type RevocationScope = 'none' | 'session' | 'token' | 'account' | 'role';
+
+/**
+ * The `RevocationScope` of every builtin audit event — declared once, the one
+ * answer the revocation listener reads, and the twin of the Rust spine's table. Typed over `AuditEventType`, so a new event type does not compile
+ * until it declares its scope here.
+ *
+ * A scope other than `none` marks an event whose success invalidates a live
+ * connection's credential or access: `logout`, `password_change`,
+ * `session_revoke_all`, `token_revoke_all`, `account_delete`, and
+ * `account_purge` are account-wide, `session_revoke` and `token_revoke` name
+ * the one credential they ended, and `role_grant_revoke` names the lost role.
+ * Granting access revokes nothing, and neither does an event about a subject
+ * other than a connection's identity.
+ *
+ * Twin of the `revocation_scope` column of the Rust spine's
+ * `AUDIT_EVENT_SPECS`.
+ */
+export const audit_event_revocation_scopes: Readonly<Record<AuditEventType, RevocationScope>> =
+	Object.freeze({
+		login: 'none',
+		logout: 'account',
+		bootstrap: 'none',
+		signup: 'none',
+		password_change: 'account',
+		session_revoke: 'session',
+		session_revoke_all: 'account',
+		token_create: 'none',
+		token_revoke: 'token',
+		token_revoke_all: 'account',
+		role_grant_create: 'none',
+		role_grant_revoke: 'role',
+		role_grant_offer_create: 'none',
+		role_grant_offer_accept: 'none',
+		role_grant_offer_decline: 'none',
+		role_grant_offer_retract: 'none',
+		role_grant_offer_expire: 'none',
+		role_grant_offer_supersede: 'none',
+		invite_create: 'none',
+		invite_delete: 'none',
+		account_delete: 'account',
+		account_purge: 'account',
+		account_undelete: 'none',
+		actor_delete: 'none',
+		actor_purge: 'none',
+		actor_undelete: 'none',
+		app_settings_update: 'none',
+		db_admin_row_delete: 'none'
+	});
+
+/**
+ * The `RevocationScope` of an `audit_log.event_type` string.
+ *
+ * An event type with no builtin entry — a consumer's own event — resolves to
+ * `none`: an event fuz_app has never heard of must not close connections. A
+ * consumer whose own event revokes closes the connections from its handler,
+ * with `queue_connection_close`.
+ */
+export const to_revocation_scope = (event_type: string): RevocationScope =>
+	Object.hasOwn(audit_event_revocation_scopes, event_type)
+		? audit_event_revocation_scopes[event_type as AuditEventType]
+		: 'none';
+
+/**
+ * The account and role a successful `role`-scope row took away, when the
+ * revoked grant was **global** — `null` otherwise.
+ *
+ * A role gate (`register_action_ws`'s `required_roles`, the audit stream's
+ * `require_role`) admits on global grants only, so revoking a scoped grant
+ * takes away nothing a gate admitted on and closes nothing. A row with no
+ * `metadata.scope_id` reads as global: when unsure, closing is the safe side.
+ * The target is `target_account_id ?? account_id`, as for the `account` scope.
+ * The revocation guard reads it for every transport, so a socket and a
+ * stream gated on one role close on the same rows.
+ *
+ * Twin of the role arm of the Rust spine's
+ * `ConnectionCloseTarget::from_audit_event`.
+ *
+ * @param event - a row whose scope is `role` (the caller dispatched on it)
+ * @returns the account and role to close on, or `null` when the row names no
+ *   role or target, or revoked a scoped grant
+ */
+export const to_global_role_revocation = (
+	event: AuditLogEvent
+): { account_id: Uuid; role: string } | null => {
+	const role = event.metadata?.role;
+	if (typeof role !== 'string' || role.length === 0) return null;
+	const scope_id = event.metadata?.scope_id;
+	if (scope_id !== undefined && scope_id !== null) return null;
+	const account_id = event.target_account_id ?? event.account_id;
+	if (!account_id) return null;
+	return { account_id, role };
+};
 
 /**
  * Letter start, then letters, digits, `_`, `.`, `/`, `-`. Accepts snake_case,
@@ -203,6 +319,10 @@ export const audit_metadata_schemas = Object.freeze({
 			description:
 				'Id of the resulting role_grant row. Omitted when the grant failed (e.g. admin-grant-path denial).'
 		}),
+		scope_kind: z.string().nullish().meta({
+			description:
+				'Kind tag paired with `scope_id` on a `role_grant_assign` row; null for a global grant.'
+		}),
 		scope_id: Uuid.nullish().meta({
 			description: 'Scope of the granted role_grant; null for global role_grants.'
 		}),
@@ -240,13 +360,21 @@ export const audit_metadata_schemas = Object.freeze({
 		to_account_id: Uuid.meta({ description: 'Account the offer is directed to.' })
 	}),
 	// `role_grant_create` is emitted alongside on accept — two events per accept by
-	// design: offer-lifecycle audit + role-grant-lifecycle audit.
+	// design: offer-lifecycle audit + role-grant-lifecycle audit. A refused
+	// accept (a builtin-role offer that must not mint) is an `outcome=failure`
+	// row with no `role_grant_id` (nothing was minted) and the wire `reason`.
 	role_grant_offer_accept: z.looseObject({
-		offer_id: Uuid.meta({ description: 'Id of the accepted offer.' }),
-		role_grant_id: Uuid.meta({ description: 'Id of the resulting role_grant row.' }),
+		offer_id: Uuid.meta({ description: 'Id of the accepted (or refused) offer.' }),
+		role_grant_id: Uuid.optional().meta({
+			description:
+				'Id of the resulting role_grant row. Omitted on `outcome=failure` because no grant was minted.'
+		}),
 		role: z.string().meta({ description: 'Role granted by the offer.' }),
 		scope_id: Uuid.nullish().meta({
 			description: 'Scope of the resulting role_grant; null for global role_grants.'
+		}),
+		reason: z.string().optional().meta({
+			description: 'Wire error reason of a refused accept. Set only on `outcome=failure`.'
 		})
 	}),
 	role_grant_offer_decline: z.looseObject({
@@ -276,21 +404,25 @@ export const audit_metadata_schemas = Object.freeze({
 	}),
 	// Emitted when an offer is obsoleted by an external event. `reason`
 	// distinguishes the trigger; `cause_id` points to the accepted offer
-	// (for `sibling_accepted`), the revoked role_grant (for `role_grant_revoked`),
-	// or the destroyed parent scope row (for `scope_destroyed`).
+	// (for `sibling_accepted`), the revoked role_grant (for `role_grant_revoked`
+	// — the recipient's grant of the offered role, or a grant of the grantor's),
+	// the destroyed parent scope row (for `scope_destroyed`), or the grantor's
+	// removed account (for `account_deleted`).
 	role_grant_offer_supersede: z.looseObject({
 		offer_id: Uuid.meta({ description: 'Id of the superseded offer.' }),
 		role: z.string().meta({ description: 'Role that was offered.' }),
 		scope_id: Uuid.nullish().meta({
 			description: 'Scope of the offered role; null for global offers.'
 		}),
-		reason: z.enum(['sibling_accepted', 'role_grant_revoked', 'scope_destroyed']).meta({
-			description:
-				'Trigger that obsoleted the offer: a sibling offer was accepted, the resulting role_grant was revoked, or the parent scope row was destroyed.'
-		}),
+		reason: z
+			.enum(['sibling_accepted', 'role_grant_revoked', 'scope_destroyed', 'account_deleted'])
+			.meta({
+				description:
+					"Trigger that obsoleted the offer: a sibling offer was accepted, the resulting role_grant or one of the grantor's was revoked, the parent scope row was destroyed, or the grantor's account was deleted or purged."
+			}),
 		cause_id: Uuid.meta({
 			description:
-				'Row that caused the supersede: accepted offer (`sibling_accepted`), revoked role_grant (`role_grant_revoked`), or destroyed parent scope row (`scope_destroyed`).'
+				"Row that caused the supersede: accepted offer (`sibling_accepted`), revoked role_grant (`role_grant_revoked`), destroyed parent scope row (`scope_destroyed`), or the grantor's account (`account_deleted`)."
 		})
 	}),
 	invite_create: z.looseObject({
@@ -459,17 +591,6 @@ export interface AuditLogEvent {
 	metadata: Record<string, unknown> | null;
 }
 
-/**
- * Narrow metadata type for a known event type.
- *
- * Use after checking `event_type` to get typed metadata access.
- */
-export const get_audit_metadata = <T extends AuditEventType>(
-	event: AuditLogEvent & { event_type: T }
-): AuditMetadataMap[T] | null => {
-	return event.metadata as AuditMetadataMap[T] | null;
-};
-
 /** Input for creating an audit log entry. */
 export interface AuditLogInput<T extends string = AuditEventType> {
 	event_type: T;
@@ -597,7 +718,12 @@ export interface AuditLogListOptions {
 	event_type_in?: Array<string>;
 	account_id?: Uuid;
 	outcome?: AuditOutcome;
-	/** When set, only return events with `seq` greater than this value. Enables SSE reconnection gap fill. */
+	/**
+	 * When set, only return events with `seq` greater than this value. Enables
+	 * SSE reconnection gap fill. `seq` is assigned at INSERT; an in-transaction
+	 * row commits later, so a row can become visible after a higher `seq` — a
+	 * gap fill can miss one that commits while the stream is down.
+	 */
 	since_seq?: number;
 }
 
@@ -609,7 +735,7 @@ export interface AuditLogListOptions {
  * types registered via `create_audit_log_config({extra_events})` round-trip
  * through queries, `on_audit_event` callbacks, and JSON-RPC responses
  * identically to builtins. `AuditLogInput<T>` stays parameterized on the
- * write side so `AuditMetadataMap` narrowing via `get_audit_metadata` works.
+ * write side so `AuditMetadataMap` narrows metadata per event type.
  */
 export const AuditLogEventJson = z.strictObject({
 	id: Uuid,
@@ -640,8 +766,8 @@ export const RoleGrantHistoryEventJson = AuditLogEventJson.extend({
 });
 export type RoleGrantHistoryEventJson = z.infer<typeof RoleGrantHistoryEventJson>;
 
-/** Zod schema for admin session listing (session + username). */
-export const AdminSessionJson = AuthSessionJson.extend({
+/** Zod schema for admin session listing (session + username, without `is_current`). */
+export const AdminSessionJson = AuthSessionJson.omit({ is_current: true }).extend({
 	username: z.string()
 });
 export type AdminSessionJson = z.infer<typeof AdminSessionJson>;

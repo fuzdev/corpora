@@ -11,18 +11,20 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, bounded_string } from '../primitive_schemas.ts';
+import type { SchemaFieldMeta } from '../schema_meta.ts';
 import {
 	FRACTIONAL_INDEX_LENGTH_MAX,
 	FRACTIONAL_INDEX_REGEX
 } from '@fuzdev/fuz_util/fractional_index.ts';
 
 import { ActingActor } from '../http/auth_shape.ts';
+import { CellRelationListLimit } from './cell_relation_list_limit.ts';
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
 
 // -- Error reasons ----------------------------------------------------------
 
-/** Error reason — `cell_item_list` got neither `parent_id` nor `child_id`. */
+/** Error reason — `cell_item_list` got neither or both of `parent_id` and `child_id`. */
 export const ERROR_CELL_ITEM_LIST_REQUIRES_PARENT_OR_CHILD =
 	'cell_item_list_requires_parent_or_child' as const;
 
@@ -48,10 +50,7 @@ export const ERROR_CELL_ITEM_POSITION_TAKEN = 'cell_item_position_taken' as cons
  * contract; the no-trailing-`'0'` invariant lives in the helper, not the
  * wire.
  */
-export const CellItemPosition = z
-	.string()
-	.min(1)
-	.max(FRACTIONAL_INDEX_LENGTH_MAX)
+export const CellItemPosition = bounded_string({ min: 1, max: FRACTIONAL_INDEX_LENGTH_MAX })
 	.regex(FRACTIONAL_INDEX_REGEX)
 	.brand('CellItemPosition');
 export type CellItemPosition = z.infer<typeof CellItemPosition>;
@@ -132,14 +131,17 @@ export type CellItemDeleteOutput = z.infer<typeof CellItemDeleteOutput>;
 
 /**
  * Input for `cell_item_list`. Pass `parent_id` for forward items or
- * `child_id` for reverse lists — exactly one. Reverse listing has 2-layer
+ * `child_id` for reverse lists — exactly one; both or neither is
+ * `invalid_params` with `ERROR_CELL_ITEM_LIST_REQUIRES_PARENT_OR_CHILD`, from
+ * the handler (the schema leaves both optional). Reverse listing has 2-layer
  * authz (child view-check gates the call; per-parent view-check filters
  * the rows).
  *
- * Forward listing supports cursor pagination via `position_after`
- * (return rows with `position > position_after`). The reverse listing
- * doesn't paginate (the result set is small in practice — number of
- * parents containing a given child).
+ * Either direction returns a page of up to `limit` items (default
+ * `CELL_RELATION_LIST_LIMIT_DEFAULT`) whose other end the caller can view —
+ * the view check runs before the limit. Forward listing pages on via
+ * `position_after` (return rows with `position > position_after`); the
+ * reverse listing has no cursor, oldest item first.
  */
 export const CellItemListInput = z
 	.strictObject({
@@ -152,15 +154,10 @@ export const CellItemListInput = z
 		position_after: CellItemPosition.optional().meta({
 			description: 'Cursor for forward pagination — return rows whose position > this.'
 		}),
-		limit: z.number().int().positive().max(500).optional().meta({
-			description:
-				'Page size cap (max 500). Omit for unbounded — explicit list calls escape the bundled `cell_get` cap.'
-		}),
+		limit: CellRelationListLimit,
 		acting: ActingActor
 	})
-	.refine((v) => Boolean(v.parent_id) !== Boolean(v.child_id), {
-		message: ERROR_CELL_ITEM_LIST_REQUIRES_PARENT_OR_CHILD
-	});
+	.meta({ empty_input_handler_guarded: true } satisfies SchemaFieldMeta);
 export type CellItemListInput = z.infer<typeof CellItemListInput>;
 
 export const CellItemListOutput = z.strictObject({

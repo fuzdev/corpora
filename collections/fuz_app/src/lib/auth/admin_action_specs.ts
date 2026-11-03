@@ -17,13 +17,12 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, Email, Username } from '../primitive_schemas.ts';
 
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
 import { ROLE_ADMIN, ROLE_KEEPER, RoleName } from './role_schema.ts';
 import { CREDENTIAL_TYPE_DAEMON_TOKEN } from './credential_type_schema.ts';
 import { AdminAccountEntryJson } from './account_schema.ts';
-import { Email, Username } from '../primitive_schemas.ts';
 import { ActingActor } from '../http/auth_shape.ts';
 import {
 	AdminSessionJson,
@@ -35,6 +34,12 @@ import {
 } from './audit_log_schema.ts';
 import { InviteJson, InviteWithUsernamesJson } from './invite_schema.ts';
 import { AppSettingsWithUsernameJson } from './app_settings_schema.ts';
+import {
+	ERROR_LIMIT_INVALID,
+	ERROR_OFFSET_INVALID,
+	ERROR_OUTCOME_INVALID,
+	ERROR_SINCE_SEQ_INVALID
+} from '../http/error_schemas.ts';
 
 /** Max audit-log page size. */
 export const AUDIT_LOG_LIST_LIMIT_MAX = 200;
@@ -59,9 +64,15 @@ export const AdminAccountListInput = z
 			.meta({
 				description: `Max accounts to return (default ${ADMIN_ACCOUNT_LIST_DEFAULT_LIMIT}, max ${
 					ADMIN_ACCOUNT_LIST_LIMIT_MAX
-				}).`
+				}).`,
+				invalid_reason: ERROR_LIMIT_INVALID
 			}),
-		offset: z.number().int().min(0).nullish().meta({ description: 'Pagination offset.' }),
+		offset: z
+			.number()
+			.int()
+			.min(0)
+			.nullish()
+			.meta({ description: 'Pagination offset.', invalid_reason: ERROR_OFFSET_INVALID }),
 		include_deleted: z.boolean().nullish().meta({
 			description:
 				'Include soft-deleted (tombstoned) accounts in the listing. Default false (active only). Used by the admin UI to surface accounts for reactivation via `account_undelete`.'
@@ -132,9 +143,12 @@ export const AuditLogListInput = z
 				'Filter by event type. Accepts builtin or consumer-registered names (regex-validated).'
 		}),
 		outcome: AuditOutcome.nullish().meta({
-			description: 'Filter by outcome (`success` or `failure`).'
+			description: 'Filter by outcome (`success` or `failure`).',
+			invalid_reason: ERROR_OUTCOME_INVALID
 		}),
-		account_id: Uuid.nullish().meta({ description: 'Filter by actor account id.' }),
+		account_id: Uuid.nullish().meta({
+			description: 'Filter by account id — matches the actor or the target account.'
+		}),
 		limit: z
 			.number()
 			.int()
@@ -144,11 +158,18 @@ export const AuditLogListInput = z
 			.meta({
 				description: `Max rows to return (default ${AUDIT_LOG_DEFAULT_LIMIT}, max ${
 					AUDIT_LOG_LIST_LIMIT_MAX
-				}).`
+				}).`,
+				invalid_reason: ERROR_LIMIT_INVALID
 			}),
-		offset: z.number().int().min(0).nullish().meta({ description: 'Pagination offset.' }),
+		offset: z
+			.number()
+			.int()
+			.min(0)
+			.nullish()
+			.meta({ description: 'Pagination offset.', invalid_reason: ERROR_OFFSET_INVALID }),
 		since_seq: z.number().int().min(0).nullish().meta({
-			description: 'Gap-fill from this seq forward. Used for SSE reconnection.'
+			description: 'Gap-fill from this seq forward. Used for SSE reconnection.',
+			invalid_reason: ERROR_SINCE_SEQ_INVALID
 		}),
 		acting: ActingActor
 	})
@@ -173,9 +194,15 @@ export const AuditLogRoleGrantHistoryInput = z
 			.meta({
 				description: `Max rows to return (default ${AUDIT_LOG_DEFAULT_LIMIT}, max ${
 					AUDIT_LOG_LIST_LIMIT_MAX
-				}).`
+				}).`,
+				invalid_reason: ERROR_LIMIT_INVALID
 			}),
-		offset: z.number().int().min(0).nullish().meta({ description: 'Pagination offset.' }),
+		offset: z
+			.number()
+			.int()
+			.min(0)
+			.nullish()
+			.meta({ description: 'Pagination offset.', invalid_reason: ERROR_OFFSET_INVALID }),
 		acting: ActingActor
 	})
 	.default({});
@@ -285,10 +312,10 @@ export const ERROR_CANNOT_DELETE_KEEPER = 'cannot_delete_keeper' as const;
  * `data.reason` (403) on `account_delete` / `account_purge` when the target
  * is the **sole remaining active admin** — removing it would leave the
  * system with no account that can authenticate into the admin surface (and
- * `account_undelete` is itself admin-gated). Unlike the keeper guard this is
- * keeper-recoverable (a keeper can re-grant admin), but the guard avoids the
- * foot-gun of an admin tombstoning the last admin in one call. Soft-deleted
- * admins don't count toward the tally (they can't log in). Mirrors the Rust
+ * `account_undelete` is itself admin-gated), and no web path re-grants admin.
+ * Soft-deleted admins don't count toward the tally (they can't log in), and
+ * the count locks the rows it counted, so two removals racing for the last
+ * two admins can't both pass. Mirrors the Rust
  * `ERROR_CANNOT_DELETE_LAST_ADMIN`.
  */
 export const ERROR_CANNOT_DELETE_LAST_ADMIN = 'cannot_delete_last_admin' as const;
@@ -504,7 +531,12 @@ export const invite_delete_action_spec = {
 /**
  * Soft-delete an account (reversible tombstone). Self-or-admin: the
  * caller may delete their own account; deleting another requires the
- * admin role (handler-enforced elevation). No `admin_` prefix — the
+ * admin role (handler-enforced elevation). The self path is session-only,
+ * also handler-enforced — the spec declares no `credential_types` so an
+ * admin deleting another account keeps any credential, and a self-delete
+ * over an API or daemon token gets the dispatcher's own 403
+ * `credential_type_required` (`required_credential_types: ['session']`),
+ * ahead of the keeper / last-admin guards. No `admin_` prefix — the
  * privilege lives in the auth check, not the name, so self-service
  * deletion stays open (`delete` = soft, `purge` = hard).
  */

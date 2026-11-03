@@ -37,7 +37,7 @@ import {
 } from '@fuzdev/fuz_util/svelte_preprocess_helpers.ts';
 
 import { mdz_parse } from './mdz.ts';
-import { mdz_to_svelte, type MdzToSvelteResult } from './mdz_to_svelte.ts';
+import { mdz_to_svelte, type MdzComponentImport, type MdzToSvelteResult } from './mdz_to_svelte.ts';
 
 /**
  * An estree `ImportDeclaration` augmented with Svelte's position data.
@@ -56,12 +56,14 @@ export interface SveltePreprocessMdzOptions {
 	/**
 	 * Component import mapping for mdz content.
 	 * Key: component name as used in mdz (e.g., 'Alert').
-	 * Value: import path (e.g., '$lib/Alert.svelte').
+	 * Value: import path (e.g., '#lib/Alert.svelte'), which receives no attributes,
+	 * or `{path, props}` naming the attributes passed as props
+	 * (e.g., `{path: '#lib/Alert.svelte', props: ['status']}`, or `props: 'all'`).
 	 *
 	 * If mdz content references a component not in this map,
 	 * that `Mdz` usage is skipped (left as runtime).
 	 */
-	components?: Record<string, string>;
+	components?: Record<string, MdzComponentImport>;
 
 	/**
 	 * Allowed HTML elements in mdz content (e.g., `{aside: true, details: true}`).
@@ -116,7 +118,7 @@ const PRECOMPILED_NAME = 'MdzPrecompiled';
  * Creates a Svelte preprocessor that compiles static `Mdz` content at build time.
  *
  * @param options - configuration for component/element resolution and file filtering
- * @returns a Svelte `PreprocessorGroup` for use in `svelte.config.js`
+ * @returns a Svelte `PreprocessorGroup` for a `preprocess` option, like `sveltekit({preprocess})` in `vite.config.ts`
  */
 export const svelte_preprocess_mdz = (
 	options: SveltePreprocessMdzOptions = {}
@@ -235,7 +237,7 @@ interface FindMdzUsagesResult {
 }
 
 interface FindMdzUsagesContext {
-	components: Record<string, string>;
+	components: Record<string, MdzComponentImport>;
 	elements: Record<string, boolean>;
 	filename: string | undefined;
 	source: string;

@@ -9,7 +9,7 @@
 
 import { test, assert, describe } from 'vitest';
 
-import { generate_bundled_css, type CssResolutionResult } from '$lib/css_bundled_resolution.ts';
+import { generate_bundled_css, type CssResolutionResult } from '#lib/css_bundled_resolution.ts';
 import { assert_css_order } from './test_helpers.ts';
 
 /**
@@ -51,12 +51,17 @@ describe('generate_bundled_css', () => {
 
 		test('emits the layer order statement and wraps each section in its layer', () => {
 			const result = create_mock_result();
-			const bundled = generate_bundled_css(result, '.p_md { padding: 16px; }');
+			const bundled = generate_bundled_css(
+				result,
+				'@layer fuz.utilities {\n.p_md { padding: 16px; }\n}\n'
+			);
 
 			assert.match(bundled, /^@layer fuz\.base, fuz\.preferences, fuz\.theme, fuz\.utilities;/);
-			// theme variables and base styles both live in fuz.base; utilities above
+			// theme variables and base styles both live in fuz.base; utilities
+			// above, layered already by `generate_classes_css`
 			assert.equal(bundled.match(/@layer fuz\.base \{/gu)?.length, 2);
 			assert.include(bundled, '@layer fuz.utilities {\n.p_md { padding: 16px; }\n}');
+			assert.equal(bundled.match(/@layer fuz\.utilities \{/gu)?.length, 1);
 		});
 
 		test('preference rules are wrapped in fuz.preferences', () => {
@@ -81,19 +86,20 @@ describe('generate_bundled_css', () => {
 			assert.notInclude(neither, 'fuz.preferences {');
 		});
 
-		test('a baked theme overlay renders into fuz.theme above the preferences', () => {
+		test('a baked theme overlay renders into the fuz.theme.baked sublayer', () => {
 			const result = create_mock_result();
 			const bundled = generate_bundled_css(result, '', {
 				theme_overlay_css: ':root {\n\tcolor-scheme: dark;\n\t--hue_neutral: var(--hue_b);\n}'
 			});
 			assert.include(bundled, '/* Theme Overrides */');
-			assert.include(bundled, '@layer fuz.theme {\n:root {\n\tcolor-scheme: dark;');
+			// the baked sublayer, so a runtime theme's direct fuz.theme styles win
+			assert.include(bundled, '@layer fuz.theme.baked {\n:root {\n\tcolor-scheme: dark;');
 			// disabled theme output drops the overlay with the rest of the theme
 			const no_theme = generate_bundled_css(result, '', {
 				include_theme: false,
 				theme_overlay_css: ':root {\n\tcolor-scheme: dark;\n}'
 			});
-			assert.notInclude(no_theme, 'fuz.theme {');
+			assert.notInclude(no_theme, 'fuz.theme.baked');
 		});
 	});
 
@@ -116,18 +122,6 @@ describe('generate_bundled_css', () => {
 			assert.notInclude(no_base, '/* Base Styles */');
 			assert.notInclude(no_base, 'button { color');
 			assert.include(no_base, '/* Utility Classes */');
-		});
-
-		test('include_utilities: false excludes utilities', () => {
-			const result = create_mock_result();
-			const no_utility = generate_bundled_css(result, '.p_md { padding: 16px; }', {
-				include_utilities: false
-			});
-
-			assert.include(no_utility, '/* Theme Variables */');
-			assert.include(no_utility, '/* Base Styles */');
-			assert.notInclude(no_utility, '/* Utility Classes */');
-			assert.notInclude(no_utility, '.p_md');
 		});
 	});
 

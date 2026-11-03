@@ -1,6 +1,10 @@
 <script lang="ts" module>
   import type { HTMLAttributes } from 'svelte/elements';
-  import { TransformState, type TransformStateOptions } from '$lib/states/transform.svelte.js';
+  import {
+    defaultScrollMode,
+    TransformState,
+    type TransformStateOptions,
+  } from '$lib/states/transform.svelte.js';
   import type { MotionProp } from '$lib/utils/motion.svelte.js';
 
   type TransformContextPropsWithoutHTML = TransformStateOptions & {
@@ -33,6 +37,7 @@
     onpointermove = () => {},
     ontouchmove = () => {},
     onpointerup = () => {},
+    onpointercancel = () => {},
     ondblclick = () => {},
     onclickcapture = () => {},
     ref: refProp = $bindable(),
@@ -54,7 +59,12 @@
     translateExtent,
     constrain,
     inertia,
+    pinch,
     scrollActivationKey,
+    initialRotation,
+    processRotate,
+    drag,
+    dragSwitchKey,
     ...restProps
   }: TransformContextProps = $props();
 
@@ -75,7 +85,12 @@
     translateExtent,
     constrain,
     inertia,
+    pinch,
     scrollActivationKey,
+    initialRotation,
+    processRotate,
+    drag,
+    dragSwitchKey,
   };
 
   let ref = $state<HTMLElement>();
@@ -92,16 +107,46 @@
   $effect.pre(() => {
     const newTranslate = initialTranslate ?? { x: 0, y: 0 };
     const newScale = initialScale ?? 1;
-    // Only reset if values actually changed from current initial values
-    if (
+    const newMode = mode ?? 'none';
+    const modeChanged = newMode !== transformState.mode;
+    transformState.mode = newMode;
+    const initialChanged =
       newTranslate.x !== transformState.initialTranslate.x ||
       newTranslate.y !== transformState.initialTranslate.y ||
-      newScale !== transformState.initialScale
-    ) {
-      transformState.initialTranslate = newTranslate;
-      transformState.initialScale = newScale;
+      newScale !== transformState.initialScale;
+    transformState.initialTranslate = newTranslate;
+    transformState.initialScale = newScale;
+    if (modeChanged) {
+      // A new mode starts over from its initial view, at once
+      transformState.reset({ instant: true });
+      if (scrollMode === undefined) {
+        transformState.scrollMode = defaultScrollMode(newMode);
+      }
+    } else if (initialChanged) {
       transformState.reset();
     }
+  });
+
+  // Follow `initialRotation` at once, leaving pan and zoom; whatever sets it (ex. `isometric.motion`)
+  // already eases it
+  $effect.pre(() => {
+    const next = initialRotation ?? null;
+    const current = transformState.initialRotation;
+    if (next?.x === current?.x && next?.y === current?.y) return;
+    transformState.initialRotation = next;
+    transformState.resetRotation({ instant: true });
+  });
+
+  $effect.pre(() => {
+    transformState.processRotate = processRotate;
+  });
+
+  $effect.pre(() => {
+    if (drag !== undefined) transformState.drag = drag;
+  });
+
+  $effect.pre(() => {
+    transformState.dragSwitchKey = dragSwitchKey ?? 'shift';
   });
 
   $effect.pre(() => {
@@ -159,6 +204,10 @@
   });
 
   $effect.pre(() => {
+    transformState.pinch = pinch ?? true;
+  });
+
+  $effect.pre(() => {
     transformState.scrollActivationKey = scrollActivationKey;
   });
 
@@ -180,12 +229,14 @@
     transformState.onPointerUp(e);
   }
 
+  function onPointerCancel(e: PointerEvent & { currentTarget: HTMLElement }) {
+    onpointercancel?.(e);
+    transformState.onPointerCancel(e);
+  }
+
   function onClick(e: MouseEvent & { currentTarget: HTMLElement }) {
     onclickcapture?.(e);
-    if (transformState.dragging) {
-      // Do not propagate click event to children if drag/moved.  Registered in capture phase (top-down)
-      e.stopPropagation();
-    }
+    transformState.onClickCapture(e);
   }
 
   function onDoubleClick(e: MouseEvent & { currentTarget: HTMLElement }) {
@@ -213,8 +264,10 @@
     }
   }}
   onpointerup={onPointerUp}
+  onpointercancel={onPointerCancel}
   ondblclick={onDoubleClick}
   onclickcapture={onClick}
+  style:touch-action={mode && mode !== 'none' && !disablePointer ? 'none' : undefined}
   class={['lc-transform-context', className]}
   bind:this={ref}
   {...restProps}

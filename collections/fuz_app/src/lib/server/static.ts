@@ -23,12 +23,13 @@ export interface ServeStaticOptions {
 /**
  * Factory function that creates a static file serving middleware.
  *
- * Matches the signature of `serveStatic` from `hono/deno` and `@hono/node-server/serve-static`.
+ * Matches the signature of `serveStatic` from `@hono/deno` and `@hono/node-server/serve-static`.
  */
 export type ServeStaticFactory = (options: ServeStaticOptions) => MiddlewareHandler;
 
-/** Default SPA route filter — serves the SPA fallback for all paths except `/api/`. */
-const is_spa_route_default = (path: string): boolean => !path.startsWith('/api/');
+/** Default SPA route filter — serves the SPA fallback for all paths except `/api` and `/api/…`. */
+const is_spa_route_default = (path: string): boolean =>
+	path !== '/api' && !path.startsWith('/api/');
 
 /**
  * Create static file serving middleware for SvelteKit static builds.

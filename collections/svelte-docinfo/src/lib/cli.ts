@@ -18,7 +18,7 @@
  * @module
  */
 
-import { Command, type OptionValues } from 'commander';
+import { Command, CommanderError, type OptionValues } from 'commander';
 import { writeFile, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import picomatch from 'picomatch';
@@ -28,7 +28,7 @@ import type { OnDuplicates } from './analyze-core.ts';
 import { DEFAULT_SOURCE_OPTIONS } from './source-config.ts';
 import type { Discovery } from './discovery.ts';
 import { hasErrors } from './diagnostics.ts';
-import { to_error_message } from './error.ts';
+import { toErrorMessage } from './error.ts';
 import type { AnalysisLog } from './log.ts';
 import { compactReplacer } from './declaration-helpers.ts';
 
@@ -37,9 +37,12 @@ const collect = (value: string, previous: Array<string> | undefined): Array<stri
 	previous ? [...previous, value] : [value];
 
 /** Allowed values for `--on-duplicates`. */
-const ON_DUPLICATES_VALUES = ['throw', 'warn'] as const;
-type OnDuplicatesFlag = (typeof ON_DUPLICATES_VALUES)[number];
-const isOnDuplicatesFlag = (value: string): value is OnDuplicatesFlag =>
+const ON_DUPLICATES_VALUES = [
+	'diagnostic',
+	'warn',
+	'throw'
+] as const satisfies ReadonlyArray<OnDuplicates>;
+const isOnDuplicatesFlag = (value: string): value is OnDuplicates =>
 	(ON_DUPLICATES_VALUES as ReadonlyArray<string>).includes(value);
 
 /** Allowed values for `--discovery`. */
@@ -62,12 +65,8 @@ export interface CliOptions {
 	 * File patterns to exclude (undefined = use defaults — test/spec files and
 	 * `internal/` directories).
 	 *
-	 * When provided, **fully replaces** the defaults — no array merge. Passing
-	 * a custom `--exclude` pattern drops the default test/spec/`internal/`
-	 * filters unless the caller re-includes them explicitly (the API's
-	 * exclude-callback form has no CLI equivalent). The always-on baseline
-	 * (`node_modules` + dot-directories below a source path) applies beneath
-	 * it and is unaffected by overrides.
+	 * When provided, **fully replaces** the defaults (the API's callback form
+	 * has no CLI equivalent) — see `ExcludeOption`.
 	 */
 	exclude?: Array<string>;
 	/** Output file path (undefined = stdout). */
@@ -106,13 +105,17 @@ export interface CliOptions {
 	 */
 	sourceRoot?: string;
 	/**
-	 * Behavior when duplicate declaration names are found across modules
-	 * (undefined = emit `duplicate_declaration` diagnostic, no dispatch).
-	 *
-	 * Duplicate detection always runs regardless of this option — the diagnostic
-	 * is the data, this option is the dispatch action.
+	 * Opt-in check that declaration names are unique across modules (see
+	 * `OnDuplicates`). Undefined skips the check.
 	 */
-	onDuplicates?: OnDuplicatesFlag;
+	onDuplicates?: OnDuplicates;
+	/**
+	 * Path to the tsconfig, relative to the project root (undefined =
+	 * `tsconfig.json`), or `false` to analyze without one.
+	 *
+	 * Mapped from `--tsconfig <path>` and `--no-tsconfig`.
+	 */
+	tsconfig?: string | false;
 	/**
 	 * Glob patterns to filter the emitted `modules` array against `ModuleJson.path`
 	 * (undefined = emit all analyzed modules).
@@ -132,7 +135,9 @@ export interface CliOptions {
  * Run the CLI with the given arguments.
  *
  * @param argv - command line arguments (defaults to `process.argv`)
- * @returns exit code: 0 for success, 1 if errors in diagnostics, 2 for CLI errors
+ * @returns exit code: 0 for success (including `--help` and `--version`), 1 if errors in
+ *   diagnostics, 2 for CLI errors (an unknown flag, a missing or invalid option value) or any
+ *   thrown analysis error (including an `--on-duplicates throw` collision)
  */
 export const runCli = async (argv: Array<string> = process.argv): Promise<number> => {
 	// Track exit code from action (commander actions don't return values)
@@ -161,6 +166,12 @@ export const runCli = async (argv: Array<string> = process.argv): Promise<number
 		);
 	})();
 
+	// Commander exits 1 on its own parse errors; throw instead so they map to 2,
+	// keeping 1 for analysis errors. Its messages go through `console.error`
+	// like the CLI's own errors.
+	program.exitOverride();
+	program.configureOutput({ writeErr: (s) => console.error(s.trimEnd()) });
+
 	program
 		.name('svelte-docinfo')
 		.description('Static analysis for TypeScript and Svelte source code')
@@ -186,7 +197,8 @@ export const runCli = async (argv: Array<string> = process.argv): Promise<number
 			'--discovery <mode>',
 			`Source file discovery strategy: ${DISCOVERY_VALUES.join('|')} ` +
 				'(default: auto — exports first, glob fallback). ' +
-				'`exports` is strict and fails if package.json exports is missing or empty ' +
+				'`exports` is strict and fails if package.json exports is missing ' +
+				'or resolves to no files ' +
 				'(also incompatible with --include).'
 		)
 		.option('--dist-dir <dir>', 'Dist directory for exports discovery (default: dist)')
@@ -203,11 +215,6 @@ export const runCli = async (argv: Array<string> = process.argv): Promise<number
 				'or longest common prefix when multiple). Pass `.` to keep paths project-relative.'
 		)
 		.option(
-			'--on-duplicates <mode>',
-			`Dispatch on duplicate declaration names across modules: ${ON_DUPLICATES_VALUES.join('|')} ` +
-				'(default: emit duplicate_declaration diagnostic, no dispatch)'
-		)
-		.option(
 			'--only <pattern>',
 			'Glob filter applied to module paths in output (repeatable). ' +
 				'Full project is still analyzed — re-exports/dependents stay correct — ' +
@@ -215,11 +222,24 @@ export const runCli = async (argv: Array<string> = process.argv): Promise<number
 				'and may reference modules dropped from output.',
 			collect
 		)
+		.option(
+			'--tsconfig <path>',
+			'Path to the tsconfig, relative to project root (default: tsconfig.json, ' +
+				'searched upward from project root)'
+		)
+		.option('--no-tsconfig', 'Analyze without a tsconfig, using built-in strict compiler options')
 		.option('--pretty', 'Pretty-print JSON output', false)
 		.option(
 			'-q, --quiet',
 			'Suppress info messages on stderr (warnings and errors still print)',
 			false
+		)
+		.option(
+			'--on-duplicates <mode>',
+			'Opt-in check that declaration names are unique across modules, ' +
+				`for packages with a flat export namespace: ${ON_DUPLICATES_VALUES.join('|')} ` +
+				'(default: off). Every mode emits duplicate_declaration diagnostics; ' +
+				'warn also logs them and throw fails the run.'
 		)
 		.addHelpText(
 			'after',
@@ -231,11 +251,12 @@ Examples:
   $ svelte-docinfo --source-dir src               Non-SvelteKit project (src/ root)
   $ svelte-docinfo --source-dir src/lib --source-dir src/routes
                                                   Multiple source dirs (source-root auto-derived as 'src')
-  $ svelte-docinfo --source-dir src/lib --source-dir lib/utils --source-root .
-                                                  No common prefix — module paths stay project-relative
+  $ svelte-docinfo --source-dir src/lib --source-dir lib/utils
+                                                  No common prefix — module paths are project-relative
   $ svelte-docinfo --discovery glob               Skip package.json exports
   $ svelte-docinfo --discovery exports            Strict — fail if exports missing
-  $ svelte-docinfo --on-duplicates throw          Enforce flat namespace
+  $ svelte-docinfo --tsconfig tsconfig.lib.json   Use a specific tsconfig
+  $ svelte-docinfo --no-tsconfig                  Analyze a project that has no tsconfig
   $ svelte-docinfo --only 'components/**'         Emit only modules under components/
   $ svelte-docinfo --only '*.svelte'              Emit only Svelte modules (top-level)
   $ svelte-docinfo | jq .                         Pipe to jq for readable output`
@@ -267,6 +288,7 @@ Examples:
 					sourceDir: raw.sourceDir,
 					sourceRoot: raw.sourceRoot,
 					onDuplicates: raw.onDuplicates,
+					tsconfig: raw.tsconfig,
 					only: raw.only,
 					quiet: raw.quiet,
 					pretty: raw.pretty
@@ -295,8 +317,6 @@ Examples:
 							}
 						: undefined;
 
-				const onDuplicates: OnDuplicates | undefined = options.onDuplicates;
-
 				const { modules, diagnostics } = await analyzeFromFiles({
 					projectRoot: resolvedRoot,
 					include: options.include,
@@ -305,7 +325,8 @@ Examples:
 					discovery: options.discovery,
 					distDir: options.distDir,
 					...(sourceOptions !== undefined ? { sourceOptions } : {}),
-					...(onDuplicates !== undefined ? { onDuplicates } : {}),
+					...(options.onDuplicates !== undefined ? { onDuplicates: options.onDuplicates } : {}),
+					...(options.tsconfig !== undefined ? { tsconfig: options.tsconfig } : {}),
 					log
 				});
 
@@ -318,10 +339,10 @@ Examples:
 				const emittedModules = matchOnly ? modules.filter((m) => matchOnly(m.path)) : modules;
 
 				// `AnalyzeResultJson` is the wire-format contract — both `modules`
-				// and `diagnostics` default to `[]` on `.parse()`, so empty arrays
+				// and `diagnostics` default to `[]` when parsed, so empty arrays
 				// stripped here round-trip losslessly through the schema. Consumers
 				// programmatically ingesting analysis JSON should parse through
-				// `AnalyzeResultJson` to restore defaults; raw-JSON consumers
+				// `parseAnalyzeResult` to restore defaults; raw-JSON consumers
 				// (`jq '.diagnostics | length'` returns `0` on `{}` since jq treats
 				// null length as 0) don't need the parse step.
 				const jsonOutput = JSON.stringify(
@@ -344,7 +365,7 @@ Examples:
 			} catch (error) {
 				// Friendly one-line error for users; full stack only on DEBUG=1
 				// so CI logs and bug reports can still capture it on demand.
-				const message = to_error_message(error);
+				const message = toErrorMessage(error);
 				console.error(`error: ${message}`);
 				if (process.env.DEBUG) {
 					console.error(error);
@@ -353,6 +374,12 @@ Examples:
 			}
 		});
 
-	await program.parseAsync(argv);
+	try {
+		await program.parseAsync(argv);
+	} catch (error) {
+		if (!(error instanceof CommanderError)) throw error;
+		// `--help` and `--version` throw with exit code 0
+		return error.exitCode === 0 ? 0 : 2;
+	}
 	return exitCode;
 };

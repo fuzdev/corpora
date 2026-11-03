@@ -1,6 +1,6 @@
 import { describe, test, assert, beforeEach } from 'vitest';
 
-import { ContextmenuState, EntryState, SubmenuState } from '$lib/contextmenu_state.svelte.ts';
+import { ContextmenuState, EntryState, SubmenuState } from '#lib/contextmenu_state.svelte.ts';
 import { add_test_entry, add_test_submenu } from './contextmenu_state_test_helpers.ts';
 
 describe('ContextmenuState - Activation', () => {

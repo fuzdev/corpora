@@ -5,6 +5,7 @@ import { surroundWithIgnoreComments } from '../../utils/ignore';
 import { preprendStr, overwriteStr } from '../../utils/magic-string';
 import { findExportKeyword, getLastLeadingDoc, isInterfaceOrTypeDeclaration } from '../utils/tsAst';
 import { HoistableInterfaces } from './HoistableInterfaces';
+import { isKitErrorFile } from '../../helpers/sveltekit';
 
 export function is$$PropsDeclaration(
     node: ts.Node
@@ -206,30 +207,30 @@ export class ExportedNames {
         }
 
         // Easy mode: User uses TypeScript and typed the $props() rune
-        if (node.initializer.typeArguments?.length > 0 || node.type) {
+        if (node.type) {
             this.hoistableInterfaces.analyze$propsRune(node);
 
-            const generic_arg = node.initializer.typeArguments?.[0] || node.type;
-            const generic = generic_arg.getText();
-            if (ts.isTypeReferenceNode(generic_arg)) {
-                this.$props.type = generic;
+            const props_type = node.type;
+            const type_name = props_type.getText();
+            if (ts.isTypeReferenceNode(props_type)) {
+                this.$props.type = type_name;
             } else {
                 // Create a virtual type alias for the unnamed generic and reuse it for the props return type
                 // so that rename, find references etc works seamlessly across components
                 this.$props.type = '$$ComponentProps';
                 preprendStr(
                     this.str,
-                    generic_arg.pos + this.astOffset,
+                    props_type.pos + this.astOffset,
                     `;type ${this.$props.type} = `
                 );
-                this.str.appendLeft(generic_arg.end + this.astOffset, ';');
+                this.str.appendLeft(props_type.end + this.astOffset, ';');
                 this.str.move(
-                    generic_arg.pos + this.astOffset,
-                    generic_arg.end + this.astOffset,
+                    props_type.pos + this.astOffset,
+                    props_type.end + this.astOffset,
                     node.parent.pos + this.astOffset
                 );
                 this.str.appendRight(
-                    generic_arg.end + this.astOffset,
+                    props_type.end + this.astOffset,
                     // so that semantic tokens ignore it, preventing an overlap of tokens
                     surroundWithIgnoreComments(this.$props.type)
                 );
@@ -323,6 +324,10 @@ export class ExportedNames {
                                     isKitLayoutFile ? 'LayoutProps' : 'PageProps'
                                 }['params']`
                             );
+                        }
+                    } else if (isKitErrorFile(this.basename)) {
+                        if (name === 'error') {
+                            props.push(`error: App.Error`);
                         }
                     } else if (element.initializer) {
                         const initializer =

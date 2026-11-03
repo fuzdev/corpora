@@ -6,7 +6,7 @@
 	import ColorSchemeInput from '@fuzdev/fuz_ui/ColorSchemeInput.svelte';
 	import ThemeInput from '@fuzdev/fuz_ui/ThemeInput.svelte';
 
-	import Mreows, { mreow_items } from '$lib/Mreows.svelte';
+	import Mreows, { mreow_items } from '#lib/Mreows.svelte';
 
 	let mreows: Array<{ glyph: string }> | undefined = $state.raw([
 		random_item(mreow_items),
@@ -21,8 +21,9 @@
 			<h1 class="mt_xl2">fuz_template</h1>
 		</header>
 		<div class="column gap_lg">
-			<a href={resolve('/about')} class="panel px_xl py_md font_size_xl2 text-align:center">about</a
-			>
+			<a href={resolve('/about')} class="panel px_xl py_md font_size_xl2 text-align:center">
+				about
+			</a>
 			<a href={resolve('/docs')} class="panel px_xl py_md font_size_xl2 text-align:center">docs</a>
 		</div>
 	</section>

@@ -1,6 +1,6 @@
 import { describe, test, assert } from 'vitest';
 
-import { Logger } from '$lib/log.ts';
+import { Logger } from '#lib/log.ts';
 import { create_test_context } from './log_test_helpers.ts';
 
 describe('Logger > Override Removal', () => {
@@ -83,7 +83,7 @@ describe('Logger > Override Removal', () => {
 
 		log.clear_colors_override();
 
-		// Should now use default colors (depends on NO_COLOR env)
+		// Should now use default colors (depends on the env and terminal)
 		assert.equal(typeof log.colors, 'boolean');
 	});
 

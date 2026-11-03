@@ -19,12 +19,16 @@
 
 import { to_error_message } from '@fuzdev/fuz_util/error.ts';
 
-import { ThrownJsonrpcError, jsonrpc_error_messages } from '../http/jsonrpc_errors.ts';
+import {
+	JSONRPC_ERROR_CODES,
+	to_thrown_jsonrpc_error,
+	jsonrpc_error_messages
+} from '../http/jsonrpc_errors.ts';
+import { ERROR_PAYLOAD_TOO_LARGE } from '../http/error_schemas.ts';
 import {
 	is_jsonrpc_notification,
 	is_jsonrpc_request,
 	to_jsonrpc_message_id,
-	to_jsonrpc_result,
 	create_jsonrpc_response,
 	create_jsonrpc_error_response
 } from '../http/jsonrpc_helpers.ts';
@@ -35,12 +39,37 @@ import type {
 	JsonrpcRequest,
 	JsonrpcRequestId,
 	JsonrpcResponseOrError,
-	JsonrpcErrorResponse
+	JsonrpcErrorObject,
+	JsonrpcErrorResponse,
+	JsonrpcResult
 } from '../http/jsonrpc.ts';
-import type { Transport, TransportSendOptions } from './transports.ts';
+import {
+	DEFAULT_WS_MAX_MESSAGE_BYTES,
+	utf8_length_over,
+	type Transport,
+	type TransportSendOptions
+} from './transports.ts';
 import { PEER_PING_METHOD, peer_ping_responder } from './peer_ping.ts';
 
 // TODO logging - maybe add a getter to Cell that falls back to the app logger?
+
+/**
+ * The WebSocket URL of `path` on the page's own origin — `ws:` for an `http:`
+ * page, `wss:` for `https:` — the shape a backend served behind the same origin
+ * as the frontend (nginx in production, the Vite dev proxy in dev) is reached
+ * at. Absolute because older browsers reject a relative WebSocket URL.
+ *
+ * Off the browser (SSR, prerender) there is no page origin and nothing
+ * connects, so `path` comes back unchanged.
+ *
+ * @param path - the endpoint path, e.g. `/api/ws`
+ * @returns the absolute same-origin WebSocket URL in a browser, else `path`
+ */
+export const to_same_origin_ws_url = (path: string): string => {
+	if (typeof location === 'undefined') return path;
+	const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+	return `${protocol}//${location.host}${path}`;
+};
 
 /**
  * Minimal interface for a WebSocket connection, decoupled from the concrete Socket Cell.
@@ -65,12 +94,50 @@ export interface WebsocketConnection {
  * underlying client's `request`.
  */
 export interface WebsocketRpcConnection extends WebsocketConnection {
+	/**
+	 * Whether the connection is down but opening on its own (connecting, or
+	 * waiting out a scheduled reconnect), so a request queued now will be
+	 * sent without a `connect()` call. `FrontendWebsocketTransport` queues
+	 * only while this holds.
+	 */
+	readonly will_reconnect: boolean;
 	request: (
 		method: string,
 		params: unknown,
 		options?: { signal?: AbortSignal; queue?: boolean; id?: JsonrpcRequestId }
 	) => Promise<unknown>;
 }
+
+/** Options for `FrontendWebsocketTransport`. */
+export interface FrontendWebsocketTransportOptions {
+	/**
+	 * Largest outbound message, in UTF-8 bytes of its JSON encoding. A larger
+	 * request or notification is refused with an `invalid_request` error
+	 * (`data.reason` `payload_too_large`) without being sent — the server
+	 * closes the socket on an oversized one (failing every request in flight
+	 * on it) rather than replying with an error. Defaults to
+	 * `DEFAULT_WS_MAX_MESSAGE_BYTES`, the server's default cap; a consumer
+	 * that raises the server's `max_message_bytes` passes the same value
+	 * here. `null` skips the measurement.
+	 *
+	 * @default DEFAULT_WS_MAX_MESSAGE_BYTES
+	 */
+	max_message_bytes?: number | null;
+}
+
+/**
+ * The error `FrontendWebsocketTransport` answers an oversized message with —
+ * `invalid_request` (the whole message is refused) carrying
+ * `data.reason: 'payload_too_large'`, the REST 413's reason.
+ */
+export const create_message_too_large_error = (
+	size: number,
+	max_message_bytes: number
+): JsonrpcErrorObject => ({
+	code: JSONRPC_ERROR_CODES.invalid_request,
+	message: `message too large: ${size} bytes exceeds the ${max_message_bytes}-byte limit`,
+	data: { reason: ERROR_PAYLOAD_TOO_LARGE }
+});
 
 /**
  * Thin adapter over `WebsocketRpcConnection` (canonical implementation:
@@ -79,18 +146,41 @@ export interface WebsocketRpcConnection extends WebsocketConnection {
  * response back over the socket; an inbound `peer/ping` is answered by the
  * built-in responder before `receive`. Responses to requests *we* sent are
  * owned by the connection's own `request()` pending map and are ignored here.
+ * An oversized outbound message (`max_message_bytes`) fails with an error
+ * envelope instead of being sent (see
+ * `FrontendWebsocketTransportOptions`).
  */
 export class FrontendWebsocketTransport implements Transport {
 	readonly transport_name = 'frontend_websocket_rpc' as const;
+
+	/**
+	 * A request sent with `queue: true` waits in the connection's durable queue
+	 * while disconnected — but only while the connection `will_reconnect` on
+	 * its own. After a close that won't reopen (superseded, permission revoked,
+	 * `disconnect()`, auto-reconnect off) this is `false`, so
+	 * `Transports.get_transport` falls back to a ready transport (HTTP) rather
+	 * than leave the request waiting on a `connect()` nobody may call.
+	 */
+	get queues(): boolean {
+		return this.#connection.will_reconnect;
+	}
 
 	#connection: WebsocketRpcConnection;
 	#receive: (data: unknown) => Promise<unknown>;
 	#remove_message_handler: (() => void) | null;
 	#remove_error_handler: (() => void) | null;
+	#max_message_bytes: number | null;
 
-	constructor(connection: WebsocketRpcConnection, receive: (data: unknown) => Promise<unknown>) {
+	constructor(
+		connection: WebsocketRpcConnection,
+		receive: (data: unknown) => Promise<unknown>,
+		options?: FrontendWebsocketTransportOptions
+	) {
 		this.#connection = connection;
 		this.#receive = receive;
+		const max_message_bytes = options?.max_message_bytes;
+		this.#max_message_bytes =
+			max_message_bytes === undefined ? DEFAULT_WS_MAX_MESSAGE_BYTES : max_message_bytes;
 
 		// Inbound dispatch — only server-pushed requests/notifications need
 		// routing here. Responses to requests we sent are correlated by the
@@ -162,6 +252,18 @@ export class FrontendWebsocketTransport implements Transport {
 		// error frames), and the catch block below preserves that code
 		// verbatim in the error envelope. Queuing is routed via `queue`.
 		const queue = options?.queue ?? false;
+		if (this.#max_message_bytes !== null) {
+			// TODO measure where the frame is serialized (the connection's `send`)
+			// so a sent message isn't stringified twice — needs the size check on
+			// the `WebsocketRpcConnection` contract
+			const size = utf8_length_over(JSON.stringify(message), this.#max_message_bytes);
+			if (size !== null) {
+				return create_jsonrpc_error_response(
+					to_jsonrpc_message_id(message),
+					create_message_too_large_error(size, this.#max_message_bytes)
+				);
+			}
+		}
 		if (is_jsonrpc_notification(message) && !this.is_ready()) {
 			return create_jsonrpc_error_response(
 				to_jsonrpc_message_id(message),
@@ -176,15 +278,11 @@ export class FrontendWebsocketTransport implements Transport {
 					signal: options?.signal,
 					queue
 				});
-				return create_jsonrpc_response(message.id, to_jsonrpc_result(result));
+				// any JSON value is a valid result — `null`, primitives, and arrays pass through
+				return create_jsonrpc_response(message.id, result as JsonrpcResult);
 			} catch (error) {
-				if (error instanceof ThrownJsonrpcError) {
-					return create_jsonrpc_error_response(message.id, {
-						code: error.code,
-						message: error.message,
-						data: error.data
-					});
-				}
+				const thrown = to_thrown_jsonrpc_error(error);
+				if (thrown) return create_jsonrpc_error_response(message.id, thrown);
 				return create_jsonrpc_error_response(
 					message.id,
 					jsonrpc_error_messages.internal_error(to_error_message(error))

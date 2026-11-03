@@ -1,14 +1,14 @@
 import { describe, test, assert } from 'vitest';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import { require_audit_sse } from '$lib/server/app_server.ts';
-import { create_audit_log_sse } from '$lib/realtime/sse_auth_guard.ts';
+import { require_audit_sse } from '#lib/server/app_server.ts';
+import { create_audit_log_sse } from '#lib/realtime/audit_log_sse.ts';
 
 const log = new Logger('test:require_audit_sse', { level: 'off' });
 
 describe('require_audit_sse', () => {
 	test('returns the audit_sse when non-null', () => {
-		const audit_sse = create_audit_log_sse({ log });
+		const audit_sse = create_audit_log_sse({ log, connection_closer: null });
 		const result = require_audit_sse({ audit_sse });
 		assert.strictEqual(result, audit_sse);
 	});

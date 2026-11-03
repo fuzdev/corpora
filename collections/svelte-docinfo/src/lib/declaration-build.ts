@@ -3,38 +3,38 @@
  *
  * These types are used by the analysis layer (`typescript-extract-*.ts`,
  * `typescript-exports.ts`, `svelte.ts`, `tsdoc.ts`) to build declarations before
- * Zod validation. Most consumers work with the validated types from `types.ts`,
+ * schema validation. Most consumers work with the validated types from `types.ts`,
  * but these are available for advanced use cases.
  *
- * @see `types.ts` for consumer-facing Zod schemas (`DeclarationJson`, `ModuleJson`)
+ * @see `types.ts` for consumer-facing schemas (`DeclarationJson`, `ModuleJson`)
  * @see `typescript-exports.ts` and `typescript-extract-*.ts` for TypeScript declaration analysis
  * @see `svelte.ts` for Svelte component analysis
  *
  * @module
  */
 
-import { z } from 'zod';
-
 import type {
 	DeclarationKind,
 	DeclarationModifier,
 	GenericParamJson,
 	MemberKind,
-	ParameterJson,
+	ParameterJsonInput,
 	OverloadJsonInput,
+	ComponentCssPropertyJsonInput,
 	ComponentPropJsonInput,
 	Reactivity,
 	ReExportJsonInput,
 	ExternalReExportJsonInput,
 	TypeJson
 } from './types.ts';
+import type { TsdocParsedComment } from './tsdoc.ts';
 
 /**
- * Permissive type for constructing members incrementally before Zod validation.
+ * Permissive type for constructing members incrementally before schema validation.
  *
  * Used by internal analysis functions in `typescript-extract-*.ts` that build members
  * by mutating a plain object. The discriminated union schema (`MemberJson`)
- * validates the final shape at the `ModuleJson.parse()` boundary.
+ * validates the final shape at the `parseModuleJson` boundary.
  *
  * Mirrors `DeclarationJsonBuild` for the same reason: construction sites
  * determine `kind` at runtime, so TypeScript can't narrow the union during
@@ -48,7 +48,7 @@ export interface MemberJsonBuild {
 	modifiers?: Array<DeclarationModifier>;
 	sourceLine?: number;
 	genericParams?: Array<GenericParamJson>;
-	parameters?: Array<z.input<typeof ParameterJson>>;
+	parameters?: Array<ParameterJsonInput>;
 	returnType?: string;
 	returnTypeInfo?: TypeJson;
 	returnDescription?: string;
@@ -71,11 +71,11 @@ export interface MemberJsonBuild {
 }
 
 /**
- * Permissive type for constructing declarations incrementally before Zod validation.
+ * Permissive type for constructing declarations incrementally before schema validation.
  *
  * Used by internal analysis functions (`analyzeDeclaration`, `extractFunctionInfo`, etc.)
  * that build declarations by mutating a plain object. The discriminated union schema
- * validates the final shape at the `ModuleJson.parse()` boundary.
+ * validates the final shape at the `parseModuleJson` boundary.
  */
 export interface DeclarationJsonBuild {
 	name?: string;
@@ -84,7 +84,7 @@ export interface DeclarationJsonBuild {
 	typeSignature?: string;
 	modifiers?: Array<DeclarationModifier>;
 	sourceLine?: number;
-	parameters?: Array<z.input<typeof ParameterJson>>;
+	parameters?: Array<ParameterJsonInput>;
 	returnType?: string;
 	returnTypeInfo?: TypeJson;
 	returnDescription?: string;
@@ -103,6 +103,7 @@ export interface DeclarationJsonBuild {
 	members?: Array<MemberJsonBuild>;
 	props?: Array<ComponentPropJsonInput>;
 	acceptsChildren?: boolean;
+	cssCustomProperties?: Array<ComponentCssPropertyJsonInput>;
 	lang?: 'js';
 	alsoExportedFrom?: Array<string>;
 	aliasOf?: { module: string; name: string };
@@ -125,7 +126,7 @@ export interface DeclarationJsonBuild {
  * Used by `analyzeModule` to filter `@nodocs` declarations before output.
  *
  * Uses `DeclarationJsonBuild` (not `DeclarationJsonInput`) because declarations
- * are constructed incrementally — Zod validation happens at the `ModuleJson.parse()` boundary.
+ * are constructed incrementally — schema validation happens at the `parseModuleJson` boundary.
  */
 export interface DeclarationAnalysis {
 	/** The analyzed declaration metadata (pre-validation). */
@@ -141,11 +142,12 @@ export interface DeclarationAnalysis {
  */
 export interface ModuleExportsAnalysis {
 	/**
-	 * Module-level documentation comment. Always `undefined` for svelte2tsx
-	 * virtual files — `analyzeSvelteModule` extracts Svelte module comments
-	 * from the original source instead.
+	 * The parsed module-level comment, projected onto `ModuleJson` by
+	 * `toModuleDocFields`. Always `undefined` for svelte2tsx virtual files —
+	 * `analyzeSvelteModule` extracts Svelte module comments from the original
+	 * source instead.
 	 */
-	moduleComment?: string;
+	moduleDoc?: TsdocParsedComment;
 	/** All exported declarations with `@nodocs` flags — consumer filters based on policy. */
 	declarations: Array<DeclarationAnalysis>;
 	/**

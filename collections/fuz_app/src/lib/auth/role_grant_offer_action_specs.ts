@@ -11,7 +11,8 @@
  * required (no roles) and rely on `query_*` IDOR guards or in-handler
  * policy checks (e.g. `role_grant_offer_list`/`_history` elevate to admin only
  * when inspecting another account — an input-dependent check that can't be
- * expressed at the spec level). `role_grant_revoke` adds `roles: ['admin']` —
+ * expressed at the spec level). `role_grant_revoke` and `role_grant_assign` add
+ * `roles: ['admin']` —
  * the RPC dispatcher's per-spec post-authorization auth gate
  * (`check_action_auth_post_authorization`) rejects non-admin callers before
  * the handler runs even though the endpoint hosts non-admin methods
@@ -21,11 +22,18 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, bounded_string } from '../primitive_schemas.ts';
 
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
-import { ERROR_ROLE_GRANT_NOT_FOUND, ERROR_ROLE_NOT_WEB_GRANTABLE } from '../http/error_schemas.ts';
+import {
+	ERROR_INSUFFICIENT_PERMISSIONS,
+	ERROR_LIMIT_INVALID,
+	ERROR_OFFSET_INVALID,
+	ERROR_ROLE_GRANT_NOT_FOUND,
+	ERROR_ROLE_NOT_WEB_GRANTABLE
+} from '../http/error_schemas.ts';
 import { RoleName } from './role_schema.ts';
+import { SCOPE_KIND_LENGTH_MAX } from './scope_kind_schema.ts';
 import {
 	ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX,
 	RoleGrantOfferJson
@@ -51,6 +59,54 @@ export const ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH = 'role_grant_offer_actor_mis
 /** Error reason — `role_grant_offer_create` was called with a `to_actor_id` that does not belong to `to_account_id`. */
 export const ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH =
 	'role_grant_offer_actor_account_mismatch' as const;
+/**
+ * Error reason — a grant path was asked to bind a builtin role to a scope
+ * (builtin roles are global-only, see `is_builtin_role`). Refused by
+ * `role_grant_assign`, `role_grant_offer_create`, and `role_grant_offer_accept`.
+ */
+export const ERROR_ROLE_GRANT_BUILTIN_SCOPED = 'role_grant_builtin_scoped' as const;
+/**
+ * Error reason — `role_grant_revoke` targeted the **keeper** account's global
+ * `admin` grant. A **403**: no web path grants `admin` to the keeper again
+ * (bootstrap is one-shot and keeper is not web-grantable), so revoking it would
+ * lock the keeper out of the admin surface for good. Twin of the Rust
+ * `ERROR_CANNOT_REVOKE_KEEPER_ADMIN`.
+ */
+export const ERROR_CANNOT_REVOKE_KEEPER_ADMIN = 'cannot_revoke_keeper_admin' as const;
+/**
+ * Error reason — `role_grant_revoke` targeted a global `admin` grant whose
+ * revoke would leave no active admin account. A **403**, counted as
+ * `account_delete`'s last-admin guard counts (active accounts, active actors),
+ * less the grant being revoked, under the same row locks. Twin of the Rust
+ * `ERROR_CANNOT_REVOKE_LAST_ADMIN`.
+ */
+export const ERROR_CANNOT_REVOKE_LAST_ADMIN = 'cannot_revoke_last_admin' as const;
+
+/**
+ * Whether a grant input's `scope_kind` + `scope_id` are paired — both absent
+ * (a global grant) or both present (a scoped one), the
+ * `role_grant_scope_kind_paired` / `role_grant_offer_scope_kind_paired`
+ * CHECKs. The grant inputs refine on it so a half-scoped call is a `-32602`
+ * rather than a constraint-violation 500.
+ *
+ * @param input - the grant input's scope pair
+ * @returns `true` when both are set or both are absent
+ */
+export const is_grant_scope_paired = (input: {
+	scope_kind?: string | null;
+	scope_id?: string | null;
+}): boolean => (input.scope_kind == null) === (input.scope_id == null);
+
+/** The message a half-scoped grant input fails with — the grant inputs' refine, and the UI's pre-RPC guard. */
+export const GRANT_SCOPE_PAIRED_MESSAGE =
+	"'scope_kind' and 'scope_id' must be given together (both for a scoped grant, neither for a global one)";
+
+/** The `scope_kind` field both grant inputs share, paired with `scope_id`. */
+const GrantScopeKind = bounded_string({ max: SCOPE_KIND_LENGTH_MAX })
+	.nullish()
+	.meta({
+		description: `Machine-readable kind tag for \`scope_id\` — paired-null with \`scope_id\` (both null for global, both non-null for scoped). Required iff \`scope_id\` is set. At most ${SCOPE_KIND_LENGTH_MAX} characters.`
+	});
 
 // -- Input/output schemas ---------------------------------------------------
 
@@ -65,27 +121,24 @@ export const ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH =
  * events. Omit (or pass null) for the account-grain default — any actor
  * on `to_account_id` may accept.
  */
-export const RoleGrantOfferCreateInput = z.strictObject({
-	to_account_id: Uuid.meta({ description: 'Account id of the recipient.' }),
-	to_actor_id: Uuid.nullish().meta({
-		description:
-			'Optional actor-grain target on the recipient account. When set, only this actor may accept and the audit envelope carries it on offer-shape events. Must belong to `to_account_id`.'
-	}),
-	role: RoleName.meta({ description: 'Role being offered.' }),
-	scope_kind: z.string().nullish().meta({
-		description:
-			'Machine-readable kind tag for `scope_id` — paired-null with `scope_id` (both null for global, both non-null for scoped). Required iff `scope_id` is set.'
-	}),
-	scope_id: Uuid.nullish().meta({
-		description: 'Scope id for resource-scoped grants (e.g. classroom id). `null` for global.'
-	}),
-	message: z
-		.string()
-		.max(ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX)
-		.nullish()
-		.meta({ description: 'Optional free-form note from the grantor.' }),
-	acting: ActingActor
-});
+export const RoleGrantOfferCreateInput = z
+	.strictObject({
+		to_account_id: Uuid.meta({ description: 'Account id of the recipient.' }),
+		to_actor_id: Uuid.nullish().meta({
+			description:
+				'Optional actor-grain target on the recipient account. When set, only this actor may accept and the audit envelope carries it on offer-shape events. Must belong to `to_account_id`.'
+		}),
+		role: RoleName.meta({ description: 'Role being offered.' }),
+		scope_kind: GrantScopeKind,
+		scope_id: Uuid.nullish().meta({
+			description: 'Scope id for resource-scoped grants (e.g. classroom id). `null` for global.'
+		}),
+		message: bounded_string({ max: ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX })
+			.nullish()
+			.meta({ description: 'Optional free-form note from the grantor.' }),
+		acting: ActingActor
+	})
+	.refine(is_grant_scope_paired, { message: GRANT_SCOPE_PAIRED_MESSAGE });
 export type RoleGrantOfferCreateInput = z.infer<typeof RoleGrantOfferCreateInput>;
 
 /** Input for `role_grant_offer_accept`. */
@@ -98,9 +151,7 @@ export type RoleGrantOfferAcceptInput = z.infer<typeof RoleGrantOfferAcceptInput
 /** Input for `role_grant_offer_decline`. */
 export const RoleGrantOfferDeclineInput = z.strictObject({
 	offer_id: Uuid.meta({ description: 'The offer to decline.' }),
-	reason: z
-		.string()
-		.max(ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX)
+	reason: bounded_string({ max: ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX })
 		.nullish()
 		.meta({ description: 'Optional free-form reason given on decline.' }),
 	acting: ActingActor
@@ -135,13 +186,16 @@ export type RoleGrantOfferListInput = z.infer<typeof RoleGrantOfferListInput>;
 export const RoleGrantRevokeInput = z.strictObject({
 	actor_id: Uuid.meta({ description: 'Actor whose role_grant to revoke.' }),
 	role_grant_id: Uuid.meta({ description: 'The role_grant to revoke.' }),
-	reason: z.string().max(ROLE_GRANT_REVOKED_REASON_LENGTH_MAX).nullish().meta({
+	reason: bounded_string({ max: ROLE_GRANT_REVOKED_REASON_LENGTH_MAX }).nullish().meta({
 		description:
 			'Optional free-form reason; stamped on `role_grant.revoked_reason` and surfaced on the revokee WS notification.'
 	}),
 	acting: ActingActor
 });
 export type RoleGrantRevokeInput = z.infer<typeof RoleGrantRevokeInput>;
+
+/** Max `role_grant_offer_history` page size. */
+export const ROLE_GRANT_OFFER_HISTORY_LIMIT_MAX = 500;
 
 /**
  * Input for `role_grant_offer_history`. Returns every offer involving the account
@@ -153,11 +207,13 @@ export const RoleGrantOfferHistoryInput = z
 		account_id: Uuid.nullish().meta({
 			description: 'Admin-only — history for another account. Defaults to the caller.'
 		}),
-		limit: z.number().int().min(1).max(500).nullish().meta({
-			description: 'Max rows to return (default 100).'
+		limit: z.number().int().min(1).max(ROLE_GRANT_OFFER_HISTORY_LIMIT_MAX).nullish().meta({
+			description: 'Max rows to return (default 100).',
+			invalid_reason: ERROR_LIMIT_INVALID
 		}),
 		offset: z.number().int().min(0).nullish().meta({
-			description: 'Pagination offset (default 0).'
+			description: 'Pagination offset (default 0).',
+			invalid_reason: ERROR_OFFSET_INVALID
 		}),
 		acting: ActingActor
 	})
@@ -178,9 +234,13 @@ export const RoleGrantOfferAcceptOutput = z.strictObject({
 });
 export type RoleGrantOfferAcceptOutput = z.infer<typeof RoleGrantOfferAcceptOutput>;
 
-/** Output for `role_grant_offer_decline` / `role_grant_offer_retract`. */
-export const RoleGrantOfferOkOutput = z.strictObject({ ok: z.literal(true) });
-export type RoleGrantOfferOkOutput = z.infer<typeof RoleGrantOfferOkOutput>;
+/** Output for `role_grant_offer_decline` — the declined offer, as `accept` answers its own. */
+export const RoleGrantOfferDeclineOutput = z.strictObject({ offer: RoleGrantOfferJson });
+export type RoleGrantOfferDeclineOutput = z.infer<typeof RoleGrantOfferDeclineOutput>;
+
+/** Output for `role_grant_offer_retract` — the retracted offer, as `accept` answers its own. */
+export const RoleGrantOfferRetractOutput = z.strictObject({ offer: RoleGrantOfferJson });
+export type RoleGrantOfferRetractOutput = z.infer<typeof RoleGrantOfferRetractOutput>;
 
 /** Output for `role_grant_offer_list`. */
 export const RoleGrantOfferListOutput = z.strictObject({ offers: z.array(RoleGrantOfferJson) });
@@ -201,23 +261,28 @@ export type RoleGrantRevokeOutput = z.infer<typeof RoleGrantRevokeOutput>;
  * Input for `role_grant_assign` — the immediate admin-only conferral path, the
  * consent-free sibling of `role_grant_offer_create`. An admin assigns a
  * role_grant straight onto the target actor; there is no offer for a grantee to
- * accept. No `message` (no offer to carry it on) and no `scope_kind` (`scope_id`
- * alone is the v1 scope discriminator — the grant row's `scope_kind` stays null).
+ * accept. No `message` (no offer to carry it on). `scope_kind` pairs with
+ * `scope_id` exactly as on `role_grant_offer_create` — both or neither — and
+ * the grant row carries the pair.
  */
-export const RoleGrantAssignInput = z.strictObject({
-	to_account_id: Uuid.meta({ description: 'Account id of the grantee.' }),
-	to_actor_id: Uuid.nullish().meta({
-		description:
-			"Optional actor-grain target on the grantee account. When set, must belong to `to_account_id`. Omit to resolve the account's sole active actor — a multi-actor account must name one."
-	}),
-	role: RoleName.meta({
-		description: "Role to assign. Must be admin-grantable (its `grant_paths` includes `'admin'`)."
-	}),
-	scope_id: Uuid.nullish().meta({
-		description: 'Scope id for resource-scoped grants. `null` for a global role_grant.'
-	}),
-	acting: ActingActor
-});
+export const RoleGrantAssignInput = z
+	.strictObject({
+		to_account_id: Uuid.meta({ description: 'Account id of the grantee.' }),
+		to_actor_id: Uuid.nullish().meta({
+			description:
+				"Optional actor-grain target on the grantee account. When set, must belong to `to_account_id`. Omit to resolve the account's sole active actor — a multi-actor account must name one."
+		}),
+		role: RoleName.meta({
+			description: "Role to assign. Must be admin-grantable (its `grant_paths` includes `'admin'`)."
+		}),
+		scope_kind: GrantScopeKind,
+		scope_id: Uuid.nullish().meta({
+			description:
+				'Scope id for resource-scoped grants. `null` for a global role_grant. Builtin roles are global-only.'
+		}),
+		acting: ActingActor
+	})
+	.refine(is_grant_scope_paired, { message: GRANT_SCOPE_PAIRED_MESSAGE });
 export type RoleGrantAssignInput = z.infer<typeof RoleGrantAssignInput>;
 
 /** Output for `role_grant_assign`. */
@@ -238,37 +303,53 @@ export type RoleGrantAssignOutput = z.infer<typeof RoleGrantAssignOutput>;
  * `ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH`) as an enumeration
  * vector. Failure-outcome audit rows preserve the forensic trail; the
  * rate cap closes the budget.
+ *
+ * `credential_types: ['session']` — see `docs/security.md` §Credential-channel
+ * gating. Offering spends the caller's authority to confer a role. Over a
+ * leaked API token that is a privilege pivot onto another account: the leak
+ * offers a role to an account its holder controls, that account accepts over
+ * its own session, and the resulting role_grant outlives revoking the token.
+ * Under a consumer `authorize` that delegates offering (a scoped holder
+ * offering roles in its scope), every such holder's token would be a
+ * role-minting credential. An offer is the grantor's consent act, as accepting
+ * is the recipient's; scripted conferral is `role_grant_assign`'s, admin-gated
+ * and narrowable by a token scope.
  */
 export const role_grant_offer_create_action_spec = {
 	method: 'role_grant_offer_create',
 	kind: 'request_response',
 	initiator: 'frontend',
-	auth: { account: 'required', actor: 'required' },
+	auth: { account: 'required', actor: 'required', credential_types: ['session'] },
 	side_effects: true,
 	input: RoleGrantOfferCreateInput,
 	output: RoleGrantOfferCreateOutput,
 	async: true,
 	description:
-		"Offer a role_grant to another account. Grantor must hold the offered role (or pass a consumer authorize callback); role's `grant_paths` must include `'admin'`.",
+		"Offer a role_grant to another account. Admin-only by default (a consumer authorize callback may widen it for app roles); role's `grant_paths` must include `'admin'`. A builtin role is global-only and offered only by a global admin, whatever the callback says.",
 	error_reasons: [
 		ERROR_ROLE_GRANT_OFFER_SELF_TARGET,
 		ERROR_ROLE_GRANT_OFFER_ROLE_NOT_GRANTABLE,
 		ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED,
-		ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH
+		ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH,
+		ERROR_ROLE_GRANT_BUILTIN_SCOPED
 	],
 	rate_limit: 'account'
 } satisfies RequestResponseActionSpec;
 
 /**
+ * `rate_limit: 'account'`, matching `role_grant_offer_create`: every call locks
+ * the offer row and reads its grant, and a replay of an accepted offer answers
+ * without minting anything, so the account bucket is what bounds a loop of them.
+ *
  * `credential_types: ['session']` — see `docs/security.md` §Credential-channel
- * gating. The only offer verb that moves the *caller's own* authority:
- * accepting a pending admin offer over a leaked API token is a privilege pivot
- * in the same family the credential-lifecycle mutations are gated to prevent
- * (the token is account-wide and non-expiring, and the resulting role_grant
- * outlives revoking it). Consent inherently belongs to a human at a browser,
- * and no automation accepts an offer on its own behalf. The sibling verbs stay
- * ungated deliberately — `_create` is the offering side, and `_decline` /
- * `_retract` destroy a pending offer and confer nothing.
+ * gating. The offer verb that moves the *caller's own* authority: accepting a
+ * pending admin offer over a leaked API token is a privilege pivot in the same
+ * family the credential-lifecycle mutations are gated to prevent (the token is
+ * account-wide and non-expiring, and the resulting role_grant outlives revoking
+ * it). Consent inherently belongs to a human at a browser, and no automation
+ * accepts an offer on its own behalf. `_create` carries the same gate (the
+ * grantor's side of the consent); `_decline` / `_retract` stay ungated
+ * deliberately — they destroy a pending offer and confer nothing.
  */
 export const role_grant_offer_accept_action_spec = {
 	method: 'role_grant_offer_accept',
@@ -280,13 +361,17 @@ export const role_grant_offer_accept_action_spec = {
 	output: RoleGrantOfferAcceptOutput,
 	async: true,
 	description:
-		'Accept an offer. Atomically marks the offer accepted, inserts the role_grant, and supersedes sibling pending offers for the same (account, role, scope).',
+		'Accept an offer. Atomically marks the offer accepted, inserts the role_grant, and supersedes sibling pending offers for the same (account, role, scope). A builtin-role offer is refused (and stays pending) when it is `keeper`, scoped, or its grantor no longer holds a global admin.',
 	error_reasons: [
 		ERROR_ROLE_GRANT_OFFER_NOT_FOUND,
 		ERROR_ROLE_GRANT_OFFER_TERMINAL,
 		ERROR_ROLE_GRANT_OFFER_EXPIRED,
-		ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH
-	]
+		ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH,
+		ERROR_ROLE_GRANT_OFFER_ROLE_NOT_GRANTABLE,
+		ERROR_ROLE_GRANT_BUILTIN_SCOPED,
+		ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED
+	],
+	rate_limit: 'account'
 } satisfies RequestResponseActionSpec;
 
 export const role_grant_offer_decline_action_spec = {
@@ -296,7 +381,7 @@ export const role_grant_offer_decline_action_spec = {
 	auth: { account: 'required', actor: 'required' },
 	side_effects: true,
 	input: RoleGrantOfferDeclineInput,
-	output: RoleGrantOfferOkOutput,
+	output: RoleGrantOfferDeclineOutput,
 	async: true,
 	description: 'Decline an offer. Recipient-only.',
 	error_reasons: [ERROR_ROLE_GRANT_OFFER_NOT_FOUND, ERROR_ROLE_GRANT_OFFER_TERMINAL]
@@ -309,7 +394,7 @@ export const role_grant_offer_retract_action_spec = {
 	auth: { account: 'required', actor: 'required' },
 	side_effects: true,
 	input: RoleGrantOfferRetractInput,
-	output: RoleGrantOfferOkOutput,
+	output: RoleGrantOfferRetractOutput,
 	async: true,
 	description: 'Retract an offer. Grantor-only, pre-decision.',
 	error_reasons: [ERROR_ROLE_GRANT_OFFER_NOT_FOUND, ERROR_ROLE_GRANT_OFFER_TERMINAL]
@@ -357,8 +442,13 @@ export const role_grant_revoke_action_spec = {
 	output: RoleGrantRevokeOutput,
 	async: true,
 	description:
-		'Revoke an active role_grant on a target actor. Admin-only. Supersedes any pending offers for the same (account, role, scope). Fires role_grant_revoke + role_grant_offer_supersede notifications.',
-	error_reasons: [ERROR_ROLE_GRANT_NOT_FOUND, ERROR_ROLE_NOT_WEB_GRANTABLE],
+		"Revoke an active role_grant on a target actor. Admin-only. Refuses the keeper account's global admin grant and the last active admin's. Supersedes any pending offers for the same (account, role, scope), and every pending offer the target actor made. Fires role_grant_revoke + role_grant_offer_supersede notifications.",
+	error_reasons: [
+		ERROR_ROLE_GRANT_NOT_FOUND,
+		ERROR_ROLE_NOT_WEB_GRANTABLE,
+		ERROR_CANNOT_REVOKE_KEEPER_ADMIN,
+		ERROR_CANNOT_REVOKE_LAST_ADMIN
+	],
 	rate_limit: 'account'
 } satisfies RequestResponseActionSpec;
 
@@ -377,8 +467,14 @@ export const role_grant_assign_action_spec = {
 	output: RoleGrantAssignOutput,
 	async: true,
 	description:
-		"Immediately assign a role_grant to a target account — admin-only, no consent step (the capability-unlock UX). The role's `grant_paths` must include `'admin'`. Idempotent: re-assigning an active grant returns it. Emits a role_grant_create audit event.",
-	error_reasons: [ERROR_ROLE_NOT_WEB_GRANTABLE, ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH],
+		"Immediately assign a role_grant to a target account — global-admin-only, no consent step (the capability-unlock UX). The role's `grant_paths` must include `'admin'`, and the consumer's offer `authorize` callback must admit it; `scope_kind` + `scope_id` are paired, and a builtin role is global-only. Idempotent: re-assigning an active grant returns it. Emits a role_grant_create audit event.",
+	error_reasons: [
+		ERROR_INSUFFICIENT_PERMISSIONS,
+		ERROR_ROLE_NOT_WEB_GRANTABLE,
+		ERROR_ROLE_GRANT_BUILTIN_SCOPED,
+		ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED,
+		ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH
+	],
 	rate_limit: 'account'
 } satisfies RequestResponseActionSpec;
 

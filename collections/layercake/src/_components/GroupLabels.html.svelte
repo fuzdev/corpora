@@ -1,34 +1,36 @@
 <!--
 	@component
-	Generates HTML text labels for a nested data structure. It places the label near the y-value of the highest x-valued data point. This is useful for labeling the final point in a multi-series line chart, for example. It expects your data to be an array of objects where each has `values` field that is an array of data objects. It uses the `z` field accessor to pull the text label.
+	Generates one HTML text label per group of a nested dataset. Each label sits at the group's largest x and largest y value, which on a multi-series line chart is just past the end of the line. The data must be an array of groups, each with a `values` array of rows. The label text comes from the `c` accessor.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 	import { max } from 'd3-array';
 
-	const { data, x, y, xScale, yScale, xRange, yRange, z } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
-	/* --------------------------------------------
-	 * Title case the first letter
-	 */
-	const cap = val => val.replace(/^\w/, d => d.toUpperCase());
+	/** @param {string} val */
+	const capitalizeFirst = val => val.replace(/^\w/, d => d.toUpperCase());
 
-	/* --------------------------------------------
-	 * Put the label on the highest value
-	 */
-	let left = $derived(values => $xScale(max(values, $x)) / Math.max(...$xRange));
-	let top = $derived(values => $yScale(max(values, $y)) / Math.max(...$yRange));
+	// The group's largest x and y values, as a share of the chart
+	/** @param {Array<any>} values */
+	function leftPercent(values) {
+		return (k.xScale(max(values, k.x)) / Math.max(...k.xRange)) * 100;
+	}
+	/** @param {Array<any>} values */
+	function topPercent(values) {
+		return (k.yScale(max(values, k.y)) / Math.max(...k.yRange)) * 100;
+	}
 </script>
 
-{#each $data as group}
+{#each k.data as group}
 	<div
 		class="label"
 		style="
-      top:{top(group.values) * 100}%;
-      left:{left(group.values) * 100}%;
+      top:{topPercent(group.values)}%;
+      left:{leftPercent(group.values)}%;
     "
 	>
-		{cap($z(group))}
+		{capitalizeFirst(k.c?.(group) ?? '')}
 	</div>
 {/each}
 

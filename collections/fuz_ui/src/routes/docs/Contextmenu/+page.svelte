@@ -1,6 +1,6 @@
 <script lang="ts">
-	import TomeContent from '$lib/TomeContent.svelte';
-	import { tome_get_by_slug } from '$lib/tome.ts';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
 	import Introduction from './Introduction.svelte';
 	import Discussion from './Discussion.svelte';
 	import ExampleFull from './ExampleFull.svelte';

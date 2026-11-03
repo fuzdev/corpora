@@ -229,6 +229,26 @@ export const validate_domain = (domain: string): void => {
 };
 
 /**
+ * Parses a repository url given as a flag or wizard answer into its web url
+ * via `to_repo_url`, so an ssh remote pasted as-is still yields working
+ * source links in the API docs.
+ */
+export const parse_repo_url = (value: string): string => {
+	const url = to_repo_url(value);
+	if (url === null) {
+		// quoted with `json_escape`, not `JSON.stringify`, so both twins print it alike
+		throw CliError.usage(
+			`invalid repository url "${json_escape(trim_url(value))}": expected an https, http, or ssh git url like https://github.com/you/app`
+		);
+	}
+	return url;
+};
+
+/** Like `parse_repo_url`, but blank input (after `trim_url`) is no url. */
+export const parse_optional_repo_url = (value: string): string | null =>
+	trim_url(value) === '' ? null : parse_repo_url(value);
+
+/**
  * Escapes a string for embedding in a JSON string literal (also valid for
  * TOML basic strings, which share the `\"`/`\\`/`\n` escapes).
  */
@@ -266,12 +286,20 @@ export interface Feature {
 	member_of: string | null;
 }
 
+export const SVELTEKIT = 'sveltekit';
 export const RUST = 'rust';
 export const CLI = 'cli';
 export const DOCS = 'docs';
 export const GITHUB_EXTRAS = 'github-extras';
 
 export const FEATURES: Array<Feature> = [
+	{
+		id: SVELTEKIT,
+		prompt: 'keep the SvelteKit app? (src/, static/, package.json, and the npm toolchain)',
+		default_keep: true,
+		requires: null,
+		member_of: null
+	},
 	{
 		id: RUST,
 		prompt: 'keep the Rust workspace? (includes the starter CLI crate, renamed to crates/<name>)',
@@ -292,7 +320,7 @@ export const FEATURES: Array<Feature> = [
 		id: DOCS,
 		prompt: 'keep the docs system? (src/routes/docs, auto-generated API docs)',
 		default_keep: true,
-		requires: null,
+		requires: SVELTEKIT,
 		member_of: null
 	},
 	{
@@ -303,6 +331,16 @@ export const FEATURES: Array<Feature> = [
 		member_of: null
 	}
 ];
+
+/**
+ * The features a project is built from — at least one must be kept, or the
+ * molted project would hold nothing to build.
+ */
+export const FOUNDATIONS = [SVELTEKIT, RUST];
+
+/** Whether `kept` holds at least one of the `FOUNDATIONS`. */
+export const has_foundation = (kept: Set<string>): boolean =>
+	FOUNDATIONS.some((id) => kept.has(id));
 
 /**
  * Splits repeatable/CSV flag values into feature ids, validating each.
@@ -389,6 +427,20 @@ export const members_of = (parent: string): Array<Feature> =>
 	FEATURES.filter((f) => f.member_of === parent);
 
 /**
+ * Whether flags already force `parent` stripped: it has required members
+ * and every one was explicitly stripped (cargo rejects a workspace with no
+ * member crates, say).
+ */
+export const members_force_strip = (
+	parent: string,
+	kept: Set<string>,
+	explicit: Set<string>
+): boolean => {
+	const members = members_of(parent);
+	return members.length > 0 && members.every((m) => explicit.has(m.id) && !kept.has(m.id));
+};
+
+/**
  * Kept features whose required members are all stripped — invalid
  * combinations the caller must reject (or repair by stripping the parent
  * too). Registry order, so callers report deterministically.
@@ -404,13 +456,30 @@ export const empty_groups = (kept: Set<string>): Array<string> =>
 /* git — twin of `crates/molt/src/git.rs` */
 
 /**
+ * Repo-locating git variables that git hooks set — cleared for every git
+ * call so git always resolves the repo from the given root.
+ */
+const INHERITED_GIT_ENV = [
+	'GIT_DIR',
+	'GIT_WORK_TREE',
+	'GIT_INDEX_FILE',
+	'GIT_COMMON_DIR',
+	'GIT_OBJECT_DIRECTORY'
+] as const;
+
+/**
  * Runs a git command at `root`, returning its stdout on success and `null`
- * on a nonzero exit (e.g. no `origin` remote configured).
+ * on a nonzero exit (e.g. no `origin` remote configured). Clears the
+ * `INHERITED_GIT_ENV` variables so git always resolves the repo from `root`.
  *
  * @throws `CliError` when git can't be spawned at all.
  */
-const git_output = (root: string, args: Array<string>): string | null => {
-	const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+export const git_output = (root: string, args: Array<string>): string | null => {
+	const cleared: ReadonlyArray<string> = INHERITED_GIT_ENV;
+	const env = Object.fromEntries(
+		Object.entries(process.env).filter(([name]) => !cleared.includes(name))
+	);
+	const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', env });
 	if (result.error) {
 		throw CliError.precondition(
 			`failed to run git: ${result.error.message}`,
@@ -421,25 +490,87 @@ const git_output = (root: string, args: Array<string>): string | null => {
 };
 
 /**
- * Normalizes a git remote url (https, scp-style `git@host:`, or
- * `ssh://git@host/`) to an https repository url, returning `null` for the
- * template's own remote (a plain `git clone` of `fuz_template` keeps origin
- * pointed at the template — deriving that would be wrong).
+ * Trims whitespace and byte-order marks from a url, matching the Rust twin's
+ * `trim_url` (JS's `\s` covers U+FEFF but not U+0085, Rust's
+ * `is_whitespace` the reverse, so each twin adds the other's).
  */
-export const normalize_remote_url = (url: string): string | null => {
-	const trimmed_url = url.trim();
-	if (trimmed_url.includes('fuzdev/fuz_template')) return null;
-	let https;
-	if (trimmed_url.startsWith('ssh://git@')) {
-		https = `https://${trimmed_url.slice('ssh://git@'.length)}`;
+export const trim_url = (url: string): string => url.replace(/^[\s\u0085]+|[\s\u0085]+$/g, '');
+
+/**
+ * Converts a repository url in any common git form (https or http,
+ * scp-style `git@host:`, or `ssh://git@host/`) to its web url — the ssh
+ * forms become https without their ssh port, userinfo (a user or token)
+ * is dropped, the scheme is lowercased, an empty port is dropped, a
+ * `?query` or `#fragment` is dropped from the `ssh://` and http(s) forms
+ * (the scp form keeps `?`/`#` as literal path characters), and a trailing
+ * `/` or `.git` is dropped — returning `null` for anything else (a local
+ * path, a bare `owner/repo`, an empty host).
+ */
+export const to_repo_url = (url: string): string | null => {
+	const trimmed_url = trim_url(url);
+	const scheme_end = trimmed_url.indexOf('://');
+	let web;
+	if (scheme_end !== -1) {
+		// ASCII-only, like the Rust twin's `to_ascii_lowercase`
+		const scheme = trimmed_url.slice(0, scheme_end).replace(/[A-Z]/g, (c) => c.toLowerCase());
+		const rest = trimmed_url.slice(scheme_end + '://'.length);
+		if (scheme === 'ssh') {
+			if (!rest.startsWith('git@')) return null;
+			const { authority, path } = split_authority(rest.slice('git@'.length));
+			// the ssh daemon's port (even an empty one) means nothing to the
+			// web host
+			const colon = authority.lastIndexOf(':');
+			const host =
+				colon !== -1 && /^[0-9]*$/.test(authority.slice(colon + 1))
+					? authority.slice(0, colon)
+					: authority;
+			if (host === '' || host.startsWith(':')) return null;
+			web = `https://${host}${path}`;
+		} else if (scheme === 'https' || scheme === 'http') {
+			const { authority, path } = split_authority(rest);
+			// userinfo (a user, or a token) never belongs in a web url
+			const userless = authority.slice(authority.lastIndexOf('@') + 1);
+			// an empty port adds nothing; a host that's only a port is none
+			const host = userless.endsWith(':') ? userless.slice(0, -1) : userless;
+			if (host === '' || host.startsWith(':')) return null;
+			web = `${scheme}://${host}${path}`;
+		} else {
+			return null;
+		}
 	} else if (trimmed_url.startsWith('git@')) {
-		https = `https://${trimmed_url.slice('git@'.length).replace(':', '/')}`;
+		const rest = trimmed_url.slice('git@'.length);
+		if (rest.search(/[:/]/) === 0 || rest === '') return null;
+		web = `https://${rest.replace(':', '/')}`;
 	} else {
-		https = trimmed_url;
+		return null;
 	}
-	const trimmed = https.endsWith('.git') ? https.slice(0, -'.git'.length) : https;
-	return trimmed.startsWith('https://') ? trimmed : null;
+	if (web.endsWith('/')) web = web.slice(0, -1);
+	if (web.endsWith('.git')) web = web.slice(0, -'.git'.length);
+	const separator = web.indexOf('://');
+	return separator !== -1 && web.length > separator + '://'.length ? web : null;
 };
+
+/**
+ * Splits a url's remainder after `scheme://` into its authority, which ends
+ * at the first `/`, `?`, or `#`, and its path, dropping any `?query` or
+ * `#fragment` (meaningless for a repository url).
+ */
+const split_authority = (rest: string): { authority: string; path: string } => {
+	const end = rest.search(/[/?#]/);
+	const authority = end === -1 ? rest : rest.slice(0, end);
+	const tail = end === -1 ? '' : rest.slice(end);
+	const path_end = tail.search(/[?#]/);
+	return { authority, path: path_end === -1 ? tail : tail.slice(0, path_end) };
+};
+
+/**
+ * Normalizes the git origin url with `to_repo_url`, returning `null` for
+ * the template's own remote (a plain `git clone` of `fuz_template` keeps
+ * origin pointed at the template — deriving that would be wrong). GitHub
+ * owner and repo names are case-insensitive, so the check is too.
+ */
+export const normalize_remote_url = (url: string): string | null =>
+	url.toLowerCase().includes('fuzdev/fuz_template') ? null : to_repo_url(url);
 
 /* anchors — twin of `crates/molt/src/anchors.rs` */
 //
@@ -451,31 +582,36 @@ export const normalize_remote_url = (url: string): string | null => {
 
 const PACKAGE_JSON_NAME = '  "name": "@fuzdev/fuz_template",\n';
 const PACKAGE_JSON_DESCRIPTION =
-	'  "description": "a web app template with TypeScript + SvelteKit + optional Rust for the fuz-stack",\n';
+	'  "description": "starter template for SvelteKit web apps, Rust native tools, or both",\n';
 const PACKAGE_JSON_GLYPH = '  "glyph": "❄",\n';
 const PACKAGE_JSON_LOGO = '  "logo": "logo.svg",\n';
-const PACKAGE_JSON_LOGO_ALT = '  "logo_alt": "a friendly pixelated spider facing you",\n';
-const PACKAGE_JSON_LICENSE = '  "license": "MIT",\n';
+const PACKAGE_JSON_LOGO_ALT = '  "logo_alt": "a friendly orange pixelated spider facing you",\n';
+const PACKAGE_JSON_LICENSE = '  "license": "0BSD",\n';
 const PACKAGE_JSON_HOMEPAGE = '  "homepage": "https://template.fuz.dev/",\n';
 const PACKAGE_JSON_REPOSITORY = '  "repository": "https://github.com/fuzdev/fuz_template",\n';
 // The TS twin ejector's npm script — removed on eject along with the script
 // itself and its check test.
 const PACKAGE_JSON_MOLT_SCRIPT = '    "molt": "node src/lib/molt.ts",\n';
 
-const LAYOUT_LOGO_IMPORT = "\timport {logo_fuz_template} from '@fuzdev/fuz_ui/logos.ts';\n";
+const LAYOUT_LOGO_IMPORT = "\timport { logo_fuz_template } from '@fuzdev/fuz_ui/logos.ts';\n";
 const LAYOUT_SITE_STATE =
-	'\t// `glyph` and `repo_url` derive from `pkg_json`; `icon` stays explicit (structured `SvgData`).\n\tsite_context.set(new SiteState({icon: logo_fuz_template, pkg_json}));';
+	'\t// `glyph` and `repo_url` derive from `pkg_json`; `icon` stays explicit (structured `SvgData`).\n\tsite_context.set(new SiteState({ icon: logo_fuz_template, pkg_json }));';
 const LAYOUT_SITE_STATE_REPLACEMENT =
-	'\t// `glyph` and `repo_url` derive from `pkg_json`.\n\tsite_context.set(new SiteState({pkg_json}));';
+	'\t// `glyph` and `repo_url` derive from `pkg_json`.\n\tsite_context.set(new SiteState({ pkg_json }));';
 const LAYOUT_TITLE = '<title>@fuzdev/fuz_template</title>';
 
-const PAGE_MREOWS_IMPORT = "import Mreows, {mreow_items} from '$lib/Mreows.svelte';";
+const PAGE_MREOWS_IMPORT = "import Mreows, { mreow_items } from '#lib/Mreows.svelte';";
 const H1_FUZ_TEMPLATE = '<h1 class="mt_xl2">fuz_template</h1>';
 
 // the docs system's tooling, stripped with the `docs` feature
-const PACKAGE_JSON_SVELTE_DOCINFO = '    "svelte-docinfo": "^0.5.3",\n';
+// A line prefix, not a whole line — the version churns with every upgrade,
+// so the plan removes the one line starting with it.
+const PACKAGE_JSON_SVELTE_DOCINFO = '    "svelte-docinfo": "';
+// The svelte-docinfo line's required ending — its trailing comma proves it
+// isn't the last entry, whose removal would strand the previous line's comma.
+const PACKAGE_JSON_SVELTE_DOCINFO_SUFFIX = '",\n';
 const VITE_DOCINFO_IMPORT = "import svelte_docinfo from 'svelte-docinfo/vite.js';\n";
-const VITE_DOCINFO_PLUGIN = 'svelte_docinfo(), ';
+const VITE_DOCINFO_PLUGIN = "\t\tsvelte_docinfo({ onDuplicates: 'throw' }),\n";
 const APP_D_TS_DOCINFO =
 	'// Registers ambient types for the `virtual:svelte-docinfo` module (Vite plugin).\n// eslint-disable-next-line @typescript-eslint/triple-slash-reference\n/// <reference types="svelte-docinfo/virtual-svelte-docinfo.js" />\n';
 
@@ -485,13 +621,20 @@ const FUNDING_GITHUB = 'github: ryanatkn';
 // links — replaced with the molted project's repo url when derivable.
 const TEMPLATE_REPO_URL = 'https://github.com/fuzdev/fuz_template';
 
+// molt's note in the `.gitattributes` header, rewritten on eject so the
+// molted project's LF rule doesn't cite anchors that no longer exist.
+const GITATTRIBUTES_MOLT_NOTE =
+	"# Force LF on checkout everywhere: molt's exact-content anchors embed `\\n`,\n# so a CRLF working tree (e.g. Windows autocrlf) would fail every anchor.\n";
+const GITATTRIBUTES_MOLT_NOTE_REPLACEMENT =
+	'# Force LF on checkout everywhere, even under Windows autocrlf.\n';
+
 const README_H1 = '# @fuzdev/fuz_template ❄';
 const CLAUDE_H1 = '# fuz_template\n';
 const CNAME_CONTENT = 'template.fuz.dev';
 const WORKSPACE_MEMBERS = 'members = ["crates/app_cli", "crates/molt"]';
 // The workspace manifest's license line — stripped on eject along with the
 // `LICENSE` file (a molted project chooses its own license).
-const WORKSPACE_LICENSE = 'license = "MIT"\n';
+const WORKSPACE_LICENSE = 'license = "0BSD"\n';
 
 // The starter CLI crate's name — molt renames every occurrence (and the
 // crate directory) to the chosen project name.
@@ -501,6 +644,54 @@ const APP_CLI_DESCRIPTION = 'description = "a CLI scaffolded by fuz_template\'s 
 // The starter CLI crate's license inheritance line, stripped on eject
 // (the workspace's license line goes with it).
 const APP_CLI_LICENSE = 'license.workspace = true\n';
+
+// The workflow's header, rewritten when the `sveltekit` feature is
+// stripped — its link is the Node.js guide, and Node is gone.
+const CI_HEADER =
+	'# Checks and builds the project. For more info:\n# https://help.github.com/actions/language-and-framework-guides/using-nodejs-with-github-actions\n';
+const CI_HEADER_REPLACEMENT = '# Checks the project.\n';
+
+// The comment inside `CI_BUILD_JOB` pointing at the anchors — removed on
+// eject when the job is kept, since molt's crate is gone.
+const CI_BUILD_JOB_MOLT_COMMENT =
+	'    # molt anchors this job (crates/molt/src/anchors.rs) so stripping\n    # the sveltekit feature can remove it — update the anchor when editing.\n';
+
+// The `build` job in `.github/workflows/check.yml`, with the blank line that
+// follows it — kept here as an exact-match anchor so stripping the
+// `sveltekit` feature can remove it. The `rust` job is always kept then, so
+// its anchor's leading newline is never needed alongside this one.
+const CI_BUILD_JOB = `  build:
+    # molt anchors this job (crates/molt/src/anchors.rs) so stripping
+    # the sveltekit feature can remove it — update the anchor when editing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        node-version: ['24.14']
+
+    steps:
+      # persist-credentials: false keeps the GITHUB_TOKEN out of .git/config, so a
+      # compromised build dependency can't read it. If you add a step that pushes
+      # via git (deploy, tag, generated commit), set this back to true or
+      # authenticate that step explicitly.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Use Node.js \${{ matrix.node-version }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: \${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npx @fuzdev/gro check --workspace --build
+
+`;
+
+// The comment inside `CI_RUST_JOB` pointing at the anchors — removed on eject
+// when the job is kept, since molt's crate is gone.
+const CI_RUST_JOB_MOLT_COMMENT =
+	'    # molt anchors this job (crates/molt/src/anchors.rs) so stripping\n    # the rust feature can remove it — update the anchor when editing.\n';
 
 // The `rust` job appended to `.github/workflows/check.yml` — kept here as an
 // exact-match anchor so stripping the `rust` feature can remove it.
@@ -515,10 +706,21 @@ const CI_RUST_JOB = `
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      # rustup auto-installs the toolchain pinned in rust-toolchain.toml
+      # The toolchain is pinned in rust-toolchain.toml, not stable: the
+      # workspace runs clippy nursery lints at warn and this job denies warnings,
+      # so a floating toolchain would fail CI whenever a new Rust release adds
+      # a nursery lint. Bump the file deliberately. The runner's preinstalled
+      # rustup installs that toolchain and its components from the file.
+      - name: Install Rust
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 `;
 
 /* templates — twin of `crates/molt/src/templates.rs` */
@@ -532,10 +734,13 @@ export interface Templates {
 	PAGE_SVELTE: string;
 	README_MD: string;
 	CLAUDE_MD: string;
+	README_SVELTEKIT_SECTION: string;
+	CLAUDE_SVELTEKIT_SECTION: string;
 	README_RUST_SECTION: string;
 	CLAUDE_RUST_SECTION: string;
 	WORKSPACE_CARGO_TOML: string;
 	FUNDING_YML: string;
+	EXAMPLE_TS: string;
 }
 
 export const load_templates = (root: string): Templates => {
@@ -545,16 +750,22 @@ export const load_templates = (root: string): Templates => {
 		PAGE_SVELTE: template('page.svelte.in'),
 		README_MD: template('README.md.in'),
 		CLAUDE_MD: template('CLAUDE.md.in'),
+		README_SVELTEKIT_SECTION: template('readme_sveltekit_section.md.in'),
+		CLAUDE_SVELTEKIT_SECTION: template('claude_sveltekit_section.md.in'),
 		README_RUST_SECTION: template('readme_rust_section.md.in'),
 		CLAUDE_RUST_SECTION: template('claude_rust_section.md.in'),
 		WORKSPACE_CARGO_TOML: template('workspace_cargo.toml.in'),
-		FUNDING_YML: template('funding.yml.in')
+		FUNDING_YML: template('funding.yml.in'),
+		EXAMPLE_TS: template('example.ts.in')
 	};
 };
 
 /** The starter page's docs link, substituted only when docs are kept. */
 const PAGE_DOCS_LINK = " · <a href={resolve('/docs')}>docs</a>";
-/** The generated CLAUDE.md's docs bullet, substituted only when docs are kept. */
+/**
+ * The generated CLAUDE.md's docs bullet, substituted into the `sveltekit`
+ * section only when docs are kept.
+ */
 const CLAUDE_DOCS_BULLET =
 	'- `src/routes/docs/` — documentation pages with auto-generated API docs from\n  the `svelte-docinfo` Vite plugin\n';
 
@@ -594,8 +805,10 @@ export const render = (template: string, substitutions: Array<[string, string]>)
  */
 export type Action =
 	| { kind: 'replace_once'; path: string; anchor: string; replacement: string; label: string }
+	| { kind: 'remove_line'; path: string; prefix: string; suffix: string; label: string }
 	| { kind: 'replace_all'; path: string; from: string; to: string; label: string }
 	| { kind: 'replace_file'; path: string; anchors: Array<string>; content: string; label: string }
+	| { kind: 'create_file'; path: string; content: string; label: string }
 	| { kind: 'rename_dir'; from: string; to: string }
 	| { kind: 'delete_file'; path: string }
 	| { kind: 'delete_dir'; path: string };
@@ -603,10 +816,13 @@ export type Action =
 export const describe = (action: Action): string => {
 	switch (action.kind) {
 		case 'replace_once':
+		case 'remove_line':
 		case 'replace_all':
 			return `edit    ${action.path} — ${action.label}`;
 		case 'replace_file':
 			return `rewrite ${action.path} — ${action.label}`;
+		case 'create_file':
+			return `create  ${action.path} — ${action.label}`;
 		case 'rename_dir':
 			return `rename  ${action.from}/ → ${action.to}/`;
 		case 'delete_file':
@@ -629,147 +845,101 @@ const replace_once = (
 	label
 });
 
+/**
+ * The ranges of the lines in `content` that start with `prefix`, each
+ * including its trailing newline when it has one.
+ */
+export const lines_with_prefix = (
+	content: string,
+	prefix: string
+): Array<{ start: number; end: number }> => {
+	const ranges: Array<{ start: number; end: number }> = [];
+	let start = 0;
+	while (start < content.length) {
+		const newline = content.indexOf('\n', start);
+		const end = newline === -1 ? content.length : newline + 1;
+		if (content.slice(start, end).startsWith(prefix)) {
+			ranges.push({ start, end });
+		}
+		start = end;
+	}
+	return ranges;
+};
+
 /** Builds the full molt plan from resolved choices. Pure — reads nothing. */
 export const build_plan = (config: MoltConfig, templates: Templates): Array<Action> => {
 	const plan: Array<Action> = [];
-	const { name, npm_name } = config;
+	const { name } = config;
 
-	// package.json identity
-	plan.push(
-		replace_once(
-			'package.json',
-			PACKAGE_JSON_NAME,
-			`  "name": "${json_escape(npm_name)}",\n`,
-			`name → ${npm_name}`
-		)
-	);
-	const description_replacement =
-		config.description === '' ? '' : `  "description": "${json_escape(config.description)}",\n`;
-	plan.push(
-		replace_once('package.json', PACKAGE_JSON_DESCRIPTION, description_replacement, 'description')
-	);
-	for (const [anchor, label] of [
-		[PACKAGE_JSON_GLYPH, 'remove template glyph'],
-		[PACKAGE_JSON_LOGO, 'remove template logo'],
-		[PACKAGE_JSON_LOGO_ALT, 'remove template logo_alt'],
-		[PACKAGE_JSON_LICENSE, 'remove license (choose your own)']
-	] as Array<[string, string]>) {
-		plan.push(replace_once('package.json', anchor, '', label));
-	}
-
-	// the template's MIT license is fuz.dev's, not the new project's
+	// the template's 0BSD license is fuz.dev's, not the new project's
 	plan.push({ kind: 'delete_file', path: 'LICENSE' });
-
-	// the TS twin ejector (`npm run molt`) is template machinery, deleted on
-	// eject like molt's own crate — the script, its npm entry, and its check
-	// test (which verifies anchors that no longer match once molted)
-	plan.push(replace_once('package.json', PACKAGE_JSON_MOLT_SCRIPT, '', 'remove the molt script'));
-	plan.push({ kind: 'delete_file', path: 'src/lib/molt.ts' });
-	plan.push({ kind: 'delete_file', path: 'src/test/molt.test.ts' });
-
-	const homepage_replacement =
-		config.domain === null ? '' : `  "homepage": "https://${config.domain}/",\n`;
-	plan.push(replace_once('package.json', PACKAGE_JSON_HOMEPAGE, homepage_replacement, 'homepage'));
-	const repository_replacement =
-		config.repo_url === null ? '' : `  "repository": "${json_escape(config.repo_url)}",\n`;
 	plan.push(
-		replace_once('package.json', PACKAGE_JSON_REPOSITORY, repository_replacement, 'repository')
+		replace_once(
+			'.gitattributes',
+			GITATTRIBUTES_MOLT_NOTE,
+			GITATTRIBUTES_MOLT_NOTE_REPLACEMENT,
+			"drop molt's note from the LF rule"
+		)
 	);
 
-	// custom domain
-	if (config.domain !== null) {
-		plan.push({
-			kind: 'replace_file',
-			path: 'static/CNAME',
-			anchors: [CNAME_CONTENT],
-			content: `${config.domain}\n`,
-			label: `custom domain → ${config.domain}`
-		});
+	if (keeps(config, SVELTEKIT)) {
+		push_sveltekit_actions(config, templates, plan);
 	} else {
-		plan.push({ kind: 'delete_file', path: 'static/CNAME' });
-	}
-
-	// root layout: title + template logo
-	plan.push(
-		replace_once('src/routes/+layout.svelte', LAYOUT_LOGO_IMPORT, '', 'remove template logo import')
-	);
-	plan.push(
-		replace_once(
-			'src/routes/+layout.svelte',
-			LAYOUT_SITE_STATE,
-			LAYOUT_SITE_STATE_REPLACEMENT,
-			'drop template icon'
-		)
-	);
-	// the project name, not the npm name — a scoped `@you/app` reads badly
-	// in a browser tab
-	plan.push(
-		replace_once(
-			'src/routes/+layout.svelte',
-			LAYOUT_TITLE,
-			`<title>${name}</title>`,
-			`title → ${name}`
-		)
-	);
-
-	// starter page + demo components
-	const docs_link = keeps(config, DOCS) ? PAGE_DOCS_LINK : '';
-	plan.push({
-		kind: 'replace_file',
-		path: 'src/routes/+page.svelte',
-		anchors: [PAGE_MREOWS_IMPORT, H1_FUZ_TEMPLATE],
-		content: render(templates.PAGE_SVELTE, [
-			['__NAME__', name],
-			['__DOCS_LINK__', docs_link]
-		]),
-		label: 'minimal starter page'
-	});
-	plan.push(
-		replace_once(
-			'src/routes/about/+page.svelte',
-			H1_FUZ_TEMPLATE,
-			`<h1 class="mt_xl2">${name}</h1>`,
-			`heading → ${name}`
-		)
-	);
-	plan.push({ kind: 'delete_file', path: 'src/lib/Mreows.svelte' });
-	plan.push({ kind: 'delete_file', path: 'src/lib/Positioned.svelte' });
-
-	// docs system, and the svelte-docinfo tooling that exists only for it
-	if (!keeps(config, DOCS)) {
-		plan.push({ kind: 'delete_dir', path: 'src/routes/docs' });
-		plan.push({ kind: 'delete_file', path: 'src/routes/library.ts' });
+		// the SvelteKit app and its npm toolchain — molt's TS twin and its
+		// check test go with `src/`
 		plan.push(
 			replace_once(
-				'package.json',
-				PACKAGE_JSON_SVELTE_DOCINFO,
-				'',
-				'remove the svelte-docinfo devDependency'
+				'.github/workflows/check.yml',
+				CI_HEADER,
+				CI_HEADER_REPLACEMENT,
+				'drop the Node.js guide link'
 			)
 		);
 		plan.push(
-			replace_once('vite.config.ts', VITE_DOCINFO_IMPORT, '', 'remove the svelte-docinfo import')
+			replace_once('.github/workflows/check.yml', CI_BUILD_JOB, '', 'remove the build job')
 		);
-		plan.push(
-			replace_once('vite.config.ts', VITE_DOCINFO_PLUGIN, '', 'remove the svelte-docinfo plugin')
-		);
-		plan.push(
-			replace_once('src/app.d.ts', APP_D_TS_DOCINFO, '', 'remove the svelte-docinfo ambient types')
-		);
+		for (const path of ['src', 'static']) {
+			plan.push({ kind: 'delete_dir', path });
+		}
+		for (const path of [
+			'package.json',
+			'package-lock.json',
+			'vite.config.ts',
+			'tsconfig.json',
+			'eslint.config.js'
+		]) {
+			plan.push({ kind: 'delete_file', path });
+		}
 	}
 
-	// regenerated docs
+	// regenerated docs; each section renders its own placeholders first,
+	// since `render` never rescans inserted values
 	const description_block = config.description === '' ? '' : `> ${config.description}\n\n`;
-	const readme_rust = keeps(config, RUST) ? templates.README_RUST_SECTION : '';
-	const claude_rust = keeps(config, RUST) ? templates.CLAUDE_RUST_SECTION : '';
-	const claude_docs_bullet = keeps(config, DOCS) ? CLAUDE_DOCS_BULLET : '';
+	let title = name;
+	let readme_sveltekit = '';
+	let claude_sveltekit = '';
+	if (keeps(config, SVELTEKIT)) {
+		const claude_docs_bullet = keeps(config, DOCS) ? CLAUDE_DOCS_BULLET : '';
+		title = config.npm_name;
+		readme_sveltekit = templates.README_SVELTEKIT_SECTION;
+		claude_sveltekit = render(templates.CLAUDE_SVELTEKIT_SECTION, [
+			['__DOCS_BULLET__', claude_docs_bullet]
+		]);
+	}
+	const readme_rust = keeps(config, RUST)
+		? render(templates.README_RUST_SECTION, [['__NAME__', name]])
+		: '';
+	const claude_rust = keeps(config, RUST)
+		? render(templates.CLAUDE_RUST_SECTION, [['__NAME__', name]])
+		: '';
 	plan.push({
 		kind: 'replace_file',
 		path: 'README.md',
 		anchors: [README_H1],
 		content: render(templates.README_MD, [
-			['__NPM_NAME__', npm_name],
+			['__TITLE__', title],
 			['__DESCRIPTION_BLOCK__', description_block],
+			['__SVELTEKIT_SECTION__', readme_sveltekit],
 			['__RUST_SECTION__', readme_rust]
 		]),
 		label: 'regenerate for the new project'
@@ -781,7 +951,7 @@ export const build_plan = (config: MoltConfig, templates: Templates): Array<Acti
 		content: render(templates.CLAUDE_MD, [
 			['__NAME__', name],
 			['__DESCRIPTION_BLOCK__', description_block],
-			['__DOCS_BULLET__', claude_docs_bullet],
+			['__SVELTEKIT_SECTION__', claude_sveltekit],
 			['__RUST_SECTION__', claude_rust]
 		]),
 		label: 'regenerate for the new project (AGENTS.md symlinks here)'
@@ -866,6 +1036,14 @@ export const build_plan = (config: MoltConfig, templates: Templates): Array<Acti
 		);
 		plan.push({ kind: 'rename_dir', from: 'crates/app_cli', to: `crates/${name}` });
 		plan.push({ kind: 'delete_dir', path: 'crates/molt' });
+		plan.push(
+			replace_once(
+				'.github/workflows/check.yml',
+				CI_RUST_JOB_MOLT_COMMENT,
+				'',
+				"remove molt's note from the rust job"
+			)
+		);
 	} else {
 		plan.push(replace_once('.github/workflows/check.yml', CI_RUST_JOB, '', 'remove the rust job'));
 		for (const path of ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'clippy.toml']) {
@@ -889,6 +1067,158 @@ export const build_plan = (config: MoltConfig, templates: Templates): Array<Acti
 };
 
 /**
+ * The edits that personalize a kept `sveltekit` app: `package.json`
+ * identity, the TS twin's removal, the custom domain, the layout and starter
+ * page, the demo components, and the docs system.
+ */
+const push_sveltekit_actions = (
+	config: MoltConfig,
+	templates: Templates,
+	plan: Array<Action>
+): void => {
+	const { name, npm_name } = config;
+
+	// package.json identity
+	plan.push(
+		replace_once(
+			'package.json',
+			PACKAGE_JSON_NAME,
+			`  "name": "${json_escape(npm_name)}",\n`,
+			`name → ${npm_name}`
+		)
+	);
+	const description_replacement =
+		config.description === '' ? '' : `  "description": "${json_escape(config.description)}",\n`;
+	plan.push(
+		replace_once('package.json', PACKAGE_JSON_DESCRIPTION, description_replacement, 'description')
+	);
+	for (const [anchor, label] of [
+		[PACKAGE_JSON_GLYPH, 'remove template glyph'],
+		[PACKAGE_JSON_LOGO, 'remove template logo'],
+		[PACKAGE_JSON_LOGO_ALT, 'remove template logo_alt'],
+		[PACKAGE_JSON_LICENSE, 'remove license (choose your own)']
+	] as Array<[string, string]>) {
+		plan.push(replace_once('package.json', anchor, '', label));
+	}
+
+	// the TS twin ejector (`npm run molt`) is template machinery, deleted on
+	// eject like molt's own crate — the script, its npm entry, and its check
+	// test (which verifies anchors that no longer match once molted)
+	plan.push(replace_once('package.json', PACKAGE_JSON_MOLT_SCRIPT, '', 'remove the molt script'));
+	plan.push({ kind: 'delete_file', path: 'src/lib/molt.ts' });
+	plan.push({ kind: 'delete_file', path: 'src/test/molt.test.ts' });
+
+	const homepage_replacement =
+		config.domain === null ? '' : `  "homepage": "https://${config.domain}/",\n`;
+	plan.push(replace_once('package.json', PACKAGE_JSON_HOMEPAGE, homepage_replacement, 'homepage'));
+	const repository_replacement =
+		config.repo_url === null ? '' : `  "repository": "${json_escape(config.repo_url)}",\n`;
+	plan.push(
+		replace_once('package.json', PACKAGE_JSON_REPOSITORY, repository_replacement, 'repository')
+	);
+
+	// custom domain
+	if (config.domain !== null) {
+		plan.push({
+			kind: 'replace_file',
+			path: 'static/CNAME',
+			anchors: [CNAME_CONTENT],
+			content: `${config.domain}\n`,
+			label: `custom domain → ${config.domain}`
+		});
+	} else {
+		plan.push({ kind: 'delete_file', path: 'static/CNAME' });
+	}
+
+	// root layout: title + template logo
+	plan.push(
+		replace_once('src/routes/+layout.svelte', LAYOUT_LOGO_IMPORT, '', 'remove template logo import')
+	);
+	plan.push(
+		replace_once(
+			'src/routes/+layout.svelte',
+			LAYOUT_SITE_STATE,
+			LAYOUT_SITE_STATE_REPLACEMENT,
+			'drop template icon'
+		)
+	);
+	// the project name, not the npm name — a scoped `@you/app` reads badly
+	// in a browser tab
+	plan.push(
+		replace_once(
+			'src/routes/+layout.svelte',
+			LAYOUT_TITLE,
+			`<title>${name}</title>`,
+			`title → ${name}`
+		)
+	);
+
+	// starter page + demo components
+	const docs_link = keeps(config, DOCS) ? PAGE_DOCS_LINK : '';
+	plan.push({
+		kind: 'replace_file',
+		path: 'src/routes/+page.svelte',
+		anchors: [PAGE_MREOWS_IMPORT, H1_FUZ_TEMPLATE],
+		content: render(templates.PAGE_SVELTE, [
+			['__NAME__', name],
+			['__DOCS_LINK__', docs_link]
+		]),
+		label: 'minimal starter page'
+	});
+	plan.push(
+		replace_once(
+			'src/routes/about/+page.svelte',
+			H1_FUZ_TEMPLATE,
+			`<h1 class="mt_xl2">${name}</h1>`,
+			`heading → ${name}`
+		)
+	);
+	plan.push({ kind: 'delete_file', path: 'src/lib/Mreows.svelte' });
+	plan.push({ kind: 'delete_file', path: 'src/lib/Positioned.svelte' });
+	// the API docs prerender a page per `src/lib/` module, so deleting the
+	// demo components would leave the docs build with no pages to render
+	if (keeps(config, DOCS)) {
+		plan.push({
+			kind: 'create_file',
+			path: 'src/lib/example.ts',
+			content: render(templates.EXAMPLE_TS, [['__NAME__', name]]),
+			label: 'starter module (the API docs need one)'
+		});
+	}
+
+	// docs system, and the svelte-docinfo tooling that exists only for it
+	if (!keeps(config, DOCS)) {
+		plan.push({ kind: 'delete_dir', path: 'src/routes/docs' });
+		plan.push({ kind: 'delete_file', path: 'src/routes/library.ts' });
+		plan.push({
+			kind: 'remove_line',
+			path: 'package.json',
+			prefix: PACKAGE_JSON_SVELTE_DOCINFO,
+			suffix: PACKAGE_JSON_SVELTE_DOCINFO_SUFFIX,
+			label: 'remove the svelte-docinfo devDependency'
+		});
+		plan.push(
+			replace_once('vite.config.ts', VITE_DOCINFO_IMPORT, '', 'remove the svelte-docinfo import')
+		);
+		plan.push(
+			replace_once('vite.config.ts', VITE_DOCINFO_PLUGIN, '', 'remove the svelte-docinfo plugin')
+		);
+		plan.push(
+			replace_once('src/app.d.ts', APP_D_TS_DOCINFO, '', 'remove the svelte-docinfo ambient types')
+		);
+	}
+
+	plan.push(
+		replace_once(
+			'.github/workflows/check.yml',
+			CI_BUILD_JOB_MOLT_COMMENT,
+			'',
+			"remove molt's note from the build job"
+		)
+	);
+};
+
+/**
  * Verifies every action's preconditions against the tree at `root`,
  * returning human-readable issues (empty = the plan is applicable).
  */
@@ -905,6 +1235,24 @@ export const verify = (root: string, plan: Array<Action>): Array<string> => {
 					if (count !== 1) {
 						issues.push(
 							`${action.path}: anchor matched ${count} times (expected exactly 1): ${JSON.stringify(action.anchor)}`
+						);
+					}
+				}
+				break;
+			}
+			case 'remove_line': {
+				const content = read(root, action.path);
+				if (content === null) {
+					issues.push(`${action.path}: file missing`);
+				} else {
+					const lines = lines_with_prefix(content, action.prefix);
+					if (lines.length !== 1) {
+						issues.push(
+							`${action.path}: line prefix matched ${lines.length} lines (expected exactly 1): ${JSON.stringify(action.prefix)}`
+						);
+					} else if (!content.slice(lines[0]!.start, lines[0]!.end).endsWith(action.suffix)) {
+						issues.push(
+							`${action.path}: the line starting with ${JSON.stringify(action.prefix)} doesn't end with ${JSON.stringify(action.suffix)}`
 						);
 					}
 				}
@@ -934,6 +1282,10 @@ export const verify = (root: string, plan: Array<Action>): Array<string> => {
 				}
 				break;
 			}
+			// a create target in the way is `conflicts`' job — its fix is
+			// moving the file aside, not restoring it
+			case 'create_file':
+				break;
 			case 'rename_dir': {
 				if (!is_dir(join(root, action.from))) {
 					issues.push(`${action.from}: expected a directory to rename`);
@@ -959,6 +1311,17 @@ export const verify = (root: string, plan: Array<Action>): Array<string> => {
 	}
 	return issues;
 };
+
+/**
+ * Lists the files the plan creates that already exist at `root`, kept apart
+ * from `verify`'s drift because the remedy differs.
+ */
+export const conflicts = (root: string, plan: Array<Action>): Array<string> =>
+	plan.flatMap((action) =>
+		action.kind === 'create_file' && existsSync(join(root, action.path))
+			? [`${action.path}: already exists, and molt creates it`]
+			: []
+	);
 
 const read = (root: string, path: string): string | null => {
 	try {
@@ -988,8 +1351,9 @@ const is_dir = (path: string): boolean => {
 /* apply — twin of `crates/molt/src/apply.rs` */
 
 /**
- * Applies a verified plan at `root`. Callers must run `verify` first —
- * apply assumes anchors match and targets exist.
+ * Applies a verified plan at `root`. Callers must run `verify` and
+ * `conflicts` first — apply assumes anchors match, targets exist, and
+ * nothing is in the way of created files.
  */
 export const apply = (root: string, plan: Array<Action>): void => {
 	for (const action of plan) {
@@ -1002,6 +1366,14 @@ export const apply = (root: string, plan: Array<Action>): void => {
 				writeFileSync(full, updated);
 				break;
 			}
+			case 'remove_line': {
+				const full = join(root, action.path);
+				const content = readFileSync(full, 'utf8');
+				const line = lines_with_prefix(content, action.prefix)[0];
+				const updated = line ? content.slice(0, line.start) + content.slice(line.end) : content;
+				writeFileSync(full, updated);
+				break;
+			}
 			case 'replace_all': {
 				const full = join(root, action.path);
 				const content = readFileSync(full, 'utf8');
@@ -1009,7 +1381,8 @@ export const apply = (root: string, plan: Array<Action>): void => {
 				writeFileSync(full, updated);
 				break;
 			}
-			case 'replace_file': {
+			case 'replace_file':
+			case 'create_file': {
 				writeFileSync(join(root, action.path), action.content);
 				break;
 			}
@@ -1031,16 +1404,27 @@ export const apply = (root: string, plan: Array<Action>): void => {
 
 /* check — twin of `crates/molt/src/check.rs` */
 
+/** What `check_all` found, split by remedy. */
+export interface CheckIssues {
+	/** Anchors or embedded templates the template drifted from. */
+	drift: Array<string>;
+	/** Template files in the way of files molt creates. */
+	conflicts: Array<string>;
+}
+
 /**
- * Verifies the plans for both sample configs, covering every anchor molt can
- * touch (each feature exercised kept in one config and stripped in the other),
+ * Verifies the plans for every sample config, covering every anchor molt can
+ * touch (each feature exercised both kept and stripped),
  * plus the embedded-template invariants that anchors alone can't see.
  */
-export const check_all = (root: string): Array<string> => {
+export const check_all = (root: string): CheckIssues => {
 	const templates = load_templates(root);
 	const issues: Array<string> = [];
+	const conflict_issues: Array<string> = [];
 	for (const config of sample_configs()) {
-		issues.push(...verify(root, build_plan(config, templates)));
+		const plan = build_plan(config, templates);
+		issues.push(...verify(root, plan));
+		conflict_issues.push(...conflicts(root, plan));
 	}
 	// the workspace template must stay byte-identical to the live root
 	// Cargo.toml apart from the members and license lines — otherwise an edit
@@ -1056,17 +1440,22 @@ export const check_all = (root: string): Array<string> => {
 			'Cargo.toml: drifted from crates/molt/templates/workspace_cargo.toml.in (only the members and license lines may differ)'
 		);
 	}
-	issues.sort();
-	return issues.filter((issue, i) => issue !== issues[i - 1]);
+	return { drift: sort_unique(issues), conflicts: sort_unique(conflict_issues) };
+};
+
+const sort_unique = (items: Array<string>): Array<string> => {
+	items.sort();
+	return items.filter((item, i) => item !== items[i - 1]);
 };
 
 /**
- * Two configs that together exercise every plan branch: one keeps every
+ * Three configs that together exercise every plan branch: one keeps every
  * registry feature (derived from `FEATURES`, so a new feature is covered
- * without touching this) and sets every optional value, one strips every
- * feature and clears the optional values.
+ * without touching this) and sets every optional value, one keeps only the
+ * `sveltekit` app and clears the optional values, and one keeps only the
+ * Rust workspace — a project needs one of the two, so no sample strips both.
  */
-export const sample_configs = (): [MoltConfig, MoltConfig] => [
+export const sample_configs = (): [MoltConfig, MoltConfig, MoltConfig] => [
 	{
 		name: 'sample_app',
 		npm_name: '@sample/sample_app',
@@ -1082,27 +1471,44 @@ export const sample_configs = (): [MoltConfig, MoltConfig] => [
 		description: '',
 		domain: null,
 		repo_url: null,
-		kept: new Set()
+		kept: new Set([SVELTEKIT])
+	},
+	{
+		name: 'rusty_app',
+		npm_name: 'rusty_app',
+		description: 'a Rust-only sample',
+		domain: null,
+		repo_url: 'https://github.com/sample/rusty_app',
+		kept: new Set([RUST, CLI, GITHUB_EXTRAS])
 	}
 ];
 
 /** Runs `molt check`: verifies every anchor and template invariant. */
 const check_run = (root: string): number => {
-	const issues = check_all(root);
-	if (issues.length === 0) {
+	const { drift, conflicts: conflict_issues } = check_all(root);
+	if (drift.length === 0 && conflict_issues.length === 0) {
 		console.log('molt check passed: all anchors and embedded templates match');
 		return 0;
 	}
-	console.error(
-		"molt check failed — the template drifted from molt's anchors or embedded templates:"
-	);
-	for (const issue of issues) {
-		console.error(`  ${issue}`);
+	if (drift.length > 0) {
+		console.error(
+			"molt check failed — the template drifted from molt's anchors or embedded templates:"
+		);
+		for (const issue of drift) {
+			console.error(`  ${issue}`);
+		}
+		console.error(
+			'(update the anchors in crates/molt/src/anchors.rs and src/lib/molt.ts, and the shared templates in crates/molt/templates/, in the same change)'
+		);
 	}
-	console.error(
-		'(update the anchors in src/lib/molt.ts — and the Rust twin in crates/molt — in the same change)'
-	);
-	// drift is caller-must-fix, same dialect as CliError kind 'drift'
+	if (conflict_issues.length > 0) {
+		console.error('molt check failed — template files are in the way of files molt creates:');
+		for (const issue of conflict_issues) {
+			console.error(`  ${issue}`);
+		}
+		console.error('(molt creates these on eject — remove or rename them in the template)');
+	}
+	// both are caller-must-fix, same dialect as CliError kind 'drift'
 	return 2;
 };
 
@@ -1118,24 +1524,34 @@ const get_rl = (): readline.Interface => {
 	return rl;
 };
 
+// TODO: two parity gaps with the Rust twin's line reads. Pasted type-ahead
+// is dropped — lines that arrive before a question is asked are consumed by
+// readline and lost — and Ctrl-D closes readline, so every remaining prompt
+// takes its default, where Rust takes the default for that one prompt and
+// keeps reading. Likely fix: a line queue fed by `rl.on('line')`, with the
+// prompts printed manually and EOF resolving only the pending question.
 /** Asks a question, resolving `null` on EOF (Ctrl-D) instead of hanging. */
 const question = (query: string): Promise<string | null> =>
 	new Promise((question_resolve) => {
 		const iface = get_rl();
 		let settled = false;
+		const on_close = (): void => {
+			if (!settled) question_resolve(null);
+		};
+		// detached once answered, so a long wizard never piles up listeners
+		iface.once('close', on_close);
 		iface.question(query).then(
 			(line) => {
 				settled = true;
+				iface.off('close', on_close);
 				question_resolve(line);
 			},
 			() => {
 				settled = true;
+				iface.off('close', on_close);
 				question_resolve(null);
 			}
 		);
-		iface.once('close', () => {
-			if (!settled) question_resolve(null);
-		});
 	});
 
 /** Prompts for a line; returns the resolved value and whether stdin hit EOF. */
@@ -1192,7 +1608,7 @@ const prompt_bool = async (label: string, default_value: boolean): Promise<boole
 
 /* cli — twin of `crates/molt/src/cli.rs` */
 
-interface TopLevel {
+export interface TopLevel {
 	name: string | null;
 	npm_name: string | null;
 	description: string | null;
@@ -1216,14 +1632,17 @@ Flags:
   --name <name>         project name (snake_case; used for crate names,
                         headings, and defaults)
   --npm-name <name>     npm package name (defaults to the project name; may
-                        be scoped like @you/name)
+                        be scoped like @you/name; needs the sveltekit
+                        feature)
   --description <text>  one-line project description
   --domain <domain>     custom domain written to static/CNAME (omit to
-                        delete CNAME and homepage)
+                        delete CNAME and homepage; needs the sveltekit
+                        feature)
   --repo <url>          repository url (defaults to the git origin remote
-                        when it isn't the template's)
+                        when it isn't the template's; required to keep
+                        docs, whose API pages link to source)
   --keep <ids>          features to keep, comma-separated or repeated
-                        (rust, cli, docs, github-extras)
+                        (sveltekit, rust, cli, docs, github-extras)
   --strip <ids>         features to strip, comma-separated or repeated
   --wetrun              apply the plan when non-interactive (without it,
                         non-interactive runs write nothing; a terminal
@@ -1241,7 +1660,7 @@ Subcommands:
  *
  * @throws `CliError` on unknown flags or a bad subcommand.
  */
-const parse_top_level = (args: Array<string>): TopLevel | null => {
+export const parse_top_level = (args: Array<string>): TopLevel | null => {
 	let parsed;
 	try {
 		parsed = parseArgs({
@@ -1382,8 +1801,7 @@ const molt = async (top: TopLevel, root: string): Promise<number> => {
 	const config = await resolve_config(top, root, is_interactive);
 	const templates = load_templates(root);
 	const plan = build_plan(config, templates);
-	const issues = verify(root, plan);
-	if (issues.length > 0) throw CliError.drift(issues);
+	ensure_applicable(root, plan);
 
 	console.log(`\nmolt plan (${plan.length} actions):`);
 	for (const action of plan) {
@@ -1428,15 +1846,35 @@ const molt = async (top: TopLevel, root: string): Promise<number> => {
 	if (gate === 'confirm' || gate === 'confirm_dirty') {
 		// the tree may have changed while the prompt waited — apply would
 		// silently skip an edit whose anchor disappeared, so verify again
-		const reverify_issues = verify(root, plan);
-		if (reverify_issues.length > 0) throw CliError.drift(reverify_issues);
+		ensure_applicable(root, plan);
 	}
 	apply(root, plan);
 	print_next_steps(config, clean);
 	return 0;
 };
 
-const resolve_config = async (
+/** Refuses a plan whose create targets are in the way or whose anchors drifted. */
+const ensure_applicable = (root: string, plan: Array<Action>): void => {
+	const conflict_issues = conflicts(root, plan);
+	if (conflict_issues.length > 0) {
+		throw CliError.precondition(
+			`these files are in the way of files molt creates:\n${conflict_issues.join('\n')}`,
+			'remove or rename the listed files, then rerun molt'
+		);
+	}
+	const issues = verify(root, plan);
+	if (issues.length > 0) throw CliError.drift(issues);
+};
+
+/** The refusal to strip both foundations, which would leave nothing to build. */
+export const FOUNDATION_NEEDED =
+	'stripping both sveltekit and rust leaves nothing to build — keep at least one';
+
+/** The non-interactive refusal to keep docs without a repository url. */
+export const DOCS_NEEDS_REPO =
+	'keeping docs needs a repository url (the API docs link to source) — pass --repo <url>, or --strip docs';
+
+export const resolve_config = async (
 	top: TopLevel,
 	root: string,
 	is_interactive: boolean
@@ -1451,16 +1889,6 @@ const resolve_config = async (
 		throw CliError.usage('--name is required when not running interactively');
 	}
 
-	let npm_name;
-	if (top.npm_name !== null) {
-		validate_npm_name(top.npm_name);
-		npm_name = top.npm_name;
-	} else if (is_interactive) {
-		npm_name = await prompt_validated('npm package name', name, validate_npm_name);
-	} else {
-		npm_name = name;
-	}
-
 	let description;
 	if (top.description !== null) {
 		description = top.description.trim();
@@ -1471,41 +1899,31 @@ const resolve_config = async (
 		description = '';
 	}
 
-	let domain: string | null;
-	if (top.domain !== null) {
-		domain = non_empty(top.domain);
-		if (domain !== null) validate_domain(domain);
-	} else if (is_interactive) {
-		domain = non_empty(
-			await prompt_validated(
-				'custom domain like example.com (optional; sets CNAME + homepage)',
-				'',
-				(value) => {
-					const trimmed = value.trim();
-					if (trimmed !== '') validate_domain(trimmed);
-				}
-			)
-		);
-	} else {
-		domain = null;
-	}
-
 	const origin = git_output(root, ['remote', 'get-url', 'origin']);
 	const derived_repo = origin === null ? null : normalize_remote_url(origin);
 	let repo_url: string | null;
 	if (top.repo !== null) {
-		repo_url = non_empty(top.repo);
+		repo_url = parse_optional_repo_url(top.repo);
 	} else if (is_interactive) {
-		repo_url = non_empty(await prompt('repository url (optional)', derived_repo));
+		repo_url = await prompt_repo_url(
+			'repository url (optional, but needed to keep docs)',
+			derived_repo,
+			false
+		);
 	} else {
 		repo_url = derived_repo;
 	}
 
 	const { kept, explicit } = resolve(top.keep, top.strip);
+	const sveltekit_flag = sveltekit_only_flag(top);
+	// a flag conflict, so refused before any prompt
+	if (explicit.has(SVELTEKIT) && !kept.has(SVELTEKIT) && sveltekit_flag !== null) {
+		throw sveltekit_only_flag_error(sveltekit_flag);
+	}
 	if (is_interactive) {
 		// registry order puts parents before dependents, so `requires` and
 		// `member_of` parents are already decided when a dependent comes up
-		for (const feature of FEATURES) {
+		for (const [position, feature] of FEATURES.entries()) {
 			if (explicit.has(feature.id)) continue;
 			if (feature.requires && !kept.has(feature.requires)) {
 				kept.delete(feature.id);
@@ -1513,6 +1931,11 @@ const resolve_config = async (
 			}
 			// a prompt whose answer explicit flags already force is skipped
 			// with a note instead of contradicting the flag after the fact
+			if (feature.id === SVELTEKIT && sveltekit_flag !== null) {
+				console.log(`note: keeping sveltekit — ${sveltekit_flag} needs it`);
+				kept.add(feature.id);
+				continue;
+			}
 			const child = FEATURES.find(
 				(f) => f.requires === feature.id && explicit.has(f.id) && kept.has(f.id)
 			);
@@ -1523,13 +1946,30 @@ const resolve_config = async (
 			}
 			// a parent whose members were all explicitly stripped can't be
 			// kept (e.g. cargo rejects a workspace with no member crates)
-			const members = members_of(feature.id);
-			if (members.length > 0 && members.every((m) => explicit.has(m.id) && !kept.has(m.id))) {
-				const member_ids = members.map((m) => m.id).join(', ');
+			if (members_force_strip(feature.id, kept, explicit)) {
+				const member_ids = members_of(feature.id)
+					.map((m) => m.id)
+					.join(', ');
 				console.log(
 					`note: --strip ${member_ids} leaves ${feature.id} without a required member — stripping it too`
 				);
 				kept.delete(feature.id);
+				continue;
+			}
+			// the last foundation left can't be declined — a project needs
+			// sveltekit or rust; flags that strip both are rejected below.
+			// another foundation is already out when it was decided stripped
+			// (by a flag or an earlier prompt) or flags strip its members
+			if (
+				FOUNDATIONS.includes(feature.id) &&
+				FOUNDATIONS.filter((id) => id !== feature.id).every((id) => {
+					const other = FEATURES.findIndex((f) => f.id === id);
+					const decided = explicit.has(id) || (other !== -1 && other < position);
+					return (decided && !kept.has(id)) || members_force_strip(id, kept, explicit);
+				})
+			) {
+				console.log(`note: keeping ${feature.id} — the project needs sveltekit or rust`);
+				kept.add(feature.id);
 				continue;
 			}
 			// the sole member of a kept parent rides with the parent's
@@ -1569,12 +2009,113 @@ const resolve_config = async (
 		const members = members_of(empty_parent)
 			.map((m) => m.id)
 			.join(', ');
+		// stripping the parent is no way out when it's the last foundation
+		const without_parent = new Set(kept);
+		without_parent.delete(empty_parent);
+		const remedy = has_foundation(without_parent)
+			? `keep one, or strip ${empty_parent} too`
+			: `keep one — ${empty_parent} is the last of sveltekit and rust kept`;
 		throw CliError.usage(
-			`keeping ${empty_parent} requires at least one of its member features (${members}) — keep one, or strip ${empty_parent} too`
+			`keeping ${empty_parent} requires at least one of its member features (${members}) — ${remedy}`
 		);
+	}
+	if (!has_foundation(kept)) throw CliError.usage(FOUNDATION_NEEDED);
+
+	// the API docs link each module to its source, and fuz_ui's `Library`
+	// refuses a package without a repository — a placeholder would ship
+	// broken links, so kept docs need a real repo url
+	if (kept.has(DOCS) && repo_url === null) {
+		if (!is_interactive) throw CliError.usage(DOCS_NEEDS_REPO);
+		if (explicit.has(DOCS)) {
+			repo_url = await prompt_repo_url(
+				'repository url (required by --keep docs — the API docs link to source)',
+				null,
+				true
+			);
+		} else {
+			repo_url = await prompt_repo_url(
+				'repository url (the API docs link to source; empty strips docs)',
+				null,
+				false
+			);
+			if (repo_url === null) {
+				console.log('note: no repository url — stripping docs (the API docs link to source)');
+				kept.delete(DOCS);
+				cascade(kept);
+			}
+		}
+	}
+
+	// the npm name and custom domain exist only in the SvelteKit app, so
+	// they're asked after the feature choices, and refused without the app
+	const sveltekit = kept.has(SVELTEKIT);
+	if (!sveltekit && sveltekit_flag !== null) throw sveltekit_only_flag_error(sveltekit_flag);
+	let npm_name;
+	if (!sveltekit) {
+		npm_name = name;
+	} else if (top.npm_name !== null) {
+		validate_npm_name(top.npm_name);
+		npm_name = top.npm_name;
+	} else if (is_interactive) {
+		npm_name = await prompt_validated('npm package name', name, validate_npm_name);
+	} else {
+		npm_name = name;
+	}
+
+	let domain: string | null;
+	if (!sveltekit) {
+		domain = null;
+	} else if (top.domain !== null) {
+		domain = non_empty(top.domain);
+		if (domain !== null) validate_domain(domain);
+	} else if (is_interactive) {
+		domain = non_empty(
+			await prompt_validated(
+				'custom domain like example.com (optional; sets CNAME + homepage)',
+				'',
+				(value) => {
+					const trimmed = value.trim();
+					if (trimmed !== '') validate_domain(trimmed);
+				}
+			)
+		);
+	} else {
+		domain = null;
 	}
 
 	return { name, npm_name, description, domain, repo_url, kept };
+};
+
+/**
+ * The first flag passed that only the `sveltekit` app uses, if any — an
+ * empty `--domain` means no domain, so it doesn't count.
+ */
+const sveltekit_only_flag = (top: TopLevel): string | null => {
+	if (top.npm_name !== null) return '--npm-name';
+	if (top.domain !== null && top.domain.trim() !== '') return '--domain';
+	return null;
+};
+
+const sveltekit_only_flag_error = (flag: string): CliError =>
+	CliError.usage(`${flag} applies only to the SvelteKit app — drop it, or keep sveltekit`);
+
+/**
+ * Prompts for a repository url, re-asking until the answer parses (and,
+ * when `required`, until there is one); an empty answer yields `null`.
+ */
+const prompt_repo_url = async (
+	label: string,
+	default_value: string | null,
+	required: boolean
+): Promise<string | null> => {
+	const answer = await prompt_validated(label, default_value, (value) => {
+		if (trim_url(value) !== '') {
+			parse_repo_url(value);
+		} else if (required) {
+			throw CliError.usage('a repository url is required to keep docs');
+		}
+	});
+	return parse_optional_repo_url(answer);
 };
 
 const non_empty = (value: string): string | null => {
@@ -1585,20 +2126,32 @@ const non_empty = (value: string): string | null => {
 const print_next_steps = (config: MoltConfig, clean: boolean): void => {
 	console.log(`\nmolt complete — the project is now ${config.name}. next steps:`);
 	console.log('  git status   # review what changed');
-	console.log('  npm i        # refresh package-lock.json for the new name');
-	console.log('  gro check    # typecheck, test, lint, format');
+	if (keeps(config, SVELTEKIT)) {
+		console.log('  npm i        # refresh package-lock.json for the new name');
+		console.log('  gro check    # typecheck, test, lint, format');
+	} else {
+		console.log(
+			"  rm -rf node_modules .svelte-kit .gro  # the npm toolchain's untracked leftovers, if present"
+		);
+	}
 	if (keeps(config, RUST)) {
-		console.log('  cargo check  # refresh Cargo.lock for your crate');
+		console.log(
+			"  cargo check  # refresh Cargo.lock for your crate (CI's cargo steps run --locked)"
+		);
 	}
 	console.log(`  git add -A && git commit -m "chore: molt fuz_template into ${config.name}"`);
 	if (clean) {
 		console.log('\nto undo the molt: git reset --hard && git clean -fd');
 	}
+	if (keeps(config, SVELTEKIT)) {
+		console.log(
+			"\nstatic/logo.svg and static/favicon.png still carry the template's spider — replace them when ready."
+		);
+	} else {
+		console.log();
+	}
 	console.log(
-		"\nstatic/logo.svg and static/favicon.png still carry the template's spider — replace them when ready."
-	);
-	console.log(
-		"molt deleted the template's MIT LICENSE and license fields — choose your own: https://choosealicense.com/"
+		"molt deleted the template's 0BSD LICENSE and license fields — choose your own: https://choosealicense.com/"
 	);
 	if (keeps(config, GITHUB_EXTRAS)) {
 		if (config.repo_url !== null) {

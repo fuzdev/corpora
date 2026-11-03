@@ -4,12 +4,7 @@ import type { HTMLAttributes } from 'svelte/elements';
 
 import type { Transition, TransitionParams, Without } from '$lib/utils/types.js';
 import type { DataProp } from '$lib/utils/dataProp.js';
-import {
-  hasAnyDataProp,
-  resolveDataProp,
-  resolveGeoDataPair,
-} from '$lib/utils/dataProp.js';
-import { chartDataArray } from '$lib/utils/common.js';
+import { hasAnyDataProp, resolveDataProp, resolveGeoDataPair } from '$lib/utils/dataProp.js';
 import {
   createMotion,
   createDataMotionMap,
@@ -19,7 +14,10 @@ import {
 import { fade } from 'svelte/transition';
 import { cubicIn } from 'svelte/easing';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { markLift, raiseItems } from '$lib/utils/isometric.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
 
@@ -47,6 +45,15 @@ export type GroupPropsWithoutHTML<In extends Transition = Transition> = {
   initialY?: number;
 
   /**
+   * Height to raise the group, and all it holds, off an `isometric` floor.  Unlike a mark's, not
+   * the chart's `z` unless given.
+   * - `number`: pixel height
+   * - `string`: data property name, resolved via zScale (data mode)
+   * - `function(d)`: accessor called per data item, result passed through zScale (data mode)
+   */
+  z?: DataProp;
+
+  /**
    * Data array to iterate over in data mode.
    * Falls back to chart context data when not provided.
    */
@@ -58,6 +65,12 @@ export type GroupPropsWithoutHTML<In extends Transition = Transition> = {
    * @default (d, i) => i
    */
   key?: (d: any, index: number) => any;
+
+  /**
+   * Series key to follow, fading the group while another series is highlighted and removing it
+   * while the series is hidden. Only applicable if `<Chart>` uses `series`.
+   */
+  seriesKey?: string;
 
   /** Center within chart. @default false */
   center?: boolean | 'x' | 'y';
@@ -104,21 +117,34 @@ const defaultKey = (_: any, i: number) => i;
 export class GroupState {
   #getProps: () => GroupProps = () => ({}) as GroupProps;
 
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: GroupProps = $derived(this.#getProps());
+
   chartCtx: ChartState = getChartContext();
+
+  markData = getMarkData();
   geo: GeoState = getGeoContext();
+  #layerIsometric = getLayerIsometric();
 
   // Data mode detection
-  dataMode = $derived(hasAnyDataProp(this.#getProps().x, this.#getProps().y));
+  dataMode = $derived(hasAnyDataProp(this.#props.x, this.#props.y));
 
-  #resolvedData: any[] = $derived(
-    this.dataMode ? (this.#getProps().data ?? chartDataArray(this.chartCtx.data)) : []
+  #resolvedData: any[] = $derived(this.dataMode ? this.markData(this.#props.data) : []);
+
+  /** The chart's `isometricLift` when the group is raised by its own `z`, else `null` */
+  #lift = $derived(
+    markLift(this.chartCtx, this.#layerIsometric, this.#props.z, this.dataMode, false)
   );
 
   resolvedItems = $derived.by(() => {
     if (!this.dataMode) return [];
-    const props = this.#getProps();
+    const props = this.#props;
     const keyFn = props.key ?? defaultKey;
-    return this.#resolvedData.map((d, i) => {
+    const items = this.#resolvedData.map((d, i) => {
       const key = keyFn(d, i);
       const resolved = this.#resolveGroup(d);
       const animated = this.#dataMotionMap?.get(key);
@@ -129,10 +155,21 @@ export class GroupState {
         y: animated?.y ?? resolved.y,
       };
     });
+
+    const m = this.#layerIsometric();
+    const lift = this.#lift;
+    if (!m || !lift) return items;
+    return raiseItems(
+      items,
+      ['x', 'y'],
+      m,
+      lift,
+      (item) => this.chartCtx.heightOf(item.d, props.z)[1]
+    );
   });
 
   #resolveGroup(d: any): { x: number; y: number } {
-    const props = this.#getProps();
+    const props = this.#props;
     if (this.geo.projection) {
       const [projX, projY] = resolveGeoDataPair(props.x, props.y, d, this.geo.projection);
       return { x: projX, y: projY };
@@ -145,35 +182,86 @@ export class GroupState {
 
   // Pixel-mode position (with center support)
   trueX = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     if (typeof props.x === 'number') return props.x;
     if (props.x == null && (props.center === 'x' || props.center === true))
       return this.chartCtx.width / 2;
     return 0;
   });
   trueY = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     if (typeof props.y === 'number') return props.y;
     if (props.y == null && (props.center === 'y' || props.center === true))
       return this.chartCtx.height / 2;
     return 0;
   });
 
+  /**
+   * The series this group follows, or `undefined` when `seriesKey` names none.
+   *
+   * Guarded on the prop rather than looking the key up unconditionally: every layout in the
+   * library is built out of `Group`, so an unset `seriesKey` must not subscribe them all to the
+   * series state.
+   */
+  series = $derived.by(() => {
+    const seriesKey = this.#props.seriesKey;
+    if (seriesKey == null) return undefined;
+    return this.chartCtx.series.series.find((s) => s.key === seriesKey);
+  });
+
+  /**
+   * Whether the legend has this group's series hidden — the marks of a hidden series aren't
+   * drawn, so whatever this group holds for it shouldn't be either.
+   *
+   * A `seriesKey` naming no series leaves the group alone: nothing on the chart claims it, so
+   * there's no state to follow.
+   */
+  hidden = $derived(this.series != null && !this.chartCtx.series.isVisible(this.series.key));
+
+  /** Faded while another series is highlighted, matching what the marks of this series do */
+  seriesOpacity = $derived.by(() => {
+    if (
+      this.series?.key == null ||
+      this.chartCtx.series.visibleSeries.length <= 1 ||
+      this.chartCtx.series.isHighlighted(this.series.key, true)
+    ) {
+      return 1;
+    }
+    return 0.1;
+  });
+
+  /**
+   * The `opacity` to render with, dimmed by the series' state. Stays `undefined` when neither
+   * the prop nor the series asks for one, so the attribute stays off the element.
+   */
+  opacity = $derived.by(() => {
+    const opacity = this.#props.opacity;
+    if (this.seriesOpacity === 1) return opacity;
+    return (opacity ?? 1) * this.seriesOpacity;
+  });
+
   #dataMotionMap: ReturnType<typeof createDataMotionMap> = null;
   #motionX!: ReturnType<typeof createMotion<number | undefined>>;
   #motionY!: ReturnType<typeof createMotion<number | undefined>>;
 
+  /** Pixel mode: `position` raised by `z` on an `isometric` floor */
+  #raise(position: number | undefined, axis: 'x' | 'y') {
+    const z = this.#props.z;
+    if (!this.#lift || typeof z !== 'number') return position;
+    return (position ?? 0) + this.#lift[axis] * z;
+  }
+
   get motionX() {
-    return this.#motionX.current;
+    return this.#raise(this.#motionX.current, 'x');
   }
   get motionY() {
-    return this.#motionY.current;
+    return this.#raise(this.#motionY.current, 'y');
   }
 
   // Transform string for SVG/HTML pixel mode
   transform = $derived.by(() => {
-    const props = this.#getProps();
-    if (props.center || props.x != null || props.y != null) {
+    const props = this.#props;
+    if (props.center || props.x != null || props.y != null || this.#lift) {
       return `translate(${this.motionX}px, ${this.motionY}px)`;
     }
     return undefined;
@@ -181,7 +269,7 @@ export class GroupState {
 
   // Default transition (fade when motion is tweened)
   defaultTransitionIn = $derived(
-    extractTweenConfig(this.#getProps().motion)?.options ? fade : () => ({})
+    extractTweenConfig(this.#props.motion)?.options ? fade : () => ({})
   );
   defaultTransitionInParams = { easing: cubicIn };
 
@@ -200,7 +288,7 @@ export class GroupState {
       const motionMap = this.#dataMotionMap;
       $effect(() => {
         if (!this.dataMode) return;
-        const props = getProps();
+        const props = this.#props;
         const keyFn = props.key ?? defaultKey;
         const activeKeys = new Set<any>();
         for (let i = 0; i < this.#resolvedData.length; i++) {

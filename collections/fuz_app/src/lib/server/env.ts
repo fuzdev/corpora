@@ -10,18 +10,24 @@
  */
 
 import { z } from 'zod';
-import { to_error_message } from '@fuzdev/fuz_util/error.ts';
+import type { Result } from '@fuzdev/fuz_util/result.ts';
 
-import { create_validated_keyring, type Keyring } from '../auth/keyring.ts';
-import { parse_allowed_origins } from '../http/origin.ts';
+import { create_keyring, type Keyring } from '../auth/keyring.ts';
+import { format_allowed_origins_error, parse_allowed_origins } from '../http/origin.ts';
+import { admit_origin_wildcards } from '../http/origin_wildcard.ts';
+import { DB_CHECKOUT_TIMEOUT_MAX_MS } from '../db/db_pg.ts';
 
 /**
  * Base Zod schema for server environment variables.
  *
- * Provides the common fields used by fuz apps:
- * server config, database, auth, security, public URLs, and SMTP.
- *
- * Apps can use directly or extend with app-specific fields via `.extend()`.
+ * Declares only what the spine reads — server config, database and its pool
+ * checkout bounds, cookie keys, allowed origins and the wildcard opt-in, and
+ * the bootstrap token path — matching the Rust spine's `BaseServerEnv`. The
+ * numeric vars parse as loosely as `PORT` (`z.coerce`, so `5e3` reads as 5000
+ * where the Rust twin refuses it); a blank or out-of-range value is refused on
+ * both. Anything else (fact storage,
+ * X-Accel delivery, public URLs) is the app's own var: extend with
+ * app-specific fields via `.extend()`.
  */
 export const BaseServerEnv = z.strictObject({
 	NODE_ENV: z.enum(['development', 'production']).meta({ description: 'Runtime environment mode' }),
@@ -44,96 +50,100 @@ export const BaseServerEnv = z.strictObject({
 	FUZ_ALLOWED_ORIGINS: z.string().min(1, 'FUZ_ALLOWED_ORIGINS is required').meta({
 		description: 'Comma-separated origin patterns for API verification'
 	}),
-	PUBLIC_FUZ_API_URL: z.string().default('/api').meta({ description: 'Public API base URL' }),
-	PUBLIC_FUZ_WEBSOCKET_URL: z.string().optional().meta({ description: 'Public WebSocket URL' }),
-	PUBLIC_FUZ_CONTACT_EMAIL: z
-		.union([z.email(), z.literal('')])
-		.optional()
-		.meta({ description: 'Public contact email address' }),
+	FUZ_ALLOW_ORIGIN_WILDCARDS: z.enum(['true', 'false']).optional().meta({
+		description:
+			'Exactly `true` lets a wildcard FUZ_ALLOWED_ORIGINS entry (`:*`, a `*` label) boot, warned of on every boot; unset or `false` refuses one'
+	}),
 	FUZ_BOOTSTRAP_TOKEN_PATH: z
 		.string()
 		.optional()
 		.meta({ description: 'Path to one-shot admin bootstrap token', sensitivity: 'secret' }),
-	SMTP_HOST: z.string().optional().meta({ description: 'SMTP server hostname' }),
-	// SMTP usernames are frequently not emails (SendGrid uses "apikey",
-	// AWS SES / Postmark use token-style credentials), so validate as a plain
-	// string — `z.email()` here would reject valid provider configs. Marked
-	// `secret`: those token-style usernames are credentials (Postmark reuses
-	// the server token as both user and password), so the value is masked in
-	// the startup summary / logs like `SMTP_PASSWORD`.
-	SMTP_USER: z
-		.string()
+	FUZ_DB_CHECKOUT_TIMEOUT_MS: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.max(DB_CHECKOUT_TIMEOUT_MAX_MS)
 		.optional()
-		.meta({ description: 'SMTP authentication username', sensitivity: 'secret' }),
-	SMTP_PASSWORD: z
-		.string()
+		.meta({
+			description:
+				'Bound on the pool checkouts a request makes, in ms (default 5000); a failed checkout answers 503. Audit writes use FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS instead, including the failed-login row a request waits on. Postgres only — PGlite and pglet have no pool'
+		}),
+	FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.max(DB_CHECKOUT_TIMEOUT_MAX_MS)
 		.optional()
-		.meta({ description: 'SMTP authentication password', sensitivity: 'secret' }),
-	FUZ_FACTS_DIR: z.string().min(1).default('./.facts').meta({
-		description: 'Directory for referenced (large) fact bytes, sharded <shard>/<rest>'
-	}),
-	FUZ_FACTS_X_ACCEL_REDIRECT_PREFIX: z.string().optional().meta({
-		description: 'Internal nginx prefix for X-Accel-Redirect fact delivery (production only)'
-	})
+		.meta({
+			description:
+				'Bound on the checkout behind each audit pool write, in ms (default 30000); a failed login waits on its row, so up to this bound. Postgres only'
+		})
 });
 export type BaseServerEnv = z.infer<typeof BaseServerEnv>;
 
 /**
  * Validated server env config — the artifacts `create_app_server()` needs.
  */
-export interface ServerEnvOptions {
-	ok: true;
+export interface ValidatedServerEnv {
 	keyring: Keyring;
 	allowed_origins: Array<RegExp>;
+	/**
+	 * `FUZ_ALLOW_ORIGIN_WILDCARDS=true` — pass to `create_app_server`'s
+	 * `allow_origin_wildcards`, which refuses a wildcard entry without it.
+	 */
+	allow_origin_wildcards: boolean;
 	bootstrap_token_path: string | null;
 }
 
 /**
  * Error from `validate_server_env` — keyring or origin validation failed.
  */
-export interface ServerEnvOptionsError {
-	ok: false;
+export interface ServerEnvValidationError {
 	field: 'SECRET_FUZ_COOKIE_KEYS' | 'FUZ_ALLOWED_ORIGINS';
 	errors: Array<string>;
 }
 
-export type ServerEnvOptionsResult = ServerEnvOptions | ServerEnvOptionsError;
-
 /**
  * Validate a loaded `BaseServerEnv` and produce the artifacts needed for server init.
  *
- * Handles keyring validation, origin parsing, and bootstrap token path extraction.
+ * Handles keyring validation, origin parsing (every refused allowlist entry is
+ * reported, each on its own line), the wildcard opt-in (a wildcard entry
+ * without `FUZ_ALLOW_ORIGIN_WILDCARDS=true` is refused with
+ * `admit_origin_wildcards`' text, as `create_app_server` would), and
+ * bootstrap token path extraction.
  * Returns a Result so callers handle errors their own way (exit, logging, etc).
  *
  * @param env - a loaded and Zod-validated `BaseServerEnv`
- * @returns `{ok: true, keyring, allowed_origins, bootstrap_token_path}` or `{ok: false, field, errors}`
+ * @returns `{ok: true, keyring, allowed_origins, allow_origin_wildcards, bootstrap_token_path}`
+ *   or `{ok: false, field, errors}`
  */
-export const validate_server_env = (env: BaseServerEnv): ServerEnvOptionsResult => {
-	const keyring_result = create_validated_keyring(env.SECRET_FUZ_COOKIE_KEYS);
+export const validate_server_env = (
+	env: BaseServerEnv
+): Result<ValidatedServerEnv, ServerEnvValidationError> => {
+	const keyring_result = create_keyring(env.SECRET_FUZ_COOKIE_KEYS);
 	if (!keyring_result.ok) {
 		return { ok: false, field: 'SECRET_FUZ_COOKIE_KEYS', errors: keyring_result.errors };
 	}
-	let allowed_origins: Array<RegExp>;
-	try {
-		allowed_origins = parse_allowed_origins(env.FUZ_ALLOWED_ORIGINS);
-	} catch (err) {
+	const origins_result = parse_allowed_origins(env.FUZ_ALLOWED_ORIGINS);
+	if (!origins_result.ok) {
 		return {
 			ok: false,
 			field: 'FUZ_ALLOWED_ORIGINS',
-			errors: [to_error_message(err, 'Invalid FUZ_ALLOWED_ORIGINS')]
+			errors: origins_result.errors.map(format_allowed_origins_error)
 		};
 	}
-	if (allowed_origins.length === 0) {
-		return {
-			ok: false,
-			field: 'FUZ_ALLOWED_ORIGINS',
-			errors: ['FUZ_ALLOWED_ORIGINS contains no valid patterns']
-		};
+	// refused here too, so an env-driven server fails before its backend
+	// touches the DB (`create_app_server` repeats the check for direct callers)
+	const allow_origin_wildcards = env.FUZ_ALLOW_ORIGIN_WILDCARDS === 'true';
+	const wildcards = admit_origin_wildcards(origins_result.origins, allow_origin_wildcards);
+	if (!wildcards.ok) {
+		return { ok: false, field: 'FUZ_ALLOWED_ORIGINS', errors: [wildcards.message] };
 	}
 	return {
 		ok: true,
 		keyring: keyring_result.keyring,
-		allowed_origins,
+		allowed_origins: origins_result.origins,
+		allow_origin_wildcards,
 		bootstrap_token_path: env.FUZ_BOOTSTRAP_TOKEN_PATH ?? null
 	};
 };

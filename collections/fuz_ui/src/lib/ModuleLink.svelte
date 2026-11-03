@@ -34,7 +34,7 @@
 	// the site-local path if `homepage_url` is unavailable.
 	const url_api = $derived((full && module?.url_api_full) || module?.url_api);
 
-	const color_class = $derived(module_path.endsWith('.svelte') ? 'color_h' : '');
+	const color_class = $derived(module_path.endsWith('.svelte') ? 'palette_h' : '');
 
 	const contextmenu_entries = $derived(module ? create_module_contextmenu(module) : undefined);
 </script>

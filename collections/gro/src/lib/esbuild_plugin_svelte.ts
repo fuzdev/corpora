@@ -8,9 +8,9 @@ import {
 	type PreprocessorGroup
 } from 'svelte/compiler';
 import { readFile } from 'node:fs/promises';
-import { relative } from 'node:path';
+import { dirname, relative } from 'node:path';
 
-import { to_define_import_meta_env, default_ts_transform_options } from './esbuild_helpers.ts';
+import { to_define_import_meta_env, TS_TRANSFORM_OPTIONS_DEFAULT } from './esbuild_helpers.ts';
 import {
 	SVELTE_COMPILE_OPTIONS_DEFAULT,
 	to_default_compile_module_options,
@@ -31,8 +31,6 @@ export interface EsbuildPluginSvelteOptions {
 	svelte_compile_options?: CompileOptions;
 	svelte_compile_module_options?: ModuleCompileOptions;
 	svelte_preprocessors?: PreprocessorGroup | Array<PreprocessorGroup>;
-	ts_transform_options?: esbuild.TransformOptions;
-	is_ts?: (filename: string) => boolean;
 }
 
 export const esbuild_plugin_svelte = (options: EsbuildPluginSvelteOptions): esbuild.Plugin => {
@@ -42,14 +40,12 @@ export const esbuild_plugin_svelte = (options: EsbuildPluginSvelteOptions): esbu
 		dir = process.cwd(),
 		svelte_compile_options = SVELTE_COMPILE_OPTIONS_DEFAULT,
 		svelte_compile_module_options = to_default_compile_module_options(svelte_compile_options),
-		svelte_preprocessors,
-		ts_transform_options = default_ts_transform_options,
-		is_ts = (f) => TS_MATCHER.test(f)
+		svelte_preprocessors
 	} = options;
 
-	const final_ts_transform_options: esbuild.TransformOptions = {
-		...ts_transform_options,
-		define: to_define_import_meta_env(dev, base_url),
+	const ts_transform_options: esbuild.TransformOptions = {
+		...TS_TRANSFORM_OPTIONS_DEFAULT,
+		define: to_define_import_meta_env({ dev, base_url }),
 		sourcemap: 'inline'
 	};
 
@@ -60,10 +56,10 @@ export const esbuild_plugin_svelte = (options: EsbuildPluginSvelteOptions): esbu
 				const source = await readFile(path, 'utf8');
 				try {
 					const filename = relative(dir, path);
-					const js_source = is_ts(filename)
+					const js_source = TS_MATCHER.test(filename)
 						? (
 								await esbuild.transform(source, {
-									...final_ts_transform_options,
+									...ts_transform_options,
 									sourcefile: filename
 								})
 							).code // TODO @many use warnings? handle not-inline sourcemaps?
@@ -75,6 +71,8 @@ export const esbuild_plugin_svelte = (options: EsbuildPluginSvelteOptions): esbu
 					const contents = js.code + '//# sourceMappingURL=' + js.map.toUrl();
 					return {
 						contents,
+						// the local-imports plugin's namespaces have no default, so imports need it set
+						resolveDir: dirname(path),
 						warnings: warnings.map((w) => convert_svelte_message_to_esbuild(filename, source, w))
 					};
 				} catch (error) {
@@ -94,6 +92,8 @@ export const esbuild_plugin_svelte = (options: EsbuildPluginSvelteOptions): esbu
 					const contents = js.code + '//# sourceMappingURL=' + js.map.toUrl();
 					return {
 						contents,
+						// same as the runes branch, harmless in the file namespace
+						resolveDir: dirname(path),
 						warnings: warnings.map((w) => convert_svelte_message_to_esbuild(filename, source, w))
 					};
 				} catch (error) {

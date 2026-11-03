@@ -7,7 +7,7 @@ import {
 	ContextmenuState,
 	contextmenu_attachment,
 	contextmenu_open
-} from '$lib/contextmenu_state.svelte.ts';
+} from '#lib/contextmenu_state.svelte.ts';
 
 describe('contextmenu_open DOM querying', () => {
 	let contextmenu: ContextmenuState;

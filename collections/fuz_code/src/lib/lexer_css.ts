@@ -1,4 +1,6 @@
 import {
+	is_digit,
+	is_hex_digit,
 	is_space,
 	matches_ci,
 	skip_quoted,
@@ -9,11 +11,12 @@ import {
 } from './lexer.ts';
 
 /**
- * Hand-written CSS lexer.
+ * CSS lexer.
  *
  * Emits: `comment`, `atrule` (a container wrapping `rule` + prelude), `rule`,
  * `selector`, `string`, `property`, `important`, `function`, `url` (a
- * container), `keyword` (`and`/`not`/`only`/`or` inside at-rule preludes), and
+ * container), `keyword` (`and`/`not`/`only`/`or` inside at-rule preludes),
+ * `number` (with its unit), `color` (`#hex`, aliased to `number`), and
  * `punctuation`.
  *
  * Structure is decided by a brace-context lookahead: from each item, the first
@@ -23,9 +26,12 @@ import {
  * flat main loop nests to any depth, so native CSS nesting works for free.
  *
  * Values (declaration right-hand sides and at-rule preludes) are tokenized
- * sparsely: only strings, `url()`, functions, `!important`, and
- * `property`-before-colon are tokenized; numbers, colors, units, and bare
- * identifiers stay plain text.
+ * sparsely: strings, `url()`, functions, `!important`, `property`-before-colon,
+ * numbers with their unit (`20rem`, `-.5em`, `50%`), and `#hex` colors. A
+ * value region is known before it's lexed, so a number or `#hex` there can't be
+ * a selector part. Bare identifiers (`auto`, `white`, `contents`) stay plain
+ * text: telling CSS keywords from custom names would take a word list that
+ * drifts as CSS grows.
  *
  * Resilience: unterminated strings extend to end of line; unterminated
  * comments and blocks extend to end of window.
@@ -45,6 +51,8 @@ const T_FUNCTION = token_type('function');
 const T_PUNCTUATION = token_type('punctuation');
 const T_URL = token_type('url');
 const T_KEYWORD = token_type('keyword');
+const T_NUMBER = token_type('number');
+const T_COLOR = token_type('color', 'number');
 
 // at-rule prelude keywords (`@media screen and (...)`), matched
 // case-insensitively without allocating (matching the rest of this file)
@@ -88,12 +96,20 @@ const scan_css_comment = (text: string, i: number, end: number): number => {
  * comments, and balanced `()`/`[]`. Returns its index, or `end` when none is
  * found. This is the selector-vs-declaration discriminator.
  */
+// the chars `scan_to_terminator` acts on: " ' / ( ) [ ] { ; }
+const TERMINATOR_SCAN = new Uint8Array(128);
+for (const c of `"'/()[]{;}`) TERMINATOR_SCAN[c.charCodeAt(0)] = 1;
+
 const scan_to_terminator = (text: string, i: number, end: number): number => {
 	let paren = 0;
 	let bracket = 0;
 	let j = i;
 	while (j < end) {
 		const c = text.charCodeAt(j);
+		if (c > 127 || TERMINATOR_SCAN[c] === 0) {
+			j++;
+			continue;
+		}
 		if (c === 34 || c === 39) {
 			j = skip_quoted(text, j, end, c);
 		} else if (c === 47 && text.charCodeAt(j + 1) === 42) {
@@ -120,10 +136,80 @@ const scan_to_terminator = (text: string, i: number, end: number): number => {
 };
 
 /**
+ * Returns the exclusive end of the number starting at `i` — an optional sign,
+ * digits with an optional fraction and exponent, then a unit (`px`, `%`) — or
+ * `-1` when no number starts there. A unit is any identifier run, as in CSS's
+ * own dimension token.
+ */
+const scan_css_number = (text: string, i: number, to: number): number => {
+	let j = i;
+	let c = text.charCodeAt(j);
+	if (c === 43 || c === 45) c = text.charCodeAt(++j);
+	let digits = false;
+	while (j < to && is_digit(c)) {
+		digits = true;
+		c = text.charCodeAt(++j);
+	}
+	if (c === 46 && j + 1 < to && is_digit(text.charCodeAt(j + 1))) {
+		j++;
+		while (j < to && is_digit(text.charCodeAt(j))) j++;
+		digits = true;
+		c = text.charCodeAt(j);
+	}
+	if (!digits) return -1;
+	// exponent only when digits follow, so `1em` keeps its unit
+	if (c === 101 || c === 69) {
+		let k = j + 1;
+		const s = text.charCodeAt(k);
+		if (s === 43 || s === 45) k++;
+		if (k < to && is_digit(text.charCodeAt(k))) {
+			j = k + 1;
+			while (j < to && is_digit(text.charCodeAt(j))) j++;
+			c = text.charCodeAt(j);
+		}
+	}
+	if (j < to && c === 37) return j + 1;
+	if (j < to && is_css_ident_start(c)) {
+		j++;
+		while (j < to && is_css_ident(text.charCodeAt(j))) j++;
+	}
+	return j;
+};
+
+/**
+ * Returns the exclusive end of the `#hex` color at `i` (3, 4, 6, or 8 hex
+ * digits, then no identifier char), or `-1` when it isn't one.
+ */
+const scan_css_hex_color = (text: string, i: number, to: number): number => {
+	let j = i + 1;
+	while (j < to && is_hex_digit(text.charCodeAt(j))) j++;
+	const len = j - i - 1;
+	if (len !== 3 && len !== 4 && len !== 6 && len !== 8) return -1;
+	if (j < to && is_css_ident(text.charCodeAt(j))) return -1;
+	return j;
+};
+
+/**
+ * Emits the number or `#hex` color starting at `i` (whose char is `c`) and
+ * returns its end, or returns `-1` when neither starts there.
+ */
+const lex_css_numeric = (l: Lexer, i: number, to: number, c: number): number => {
+	if (c === 35) {
+		const end = scan_css_hex_color(l.text, i, to);
+		if (end !== -1) l.leaf(T_COLOR, i, end);
+		return end;
+	}
+	if (!is_digit(c) && c !== 46 && c !== 43 && c !== 45) return -1;
+	const end = scan_css_number(l.text, i, to);
+	if (end !== -1) l.leaf(T_NUMBER, i, end);
+	return end;
+};
+
+/**
  * Tokenizes a `[from, to)` value region — a declaration right-hand side or an
  * at-rule prelude interior. Emits strings, `url()`, functions, `!important`,
- * `property`-before-colon, punctuation, and (when `is_atrule`)
- * `and`/`not`/`only`/`or` keywords; everything else is plain text.
+ * `property`-before-colon, numbers, `#hex` colors, punctuation, and (when
+ * `is_atrule`) `and`/`not`/`only`/`or` keywords; everything else is plain text.
  */
 const lex_css_value = (l: Lexer, from: number, to: number, is_atrule: boolean): void => {
 	const { text } = l;
@@ -162,6 +248,14 @@ const lex_css_value = (l: Lexer, from: number, to: number, is_atrule: boolean): 
 			continue;
 		}
 		if (is_css_ident_start(c)) {
+			// a `-` starts both an identifier (`--x`) and a number (`-2px`)
+			if (c === 45) {
+				const num_end = lex_css_numeric(l, i, to, c);
+				if (num_end !== -1) {
+					i = num_end;
+					continue;
+				}
+			}
 			let ident_end = i + 1;
 			while (ident_end < to && is_css_ident(text.charCodeAt(ident_end))) ident_end++;
 			// `url(...)` — a container, not a plain function call
@@ -194,7 +288,12 @@ const lex_css_value = (l: Lexer, from: number, to: number, is_atrule: boolean): 
 			i++;
 			continue;
 		}
-		i++; // numbers, `#hex`, `%`, `.`, `-` before digits, … stay plain
+		const num_end = lex_css_numeric(l, i, to, c);
+		if (num_end !== -1) {
+			i = num_end;
+			continue;
+		}
+		i++; // operators, a `#` that isn't a color, … stay plain
 	}
 };
 

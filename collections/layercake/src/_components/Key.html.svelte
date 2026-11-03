@@ -1,43 +1,45 @@
 <!--
 	@component
-	Creates a key for ordinal scales on `zScale`.
+	Generates an HTML key for an ordinal `c` scale, with one chip and label per domain value.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
+
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {string} [shape='square'] - The shape for each item. Can be 'circle', 'line', or 'square';
-	 * @property {string} [align='start'] - Sets the CSS flexbox justify-content setting for the box as a whole. Can be 'start', 'center' or 'end'.
-	 * @property {Function|Object} [lookup] - Either a function that takes the value and returns a formatted string, or an object of values. If a given value is not present in a lookup object, it returns the original value.
-	 * @property {boolean} [capitalize=true] - Capitalize the first character.
+	 * @property {'circle'|'line'|'square'} [shape='square'] - The shape of each chip.
+	 * @property {'start'|'center'|'end'} [align='start'] - Where the key sits in its box, as flexbox `justify-content`.
+	 * @property {((d: any) => string)|Record<string, string>} [lookup] - Either a function that formats a value, or an object mapping values to labels. A value missing from the object is shown as is.
+	 * @property {boolean} [capitalize=true] - Capitalize the first character of each label.
 	 */
 
 	/** @type {Props} */
 	let { shape = 'square', align = 'start', lookup, capitalize = true } = $props();
 
-	const { zDomain, zScale } = getContext('LayerCake');
-
-	function cap(val) {
+	/** @param {any} val */
+	function capitalizeFirst(val) {
 		return String(val).replace(/^\w/, d => d.toUpperCase());
 	}
 
+	/** @param {any} val */
 	function displayName(val) {
 		if (lookup) {
 			return typeof lookup === 'function' ? lookup(val) : lookup[val] || val;
 		}
-		return capitalize === true ? cap(val) : val;
+		return capitalize === true ? capitalizeFirst(val) : val;
 	}
 </script>
 
 <div class="key" style="justify-content: {align === 'end' ? 'flex-end' : align};">
-	{#each $zDomain as item}
+	{#each k.cDomain as item}
 		<div class="key-item">
 			<div
 				class="chip chip__{shape}"
 				style="background: {shape === `line`
-					? `linear-gradient(-45deg, #ffffff 40%, ${$zScale(item)} 41%, ${$zScale(item)} 59%, #ffffff 60%)`
-					: $zScale(item)};"
+					? `linear-gradient(-45deg, #ffffff 40%, ${k.cScale?.(item) ?? '#ccc'} 41%, ${k.cScale?.(item) ?? '#ccc'} 59%, #ffffff 60%)`
+					: (k.cScale?.(item) ?? '#ccc')};"
 			></div>
 			<div class="name">{displayName(item)}</div>
 		</div>

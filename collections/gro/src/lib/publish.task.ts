@@ -1,5 +1,6 @@
 import { spawn } from '@fuzdev/fuz_util/process.ts';
-import { z } from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 import { styleText as st } from 'node:util';
 import { fs_exists } from '@fuzdev/fuz_util/fs.ts';
 import {
@@ -15,53 +16,56 @@ import { TaskError, type Task } from './task.ts';
 import { install_with_cache_healing_or_throw } from './npm_install_helpers.ts';
 import { package_json_load, package_json_parse_repo_url } from './package_json.ts';
 import { find_cli, spawn_cli } from './cli.ts';
-import { has_sveltekit_library } from './sveltekit_helpers.ts';
+import { has_sveltekit_library, sveltekit_sync } from './sveltekit_helpers.ts';
 import { update_changelog } from './changelog.ts';
 import { load_from_env } from './env.ts';
 import { CHANGESET_CLI } from './changeset_helpers.ts';
 
 /** @nodocs */
-export const Args = z.strictObject({
-	branch: GitBranch.meta({ description: 'branch to publish from' }).default('main'),
-	origin: GitOrigin.meta({ description: 'git origin to publish from' }).default('origin'),
-	changelog: z
-		.string()
-		.meta({ description: 'file name and path of the changelog' })
-		.default('CHANGELOG.md'),
-	preserve_changelog: z
-		.boolean()
-		.meta({
+export const Args = s.object({
+	branch: s.with_default(meta(GitBranch, { description: 'branch to publish from' }), 'main'),
+	origin: s.with_default(meta(GitOrigin, { description: 'git origin to publish from' }), 'origin'),
+	changelog: s.with_default(
+		meta(s.string, { description: 'file name and path of the changelog' }),
+		'CHANGELOG.md'
+	),
+	preserve_changelog: s.with_default(
+		meta(s.boolean, {
 			description:
 				'opt out of linkifying and formatting the changelog from @changesets/changelog-git'
-		})
-		.default(false),
-	optional: z
-		.boolean()
-		.meta({ description: 'exit gracefully if there are no changesets' })
-		.default(false),
-	dry: z
-		.boolean()
-		.meta({ description: 'build and prepare to publish without actually publishing' })
-		.default(false),
-	check: z.boolean().meta({ description: 'dual of no-check' }).default(true),
-	'no-check': z
-		.boolean()
-		.meta({ description: 'opt out of checking before publishing' })
-		.default(false),
-	build: z.boolean().meta({ description: 'dual of no-build' }).default(true),
-	'no-build': z.boolean().meta({ description: 'opt out of building' }).default(false),
-	pull: z.boolean().meta({ description: 'dual of no-pull' }).default(true),
-	'no-pull': z.boolean().meta({ description: 'opt out of git pull' }).default(false),
-	sync: z.boolean().meta({ description: 'dual of no-sync' }).default(true),
-	'no-sync': z.boolean().meta({ description: 'opt out of gro sync' }).default(false),
-	install: z.boolean().meta({ description: 'dual of no-install' }).default(true),
-	'no-install': z
-		.boolean()
-		.meta({ description: 'opt out of installing packages before publishing' })
-		.default(false),
-	changeset_cli: z.string().meta({ description: 'the changeset CLI to use' }).default(CHANGESET_CLI)
+		}),
+		false
+	),
+	optional: s.with_default(
+		meta(s.boolean, { description: 'exit gracefully if there are no changesets' }),
+		false
+	),
+	dry: s.with_default(
+		meta(s.boolean, { description: 'build and prepare to publish without actually publishing' }),
+		false
+	),
+	check: s.with_default(meta(s.boolean, { description: 'dual of no-check' }), true),
+	'no-check': s.with_default(
+		meta(s.boolean, { description: 'opt out of checking before publishing' }),
+		false
+	),
+	build: s.with_default(meta(s.boolean, { description: 'dual of no-build' }), true),
+	'no-build': s.with_default(meta(s.boolean, { description: 'opt out of building' }), false),
+	pull: s.with_default(meta(s.boolean, { description: 'dual of no-pull' }), true),
+	'no-pull': s.with_default(meta(s.boolean, { description: 'opt out of git pull' }), false),
+	sync: s.with_default(meta(s.boolean, { description: 'dual of no-sync' }), true),
+	'no-sync': s.with_default(meta(s.boolean, { description: 'opt out of gro sync' }), false),
+	install: s.with_default(meta(s.boolean, { description: 'dual of no-install' }), true),
+	'no-install': s.with_default(
+		meta(s.boolean, { description: 'opt out of installing packages before publishing' }),
+		false
+	),
+	changeset_cli: s.with_default(
+		meta(s.string, { description: 'the changeset CLI to use' }),
+		CHANGESET_CLI
+	)
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
 /** @nodocs */
 export const task: Task<Args> = {
@@ -154,17 +158,26 @@ export const task: Task<Args> = {
 
 			const changeset_version_result = await spawn_cli(found_changeset_cli, ['version'], log);
 			if (!changeset_version_result?.ok) {
-				throw Error('changeset version failed: no commits were made: see the error above');
+				throw new TaskError('changeset version failed: no commits were made: see the error above');
 			}
 
 			if (!preserve_changelog) {
 				const token = load_from_env('SECRET_GITHUB_API_TOKEN');
 				if (!token) {
 					log.warn(
-						'the env var SECRET_GITHUB_API_TOKEN was not found, so API calls with be unauthorized'
+						'the env var SECRET_GITHUB_API_TOKEN was not found in the env or `.env`,' +
+							' so API calls will be unauthorized - set it for one run with' +
+							' `SECRET_GITHUB_API_TOKEN=$(gh auth token) gro publish`'
 					);
 				}
-				await update_changelog(parsed_repo_url.owner, parsed_repo_url.repo, changelog, token, log);
+				await update_changelog(
+					parsed_repo_url.owner,
+					parsed_repo_url.repo,
+					globalThis.fetch,
+					changelog,
+					token,
+					log
+				);
 			}
 
 			// Update package-lock.json to reflect the new version.
@@ -173,6 +186,9 @@ export const task: Task<Args> = {
 					log,
 					context: 'after version bump'
 				});
+				// npm prunes SvelteKit's generated `node_modules/$app` (not a package) on install,
+				// so re-sync before gen reads a tsconfig that extends `$app/tsconfig`.
+				await sveltekit_sync({ pm_cli: config.pm_cli });
 			}
 
 			// Regenerate files that depend on package.json version.
@@ -223,8 +239,21 @@ export const task: Task<Args> = {
 		if (!changelog_exists && (await fs_exists(changelog))) {
 			await spawn('git', ['add', changelog]);
 		}
-		await spawn('git', ['commit', '-a', '-m', `publish v${version}`]);
-		await spawn('git', ['push', '--follow-tags']);
+		const commit_result = await spawn('git', ['commit', '-a', '-m', `publish v${version}`]);
+		if (!commit_result.ok) {
+			throw new TaskError(
+				`the release commit failed, but v${version} is already published to the registry -` +
+					` resolve the failure, commit, then push with \`git push --follow-tags\``
+			);
+		}
+		const push_result = await spawn('git', ['push', '--follow-tags']);
+		if (!push_result.ok) {
+			throw new TaskError(
+				`\`git push --follow-tags\` failed: the release commit and tag v${version} are local only,` +
+					` but v${version} is already published to the registry - resolve the failure,` +
+					' then push manually with `git push --follow-tags`'
+			);
+		}
 
 		log.info(st('green', `published to branch ${st('cyan', branch)}!`));
 	}

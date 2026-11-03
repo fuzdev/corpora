@@ -6,6 +6,7 @@
 
 	import { contextmenu_context } from './contextmenu_state.svelte.ts';
 	import { icon_external_link, icon_link } from './icons.ts';
+	import { href_is_current_page } from './page_helpers.ts';
 	import type { SvgData } from './svg.ts';
 	import Svg from './Svg.svelte';
 	import ContextmenuIcon from './ContextmenuIcon.svelte';
@@ -53,7 +54,7 @@
 	const external = $derived(!(text[0] === '.' || (text[0] === '/' && text[1] !== '/')));
 	const rel = $derived(external ? external_rel : undefined);
 
-	const current_page = $derived(page.url.pathname === href);
+	const current_page = $derived(href_is_current_page(href, page.url));
 </script>
 
 <li role="none">

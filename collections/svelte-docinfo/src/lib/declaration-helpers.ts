@@ -4,7 +4,7 @@
  * Display formatting, code generation, serialization, type narrowing,
  * and `TypeJson` tokenization for `DeclarationJson` and `MemberJson`.
  *
- * @see `types.ts` for `DeclarationJson`, `MemberJson`, `TypeJson` Zod schemas
+ * @see `types.ts` for the `DeclarationJson`, `MemberJson`, `TypeJson` schemas
  *
  * @module
  */
@@ -21,10 +21,11 @@ import type {
 // Serialization
 
 /**
- * JSON replacer that strips Zod default values for compact serialization.
+ * JSON replacer that strips schema default values for compact serialization.
  *
- * Strips empty arrays and `false` booleans — both are Zod `.default()` values
- * restored on `.parse()`, so the round-trip is lossless for svelte-docinfo types.
+ * Strips empty arrays and `false` booleans — both are schema defaults restored
+ * by `parseAnalyzeResult` / `parseModuleJson`, so the round-trip is lossless
+ * for svelte-docinfo types.
  * Assumes all boolean fields in the schema default to `false` — a `true`-defaulted
  * boolean would need its `false` values preserved, breaking the round-trip.
  *
@@ -38,26 +39,29 @@ import type {
  * `undefined` (not the string `'[]'`), and `JSON.stringify(false, compactReplacer)`
  * returns the JS `undefined` too. Object-rooted callers (`AnalyzeResultJson`
  * envelope, CLI output) don't hit this — empty inner arrays strip and
- * `AnalyzeResultJson.parse` restores them on the consumer side. Array-rooted
+ * `parseAnalyzeResult` restores them on the consumer side. Array-rooted
  * callers (Vite plugin, anyone splicing the JSON into a source template)
  * must handle the empty case themselves before calling this; see
  * `vite.ts:updateOutputFromQuery` for the pattern.
  *
- * Two guard tests in `declaration-helpers.test.ts` lock this in:
- * - `every z.boolean().default in types.ts uses false` — source-regex check
- *   that fails on a new `z.boolean().default(true)`.
+ * Guard tests in `declaration-helpers.test.ts` lock this in:
+ * - `every defaulted v.boolean() in types.ts defaults to false` — source-regex
+ *   check that fails on a new `v.optional(v.boolean(), true)`.
+ * - `every schema default is false or a fresh-array factory` — walks the
+ *   schema tree from `AnalyzeResultJson`, so a default the replacer can't
+ *   restore (or a shared literal `[]`) fails wherever it's declared.
  * - `parse → stringify(compactReplacer) → parse is a faithful round-trip
  *   across every variant` — exercises every variant and member through a
- *   full round-trip, catching regressions where a `.default(false)` or
- *   `.default([])` is removed (or a new field is added that the replacer
- *   drops but Zod doesn't restore).
+ *   full round-trip, catching regressions where a `false` or `[]` default is
+ *   removed (or a new field is added that the replacer drops but the schema
+ *   doesn't restore).
  *
  * @example
  * ```ts
  * const result = await analyze({sourceFiles, sourceOptions});
  * const json = JSON.stringify(result, compactReplacer);
- * // On the consumer side, restore Zod defaults:
- * const restored = AnalyzeResultJson.parse(JSON.parse(json));
+ * // on the consumer side, restore the defaults:
+ * const restored = parseAnalyzeResult(JSON.parse(json));
  * ```
  */
 export const compactReplacer = (key: string, value: unknown): unknown =>
@@ -117,7 +121,8 @@ export const getDisplayName = (declaration: DeclarationJson | MemberJson): strin
  *   synthesized JS binding).
  *
  * @param declaration - the `DeclarationJson` to generate an import for
- * @param modulePath - module path relative to source root (e.g., `foo.ts`)
+ * @param modulePath - module path relative to source root (e.g., `foo.ts`); the
+ *   specifier names the file it ships as (`.ts`, `.tsx`, `.jsx` → `.js`, `.mts` → `.mjs`)
  * @param libraryName - package name for the import specifier (e.g., `@pkg/lib`)
  * @returns formatted import statement string
  *
@@ -135,8 +140,7 @@ export const generateImport = (
 	modulePath: string,
 	libraryName: string
 ): string => {
-	const jsPath = modulePath.replace(/\.ts$/, '.js');
-	const specifier = `${libraryName}/${jsPath}`;
+	const specifier = `${libraryName}/${toDistModulePath(modulePath)}`;
 
 	// Default-slot entries — derive the import binding from the module path.
 	if (declaration.name === 'default') {
@@ -163,8 +167,18 @@ export const generateImport = (
 	return `${typeOnly ? 'import type' : 'import'} {${declaration.name}} from '${specifier}';`;
 };
 
+/**
+ * The module path a source module ships under: `.ts`, `.tsx`, and `.jsx` →
+ * `.js`, `.mts` → `.mjs`, every other extension kept. The inverse of exports
+ * discovery's `dist` → source mapping (`mapDistToSource` and its fallbacks).
+ * Assumes JSX is compiled: under `jsx: 'preserve'` a `.tsx` ships as `.jsx`,
+ * which this can't know without the compiler options.
+ */
+const toDistModulePath = (modulePath: string): string =>
+	modulePath.replace(/\.(?:tsx?|jsx)$/, '.js').replace(/\.mts$/, '.mjs');
+
 const pascalCaseFromModulePath = (modulePath: string): string => {
-	const moduleName = modulePath.replace(/\.(js|ts|svelte)$/, '');
+	const moduleName = modulePath.replace(/\.(?:[mc]?[jt]sx?|svelte)$/, '');
 	return moduleName
 		.split(/[-_/]/)
 		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
@@ -331,6 +345,10 @@ const pushNode = (tokens: Array<TypeJsonToken>, node: TypeJson): void => {
  * API docs and syntax-highlights `code` tokens; a CLI might print them all
  * plainly. Adjacent punctuation merges into single `text` tokens.
  *
+ * Union members render in the tree's order — written order where the tree
+ * recovered it (see `TypeJson`) — so the result can list them in a different
+ * order from the flat string beside the tree, which prints in the checker's.
+ *
  * @param node - the `TypeJson` tree to flatten (a `typeInfo`/`returnTypeInfo` field)
  * @returns tokens in source order; concatenating their text yields the printed type
  *
@@ -354,7 +372,9 @@ export const typeJsonToTokens = (node: TypeJson): Array<TypeJsonToken> => {
 /**
  * The plain-text printed form of a `TypeJson` tree — `typeJsonToTokens`
  * concatenated. For consumers with no linkification or highlighting surface
- * (CLI output, markdown code spans, log lines) and for test assertions.
+ * (CLI output, markdown code spans, log lines) and for test assertions. Not a
+ * reprint of the flat string: union members keep the tree's order (see
+ * `typeJsonToTokens`).
  *
  * @example
  * ```ts

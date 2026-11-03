@@ -1,4 +1,4 @@
-import type { Tome } from '$lib/tome.ts';
+import type { Tome } from '#lib/tome.ts';
 import introduction from './introduction/+page.svelte';
 import ThemeRoot from './ThemeRoot/+page.svelte';
 import PendingAnimation from './PendingAnimation/+page.svelte';
@@ -214,8 +214,8 @@ export const tomes: Array<Tome> = [
 		category: 'components',
 		Component: Sparkline,
 		related_tomes: ['Svg'],
-		related_modules: ['sparkline.ts', 'project_stats.ts', 'projects.ts'],
-		related_declarations: ['Sparkline', 'ProjectActivityChart']
+		related_modules: ['sparkline.ts'],
+		related_declarations: ['Sparkline']
 	},
 	{
 		slug: 'Svg',

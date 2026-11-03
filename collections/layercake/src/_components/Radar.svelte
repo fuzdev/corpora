@@ -1,23 +1,23 @@
 <!--
 	@component
-	Generates an SVG radar chart.
+	Generates an SVG radar chart. Each row becomes one polygon. The x accessor must be a list of keys, one per axis, and the x scale maps each value to a radius.
  -->
 <script>
-	import { getContext } from 'svelte';
 	import { line, curveCardinalClosed } from 'd3-shape';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, width, height, xGet, config } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {string} [fill='#f0c'] - The radar's fill color. This is technically optional because it comes with a default value but you'll likely want to replace it with your own color.
-	 * @property {string} [stroke='#f0c'] - The radar's stroke color. This is technically optional because it comes with a default value but you'll likely want to replace it with your own color.
-	 * @property {number} [strokeWidth=2] - The radar's stroke width.
-	 * @property {number} [fillOpacity=0.5] - The radar's fill opacity.
-	 * @property {number} [r=4.5] - Each circle's radius.
-	 * @property {string} [circleFill='#f0c'] - Each circle's fill color. This is technically optional because it comes with a default value but you'll likely want to replace it with your own color.
-	 * @property {string} [circleStroke='#fff'] - Each circle's stroke color. This is technically optional because it comes with a default value but you'll likely want to replace it with your own color.
-	 * @property {number} [circleStrokeWidth=1] - Each circle's stroke width.
+	 * @property {string} [fill='#f0c'] - The polygon's fill color.
+	 * @property {string} [stroke='#f0c'] - The polygon's stroke color.
+	 * @property {number} [strokeWidth=2] - The polygon's stroke width in pixels.
+	 * @property {number} [fillOpacity=0.5] - The polygon's fill opacity.
+	 * @property {number} [r=4.5] - Each circle's radius in pixels.
+	 * @property {string} [circleFill='#f0c'] - Each circle's fill color.
+	 * @property {string} [circleStroke='#fff'] - Each circle's stroke color.
+	 * @property {number} [circleStrokeWidth=1] - Each circle's stroke width in pixels.
 	 */
 
 	/** @type {Props} */
@@ -32,38 +32,20 @@
 		circleStrokeWidth = 1
 	} = $props();
 
-	let angleSlice = $derived((Math.PI * 2) / $config.x.length);
+	let angleSlice = $derived((Math.PI * 2) / k.config.x.length);
 
+	// Each value is a radius. Axis i sits at angle i around the circle, starting from the top.
 	let path = $derived(
-		line()
-			.curve(curveCardinalClosed)
-			// @ts-expect-error
-			.x((d, i) => d * Math.cos(angleSlice * i - Math.PI / 2))
-			// @ts-expect-error
-			.y((d, i) => d * Math.sin(angleSlice * i - Math.PI / 2))
+		line(
+			(/** @type {number} */ d, i) => d * Math.cos(angleSlice * i - Math.PI / 2),
+			(/** @type {number} */ d, i) => d * Math.sin(angleSlice * i - Math.PI / 2)
+		).curve(curveCardinalClosed)
 	);
-
-	/* The non-D3 line generator way. */
-	// let path = $derived(
-	// 	values =>
-	// 		'M' +
-	// 		values
-	// 			.map(d => {
-	// 				return $rGet(d).map((val, i) => {
-	// 					return [
-	// 						val * Math.cos(angleSlice * i - Math.PI / 2),
-	// 						val * Math.sin(angleSlice * i - Math.PI / 2)
-	// 					].join(',');
-	// 				});
-	// 			})
-	// 			.join('L') +
-	// 		'z'
-	// );
 </script>
 
-<g transform="translate({$width / 2}, {$height / 2})">
-	{#each $data as row}
-		{@const xVals = $xGet(row)}
+<g transform="translate({k.width / 2}, {k.height / 2})">
+	{#each k.data as row}
+		{@const xVals = k.xGet(row)}
 		<!-- Draw a line connecting all the dots -->
 		<path
 			class="path-line"
@@ -74,7 +56,7 @@
 			fill-opacity={fillOpacity}
 		></path>
 
-		<!-- Plot each dots -->
+		<!-- One dot per value -->
 		{#each xVals as circleR, i}
 			{@const thisAngleSlice = angleSlice * i - Math.PI / 2}
 			<circle

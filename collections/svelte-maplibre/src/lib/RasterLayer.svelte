@@ -3,10 +3,11 @@
   import Layer from './Layer.svelte';
   import type { Feature } from 'geojson';
   import type { CommonLayerProps } from './types.js';
+  import type { RasterLayerSpecification } from 'maplibre-gl';
 
   interface Props extends CommonLayerProps<FEATURE> {
-    paint: maplibregl.RasterLayerSpecification['paint'];
-    layout?: maplibregl.RasterLayerSpecification['layout'] | undefined;
+    paint: RasterLayerSpecification['paint'];
+    layout?: RasterLayerSpecification['layout'] | undefined;
   }
 
   let {
@@ -28,6 +29,12 @@
     onmouseleave = undefined,
   }: Props = $props();
 </script>
+
+<!-- @component
+Add a MapLibre `raster` layer to the map. It shows raster tiles, such as from a `RasterTileSource`.
+
+This is a thin wrapper around `Layer` with `type` set to `raster`. Place it inside a source component such as `GeoJSON`, or set the `source` prop.
+-->
 
 <Layer
   {id}

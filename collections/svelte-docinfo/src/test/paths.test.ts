@@ -12,20 +12,20 @@
 import { test, assert, describe } from 'vitest';
 import { join } from 'node:path';
 
-import { toPosixPath, isAbsolutePosixPath } from '$lib/paths.ts';
+import { toPosixPath, isAbsolutePosixPath } from '#lib/paths.ts';
 import {
 	createSourceOptions,
 	extractPath,
 	isSource,
 	normalizeSourceOptions,
 	type ModuleSourceOptions
-} from '$lib/source-config.ts';
-import { createAnalysisSession } from '$lib/session.ts';
-import { analyze, analyzeFromFiles } from '$lib/analyze.ts';
-import { SVELTE_VIRTUAL_SUFFIX, type SourceFileInfo } from '$lib/source.ts';
-import { transformSvelteSource } from '$lib/svelte.ts';
-import { loadFile, globFiles } from '$lib/files.ts';
-import { discoverFromExports } from '$lib/exports.ts';
+} from '#lib/source-config.ts';
+import { createAnalysisSession } from '#lib/session.ts';
+import { analyze, analyzeFromFiles } from '#lib/analyze.ts';
+import { SVELTE_VIRTUAL_SUFFIX, type SourceFileInfo } from '#lib/source.ts';
+import { transformSvelteSource } from '#lib/svelte.ts';
+import { loadFile, globFiles } from '#lib/files.ts';
+import { discoverFromExports } from '#lib/exports.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -139,7 +139,7 @@ describe('normalizeSourceOptions — Windows-shaped inputs', () => {
 	});
 
 	test('strips trailing slashes and posixifies in one pass', () => {
-		// a leading slash is no longer stripped — it marks a filesystem-absolute
+		// a leading slash isn't stripped — it marks a filesystem-absolute
 		// entry (accepted in-root, thrown out-of-root); see source-config.test.ts
 		const normalized = normalizeSourceOptions({
 			projectRoot: PROJECT_ROOT_POSIX,
@@ -476,11 +476,12 @@ describe(
 	{ timeout: 30_000 },
 	() => {
 		test('Svelte SourceFileInfo with backslash id analyzes successfully and outputs POSIX paths', async () => {
-			// The legacy `export let` earns its keep: it forces a `legacy_props`
-			// warning, so the diagnostic loop below observes a Svelte-layer
-			// diagnostic instead of running over an empty array.
+			// The doubled doc (HTML `@component` plus in-script JSDoc) earns its
+			// keep: it forces a `duplicate_comment` warning, so the diagnostic
+			// loop below observes a Svelte-layer diagnostic instead of running
+			// over an empty array.
 			const content =
-				'<script lang="ts">export let label: string;</script><button>{label}</button>';
+				'<!-- @component Description. --><script lang="ts">/** Description 1 */ let {label}: {label: string} = $props();</script><button>{label}</button>';
 			await withTestProject({ 'src/lib/Button.svelte': content }, async (projectRoot) => {
 				const sourceOptions = createSourceOptions(projectRoot);
 				const posixId = join(projectRoot, 'src/lib/Button.svelte');
@@ -499,7 +500,7 @@ describe(
 				assert.ok(decl, 'expected one declaration on Button.svelte');
 				assert.strictEqual(decl.kind, 'component');
 
-				// All diagnostic file paths POSIX. The `legacy_props` warning is
+				// All diagnostic file paths POSIX. The `duplicate_comment` warning is
 				// what makes this loop non-vacuous — assert it so a future edit to
 				// the component can't quietly empty the array.
 				assert.isNotEmpty(result.diagnostics);

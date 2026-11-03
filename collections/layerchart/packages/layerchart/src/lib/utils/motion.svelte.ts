@@ -142,6 +142,11 @@ type InternalMotionOptions = {
    * rather than automatically tracking changes to the source value
    */
   controlled?: boolean;
+  /**
+   * Read on each change of the source value: `true` jumps to it rather than easing (ex. a path
+   * that moved only because an isometric view turned)
+   */
+  instant?: () => boolean;
 };
 
 /**
@@ -181,7 +186,11 @@ function setupTracking<T>(
     // Use untrack to prevent reactive reads inside motion.set() and motion.target
     // from being tracked as dependencies of this effect (which would cause infinite loops)
     untrack(() => {
-      motion.set(value, { instant: motion.target == null });
+      if (options.instant?.()) {
+        (motion as any).set(value, motion.type === 'tween' ? { duration: 0 } : { instant: true });
+      } else {
+        motion.set(value, { instant: motion.target == null });
+      }
     });
   });
 }
@@ -326,6 +335,63 @@ export function createDataMotionMap(motionProp: MotionOptions | undefined) {
 }
 
 export type DataMotionMap = NonNullable<ReturnType<typeof createDataMotionMap>>;
+
+/**
+ * Per-key path tweens, for marks that draw one path per group (`g`) instead of a single path.
+ *
+ * `createMotion` covers the single-path case, but a grouped mark's paths come and go with the
+ * data, so each group needs a tween of its own that survives across updates. Tween only: an
+ * interpolator walks two `d` strings, which a spring has no way to do — so `motion="spring"`
+ * leaves grouped paths unanimated, exactly as it already does for the ungrouped path.
+ *
+ * `interpolate` is a parameter rather than an import so the path interpolator stays out of the
+ * bundle of every mark that reaches for `motion`.
+ */
+export function createPathMotionMap(
+  motionProp: MotionProp | undefined,
+  interpolate: (a: string, b: string) => (t: number) => string
+) {
+  const tween = extractTweenConfig(motionProp);
+  if (!tween) return null;
+
+  const map = new Map<any, MotionTween<string>>();
+
+  return {
+    /**
+     * Point `key`'s path at `d`, creating its tween on first sight.
+     *
+     * `getInitial` supplies the value a newly seen group starts from — the flattened baseline,
+     * so a group that appears grows in rather than popping. It is a thunk because building that
+     * path is only worth doing on the update that actually creates the tween.  `instant` jumps
+     * there rather than easing.
+     */
+    update(key: any, d: string, getInitial?: () => string, instant = false) {
+      let state = map.get(key);
+      if (!state) {
+        state = new MotionTween(getInitial?.() ?? d, {
+          interpolate,
+          ...(tween.options as TweenOptions<string>),
+        });
+        map.set(key, state);
+      }
+      state.set(d, instant ? { duration: 0 } : undefined);
+    },
+
+    /** Current animated `d` for `key`, or `null` until its first `update` */
+    get(key: any): string | null {
+      return map.get(key)?.current ?? null;
+    },
+
+    /** Drop groups that are no longer in the data */
+    cleanup(activeKeys: Set<any>) {
+      for (const key of map.keys()) {
+        if (!activeKeys.has(key)) map.delete(key);
+      }
+    },
+  };
+}
+
+export type PathMotionMap = NonNullable<ReturnType<typeof createPathMotionMap>>;
 
 /**
  * Extracts tween configuration from a motion prop

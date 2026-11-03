@@ -2,11 +2,11 @@
  * TypeScript program and language-service creation.
  *
  * Two entry points sharing host configuration (tsconfig parsing, virtual file
- * plumbing, `.svelte` module resolution):
+ * plumbing, `.svelte` module resolution, svelte2tsx shim roots):
  *
  * - `createAnalysisProgram` — one-shot `ts.Program` from a `ts.CompilerHost`.
- *   Lower-level escape hatch for power users + dependency resolution. Does not
- *   support incremental updates.
+ *   Lower-level escape hatch for power users. Does not support incremental
+ *   updates.
  * - `createAnalysisLanguageService` — persistent `ts.LanguageService` with
  *   versioned `IScriptSnapshot`s. Incremental: subsequent `getProgram()` calls
  *   reuse parsed ASTs and checker state for unchanged files. Used by
@@ -19,13 +19,15 @@
  * @module
  */
 
-import { join, dirname } from 'node:path';
+import { createRequire } from 'node:module';
+import { join, dirname, resolve } from 'node:path';
 import ts from 'typescript';
 
 import type { AnalysisLog } from './log.ts';
-import { SVELTE_VIRTUAL_SUFFIX } from './source.ts';
+import { SVELTE_VIRTUAL_SUFFIX, isSvelteVirtualPath } from './source.ts';
 import { type ModuleSourceOptions, getSourceRoot } from './source-config.ts';
 import { toPosixPath } from './paths.ts';
+import { compareStrings } from './postprocess.ts';
 
 /**
  * Base configuration shared by every entry point in this module.
@@ -41,18 +43,115 @@ export interface LoadTsconfigOptions {
 	 */
 	projectRoot?: string;
 	/**
-	 * Path to tsconfig.json (relative to `projectRoot`).
+	 * Path to tsconfig.json, relative to `projectRoot`; parent directories are
+	 * searched when it isn't there. Any config file name works, `jsconfig.json`
+	 * included.
+	 *
+	 * `false` analyzes without a config file: no lookup runs, the compiler
+	 * options are `DEFAULT_COMPILER_OPTIONS` with `compilerOptions` merged on
+	 * top, and there are no config roots. It's an explicit choice, never a
+	 * fallback — a config that's named or defaulted and can't be found still
+	 * throws.
 	 * @default 'tsconfig.json'
 	 */
-	tsconfig?: string;
+	tsconfig?: string | false;
 	/**
 	 * Compiler options merged on top of those parsed from `tsconfig.json`
-	 * (per-key override; user-supplied keys win). Does not bypass the
-	 * `tsconfig.json` file requirement — `loadTsconfig` still throws when no
-	 * config file is found.
+	 * (per-key override; user-supplied keys win), or on top of
+	 * `DEFAULT_COMPILER_OPTIONS` under `tsconfig: false`. Does not by itself
+	 * bypass the config file requirement — without `tsconfig: false`,
+	 * `loadTsconfig` still throws when no config file is found.
 	 */
 	compilerOptions?: ts.CompilerOptions;
+	/**
+	 * The program's root files beyond the analyzed ones, replacing the roots
+	 * the tsconfig's `files`/`include` produce (see `RootFileNames`).
+	 * @default the tsconfig's roots
+	 */
+	rootFileNames?: RootFileNames;
 }
+
+/**
+ * Root files for the analysis program: a list, or a function from the
+ * tsconfig's roots to the ones to keep (it receives `[]` under
+ * `tsconfig: false`). Paths are absolute or relative to `projectRoot`.
+ *
+ * By default every file the tsconfig includes is a root, so the cold cost of
+ * a program scales with the project — tests, routes, and config files are
+ * parsed and bound, along with the packages only they import — however few
+ * files are analyzed. The files a session or a one-shot entry analyzes, and
+ * their imports, are always in the program (they're roots of their own), so
+ * narrowing the roots changes output only where a type reaches a
+ * file through no import: an ambient declaration (`declare global`, a
+ * `declare module` augmentation, a script-style `.d.ts`) in a file nothing
+ * imports. Drop such a root and the types it declares resolve to `any`, with
+ * no diagnostic.
+ *
+ * `declarationFileRoots` keeps the declaration files, the usual home of
+ * ambient types, and is the narrowing to reach for first:
+ *
+ * ```ts
+ * rootFileNames: declarationFileRoots
+ * ```
+ *
+ * `[]` roots nothing but the analyzed files — the fastest program, for
+ * projects known to declare no ambient types.
+ */
+export type RootFileNames = Array<string> | ((tsconfigRoots: Array<string>) => Array<string>);
+
+/**
+ * A `RootFileNames` function that keeps the tsconfig's declaration files
+ * (`.d.ts`, `.d.mts`, `.d.cts`) and drops its other roots.
+ *
+ * Declaration files are where ambient types usually live (`app.d.ts`, a
+ * `global.d.ts`), so this keeps them resolving while the program stops
+ * loading every test, route, and config file the tsconfig includes. It does
+ * not cover an ambient declaration written in an ordinary `.ts` file that
+ * nothing imports — a `declare global` block or a `declare module`
+ * augmentation there is dropped with its file.
+ */
+export const declarationFileRoots = (tsconfigRoots: Array<string>): Array<string> =>
+	tsconfigRoots.filter((file) => DECLARATION_FILE_SUFFIXES.some((suffix) => file.endsWith(suffix)));
+
+/**
+ * The compiler options used under `tsconfig: false`, before the caller's
+ * `compilerOptions` are merged on top.
+ *
+ * Set explicitly because the compiler's own defaults vary by TypeScript
+ * version, and before TypeScript 6 they are non-strict: without
+ * `strictNullChecks` a `string | null` prop prints as `string`.
+ * `allowJs`/`checkJs` type the imports of JS-lang components and `.js`
+ * modules (`allowJs` is forced on under any options; see `withAllowJs`).
+ */
+export const DEFAULT_COMPILER_OPTIONS: ts.CompilerOptions = {
+	strict: true,
+	target: ts.ScriptTarget.ESNext,
+	module: ts.ModuleKind.ESNext,
+	moduleResolution: ts.ModuleResolutionKind.Bundler,
+	allowJs: true,
+	checkJs: true,
+	skipLibCheck: true,
+	noEmit: true
+};
+
+/**
+ * `compilerOptions` with `allowJs` on, the same reference when it already is.
+ *
+ * Both program paths (`createAnalysisProgram`, `createAnalysisLanguageService`)
+ * always run with these options, whatever the tsconfig says: without
+ * `allowJs` the program leaves a JS file out, so it documents nothing
+ * (`module_skipped`) and every TypeScript import of it types as `any`.
+ * Forcing it unconditionally, rather than while a JS file is served, keeps
+ * output a function of the file set: the language service reuses its program
+ * when the roots don't change, so a settings flip wouldn't reach a JS file
+ * that's already a root, and JS reached only through imports (an out-of-root
+ * file, a `.cjs`) would type by whether some unrelated JS file was owned.
+ * `checkJs` stays as configured; it adds type errors, not types. The
+ * tsconfig's own roots are fixed when it's parsed, so a JS file the analysis
+ * doesn't serve joins the program only through an import.
+ */
+const withAllowJs = (compilerOptions: ts.CompilerOptions): ts.CompilerOptions =>
+	compilerOptions.allowJs ? compilerOptions : { ...compilerOptions, allowJs: true };
 
 /**
  * A host-served file entry: content plus optional parser treatment.
@@ -61,7 +160,9 @@ export interface VirtualFileEntry {
 	content: string;
 	/**
 	 * Overrides script-kind inference from the path's extension; `undefined`
-	 * defers to the extension.
+	 * defers to the extension. JS-lang Svelte virtuals set this to parse as JS
+	 * despite their `.ts` suffix; no `allowJs` needed, since virtuals are
+	 * host-served.
 	 */
 	scriptKind?: ts.ScriptKind;
 }
@@ -267,6 +368,14 @@ export interface AnalysisLanguageService {
 	 * Cheap accessor over the construction-time `loadTsconfig` result; prefer
 	 * it over `getProgram().getCompilerOptions()` when only the options are
 	 * needed — `getProgram()` forces the LS to sync and parse every root file.
+	 * `allowJs` is forced on (see `withAllowJs`), so these are the options the
+	 * program runs with. Module resolution reads `allowJs` only for a package's
+	 * self-name imports through its `exports`, so a resolver built from the
+	 * unforced options would resolve the same otherwise; the session's default
+	 * resolver is built from these, matching the program there too. There,
+	 * output can differ from the project's own `tsc` without `allowJs`: an
+	 * `exports` entry listing `import`/`default` before `types` resolves to the
+	 * JS target.
 	 *
 	 * Treat the returned object as read-only: it is the same reference the LS
 	 * host serves via `getCompilationSettings`, so mutating it would desync
@@ -300,6 +409,40 @@ export interface AnalysisLanguageService {
 	dispose(): void;
 }
 
+// `ts.Diagnostics` isn't in the public typings, so the codes are literals
+const TS_FILE_NOT_FOUND = 6053; // `extends` bare specifier that doesn't resolve
+const TS_CANNOT_READ_FILE = 5083; // `extends` path that doesn't exist or can't be read
+const TS_ROOT_NOT_OBJECT = 5092; // `extends` target whose root value isn't an object
+
+/**
+ * Whether a `parseJsonConfigFileContent` diagnostic means a config in the
+ * `extends` chain didn't load: a target that's missing or unreadable, one that
+ * fails to parse (a syntax diagnostic, TypeScript's 1xxx range), or one whose
+ * root isn't an object.
+ */
+const isConfigChainDiagnostic = (diagnostic: ts.Diagnostic): boolean =>
+	diagnostic.category === ts.DiagnosticCategory.Error &&
+	(diagnostic.code === TS_FILE_NOT_FOUND ||
+		diagnostic.code === TS_CANNOT_READ_FILE ||
+		diagnostic.code === TS_ROOT_NOT_OBJECT ||
+		(diagnostic.code >= 1000 && diagnostic.code < 2000));
+
+/**
+ * Whether a chain diagnostic names a config SvelteKit generates during
+ * `svelte-kit sync`: `$app/tsconfig` (SvelteKit 3) or
+ * `.svelte-kit/tsconfig.json` (SvelteKit 2). Matched on the specifier alone,
+ * not the quotes around it, since localized messages may quote differently.
+ */
+const isSvelteKitGeneratedConfigMessage = (message: string): boolean =>
+	message.includes('$app/') || message.includes('.svelte-kit/tsconfig.json');
+
+const formatConfigDiagnostic = (diagnostic: ts.Diagnostic, configPath: string): string => {
+	const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ');
+	const file = diagnostic.file?.fileName;
+	const location = file && file !== configPath ? ` in ${file}` : '';
+	return `TS${diagnostic.code}${location}: ${message}`;
+};
+
 /**
  * Load and parse tsconfig.json into compiler options + initial file list.
  *
@@ -309,30 +452,110 @@ export interface AnalysisLanguageService {
  * resolution via `ts.resolveModuleName`) without the cost of building a full
  * `ts.Program`.
  *
- * @throws Error if tsconfig.json (or the requested `tsconfigName`) is not found.
+ * Each call globs the tsconfig `include` to build `rootFileNames`; reuse the
+ * result rather than calling per resolve.
+ *
+ * The config is located like `tsc -p`: `options.tsconfig` relative to
+ * `projectRoot`, walking up through parent directories when it isn't there.
+ * Relative paths inside it (`extends`, `include`, path-valued options) resolve
+ * against the config file's own directory, not `projectRoot`.
+ *
+ * A config that can't be fully loaded throws rather than analyzing with a
+ * partial config: TypeScript reports a missing `extends` target as a
+ * diagnostic and carries on without the inherited options (`lib`, `types`,
+ * `paths`, `rootDirs`), so external types would silently degrade to `any`.
+ * SvelteKit's generated config is the common case (`$app/tsconfig`, or
+ * `.svelte-kit/tsconfig.json` before SvelteKit 3) — it exists only after
+ * `svelte-kit sync`. Option-level diagnostics (an unknown option, a bad
+ * value) and an `include` matching no files don't throw: TypeScript still
+ * applies the rest of the config, and the project's own typecheck reports
+ * them.
+ *
+ * Under `tsconfig: false` no file is read: the options are
+ * `DEFAULT_COMPILER_OPTIONS` with `options.compilerOptions` merged on top, and
+ * the config contributes no roots. `options.rootFileNames` then replaces or
+ * filters the roots either way (see `RootFileNames`).
+ *
+ * @throws Error if tsconfig.json (or the file named by `options.tsconfig`) is
+ *   not found or fails to parse, or a config in its `extends` chain is missing
+ *   or fails to parse. A missing SvelteKit-generated target adds a hint to run
+ *   `svelte-kit sync`.
  */
 export const loadTsconfig = (
 	options?: LoadTsconfigOptions,
 	log?: AnalysisLog
 ): { compilerOptions: ts.CompilerOptions; rootFileNames: Array<string> } => {
 	const projectRoot = options?.projectRoot ?? process.cwd();
+
+	if (options?.tsconfig === false) {
+		log?.info('analyzing without a tsconfig');
+		return {
+			compilerOptions: { ...DEFAULT_COMPILER_OPTIONS, ...options.compilerOptions },
+			rootFileNames: resolveRootFileNames(options.rootFileNames, [], projectRoot)
+		};
+	}
 	const tsconfigName = options?.tsconfig ?? 'tsconfig.json';
 
 	const configPath = ts.findConfigFile(projectRoot, ts.sys.fileExists, tsconfigName);
 	if (!configPath) {
-		throw new Error(`No ${tsconfigName} found in ${projectRoot}`);
+		throw new Error(`No ${tsconfigName} found in ${projectRoot} or its parent directories`);
 	}
 
 	log?.info(`using ${configPath}`);
 
 	const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
-	const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectRoot);
+	if (configFile.error) {
+		throw new Error(
+			`Failed to read ${configPath}: ${formatConfigDiagnostic(configFile.error, configPath)}`
+		);
+	}
+	// base path = the config's own dir (as `tsc -p` does), so relative
+	// `extends`/`include` still resolve when the config was found by walking up
+	// or `options.tsconfig` names a file in a subdirectory
+	const parsedConfig = ts.parseJsonConfigFileContent(
+		configFile.config,
+		ts.sys,
+		dirname(configPath),
+		undefined,
+		configPath
+	);
+
+	const chainErrors = parsedConfig.errors.filter(isConfigChainDiagnostic);
+	if (chainErrors.length > 0) {
+		const messages = chainErrors.map((d) => formatConfigDiagnostic(d, configPath));
+		// the diagnostic text names the unresolved target, e.g. `File '$app/tsconfig' not found.`
+		const hint = messages.some(isSvelteKitGeneratedConfigMessage)
+			? ' SvelteKit generates its tsconfig: run `svelte-kit sync` (or `gro sync`) first.'
+			: '';
+		throw new Error(
+			`Failed to load the extends chain of ${configPath}: ${messages.join(' ')}${hint}`
+		);
+	}
 
 	const compilerOptions = options?.compilerOptions
 		? { ...parsedConfig.options, ...options.compilerOptions }
 		: parsedConfig.options;
 
-	return { compilerOptions, rootFileNames: parsedConfig.fileNames };
+	return {
+		compilerOptions,
+		rootFileNames: resolveRootFileNames(options?.rootFileNames, parsedConfig.fileNames, projectRoot)
+	};
+};
+
+/**
+ * Apply a `RootFileNames` option to the tsconfig's roots: absent keeps them,
+ * a list replaces them, a function maps them. Results are POSIX and absolute
+ * (relative entries resolve against `projectRoot`), like every path the
+ * program hosts key on.
+ */
+const resolveRootFileNames = (
+	option: RootFileNames | undefined,
+	tsconfigRoots: Array<string>,
+	projectRoot: string
+): Array<string> => {
+	if (option === undefined) return tsconfigRoots;
+	const roots = typeof option === 'function' ? option([...tsconfigRoots]) : option;
+	return roots.map((file) => toPosixPath(resolve(projectRoot, file)));
 };
 
 /**
@@ -379,6 +602,125 @@ const createResolveModuleNameLiterals =
 		});
 
 /**
+ * svelte2tsx's ambient declarations for the code it generates, as file names
+ * in the package root. They're joined onto the directory of the package's main
+ * entry (the package root) rather than resolved as subpath specifiers, which an
+ * `exports` map that doesn't list them would block. A layout change shows up as
+ * the shim tests failing, with component types back to `any`.
+ *
+ * Every Svelte virtual calls helpers that only these declare — the component
+ * export is `__sveltets_2_fn_component($$render())`, beside
+ * `__sveltets_$$bindings`, `__sveltets_2_ensureSnippet`, and friends. Without
+ * them those names don't resolve, so each component's default export is `any`,
+ * and so is everything typed through one (`typeof Button`,
+ * `ComponentProps<typeof Button>['variant']`) in a `.svelte` or `.ts` module.
+ * Props extraction is unaffected either way: it reads the `$props()`
+ * annotation, not the component's type.
+ *
+ * Only the `-v4` shims, the set svelte2tsx emits against for Svelte 4 and up
+ * (`svelte.ts` enforces Svelte 5). The template-side `svelteHTML` namespace
+ * (`svelte-jsx-v4.d.ts`, or `svelte/svelte-html.d.ts`, which svelte-check
+ * roots in its place for Svelte 5) is deliberately left out: template
+ * expressions live as statements inside `$$render`'s body, so they never reach
+ * a documented type, and that file's `/// <reference lib="dom" />` would add
+ * the DOM lib to projects whose `lib` doesn't have it, changing what their
+ * own globals resolve to. The unresolved `svelteHTML` calls only produce
+ * checker errors in the virtuals, which analysis never reads.
+ */
+const SVELTE_SHIM_FILE_NAMES = ['svelte-shims-v4.d.ts'];
+
+let svelteShimPaths: ReadonlyArray<string> | undefined;
+
+/** The shim files' POSIX paths, resolved once and cached (see `getSvelteShimRoots`). */
+const resolveSvelteShimPaths = (): ReadonlyArray<string> => {
+	if (!svelteShimPaths) {
+		const packageRoot = dirname(createRequire(import.meta.url).resolve('svelte2tsx'));
+		svelteShimPaths = SVELTE_SHIM_FILE_NAMES.map((n) => toPosixPath(join(packageRoot, n)));
+	}
+	return svelteShimPaths;
+};
+
+/**
+ * Whether a file is one of the svelte2tsx shims `getSvelteShimRoots` roots,
+ * compared by the same resolved path rather than by file name. The `TypeJson`
+ * builder reads it to treat a shim-declared svelte2tsx alias as nameless
+ * (`linkableAliasSymbol` in `typescript-extract-type-json.ts`).
+ *
+ * @param fileName - a POSIX path, as `ts.SourceFile.fileName` holds it
+ * @internal Not a stable API.
+ */
+export const isSvelteShimPath = (fileName: string): boolean =>
+	resolveSvelteShimPaths().includes(fileName);
+
+/**
+ * The program roots svelte2tsx's shims add to a program over `paths`: the shim
+ * files when any path is a Svelte virtual, otherwise none, so TS-only programs
+ * keep exactly their tsconfig roots and globals.
+ *
+ * Callers put these first in the root list, ahead of the tsconfig roots.
+ *
+ * - **Resolution** — the `svelte2tsx` main entry, resolved from svelte-docinfo's
+ *   own location (the lookup `svelte.ts`'s `svelte2tsx` import makes), whose
+ *   directory is the package root holding the shims. So the shims always match
+ *   the copy that generated the virtuals; the helper signatures change in
+ *   lockstep with the emitted calls. Resolved once and cached, as POSIX paths.
+ * - **A project that also roots the shims** (a tsconfig `include`, or a
+ *   triple-slash reference) — the same file dedupes by path. A different copy
+ *   (another installed svelte2tsx) declares the same globals twice, and no
+ *   single copy wins: a duplicate type alias keeps its first declaration (ours,
+ *   rooted first), while duplicate functions merge into one overload set
+ *   whose resolution order doesn't follow root order. The duplicate-identifier
+ *   errors land in files analysis never reads, but where the two copies
+ *   disagree a component's type can mix them. svelte2tsx renames a helper (the
+ *   `__sveltets_2_` prefix) when its shape changes incompatibly, which keeps
+ *   that rare; it's not detected.
+ * - **Shim globals are project-visible** — beside the `__sveltets_` helpers,
+ *   the shims declare unprefixed global types (`Expand`, `KeysMatching`,
+ *   `SvelteStore`, and others). A project global of the same name collides,
+ *   and the shim's declaration wins, being rooted first, so a `.ts` module
+ *   typed through that global documents the shim's meaning.
+ * - **Never documented** — the files resolve under `node_modules`, so they're
+ *   external (`createIsExternalFile`), never `isSource`, and outside the alias
+ *   registry. As global scripts they never print as `typeof import("…")`, so
+ *   `normalizeModulePathsInTypes` never sees them.
+ * - **Order** — a fixed list, so the language service's root-list comparison
+ *   still reuses the program when nothing changed. Resolving the helpers can
+ *   move when the checker first creates a type, which reorders an origin-less
+ *   union printed elsewhere (see "Input order" on `AnalysisSession`).
+ *
+ * @internal Shared by both program paths and the test-side program helpers;
+ *   not a stable API.
+ */
+export const getSvelteShimRoots = (paths: Iterable<string>): ReadonlyArray<string> => {
+	for (const path of paths) {
+		if (isSvelteVirtualPath(path)) return resolveSvelteShimPaths();
+	}
+	return [];
+};
+
+/**
+ * A program's root list: the Svelte shims for `extraRoots` (see
+ * `getSvelteShimRoots`), then `tsconfigRoots`, then `extraRoots`, deduped by
+ * path with first occurrence kept. Dedupe covers an extra root the tsconfig
+ * also roots, and a shim the tsconfig (or a caller) roots itself.
+ *
+ * Callers own the order of `extraRoots`; the language-service path passes its
+ * owned roots sorted, so the list is a function of the file set.
+ *
+ * @param tsconfigRoots - the tsconfig's root file names
+ * @param extraRoots - roots beyond the tsconfig's, virtual files included
+ * @returns a fresh array
+ * @internal Shared by both program paths and the test-side program helpers;
+ *   not a stable API.
+ */
+export const buildRootFileNames = (
+	tsconfigRoots: Iterable<string>,
+	extraRoots: ReadonlyArray<string>
+): Array<string> => [
+	...new Set([...getSvelteShimRoots(extraRoots), ...tsconfigRoots, ...extraRoots])
+];
+
+/**
  * Create TypeScript program for one-shot analysis.
  *
  * Use `createAnalysisLanguageService` instead when you need to analyze the
@@ -388,7 +730,7 @@ const createResolveModuleNameLiterals =
  * @param options - configuration options for program creation
  * @param log - optional logger for info messages
  * @returns the TypeScript program
- * @throws Error if tsconfig.json is not found
+ * @throws Error if the tsconfig can't be loaded (see `loadTsconfig`)
  *
  * @example
  * ```ts
@@ -399,15 +741,16 @@ export const createAnalysisProgram = (
 	options?: AnalysisProgramOptions,
 	log?: AnalysisLog
 ): ts.Program => {
-	const { compilerOptions, rootFileNames } = loadTsconfig(options, log);
+	const { compilerOptions: configured, rootFileNames } = loadTsconfig(options, log);
+	const compilerOptions = withAllowJs(configured);
 	const virtualFiles = options?.virtualFiles;
 
 	if (!virtualFiles || virtualFiles.size === 0) {
 		return ts.createProgram(rootFileNames, compilerOptions);
 	}
 
-	// Include virtual file paths alongside real files
-	const allRootFiles = [...rootFileNames, ...virtualFiles.keys()];
+	// virtual file paths alongside real files, Svelte shims first
+	const allRootFiles = buildRootFileNames(rootFileNames, [...virtualFiles.keys()]);
 
 	const host = ts.createCompilerHost(compilerOptions);
 	// Resolution keys off the copied snapshot, not the caller's map — same
@@ -430,7 +773,7 @@ export const createAnalysisProgram = (
  * @param options - configuration options
  * @param log - optional logger for info messages
  * @returns the language service handle
- * @throws Error if tsconfig.json is not found
+ * @throws Error if the tsconfig can't be loaded (see `loadTsconfig`)
  *
  * @example
  * ```ts
@@ -448,7 +791,8 @@ export const createAnalysisLanguageService = (
 	log?: AnalysisLog
 ): AnalysisLanguageService => {
 	const projectRoot = options?.projectRoot ?? process.cwd();
-	const { compilerOptions, rootFileNames } = loadTsconfig(options, log);
+	const { compilerOptions: configured, rootFileNames } = loadTsconfig(options, log);
+	const compilerOptions = withAllowJs(configured);
 	const documentRegistry = options?.documentRegistry ?? ts.createDocumentRegistry();
 
 	interface OwnedFile extends VirtualFileEntry {
@@ -459,9 +803,10 @@ export const createAnalysisLanguageService = (
 	// Ancestor directories of the owned set, kept in lockstep by
 	// `setFileInternal`/`deleteFile` — see `createOwnedDirIndex`.
 	const ownedDirs = createOwnedDirIndex();
-	// Root file names from tsconfig — kept as a Set for fast membership checks
-	// during deleteFile (so a deleted owned file that was *also* in tsconfig
-	// stays in the program's root set, falling through to disk).
+	// Root file names from the tsconfig (or the `rootFileNames` option) — kept
+	// as a Set for fast membership checks during deleteFile (so a deleted owned
+	// file that was *also* a configured root stays in the program's root set,
+	// falling through to disk).
 	const tsconfigRoots = new Set<string>(rootFileNames);
 	// Virtual roots (e.g., `.__svelte2tsx__.ts` paths) added via `setFile`.
 	// Tracked separately so `deleteFile` can drop them from the LS's root list.
@@ -520,11 +865,16 @@ export const createAnalysisLanguageService = (
 		getCompilationSettings: () => compilerOptions,
 		getScriptFileNames: () => {
 			// Combine tsconfig roots with owned virtual roots. Set semantics
-			// dedupe when an owned file was also a tsconfig root.
+			// dedupe when an owned file was also a tsconfig root. Owned roots
+			// are sorted rather than kept in ingest order: root order sets the
+			// program's file order, and with it the merge order of
+			// `declare global`, module augmentations, and interface merging.
+			// The LS compares root lists by content, so a stable sort keeps
+			// program reuse intact.
+			// Svelte shims lead (see `getSvelteShimRoots`), joining with the
+			// first owned virtual and leaving with the last.
 			if (ownedRoots.size === 0) return [...tsconfigRoots];
-			const combined = new Set(tsconfigRoots);
-			for (const path of ownedRoots) combined.add(path);
-			return [...combined];
+			return buildRootFileNames(tsconfigRoots, [...ownedRoots].sort(compareStrings));
 		},
 		getScriptVersion: (fileName) => {
 			const entry = owned.get(fileName);
@@ -598,24 +948,14 @@ export const createAnalysisLanguageService = (
 
 /**
  * Predicate for determining whether a TypeScript source file is external to the project.
- * Used by intersection type filtering to separate user-authored properties from
- * library/framework properties.
+ * Used by external-contribution filtering (`filterDocumentedProperties` and the
+ * index/call-signature origin checks) and `externalTypes` attribution to separate
+ * project-authored contributions from library/framework ones.
  *
- * Constructed from `ModuleSourceOptions` at analysis entry points — files under the
- * source root (e.g., `src/lib/`) are internal, everything else is external.
+ * Built by `createIsExternalFile`, which defines externality.
  */
 export type IsExternalFile = (sourceFile: ts.SourceFile) => boolean;
 
-/**
- * Create an `IsExternalFile` predicate from `ModuleSourceOptions`.
- *
- * A file is external if it is:
- * - Outside the project root
- * - Inside `node_modules/`
- * - A `.d.ts` declaration file outside the source root (catches framework-generated
- *   declarations like `.svelte-kit/non-ambient.d.ts` while keeping user `.d.ts` files
- *   in the source tree)
- */
 /** The project/source prefixes both externality predicates compare against. */
 const externalityPrefixes = (
 	options: ModuleSourceOptions
@@ -628,6 +968,16 @@ const externalityPrefixes = (
 	};
 };
 
+/**
+ * Create an `IsExternalFile` predicate from `ModuleSourceOptions`.
+ *
+ * A file is external if it is:
+ * - Outside the project root
+ * - Inside `node_modules/`
+ * - A `.d.ts` declaration file outside the source root (catches framework-generated
+ *   declarations like `.svelte-kit/non-ambient.d.ts` while keeping user `.d.ts` files
+ *   in the source tree)
+ */
 export const createIsExternalFile = (options: ModuleSourceOptions): IsExternalFile => {
 	const { projectPrefix, sourcePrefix } = externalityPrefixes(options);
 	return (sf) =>

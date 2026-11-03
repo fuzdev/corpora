@@ -19,13 +19,10 @@ import { DEV } from 'esm-env';
 import type { MiddlewareHandler } from 'hono';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import {
-	AUTH_API_TOKEN_ID_KEY,
-	ACCOUNT_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TOKEN_SCOPE_KEY
-} from '../hono_context.ts';
-import { parse_stored_token_scope, token_scope_full } from './token_scope.ts';
+import { RESOLVED_AUTH_KEY } from '../hono_context.ts';
+import { credential_deadline_after } from './credential_deadline.ts';
+import { get_resolved_auth } from './resolved_auth.ts';
+import { is_api_token_shaped } from './api_token.ts';
 import { query_validate_api_token } from './api_token_queries.ts';
 import type { QueryDeps } from '../db/query_deps.ts';
 import { get_client_ip } from '../http/client_ip.ts';
@@ -34,7 +31,7 @@ import { is_browser_context } from '../http/origin.ts';
 /**
  * Create middleware that authenticates via bearer token.
  *
- * Soft-fails for invalid, expired, or empty tokens — calls `next()` without
+ * Soft-fails for malformed, invalid, expired, or empty tokens — calls `next()` without
  * setting account identity, letting downstream auth enforcement (the RPC
  * dispatcher's pre-authorization / post-authorization auth gates or
  * `require_auth`) return a consistent JSON-RPC or route-level error. This
@@ -42,12 +39,18 @@ import { is_browser_context } from '../http/origin.ts';
  * (`invalid_token`, `account_not_found`) that could aid enumeration attacks,
  * and ensures public actions are not blocked by bad credentials.
  *
- * Rejects bearer tokens when an `Origin` or `Referer` header is present —
- * browsers must use cookie auth to reduce attack surface.
+ * Discards bearer tokens when an `Origin` or `Referer` header is present —
+ * `next()` with no identity, as for a bad token — so browsers must use cookie
+ * auth, reducing attack surface.
+ * A token that fails the `is_api_token_shaped` precheck soft-fails before
+ * the database is touched.
  * Auth scheme matching is case-insensitive per RFC 7235.
- * On success, sets `c.var.auth_account_id`, `CREDENTIAL_TYPE_KEY = 'api_token'`,
- * and `AUTH_API_TOKEN_ID_KEY`. Skips when an account is already authenticated
- * (e.g. by session middleware). Acting-actor resolution + `RequestContext`
+ * On success, sets the `api_token` arm of `ResolvedAuth` (`RESOLVED_AUTH_KEY`):
+ * the account, the token id, its scope, and its deadline. The last leg of the
+ * chain, it skips when an earlier one (the daemon token or a session cookie)
+ * already resolved the request — before reading the header, so a token sent
+ * beside a winning credential is never looked up and its `last_used_at` /
+ * `last_used_ip` never move. Acting-actor resolution + `RequestContext`
  * construction are deferred to the dispatcher's authorization phase.
  *
  * There is deliberately **no rate limit on this path**, and no 429 — every
@@ -61,12 +64,12 @@ import { is_browser_context } from '../http/origin.ts';
  *
  * @param deps - query dependencies (pool-level db for middleware)
  * @param log - the logger instance
- * @mutates Hono context - sets `ACCOUNT_ID_KEY`, `CREDENTIAL_TYPE_KEY`, and `AUTH_API_TOKEN_ID_KEY` on success
+ * @mutates Hono context - sets `RESOLVED_AUTH_KEY` on success
  */
 export const create_bearer_auth_middleware = (deps: QueryDeps, log: Logger): MiddlewareHandler => {
 	return async (c, next): Promise<Response | void> => {
-		// Skip if an account is already authenticated (e.g. by session middleware)
-		if (c.get(ACCOUNT_ID_KEY) != null) {
+		// an earlier leg (daemon token, session cookie) already resolved the request
+		if (get_resolved_auth(c) !== null) {
 			await next();
 			return;
 		}
@@ -107,6 +110,14 @@ export const create_bearer_auth_middleware = (deps: QueryDeps, log: Logger): Mid
 			return;
 		}
 
+		// A value that cannot be a token soft-fails before any database work —
+		// no pool checkout, no query — so junk bearers cost nothing to refuse.
+		if (!is_api_token_shaped(raw_token)) {
+			log.debug('bearer auth soft-fail: malformed token');
+			await next();
+			return;
+		}
+
 		// `ip` feeds the token's `last_used_ip` bookkeeping, not a limiter.
 		const ip = get_client_ip(c);
 
@@ -124,13 +135,16 @@ export const create_bearer_auth_middleware = (deps: QueryDeps, log: Logger): Mid
 			return;
 		}
 
-		c.set(ACCOUNT_ID_KEY, api_token.account_id);
-		c.set(CREDENTIAL_TYPE_KEY, 'api_token');
-		c.set(AUTH_API_TOKEN_ID_KEY, api_token.id);
-		// `query_validate_api_token` is fail-closed on an unreadable scope, so a
-		// token that got this far has a readable one. The `?? token_scope_full()`
-		// is unreachable defensive cover, not a fallback with meaning.
-		c.set(TOKEN_SCOPE_KEY, parse_stored_token_scope(api_token.scope) ?? token_scope_full());
+		c.set(RESOLVED_AUTH_KEY, {
+			credential_type: 'api_token',
+			account_id: api_token.account_id,
+			api_token_id: api_token.id,
+			// Parsed by the query, which refuses a token whose stored scope is
+			// unreadable — there is no default to fall back to.
+			scope: api_token.scope,
+			// the row's expiry, read on the database clock; none for an eternal token
+			credential_deadline: credential_deadline_after([api_token.expires_in_ms])
+		});
 
 		await next();
 	};

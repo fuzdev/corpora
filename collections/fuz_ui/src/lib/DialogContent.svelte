@@ -68,8 +68,8 @@
 		max_width?: string;
 		/**
 		 * The close button floating just outside the content surface's top-right
-		 * corner. `true` (the default) renders an absolutely-positioned `.sm.plain.icon_button`
-		 * that closes the dialog; `false` removes it. It renders after
+		 * corner. `true` (the default) renders an absolutely-positioned
+		 * `.sized_sm.plain.icon_button` that closes the dialog; `false` removes it. It renders after
 		 * `children`, so a content control (or an `autofocus` element) takes initial
 		 * focus on open rather than the close button.
 		 *
@@ -107,7 +107,7 @@
 	// into the consumer's snippet, which carries its own style scope
 	const close_button_attrs: DialogCloseButtonAttrs = {
 		type: 'button',
-		class: 'sm plain icon_button',
+		class: 'sized_sm plain icon_button',
 		style: 'position: absolute; top: 0; right: 0;',
 		onclick: dialog.close,
 		title: 'close',

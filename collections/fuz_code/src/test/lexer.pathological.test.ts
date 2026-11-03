@@ -1,7 +1,7 @@
 import { describe, test, assert } from 'vitest';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { validate_syntax_events } from '$lib/lexer.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { validate_syntax_events } from '#lib/lexer.ts';
 import { PATHOLOGICAL_CASES } from './pathological.ts';
 
 // Pathological workloads (see `pathological.ts`) — enforces the lexer design's

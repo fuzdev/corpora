@@ -30,16 +30,12 @@
  * scan, deliberately: the property ("no *unreviewed* site exists") is about
  * code not yet written, which no type can express.
  *
- * The TS spine also needs one assertion the Rust census does not. Rust resolves
- * every credential through a single `resolve_auth_from_headers`, so a resolved
- * credential always carries a scope — `ResolvedAuth.scope` is not optional.
- * Here resolution is three separate middlewares writing `TOKEN_SCOPE_KEY` into
- * the Hono context, and the shared guard `token_scope_surface_denial` must read
- * that key defensively (`scope && !admits(scope)`) because the anonymous caller
- * has none. A fourth middleware that authenticated someone and forgot the key
- * would therefore sail through every rule-3 surface at once — the permissive
- * default, re-entered by omission. The `resolvers set the token scope` case
- * below pins it.
+ * That a resolved credential carries a scope is held by the type, on both
+ * spines: every resolver writes one `ResolvedAuth` value (`RESOLVED_AUTH_KEY`),
+ * whose `api_token` arm requires its `scope` and whose other arms answer `full`
+ * through `resolved_auth_scope` — so no middleware can authenticate a caller and
+ * leave it un-narrowable. The `resolvers write the one resolved value` case
+ * below pins that each resolver writes it, and that the type keeps the shape.
  *
  * **This is the proportionate control, not the strongest one.** The strongest
  * is making the scope-consulting read the only way to obtain a usable identity,
@@ -57,7 +53,27 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, assert, test } from 'vitest';
 
-import { is_token_surface, TOKEN_SURFACES, type TokenSurface } from '$lib/auth/token_scope.ts';
+import {
+	get_resolved_auth,
+	resolved_auth_scope,
+	type ResolvedApiTokenAuth,
+	type ResolvedDaemonTokenAuth,
+	type ResolvedSessionAuth
+} from '#lib/auth/resolved_auth.ts';
+import {
+	is_token_surface,
+	TOKEN_SURFACES,
+	type TokenScope,
+	type TokenSurface
+} from '#lib/auth/token_scope.ts';
+import { RESOLVED_AUTH_KEY } from '#lib/hono_context.ts';
+
+/**
+ * The context key's constant name, as source spells it. A rename of the
+ * constant fails the positive controls below rather than leaving the markers
+ * matching nothing.
+ */
+const RESOLVED_AUTH_KEY_NAME = 'RESOLVED_AUTH_KEY';
 
 /** How a reviewed site relates to the credential's `TokenScope`. */
 type CensusRole =
@@ -93,19 +109,19 @@ const CENSUS: ReadonlyArray<CensusEntry> = [
 		file: 'auth/bearer_auth.ts',
 		role: 'resolves',
 		reason:
-			'the only credential that can carry a narrowing — reads `api_token.scope` off the validated row, fail-closed to full only when the row parses (an unreadable document refuses the credential outright)'
+			'the only credential that can carry a narrowing — writes the `api_token` arm, whose `scope` the type requires, read off the validated row (an unreadable document refuses the credential outright)'
 	},
 	{
 		file: 'auth/request_context.ts',
 		role: 'resolves',
 		reason:
-			'session cookies resolve to full by construction — a browser session *is* full account authority, and narrowing it is what role grants are for'
+			'session cookies resolve to full by construction (the `session` arm carries no scope; `resolved_auth_scope` answers full) — a browser session *is* full account authority, and narrowing it is what role grants are for'
 	},
 	{
 		file: 'auth/daemon_token_middleware.ts',
 		role: 'resolves',
 		reason:
-			'the daemon token resolves to full — singular, filesystem-proved, and keeper-bound, with no minting surface to attach a narrowing to'
+			'the daemon token resolves to full (the `daemon_token` arm carries no scope) — singular, filesystem-proved, and keeper-bound, with no minting surface to attach a narrowing to'
 	},
 	// --- Consults scope ---
 	{
@@ -118,19 +134,13 @@ const CENSUS: ReadonlyArray<CensusEntry> = [
 		file: 'actions/register_action_ws.ts',
 		role: 'consults',
 		reason:
-			'WS upgrade — rule 3 rejects a narrowed token at the boundary (server-initiated pushes have no per-recipient filter), and the socket retains the scope for the per-message gate'
-	},
-	{
-		file: 'actions/register_ws_endpoint.ts',
-		role: 'consults',
-		reason:
-			'the composed upgrade stack mounts the rule-3 guard between `require_auth` and the role guard, so a narrowed token hears about its scope rather than about a role it also lacks; `register_action_ws` repeats the check for consumers that mount it directly'
+			"WS upgrade — the route declares `required_scope: 'surface:ws_upgrade'` through `fuz_auth_guard_resolver`, so rule 3 rejects a narrowed token at the boundary ahead of the role gate (server-initiated pushes have no per-recipient filter), and the socket retains the scope for the per-message gate"
 	},
 	{
 		file: 'auth/audit_log_route_schema.ts',
 		role: 'consults',
 		reason:
-			'declares `token_surface: audit_stream` on the route shape — a long-lived admin SSE feed with no point after open at which a narrowing could be applied'
+			"declares `required_scope: 'surface:audit_stream'` on the route shape — a long-lived admin SSE feed with no point after open at which a narrowing could be applied. Its sibling `credential_types` gate is the one that actually keeps a bearer off the stream (rule 3 refuses a *narrowed* token; a full-scope one passes it, and SSE subscribers are keyed by session hash, so `token_revoke` could not close it) — the scope declaration stays as the rule-3 statement, governing a consumer that widens the channel"
 	},
 	{
 		file: 'actions/perform_action.ts',
@@ -139,29 +149,41 @@ const CENSUS: ReadonlyArray<CensusEntry> = [
 			'the shared dispatch core, and the per-method gate itself — runs between the credential gate and the role gate for every transport that reaches it (HTTP RPC and WS)'
 	},
 	{
-		file: 'actions/action_bridge.ts',
-		role: 'consults',
-		reason:
-			'derives `required_scope: rpc:<method>` onto every bridged route — a bridged handler runs through the REST pipeline and never reaches `perform_action`, so without this the per-method gate simply would not fire on that transport'
-	},
-	{
 		file: 'server/serve_fact_route.ts',
 		role: 'consults',
 		reason:
-			'declares `token_surface: fact_bare` — the admin-only bare-hash read serves any stored fact with no per-reference cell check; the sibling per-cell route is ungated because its authz is the `(cell, hash)` edge, which a narrowed token can already reach through the RPC methods it names'
+			"declares `required_scope: 'surface:fact_bare'` — the admin-only bare-hash read serves any stored fact with no per-reference cell check. The sibling per-cell route answers anonymous callers, so it reads the credential through `get_public_account_id`: a narrowed token is the anonymous caller there and reads public cells' facts only, never one its account could otherwise view"
+	},
+	{
+		file: 'auth/account_route_schema.ts',
+		role: 'consults',
+		reason:
+			"declares `required_scope: 'surface:account_verify'` on the `/verify` shape — the nginx `auth_request` probe answers 200 for the account behind any credential, so a narrowed token would pass every location the probe guards as its account; it is not an RPC method, so a narrowed token is refused it"
+	},
+	{
+		file: 'auth/account_routes.ts',
+		role: 'consults',
+		reason:
+			"`/status` hands out the account's email, its verification, and the acting actor's role grants — a non-RPC surface, so it reads the credential through `get_public_account_id` and a narrowed token is answered as the anonymous caller (401 plus the bootstrap flag): the route answers anonymous callers, so a 403 would add nothing to that. `/verify` takes its rule-3 gate from its shape; `/login` mints and `/logout` tears down; `/password` is already credential-gated to the session channel, so no bearer credential arrives"
+	},
+	{
+		file: 'server/surface_route.ts',
+		role: 'consults',
+		reason:
+			"declares `required_scope: 'surface:app_surface'` — the opt-in surface explorer serves a map of every route, its auth, and its schemas; it is not an RPC method, so a narrowed token gets none of it, ahead of the admin role gate"
 	},
 	// --- Exempt, with reasons ---
 	{
 		file: 'auth/audit_log_routes.ts',
 		role: 'exempt',
 		reason:
-			'the SSE handler behind the shape above; it reads the resolved context to key the subscription and adds no reach of its own, the rule-3 decision having been declared on the shape it spreads'
+			'the SSE handler behind the shape above; it reads the resolved context to key the subscription and to re-read the credential and role before admitting the stream, and adds no reach of its own, the rule-3 decision having been declared on the shape it spreads'
 	},
 	{
-		file: 'auth/account_routes.ts',
+		file: 'auth/resolved_auth.ts',
 		role: 'exempt',
 		reason:
-			"`/status` and `/verify` read back the caller's own credential state, which crosses no boundary; `/login` mints and `/logout` tears down; `/password` is already credential-gated to the session channel, so no bearer credential arrives"
+			'gathers the credential the middleware already resolved and re-reads whether it still authenticates, for a connection being admitted — it can only refuse, never admit: both callers (the WS upgrade, the audit stream) ran their rule-3 gate first, and the scope is not re-read because nothing rewrites it after the mint'
 	}
 ];
 
@@ -177,16 +199,18 @@ const CENSUS: ReadonlyArray<CensusEntry> = [
  * missed it.
  */
 const CREDENTIAL_MARKERS: ReadonlyArray<string | RegExp> = [
-	'ACCOUNT_ID_KEY',
-	'CREDENTIAL_TYPE_KEY',
-	'TOKEN_SCOPE_KEY',
+	RESOLVED_AUTH_KEY_NAME,
+	get_resolved_auth.name,
+	// The scope read itself, so a site gating on a `ResolvedAuth` handed to it
+	// as a parameter is found though it never touches the context.
+	resolved_auth_scope.name,
 	'REQUEST_CONTEXT_KEY',
 	'require_request_context',
 	'get_request_context',
 	'token_scope_surface_denial',
+	'get_public_account_id',
 	// Building a capability string is deciding what a credential's scope must
-	// admit, which is a census-worthy act even in a file that never reads one:
-	// it is how `actions/action_bridge.ts` gates a route the dispatcher can't.
+	// admit, which is a census-worthy act even in a file that never reads one.
 	'token_scope_method_capability',
 	// A route shape declaring the scope slot decides about a credential's
 	// scope without otherwise touching one, so it needs its own marker.
@@ -223,19 +247,15 @@ const NON_SURFACE_SITES: ReadonlyArray<string> = [
  * Which file gates each rule-3 surface and the exact source it must contain,
  * or `null` when the spine does not mount the surface.
  *
- * Two shapes, because there are two kinds of surface. A route spec declares
- * `required_scope: 'surface:<name>'` on its `auth` and `fuz_auth_guard_resolver`
- * mounts the guard ahead of the role gate; the WS upgrade is not a route spec,
- * so it calls the shared decision directly. Both are exact-match, so a gate
- * that is imported and documented but never reached still fails — the original
- * miss's shape.
+ * Every site declares `required_scope: 'surface:<name>'` on an auth shape and
+ * `fuz_auth_guard_resolver` mounts the guard ahead of the role gate — a route
+ * spec's `auth`, or the WS upgrade's, which `register_action_ws` hands the same
+ * resolver. Exact-match, so a gate that is imported and documented but never
+ * reached still fails — the original miss's shape.
  *
- * Both spellings name the surface the same way — `'surface:<name>'` — so the
- * declaration scan below covers the direct call too, and every site here is
- * pinned twice: once by exact source, once by "names a surface we mount". The
- * direct-call form deliberately isn't type-narrowed to `TokenSurface` (a
- * consumer surface would have nothing to pass), so those two are what stands in
- * for the compile-time check.
+ * The declaration scan below covers the same literal, so every site here is
+ * pinned twice: once by exact source, once by "names a surface we mount" — what
+ * stands in for a compile-time check, since `required_scope` is a plain string.
  *
  * `db_admin` is `null`, but **not** because the spine ships no table browser —
  * `http/db_routes.ts` is exactly that, an allowlist-gated browser over the
@@ -243,9 +263,18 @@ const NON_SURFACE_SITES: ReadonlyArray<string> = [
  * auth is `credential_types: ['daemon_token']`, and a daemon token resolves to
  * `full` by construction: no narrowed credential can reach it, and the
  * credential gate — which now runs ahead of the scope guard — answers first
- * with the coarser `credential_type_required`. Declaring the surface would
- * invert that and name a scope to a channel that may never call the route at
- * all.
+ * with the coarser `credential_type_required`.
+ *
+ * **A credential gate does not by itself retire the scope declaration**, which
+ * is why the audit stream carries both. The two routes differ in what the
+ * declaration would be *for*: `audit_stream` is a named `TokenSurface` this
+ * census requires a site for, so its `required_scope` is the rule-3 statement
+ * — dead on the default mount, live for a consumer that widens the channel to
+ * admit bearers. `db_admin` has no such consumer story worth pre-declaring: a
+ * consumer that re-auths `create_db_route_specs` off the keeper channel is
+ * rewriting the route's authority wholesale and owns its own census, so a
+ * scope string on the shipped spec would name a capability to a channel that
+ * may never call the route at all and pre-empt nothing.
  *
  * **The hazard that reasoning rests on is the consumer's auth, not ours.** A
  * consumer mounting `create_db_route_specs` under a widened `auth` — dropping
@@ -264,14 +293,91 @@ const RULE_3_SURFACE_SITES: Record<TokenSurface, { file: string; source: string 
 	},
 	ws_upgrade: {
 		file: 'actions/register_action_ws.ts',
-		source: "token_scope_surface_denial(c, 'surface:ws_upgrade')"
+		source: "required_scope: 'surface:ws_upgrade'"
 	},
 	audit_stream: {
 		file: 'auth/audit_log_route_schema.ts',
 		source: "required_scope: 'surface:audit_stream'"
 	},
+	app_surface: {
+		file: 'server/surface_route.ts',
+		source: "required_scope: 'surface:app_surface'"
+	},
+	account_verify: {
+		file: 'auth/account_route_schema.ts',
+		source: "required_scope: 'surface:account_verify'"
+	},
 	db_admin: null
 };
+
+/**
+ * The rule-3 surfaces that answer anonymous callers, and the exact call each
+ * handler must make.
+ *
+ * Such a route can't declare `required_scope` (the guard resolver refuses it on
+ * an unrestricted route — the holder would drop the credential and read the
+ * anonymous answer anyway), so it applies rule 3 itself by reading the
+ * credential through `get_public_account_id`, which answers a narrowed token
+ * as anonymous. Pinned by exact source for the same reason as
+ * `RULE_3_SURFACE_SITES`: a handler that reverts to reading `get_resolved_auth`
+ * directly would hand a narrowed token the account's view with nothing else
+ * failing.
+ */
+const RULE_3_DOWNGRADE_SITES: ReadonlyArray<{
+	file: string;
+	source: string;
+	/**
+	 * The exact lines that read the resolved credential for something other
+	 * than the account — each a handler on another route of the same module,
+	 * exempted by name.
+	 */
+	other_reads?: ReadonlyArray<{ source: string; reason: string }>;
+}> = [
+	{
+		file: 'auth/account_routes.ts',
+		source: 'const account_id = get_public_account_id(c);',
+		other_reads: [
+			{
+				source: 'const session_hash = resolved_auth_session_hash(get_resolved_auth(c));',
+				reason:
+					'`/logout` revokes the session it was called on; its shape admits only a session credential, so no bearer reaches it'
+			},
+			{
+				source: 'const credential_type = get_resolved_auth(c)?.credential_type;',
+				reason:
+					'`/password` records the credential type in its audit metadata; credential-gated to the session channel'
+			}
+		]
+	},
+	{ file: 'server/serve_fact_route.ts', source: 'const account_id = get_public_account_id(c);' }
+];
+
+/**
+ * The raw reads of the resolved credential — the context key by constant
+ * (`RESOLVED_AUTH_KEY`), by its value (the bare `resolved_auth`, which also
+ * matches the literal in `c.get('resolved_auth')` and `c.var.resolved_auth`,
+ * quote and dot being word boundaries), and the getter (`get_resolved_auth`).
+ * The bare value skips a module path (`./resolved_auth.ts`), which names the
+ * module, not the value. Built from
+ * the live key value and the getter's name, so a rename moves the pattern
+ * with it; the positive control below holds it to matching each spelling.
+ *
+ * A `RULE_3_DOWNGRADE_SITES` file holds none of them: the downgrade call pins
+ * that the site *makes* the downgrade, not that it acts on its answer, so a
+ * raw read beside the call would hand a narrowed token the account's view
+ * with the call still present. Whole-file, so a later handler in the same
+ * module that needs the full credential has to move or be exempted here by
+ * name (`other_reads`). Only whole comment lines are stripped, so a trailing
+ * comment or a string spelling one of these names counts too — reword it.
+ */
+const RAW_CREDENTIAL_READ = new RegExp(
+	[
+		`\\b${RESOLVED_AUTH_KEY_NAME}\\b`,
+		`\\b${RESOLVED_AUTH_KEY}\\b(?!\\.ts)`,
+		`\\b${get_resolved_auth.name}\\s*\\(`
+	].join('|'),
+	'u'
+);
 
 /**
  * Matches any `'surface:<name>'` literal — a route spec's `required_scope`
@@ -344,10 +450,12 @@ const strip_comment_lines = (source: string): string =>
 		.join('\n');
 
 /** Walk `src/lib` for files that reach a resolved credential. */
-const discover_credential_sites = (): Set<string> =>
+const discover_credential_sites = (
+	markers: ReadonlyArray<string | RegExp> = CREDENTIAL_MARKERS
+): Set<string> =>
 	discover_lib_files((raw) => {
 		const source = strip_comment_lines(raw);
-		return CREDENTIAL_MARKERS.some((marker) =>
+		return markers.some((marker) =>
 			typeof marker === 'string' ? source.includes(marker) : marker.test(source)
 		);
 	});
@@ -398,8 +506,7 @@ describe('token scope surface census', () => {
 
 	/**
 	 * The scope-consulting set is exactly the dispatch core and its two RPC
-	 * transports, the REST bridge that stands in for the core on a transport it
-	 * never reaches, and the non-RPC surfaces the spine mounts — pinned as an
+	 * transports, and the non-RPC surfaces the spine mounts — pinned as an
 	 * exact list so *narrowing* it (deleting a check) fails here too, not just
 	 * widening it.
 	 */
@@ -408,33 +515,105 @@ describe('token scope surface census', () => {
 			.map((e) => e.file)
 			.sort();
 		assert.deepStrictEqual(consulting, [
-			'actions/action_bridge.ts',
 			'actions/action_rpc.ts',
 			'actions/perform_action.ts',
 			'actions/register_action_ws.ts',
-			'actions/register_ws_endpoint.ts',
+			'auth/account_route_schema.ts',
+			'auth/account_routes.ts',
 			'auth/audit_log_route_schema.ts',
-			'server/serve_fact_route.ts'
+			'server/serve_fact_route.ts',
+			'server/surface_route.ts'
 		]);
 	});
 
 	/**
-	 * Every resolver writes `TOKEN_SCOPE_KEY`.
+	 * Every resolver writes the one resolved value, and the type holds the
+	 * scope.
 	 *
-	 * The TS-specific half of the census, and the one with no Rust twin. Every
-	 * gate reads the key as `scope && !admits(scope)` — necessarily, since the
-	 * anonymous caller holds no credential to narrow — so a middleware that
-	 * authenticates a caller and leaves the key unset makes that caller
-	 * *un-narrowable* at every surface at once. That is the permissive default
-	 * this design removed, re-entered by omission rather than by decision.
+	 * The scope half is a shape rule: the `api_token` arm requires `scope`, the
+	 * `session` and `daemon_token` arms carry none (`resolved_auth_scope`
+	 * answers `full` for them), so a resolver cannot authenticate a caller and
+	 * leave it un-narrowable without failing typecheck here. The source half
+	 * pins that each resolver writes the value, under the key constant the
+	 * markers and the raw-read pattern are built from.
 	 */
-	test('resolvers set the token scope', () => {
-		for (const entry of CENSUS) {
-			if (entry.role !== 'resolves') continue;
-			const source = read_lib_source(entry.file);
+	test('resolvers write the one resolved value', () => {
+		type HasKey<T, K extends PropertyKey> = K extends keyof T ? true : false;
+		const shape: [
+			HasKey<ResolvedApiTokenAuth, 'scope'>,
+			HasKey<ResolvedSessionAuth, 'scope'>,
+			HasKey<ResolvedDaemonTokenAuth, 'scope'>,
+			ResolvedApiTokenAuth['scope'] extends TokenScope ? true : false
+		] = [true, false, false, true];
+		assert.deepStrictEqual(shape, [true, false, false, true]);
+		assert.strictEqual(resolved_auth_scope(null), null, 'only the anonymous caller lacks a scope');
+
+		const resolvers = CENSUS.filter((e) => e.role === 'resolves');
+		assert.strictEqual(resolvers.length, 3, 'the daemon-token, session, and bearer legs');
+		for (const entry of resolvers) {
+			const source = strip_comment_lines(read_lib_source(entry.file));
 			assert.ok(
-				source.includes(`c.set(TOKEN_SCOPE_KEY`),
-				`${entry.file} resolves a credential but never sets TOKEN_SCOPE_KEY — the caller would be un-narrowable at every surface`
+				source.includes(`c.set(${RESOLVED_AUTH_KEY_NAME}, {`),
+				`${entry.file} resolves a credential but never sets ${RESOLVED_AUTH_KEY_NAME}`
+			);
+		}
+	});
+
+	/**
+	 * The markers and the raw-read pattern still match what they scan for.
+	 *
+	 * Without this a rename of the key or the getter would leave every marker
+	 * matching nothing — the census discovering fewer sites, the downgrade
+	 * check passing vacuously — and nothing would fail.
+	 */
+	test('the markers match real credential reads (positive control)', () => {
+		assert.strictEqual(
+			read_lib_source('hono_context.ts').includes(
+				`export const ${RESOLVED_AUTH_KEY_NAME} = '${RESOLVED_AUTH_KEY}';`
+			),
+			true,
+			`${RESOLVED_AUTH_KEY_NAME} is not declared under that name — update the census markers`
+		);
+		for (const spelling of [
+			`c.get(${RESOLVED_AUTH_KEY_NAME})`,
+			`c.get('${RESOLVED_AUTH_KEY}')`,
+			`c.var.${RESOLVED_AUTH_KEY}`,
+			`const { ${RESOLVED_AUTH_KEY} } = c.var;`,
+			`${get_resolved_auth.name}(c)`
+		]) {
+			assert.ok(RAW_CREDENTIAL_READ.test(spelling), `the raw-read pattern misses \`${spelling}\``);
+		}
+		for (const near_miss of [
+			`import { x } from './${RESOLVED_AUTH_KEY}.ts';`,
+			`import { x } from '#lib/auth/${RESOLVED_AUTH_KEY}.ts';`,
+			`${RESOLVED_AUTH_KEY}_scope(auth)`
+		]) {
+			assert.ok(
+				!RAW_CREDENTIAL_READ.test(near_miss),
+				`the raw-read pattern matches \`${near_miss}\`, which reads no credential`
+			);
+		}
+		// the getter and the key are each reached by real lib code
+		const discovered = discover_credential_sites();
+		for (const file of [
+			'auth/request_context.ts',
+			'auth/bearer_auth.ts',
+			'auth/daemon_token_middleware.ts',
+			'actions/action_rpc.ts'
+		]) {
+			assert.ok(discovered.has(file), `${file} reads the credential but the markers miss it`);
+		}
+		// each way to read the credential is a marker, and each reaches real code
+		for (const [marker, file] of [
+			[RESOLVED_AUTH_KEY_NAME, 'auth/bearer_auth.ts'],
+			[get_resolved_auth.name, 'actions/action_rpc.ts'],
+			// a site handed the credential as a parameter, reached by the scope read alone
+			[resolved_auth_scope.name, 'actions/perform_action.ts']
+		] as const) {
+			assert.ok(CREDENTIAL_MARKERS.includes(marker), `\`${marker}\` is not a credential marker`);
+			assert.ok(
+				discover_credential_sites([marker]).has(file),
+				`the \`${marker}\` marker misses ${file}`
 			);
 		}
 	});
@@ -467,14 +646,51 @@ describe('token scope surface census', () => {
 	});
 
 	/**
+	 * Every anonymous-admitting rule-3 surface reads the credential through the
+	 * downgrade and no raw read beside it, and is censused as consulting the
+	 * scope.
+	 */
+	test('every anonymous-admitting rule-3 surface downgrades a narrowed token', () => {
+		const consulting = new Set(CENSUS.filter((e) => e.role === 'consults').map((e) => e.file));
+		for (const site of RULE_3_DOWNGRADE_SITES) {
+			assert.ok(
+				consulting.has(site.file),
+				`${site.file} downgrades a narrowed token but is not censused as consulting scope`
+			);
+			assert.ok(
+				strip_comment_lines(read_lib_source(site.file)).includes(site.source),
+				`${site.file} answers anonymous callers but does not contain \`${site.source}\` — a narrowed token would read the account's view`
+			);
+			let source = strip_comment_lines(read_lib_source(site.file));
+			for (const other of site.other_reads ?? []) {
+				assert.ok(
+					source.includes(other.source),
+					`${site.file} names an exempt read it no longer makes: \`${other.source}\``
+				);
+				assert.ok(other.reason.length > 20, `${site.file} needs a reason for \`${other.source}\``);
+				// exactly once, so a copy of an exempt line in another handler is still a raw read
+				assert.strictEqual(
+					source.split(other.source).length - 1,
+					1,
+					`${site.file} makes the exempt read \`${other.source}\` more than once — exempt each by its own handler`
+				);
+				source = source.replace(other.source, '');
+			}
+			const raw_read = RAW_CREDENTIAL_READ.exec(source);
+			assert.ok(
+				raw_read === null,
+				`${site.file} answers anonymous callers but reads the account id raw (\`${raw_read?.[0]}\`) beside the downgrade — a narrowed token would read the account's view`
+			);
+		}
+	});
+
+	/**
 	 * **The spine names only surfaces the spine mounts.**
 	 *
 	 * `auth.required_scope` is deliberately open on the identifier — a consumer
 	 * names its own non-RPC surface without registering it upstream, because the
-	 * name decides nothing (rule 3 is all-or-nothing) and the sibling
-	 * `rpc:<method>` arm of the same wire field has always carried arbitrary
-	 * consumer method names. The resolver therefore checks *shape*, not
-	 * membership.
+	 * name decides nothing (rule 3 is all-or-nothing). The resolver therefore
+	 * checks *shape*, not membership.
 	 *
 	 * That leaves fuz_app's own declarations unguarded against a typo, which
 	 * this restores and then some: every `'surface:<name>'` literal in `src/lib`

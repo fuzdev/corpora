@@ -26,33 +26,35 @@ import {
 	cell_delete_action_spec,
 	cell_clone_action_spec,
 	cell_moderate_action_spec,
+	cell_policy_set_action_spec,
 	ERROR_CELL_NOT_FOUND
-} from '$lib/auth/cell_action_specs.ts';
+} from '#lib/auth/cell_action_specs.ts';
 import {
 	cell_grant_create_action_spec,
 	cell_grant_revoke_action_spec
-} from '$lib/auth/cell_grant_action_specs.ts';
+} from '#lib/auth/cell_grant_action_specs.ts';
 import {
 	cell_field_set_action_spec,
 	cell_field_delete_action_spec,
 	type CellFieldName
-} from '$lib/auth/cell_field_action_specs.ts';
+} from '#lib/auth/cell_field_action_specs.ts';
 import {
 	cell_item_insert_action_spec,
 	cell_item_move_action_spec,
 	cell_item_delete_action_spec,
 	type CellItemPosition
-} from '$lib/auth/cell_item_action_specs.ts';
+} from '#lib/auth/cell_item_action_specs.ts';
 import {
 	cell_audit_list_action_spec,
 	CellAuditEventJson
-} from '$lib/auth/cell_audit_action_specs.ts';
-import { cell_audit_events } from '$lib/auth/cell_audit_events.ts';
-import { query_audit_log_list } from '$lib/auth/audit_log_queries.ts';
+} from '#lib/auth/cell_audit_action_specs.ts';
+import { cell_audit_events } from '#lib/auth/cell_audit_events.ts';
+import { query_audit_log_list } from '#lib/auth/audit_log_queries.ts';
 import { fractional_index_between } from '@fuzdev/fuz_util/fractional_index.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { create_cell_test_app, create_cell, call, error_reason } from './cell_test_helpers.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { create_cell_test_app, create_cell, call } from './cell_test_helpers.ts';
+import { error_reason } from './rpc_test_helpers.ts';
 import { describe_db } from '../cell_db_fixture.ts';
 
 describe_db('cell audit', (get_db) => {
@@ -145,8 +147,9 @@ describe_db('cell audit', (get_db) => {
 			// cell_moderate — create a contribution under `parent` (the owner owns
 			// `parent`, so it manages the governing root), then moderate it. No
 			// authorizer is mounted in-process, so the contribution is born
-			// unmoderated; the verb still flips the marker + emits its event, which
-			// is what the completeness check counts.
+			// unmoderated; the marker is set to `pending` directly (the verb decides
+			// only a pending contribution), and the decision emits the event the
+			// completeness check counts.
 			const contribution = await call(
 				app,
 				cell_create_action_spec,
@@ -154,6 +157,9 @@ describe_db('cell audit', (get_db) => {
 				h
 			);
 			assert.ok(contribution.ok, JSON.stringify(contribution));
+			await get_db().query(`UPDATE cell SET moderation = 'pending' WHERE id = $1`, [
+				contribution.result.cell.id
+			]);
 			assert.ok(
 				(
 					await call(
@@ -163,6 +169,12 @@ describe_db('cell audit', (get_db) => {
 						h
 					)
 				).ok
+			);
+
+			// cell_policy_set — clearing needs no authorizer (a non-null policy
+			// would, and none is mounted here).
+			assert.ok(
+				(await call(app, cell_policy_set_action_spec, { cell_id: parent, policy: null }, h)).ok
 			);
 
 			// cell_delete

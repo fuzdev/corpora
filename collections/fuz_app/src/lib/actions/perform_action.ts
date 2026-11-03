@@ -9,30 +9,44 @@
  *    on `'required'` axes.
  * 2. **Authorization phase** — when `auth.actor !== 'none'` (or
  *    `auth.account !== 'none' && actor === 'none'`), resolves the actor
- *    via `apply_authorization_phase` against the supplied `account_id`
+ *    via `apply_authorization_phase` against the resolved credential's account
  *    plus the request's `acting` selector, read off the raw params by
  *    `read_acting`. Failures fold into a JSON-RPC error envelope. The
  *    test-harness escape hatch lives in the caller — pass
  *    `preset.request_context` to skip the live phase and use a pre-baked
  *    context instead.
  * 3. **Post-authorization auth (403)** — gates `auth.credential_types`,
- *    the credential's `token_scope`, and `auth.roles` against the resolved
- *    context.
- * 4. **Validate params (400)** — `spec.input.safeParse(raw_params)` with
- *    `z.void()` / `?? {}` rules. Runs **after** the authority gates: a
+ *    the credential's scope (`resolved_auth_scope`), and `auth.roles` against
+ *    the resolved context.
+ * 4. **Rate limit (429)** — per-action IP / account throttling, throttle-
+ *    requests semantics (every invocation records, regardless of outcome).
+ *    Ahead of validation so the budget is charged for malformed params too
+ *    — a flood of garbage bodies must cost the sender its quota, not slip
+ *    past the limiter on a cheap 400 — and so a throttled caller never pays
+ *    for schema work. The account key is the credential's own account
+ *    (`request_context.account.id`), settled by authentication, so the gate
+ *    sits behind the authority gates by choice rather than necessity: a
+ *    caller those gates refuse is answered 403, not 429.
+ * 5. **Validate params (400)** — first, object `params` holding an own
+ *    `__proto__` key at any depth (`json_has_own_proto_key`) are refused
+ *    with `data.reason` `params_proto_key` (`ERROR_PARAMS_PROTO_KEY`), on
+ *    every input schema, before it runs; then
+ *    `spec.input.safeParse(raw_params)` with
+ *    `z.void()` / `?? {}` rules (`to_input_params`). A refusal is the generic
+ *    `invalid params`, with `data.reason` when the first issue's field
+ *    declares an `invalid_reason` (`to_invalid_params_error`) and the Zod
+ *    issues under DEV only. Runs **after** the authority gates: a
  *    400 describing the action's input shape to a caller those gates
  *    refuse would confirm the method exists and describe how to call it,
  *    to a channel that should have learned nothing. Coarse authority
  *    facts before fine ones, and no shape disclosure before authority is
  *    settled — the same argument that puts the credential gate ahead of
  *    the scope gate. The cost: a malformed request from an *authenticated*
- *    caller now pays for the authorization phase's actor + role_grant reads
- *    before being rejected, where validation used to turn it away first.
- *    Not a new DoS lever — the same caller reaches that work anyway by
- *    sending well-formed params — but it does remove a cheap-rejection path
- *    that buggy clients used to hit.
- * 5. **Rate limit (429)** — per-action IP / account throttling, throttle-
- *    requests semantics (every invocation records, regardless of outcome).
+ *    caller pays for the authorization phase's actor + role_grant reads
+ *    before being rejected, rather than being turned away by validation
+ *    first. Not a new DoS lever — the same caller reaches that work anyway
+ *    by sending well-formed params — but there is no cheap-rejection path
+ *    for buggy clients.
  * 6. **Dispatch + DEV-only output validation + error normalization** —
  *    `spec.side_effects` picks transaction (`deps.db.transaction`) vs
  *    pool. Handler throws roll back the transaction; the catch sits
@@ -41,8 +55,7 @@
  *    throws, never mutates the result).
  *
  * The function is pure data — it never touches a Hono context, so HTTP
- * RPC, REST bridge (when on the action surface), and WS dispatch all
- * call into it the same way and bind the discriminated
+ * RPC and WS dispatch call into it the same way and bind the discriminated
  * `PerformActionResult` to their wire shape.
  *
  * @module
@@ -50,45 +63,52 @@
 
 import { DEV } from 'esm-env';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { z } from 'zod';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import {
 	apply_authorization_phase,
 	has_any_scoped_role,
 	type RequestContext
 } from '../auth/request_context.ts';
-import { type CredentialType } from '../hono_context.ts';
+import {
+	resolved_auth_scope,
+	resolved_auth_session_hash,
+	type ResolvedAuth
+} from '../auth/resolved_auth.ts';
 import type { Db } from '../db/db.ts';
-import { is_void_schema } from '../http/schema_helpers.ts';
+import { is_db_checkout_error } from '../db/db_checkout_error.ts';
+import { resolve_issues_invalid_reason } from '../schema_meta.ts';
+import { json_has_own_proto_key, to_input_params } from '../http/schema_helpers.ts';
+import { rate_limit_ip_key } from '../http/ip_canonical.ts';
 import { dispatch_with_post_commit_rollback } from '../http/pending_effects.ts';
 import {
-	JSONRPC_VERSION,
 	type JsonrpcRequestId,
-	type JsonrpcErrorCode,
-	type JsonrpcErrorObject
+	type JsonrpcErrorObject,
+	type JsonrpcErrorResponse,
+	type JsonrpcResponse
 } from '../http/jsonrpc.ts';
+import { create_jsonrpc_error_response, create_jsonrpc_response } from '../http/jsonrpc_helpers.ts';
 import {
 	jsonrpc_error_messages,
 	jsonrpc_error_code_to_http_status,
 	http_status_to_jsonrpc_error_code,
 	JSONRPC_ERROR_CODES,
-	dev_only
+	dev_only,
+	to_thrown_jsonrpc_error
 } from '../http/jsonrpc_errors.ts';
 import {
 	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_INSUFFICIENT_PERMISSIONS,
 	ERROR_CREDENTIAL_TYPE_REQUIRED,
+	ERROR_PARAMS_PROTO_KEY,
 	ERROR_TOKEN_SCOPE_REQUIRED
 } from '../http/error_schemas.ts';
 import type { RateLimiter } from '../rate_limiter.ts';
 import { is_public_auth, needs_actor, parse_acting, type RouteAuth } from '../http/auth_shape.ts';
-import type { ActionContext, ActionHandler, RpcAction } from './action_rpc.ts';
+import type { ActionContext, ActionHandler, RpcAction } from './action_types.ts';
 import type { RequestClient } from './peer_request.ts';
-import {
-	token_scope_admits_method,
-	token_scope_method_capability,
-	type TokenScope
-} from '../auth/token_scope.ts';
+import { token_scope_admits_method, token_scope_method_capability } from '../auth/token_scope.ts';
 
 /**
  * Per-call inputs to `perform_action`. Each transport assembles this from
@@ -101,17 +121,14 @@ export interface PerformActionInput {
 	raw_params: unknown;
 	/** JSON-RPC request id — echoed onto the response. */
 	request_id: JsonrpcRequestId;
-	/** Authenticated account id, or `null` for anonymous. */
-	account_id: string | null;
-	/** Credential type the request arrived on, or `null` for anonymous. */
-	credential_type: CredentialType | null;
 	/**
-	 * The credential's authority narrowing — `null` only for the anonymous
-	 * caller, who holds no credential to narrow. Every resolved credential
-	 * carries one, so this mirrors the `null` shape `credential_type` already
-	 * has rather than introducing a permissive absent case.
+	 * The credential the request authenticated with (`get_resolved_auth`), or
+	 * `null` for anonymous. Its account is what the authorization phase
+	 * resolves the acting actor against, its type and scope what the
+	 * post-authorization gates read, and its type and session hash what the
+	 * handler sees on `ActionContext`.
 	 */
-	token_scope: TokenScope | null;
+	auth: ResolvedAuth | null;
 	/** Resolved client IP (`'unknown'` if upstream couldn't resolve). */
 	client_ip: string;
 	/** Per-request abort signal. HTTP: `c.req.raw.signal`. WS: `AbortSignal.any([socket, request])`. */
@@ -178,10 +195,10 @@ export type PerformActionResult =
  * transport calls into this with pre-parsed inputs and binds the result
  * to its wire shape.
  *
- * Phase order: 401 → authz → 403 → 400 → handler. On the test-preset path
+ * Phase order: 401 → authz → 403 → 429 → 400 → handler. On the test-preset path
  * the dispatcher skips the live authorization phase and uses the supplied
  * pre-baked context for post-authorization checks; the 401 still fires when
- * the harness omits `account_id`.
+ * the harness omits `auth`.
  */
 export const perform_action = async (
 	input: PerformActionInput,
@@ -191,9 +208,7 @@ export const perform_action = async (
 		action,
 		raw_params,
 		request_id: id,
-		account_id,
-		credential_type,
-		token_scope,
+		auth,
 		client_ip,
 		signal,
 		notify,
@@ -211,27 +226,37 @@ export const perform_action = async (
 	} = deps;
 	const { spec, handler } = action;
 	const action_auth = spec.auth;
+	const account_id = auth?.account_id ?? null;
 
 	// step 1: pre-authorization auth — 401 short-circuit.
 	const pre = check_action_auth_pre_authorization(action_auth, account_id);
 	if (pre) return error_result(pre);
 
 	// step 2: authorization phase. `acting` reads off the raw params rather
-	// than a validated field, because validation now runs after the authority
+	// than a validated field, because validation runs after the authority
 	// gates. Per registry-time invariant 2,
 	// `auth.actor !== 'none' ⟺ input declares acting?: ActingActor` — so the
-	// selector is present on exactly the specs that need it, and step 4 is
+	// selector is present on exactly the specs that need it, and step 5 is
 	// what rejects a malformed one.
 	let request_context: RequestContext | null = null;
 	if (preset !== undefined) {
 		request_context = preset.request_context;
 	} else if (!is_public_auth(action_auth)) {
-		const result = await apply_authorization_phase(
-			{ db },
-			account_id,
-			action_auth,
-			read_acting(action_auth, raw_params)
-		);
+		// A throw here (a failed checkout or read) answers the JSON-RPC envelope
+		// like a handler throw does — never escaping to the transport's REST
+		// catch — so the RPC endpoint answers in its own shape, as the Rust
+		// dispatcher does.
+		let result: Awaited<ReturnType<typeof apply_authorization_phase>>;
+		try {
+			result = await apply_authorization_phase(
+				{ db },
+				account_id,
+				action_auth,
+				read_acting(action_auth, raw_params)
+			);
+		} catch (err) {
+			return thrown_error_result(err, `authorization phase error: ${spec.method}`, log);
+		}
 		if (!result.ok) {
 			const { error: reason, ...rest } = result.body;
 			const code = http_status_to_jsonrpc_error_code(result.status);
@@ -250,52 +275,70 @@ export const perform_action = async (
 	const post = check_action_auth_post_authorization(
 		action_auth,
 		request_context,
-		credential_type,
-		action.spec.method,
-		token_scope
+		auth,
+		action.spec.method
 	);
 	if (post) return error_result(post);
 
-	// step 4: validate params. JSON-RPC 2.0 §4.2 forbids `params: null`;
-	// registration sites reject `z.null()` inputs. Empty-body convention
-	// (`raw_params ?? {}`) lets all-optional-object methods omit `params`.
-	const params = is_void_schema(spec.input) ? raw_params : (raw_params ?? {});
-	const parse_result = spec.input.safeParse(params);
-	if (!parse_result.success) {
-		return error_result(
-			jsonrpc_error_messages.invalid_params(
-				'invalid params',
-				dev_only({ issues: parse_result.error.issues })
-			)
-		);
-	}
-	const validated_input = parse_result.data;
-
-	// step 5: rate limit — throttle-requests semantics (record on every
+	// step 4: rate limit — throttle-requests semantics (record on every
 	// invocation, no success-reset). Same limiters shared with the WS
 	// dispatcher so an attacker can't switch transports to bypass the budget.
+	// Runs ahead of validation so a flood of malformed params burns the
+	// budget it should, and so a throttled caller pays no schema work.
 	const rate_limit = spec.rate_limit;
 	if (rate_limit) {
-		const ip_check = action_ip_rate_limiter && (rate_limit === 'ip' || rate_limit === 'both');
+		const ip_limiter = rate_limit === 'ip' || rate_limit === 'both' ? action_ip_rate_limiter : null;
 		const account_keyed_context =
 			action_account_rate_limiter &&
 			request_context !== null &&
 			(rate_limit === 'account' || rate_limit === 'both')
 				? request_context
 				: null;
-		if (ip_check) {
-			const result = action_ip_rate_limiter.check(client_ip);
+		// keyed by the address's rate-limit key (an IPv6 client's /64); the
+		// audit trail keeps `client_ip` whole
+		const ip_key = ip_limiter ? rate_limit_ip_key(client_ip) : '';
+		if (ip_limiter) {
+			const result = ip_limiter.check(ip_key);
 			if (!result.allowed) return rate_limited_result(result.retry_after);
 		}
 		if (account_keyed_context) {
 			const result = action_account_rate_limiter!.check(account_keyed_context.account.id);
 			if (!result.allowed) return rate_limited_result(result.retry_after);
 		}
-		if (ip_check) action_ip_rate_limiter.record(client_ip);
+		if (ip_limiter) ip_limiter.record(ip_key);
 		if (account_keyed_context) {
 			action_account_rate_limiter!.record(account_keyed_context.account.id);
 		}
 	}
+
+	// step 5: validate params. JSON-RPC 2.0 §4.2 forbids `params: null`;
+	// registration sites reject `z.null()` inputs. Empty-body convention
+	// (`raw_params ?? {}`) lets all-optional-object methods omit `params`;
+	// a `z.void()` input reads every empty shape as the no-arg call — see
+	// `to_input_params`.
+	//
+	// An own `__proto__` key anywhere in object params is refused first, on
+	// every input: Zod drops a top-level one from a loose object and keeps a
+	// nested one by reference, so a schema alone would store it — a sink for
+	// any client that copies the value back with plain assignment. Only an
+	// object is walked, so a non-object `params` is the schema's refusal, as
+	// the Rust twin's shape check answers it ahead of its walk.
+	if (
+		typeof raw_params === 'object' &&
+		raw_params !== null &&
+		!Array.isArray(raw_params) &&
+		json_has_own_proto_key(raw_params)
+	) {
+		return error_result(
+			jsonrpc_error_messages.invalid_params('invalid params', { reason: ERROR_PARAMS_PROTO_KEY })
+		);
+	}
+	const params = to_input_params(spec.input, raw_params);
+	const parse_result = spec.input.safeParse(params);
+	if (!parse_result.success) {
+		return error_result(to_invalid_params_error(spec.input, parse_result.error.issues));
+	}
+	const validated_input = parse_result.data;
 
 	// step 6: dispatch — transaction for mutations, pool for reads.
 	const use_transaction = spec.side_effects;
@@ -310,7 +353,8 @@ export const perform_action = async (
 			pending_effects,
 			post_commit_effects,
 			client_ip,
-			credential_type,
+			credential_type: auth?.credential_type ?? null,
+			session_hash: resolved_auth_session_hash(auth),
 			log,
 			notify,
 			signal
@@ -340,27 +384,57 @@ export const perform_action = async (
 			use_transaction ? db.transaction((tx) => execute(tx)) : execute(db)
 		);
 	} catch (err) {
-		// Duck-type check: Error with numeric `code` signals a JSON-RPC error.
-		// Avoids cross-realm `instanceof` misses when consumers throw their own
-		// `ThrownJsonrpcError` (structurally identical, different class identity).
-		const error_like = err as { code?: unknown; data?: unknown };
-		if (err instanceof Error && typeof error_like.code === 'number') {
-			const code = error_like.code as JsonrpcErrorCode;
-			const status = jsonrpc_error_code_to_http_status(code);
-			const error: JsonrpcErrorObject = { code, message: err.message };
-			if (error_like.data !== undefined) error.data = error_like.data;
-			return { kind: 'error', status, error };
-		}
-		log.error(`unhandled action handler error: ${spec.method}`, err);
-		// Raw exception messages can leak internals (paths, SQL, secrets in a
-		// message) — surface them only in development; production falls back to
-		// the generic `internal_error` default. Same gate as the Zod-issue redaction.
-		return error_result(
-			jsonrpc_error_messages.internal_error(
-				dev_only(err instanceof Error ? err.message : undefined)
-			)
-		);
+		return thrown_error_result(err, `unhandled action handler error: ${spec.method}`, log);
 	}
+};
+
+/**
+ * The dispatcher's answer to a thrown value: the JSON-RPC error it carries
+ * (`to_thrown_jsonrpc_error` — a `ThrownJsonrpcError` from any copy of
+ * fuz_app, or a failed pool checkout's `service_unavailable`), else a logged,
+ * masked `internal_error`.
+ */
+const thrown_error_result = (err: unknown, context: string, log: Logger): PerformActionResult => {
+	const thrown = to_thrown_jsonrpc_error(err);
+	if (thrown) {
+		// a failed checkout is the server's to see, though the caller gets the 503
+		if (is_db_checkout_error(err)) log.error(context, err);
+		return {
+			kind: 'error',
+			status: jsonrpc_error_code_to_http_status(thrown.code),
+			error: thrown
+		};
+	}
+	log.error(context, err);
+	// Raw exception messages can leak internals (paths, SQL, secrets in a
+	// message) — surface them only in development; production falls back to
+	// the generic `internal_error` default. Same gate as the Zod-issue redaction.
+	return error_result(
+		jsonrpc_error_messages.internal_error(dev_only(err instanceof Error ? err.message : undefined))
+	);
+};
+
+/**
+ * The `invalid_params` error an input validation failure answers: the generic
+ * `invalid params` message, `data.reason` when the field the first issue lands
+ * on declares an `invalid_reason` and no issue sits on the input itself
+ * (`resolve_issues_invalid_reason`), and the Zod issues under DEV only
+ * (`dev_only`). With no declared reason, production sends no `data` at all.
+ *
+ * @param input - the action's input schema
+ * @param issues - the failed parse's issues, in Zod's order
+ * @returns the JSON-RPC error object
+ */
+export const to_invalid_params_error = (
+	input: z.ZodType,
+	issues: ReadonlyArray<z.core.$ZodIssue>
+): JsonrpcErrorObject => {
+	const reason = resolve_issues_invalid_reason(input, issues);
+	const issues_data = dev_only({ issues });
+	return jsonrpc_error_messages.invalid_params(
+		'invalid params',
+		reason === undefined ? issues_data : { reason, ...issues_data }
+	);
 };
 
 const error_result = (error: JsonrpcErrorObject): PerformActionResult => ({
@@ -423,6 +497,23 @@ const check_action_auth_pre_authorization = (
 };
 
 /**
+ * The credential-type 403 — one builder, so the dispatcher's gate below and a
+ * handler that gates a credential channel on its input (`account_delete`'s
+ * self path) emit a byte-identical error. Twin of the Rust
+ * `fuz_auth::credential_type_required`.
+ *
+ * @param required_credential_types - the channels that would be admitted
+ * @returns the `forbidden` error object with reason `credential_type_required`
+ */
+export const credential_type_required_error = (
+	required_credential_types: ReadonlyArray<string>
+): JsonrpcErrorObject =>
+	jsonrpc_error_messages.forbidden('forbidden', {
+		reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
+		required_credential_types
+	});
+
+/**
  * Post-authorization auth gate — fires after the authorization phase
  * resolved the actor + role_grants. Enforces `auth.credential_types` and
  * `auth.roles`.
@@ -439,7 +530,7 @@ const check_action_auth_pre_authorization = (
  * **Scope second**, before the role gate, because scope is a fact about the
  * credential decided without a DB read, while the role gate reads the resolved
  * actor's grants. Coarse → fine, and an under-scoped token learns nothing about
- * the deployment's role structure. `token_scope` is `null` only for the
+ * the deployment's role structure. The scope is `null` only for the
  * anonymous caller, who has no credential to narrow.
  *
  * **Role gate third**: if the spec declares any roles and the actor doesn't hold
@@ -449,21 +540,18 @@ const check_action_auth_pre_authorization = (
 const check_action_auth_post_authorization = (
 	auth: RouteAuth,
 	request_context: RequestContext | null,
-	credential_type: CredentialType | null,
-	method: string,
-	token_scope: TokenScope | null
+	credential: ResolvedAuth | null,
+	method: string
 ): JsonrpcErrorObject | null => {
 	if (auth.credential_types?.length) {
-		if (!credential_type || !auth.credential_types.includes(credential_type)) {
-			return jsonrpc_error_messages.forbidden('forbidden', {
-				reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
-				required_credential_types: auth.credential_types
-			});
+		if (!credential || !auth.credential_types.includes(credential.credential_type)) {
+			return credential_type_required_error(auth.credential_types);
 		}
 	}
 	// Token-scope gate — second of three. See the doc comment for why the order
 	// is credential → scope → role.
-	if (token_scope && !token_scope_admits_method(token_scope, method)) {
+	const token_scope = resolved_auth_scope(credential);
+	if (token_scope !== null && !token_scope_admits_method(token_scope, method)) {
 		return jsonrpc_error_messages.forbidden('forbidden', {
 			reason: ERROR_TOKEN_SCOPE_REQUIRED,
 			required_scope: token_scope_method_capability(method)
@@ -471,7 +559,7 @@ const check_action_auth_post_authorization = (
 	}
 	if (auth.roles?.length) {
 		if (!has_any_scoped_role(request_context, auth.roles, null)) {
-			return jsonrpc_error_messages.forbidden(`requires role: ${auth.roles.join(' or ')}`, {
+			return jsonrpc_error_messages.forbidden('forbidden', {
 				reason: ERROR_INSUFFICIENT_PERMISSIONS,
 				required_roles: auth.roles
 			});
@@ -484,14 +572,60 @@ const check_action_auth_post_authorization = (
  * Build a JSON-RPC response envelope from a `PerformActionResult` for
  * transports that wire over the JSON-RPC 2.0 message shape (HTTP RPC + WS).
  */
-export const perform_action_result_to_envelope = (
+const perform_action_result_to_envelope = (
 	id: JsonrpcRequestId,
 	result: PerformActionResult
-): { jsonrpc: string; id: JsonrpcRequestId } & (
-	{ result: unknown } | { error: JsonrpcErrorObject }
-) => {
-	if (result.kind === 'ok') {
-		return { jsonrpc: JSONRPC_VERSION, id, result: result.result };
+): JsonrpcResponse | JsonrpcErrorResponse =>
+	result.kind === 'ok'
+		? create_jsonrpc_response(id, result.result as JsonrpcResponse['result'])
+		: create_jsonrpc_error_response(id, result.error);
+
+/** A `PerformActionResult` serialized for the wire: the JSON body and its HTTP status. */
+export interface SerializedActionResult {
+	body: string;
+	/** `200` for a result, the error's status otherwise. WS ignores it. */
+	status: number;
+}
+
+/**
+ * Serialize a `PerformActionResult` to its JSON-RPC envelope text — the one
+ * step HTTP RPC and WS share after `perform_action` returns.
+ *
+ * A result that cannot be serialized (a `bigint`, a cycle) answers
+ * `internal_error` rather than throwing. By then the action has committed, so
+ * a throw would cost its effects: over HTTP the route wrapper reads it as a
+ * rollback and discards `post_commit_effects` (a revocation's connection
+ * closes among them); over WS the adapter does not await the frame handler, so
+ * the rejection is unhandled and the caller gets no reply to a request that
+ * did run.
+ *
+ * @param id - the request id the envelope echoes
+ * @param result - what `perform_action` returned
+ * @param method - the action method, for the log line
+ * @param log - where a serialization failure is logged
+ * @returns the envelope text and the HTTP status to send it with
+ */
+export const serialize_action_result = (
+	id: JsonrpcRequestId,
+	result: PerformActionResult,
+	method: string,
+	log: Logger
+): SerializedActionResult => {
+	const status = result.kind === 'error' ? result.status : 200;
+	try {
+		return { body: JSON.stringify(perform_action_result_to_envelope(id, result)), status };
+	} catch (error) {
+		log.error(`action result is not serializable: ${method}`, error);
+		return {
+			body: JSON.stringify(
+				create_jsonrpc_error_response(
+					id,
+					jsonrpc_error_messages.internal_error(
+						dev_only(error instanceof Error ? error.message : undefined)
+					)
+				)
+			),
+			status: jsonrpc_error_code_to_http_status(JSONRPC_ERROR_CODES.internal_error)
+		};
 	}
-	return { jsonrpc: JSONRPC_VERSION, id, error: result.error };
 };

@@ -50,7 +50,7 @@ export const RESULT_COLUMNS: Array<ResultColumn> = [
 	{
 		header: 'CV',
 		get_value: (r) => `${fmt(r.stats.core.cv * 100, 1)}%`,
-		get_class: (r) => (r.stats.core.cv > 0.15 ? 'warning' : '')
+		get_class: (r) => (r.stats.core.cv > 0.15 ? 'caution_60' : '')
 	},
 	{
 		header: 'P75 (ms)',
@@ -75,17 +75,17 @@ export const RESULT_COLUMNS: Array<ResultColumn> = [
 	{
 		header: 'Outliers',
 		get_value: (r) => `${r.stats.core.outliers_ns.length}/${r.stats.core.raw_sample_size}`,
-		get_class: (r) => (r.stats.core.outlier_ratio > 0.1 ? 'warning' : '')
+		get_class: (r) => (r.stats.core.outlier_ratio > 0.1 ? 'caution_60' : '')
 	},
 	{
 		header: 'Failed',
 		get_value: (r) => r.stats.core.failed_iterations.toString(),
-		get_class: (r) => (r.stats.core.failed_iterations > 0 ? 'warning' : '')
+		get_class: (r) => (r.stats.core.failed_iterations > 0 ? 'caution_60' : '')
 	},
 	{
 		header: 'Stability',
 		get_value: (r) => `${fmt(r.stats.stability_ratio * 100, 0)}%`,
-		get_class: (r) => (r.stats.stability_ratio > 0.9 ? 'good' : '')
+		get_class: (r) => (r.stats.stability_ratio > 0.9 ? 'positive_60' : '')
 	}
 ];
 

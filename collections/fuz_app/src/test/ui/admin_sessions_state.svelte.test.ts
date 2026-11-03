@@ -12,9 +12,9 @@
 
 import { describe, test, assert, vi, afterEach } from 'vitest';
 
-import { AdminSessionsState } from '$lib/ui/admin_sessions_state.svelte.ts';
-import type { AdminAccountsRpc } from '$lib/ui/admin_accounts_state.svelte.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { AdminSessionsState } from '#lib/ui/admin_sessions_state.svelte.ts';
+import type { AdminAccountsRpc } from '#lib/ui/admin_accounts_state.svelte.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 
 import { make_offer } from './role_grant_offer_fixtures.ts';
 import { make_admin_session as make_session } from './session_fixtures.ts';
@@ -32,7 +32,7 @@ const make_rpc = (overrides: Partial<AdminAccountsRpc> = {}): AdminAccountsRpc =
 	list_sessions: vi.fn().mockResolvedValue({ sessions: [] }),
 	create_role_grant: vi.fn().mockResolvedValue({ offer: make_offer() }),
 	revoke_role_grant: vi.fn().mockResolvedValue({ ok: true, revoked: true }),
-	retract_offer: vi.fn().mockResolvedValue({ ok: true }),
+	retract_offer: vi.fn().mockResolvedValue({ offer: make_offer() }),
 	session_revoke_all: vi.fn().mockResolvedValue({ ok: true, count: 1 }),
 	token_revoke_all: vi.fn().mockResolvedValue({ ok: true, count: 1 }),
 	...overrides

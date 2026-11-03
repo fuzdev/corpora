@@ -24,6 +24,8 @@
 		return () => docs_links.remove(id);
 	});
 
+	// the tag renders through `svelte:element`, so declare it for fuz_css extraction
+	// @fuz-elements h1 h2
 	const { path, path_is_selected } = $derived(to_docs_path_info(fragment, page.url.pathname));
 </script>
 

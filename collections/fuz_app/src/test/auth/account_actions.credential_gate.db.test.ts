@@ -9,7 +9,7 @@
  * Positive controls assert (a) session-credential calls still reach the
  * handler on the same gated specs and (b) un-gated specs accept bearer.
  *
- * Dispatcher ordering note: the pipeline is **401 → authz → 403 → 400 →
+ * Dispatcher ordering note: the pipeline is **401 → authz → 403 → 429 → 400 →
  * handler**, so `credential_types` (403) fires *before* input validation
  * (400) and the fixtures below could be any shape. They stay well-formed
  * (`SessionId`-shaped session ids, `tok_`-prefixed token ids, valid
@@ -21,43 +21,32 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { SessionId } from '$lib/auth/account_schema.ts';
+import { SessionId } from '#lib/auth/account_schema.ts';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
 import {
 	account_session_revoke_action_spec,
 	account_session_revoke_all_action_spec,
 	account_token_create_action_spec,
 	account_token_list_action_spec,
 	account_token_revoke_action_spec
-} from '$lib/auth/account_action_specs.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { DEFAULT_TEST_PASSWORD } from '$lib/testing/test_credentials.ts';
-import {
-	auth_integration_truncate_tables,
-	create_describe_db,
-	create_pglite_factory
-} from '$lib/testing/db.ts';
-import { rpc_call, rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { find_auth_route } from '$lib/testing/integration_helpers.ts';
-import { ERROR_CREDENTIAL_TYPE_REQUIRED } from '$lib/http/error_schemas.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import { prefix_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/auth/account_action_specs.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { TEST_ORIGIN } from '#lib/testing/test_origin.ts';
+import { DEFAULT_TEST_PASSWORD } from '#lib/testing/test_credentials.ts';
+import { rpc_call, rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { find_auth_route } from '#lib/testing/integration_helpers.ts';
+import { ERROR_CREDENTIAL_TYPE_REQUIRED } from '#lib/http/error_schemas.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import { prefix_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 	...prefix_route_specs(
@@ -70,6 +59,8 @@ const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
 		})
 	),
 	...create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: create_account_actions(ctx.deps),
 		log: ctx.deps.log
@@ -178,7 +169,7 @@ describe_db('credential_channel_gate', (get_db) => {
 	});
 
 	describe('authority gates precede input validation', () => {
-		// The dispatcher runs 401 → authz → 403 → 400, so a caller the authority
+		// The dispatcher runs 401 → authz → 403 → 429 → 400, so a caller the authority
 		// gates refuse is never told what the action's input looks like. A 400
 		// here would confirm the method exists and describe how to call it, to a
 		// channel that should have learned neither — the same disclosure argument
@@ -301,7 +292,7 @@ describe_db('credential_channel_gate', (get_db) => {
 				headers: {
 					'content-type': 'application/json',
 					host: 'localhost',
-					origin: 'http://localhost:5173'
+					origin: TEST_ORIGIN
 				},
 				body: JSON.stringify({
 					current_password: DEFAULT_TEST_PASSWORD,

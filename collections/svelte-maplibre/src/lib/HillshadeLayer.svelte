@@ -3,10 +3,11 @@
   import Layer from './Layer.svelte';
   import type { Feature } from 'geojson';
   import type { CommonLayerProps } from './types.js';
+  import type { HillshadeLayerSpecification } from 'maplibre-gl';
 
   interface Props extends CommonLayerProps<FEATURE> {
-    paint?: maplibregl.HillshadeLayerSpecification['paint'] | undefined;
-    layout?: maplibregl.HillshadeLayerSpecification['layout'] | undefined;
+    paint?: HillshadeLayerSpecification['paint'] | undefined;
+    layout?: HillshadeLayerSpecification['layout'] | undefined;
   }
 
   let {
@@ -28,6 +29,12 @@
     onmouseleave = undefined,
   }: Props = $props();
 </script>
+
+<!-- @component
+Add a MapLibre `hillshade` layer to the map. It shows terrain shading from a raster DEM source, such as `RasterDEMTileSource`.
+
+This is a thin wrapper around `Layer` with `type` set to `hillshade`. Place it inside a source component such as `GeoJSON`, or set the `source` prop.
+-->
 
 <Layer
   {id}

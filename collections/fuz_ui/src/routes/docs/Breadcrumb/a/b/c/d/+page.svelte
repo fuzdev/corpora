@@ -1,7 +1,7 @@
 <script lang="ts">
-	import BreadcrumbExample from '$routes/docs/Breadcrumb/BreadcrumbExample.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import BreadcrumbExample from '#routes/docs/Breadcrumb/BreadcrumbExample.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 </script>
 
 <TomeSection>

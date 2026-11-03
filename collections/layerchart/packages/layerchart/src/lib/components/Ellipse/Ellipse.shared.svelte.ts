@@ -3,15 +3,13 @@ import type { SVGAttributes } from 'svelte/elements';
 
 import type { Without } from '$lib/utils/types.js';
 import type { DataProp, DataDrivenStyleProps } from '$lib/utils/dataProp.js';
-import {
-  hasAnyDataProp,
-  resolveDataProp,
-  resolveGeoDataPair,
-} from '$lib/utils/dataProp.js';
-import { chartDataArray } from '$lib/utils/common.js';
+import { hasAnyDataProp, resolveDataProp, resolveGeoDataPair } from '$lib/utils/dataProp.js';
 import { createMotion, createDataMotionMap, type MotionProp } from '$lib/utils/motion.svelte.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { markLift, raiseItems } from '$lib/utils/isometric.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
 
@@ -40,6 +38,16 @@ export type EllipsePropsWithoutHTML = {
   ref?: SVGEllipseElement;
   /** Motion configuration (pixel mode only). */
   motion?: MotionProp;
+  /** Degrees to turn the ellipse clockwise about its centre */
+  rotate?: number;
+  /**
+   * Height to raise the ellipse off an `isometric` floor, defaulting to the chart's `z` in data
+   * mode.
+   * - `string`: data property name, resolved via zScale
+   * - `function(d)`: accessor called per data item, result passed through zScale
+   * - `number`: pixel height (also in pixel mode)
+   */
+  z?: DataProp;
 } & DataDrivenStyleProps;
 
 export type EllipseProps = EllipsePropsWithoutHTML &
@@ -65,27 +73,33 @@ export function ellipseMarkInfo(props: EllipseProps, dataMode: boolean) {
 export class EllipseState {
   #getProps: () => EllipseProps = () => ({}) as EllipseProps;
 
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: EllipseProps = $derived(this.#getProps());
+
   chartCtx: ChartState = getChartContext();
+
+  markData = getMarkData();
   geo: GeoState = getGeoContext();
+  #layerIsometric = getLayerIsometric();
 
   dataMode = $derived(
-    hasAnyDataProp(
-      this.#getProps().cx,
-      this.#getProps().cy,
-      this.#getProps().rx,
-      this.#getProps().ry
-    )
+    hasAnyDataProp(this.#props.cx, this.#props.cy, this.#props.rx, this.#props.ry)
   );
 
-  #resolvedData: any[] = $derived(
-    this.dataMode ? (this.#getProps().data ?? chartDataArray(this.chartCtx.data)) : []
-  );
+  #resolvedData: any[] = $derived(this.dataMode ? this.markData(this.#props.data) : []);
+
+  /** The chart's `isometricLift` when the ellipses float off the floor, else `null` */
+  #lift = $derived(markLift(this.chartCtx, this.#layerIsometric, this.#props.z, this.dataMode));
 
   resolvedItems = $derived.by(() => {
     if (!this.dataMode) return [];
-    const props = this.#getProps();
+    const props = this.#props;
     const keyFn = props.key ?? defaultKey;
-    return this.#resolvedData.map((d, i) => {
+    const items = this.#resolvedData.map((d, i) => {
       const key = keyFn(d, i);
       const resolved = this.#resolveEllipse(d);
       const animated = this.#dataMotionMap?.get(key);
@@ -98,24 +112,55 @@ export class EllipseState {
         ry: animated?.ry ?? resolved.ry,
       };
     });
+
+    const m = this.#layerIsometric();
+    const lift = this.#lift;
+    if (!m || !lift) return items;
+    return raiseItems(
+      items,
+      ['cx', 'cy'],
+      m,
+      lift,
+      (item) => this.chartCtx.heightOf(item.d, props.z)[1]
+    );
   });
 
   #resolveEllipse(d: any) {
-    const props = this.#getProps();
+    const props = this.#props;
     if (this.geo.projection) {
       const [projX, projY] = resolveGeoDataPair(props.cx, props.cy, d, this.geo.projection);
       return {
         cx: projX,
         cy: projY,
-        rx: resolveDataProp(props.rx, d, this.chartCtx.rScale, typeof props.rx === 'number' ? props.rx : 1),
-        ry: resolveDataProp(props.ry, d, this.chartCtx.rScale, typeof props.ry === 'number' ? props.ry : 1),
+        rx: resolveDataProp(
+          props.rx,
+          d,
+          this.chartCtx.rScale,
+          typeof props.rx === 'number' ? props.rx : 1
+        ),
+        ry: resolveDataProp(
+          props.ry,
+          d,
+          this.chartCtx.rScale,
+          typeof props.ry === 'number' ? props.ry : 1
+        ),
       };
     }
     return {
       cx: resolveDataProp(props.cx, d, this.chartCtx.xScale, 0),
       cy: resolveDataProp(props.cy, d, this.chartCtx.yScale, 0),
-      rx: resolveDataProp(props.rx, d, this.chartCtx.rScale, typeof props.rx === 'number' ? props.rx : 1),
-      ry: resolveDataProp(props.ry, d, this.chartCtx.rScale, typeof props.ry === 'number' ? props.ry : 1),
+      rx: resolveDataProp(
+        props.rx,
+        d,
+        this.chartCtx.rScale,
+        typeof props.rx === 'number' ? props.rx : 1
+      ),
+      ry: resolveDataProp(
+        props.ry,
+        d,
+        this.chartCtx.rScale,
+        typeof props.ry === 'number' ? props.ry : 1
+      ),
     };
   }
 
@@ -125,11 +170,17 @@ export class EllipseState {
   #motionRx!: ReturnType<typeof createMotion<number>>;
   #motionRy!: ReturnType<typeof createMotion<number>>;
 
+  /** Pixel mode: raised by `z` on an `isometric` floor */
+  #raise(axis: 'x' | 'y') {
+    const z = this.#props.z;
+    return this.#lift && typeof z === 'number' ? this.#lift[axis] * z : 0;
+  }
+
   get motionCx() {
-    return this.#motionCx.current;
+    return this.#motionCx.current + this.#raise('x');
   }
   get motionCy() {
-    return this.#motionCy.current;
+    return this.#motionCy.current + this.#raise('y');
   }
   get motionRx() {
     return this.#motionRx.current;
@@ -139,31 +190,25 @@ export class EllipseState {
   }
 
   staticFill = $derived(
-    typeof this.#getProps().fill === 'string' ? (this.#getProps().fill as string) : undefined
+    typeof this.#props.fill === 'string' ? (this.#props.fill as string) : undefined
   );
   staticFillOpacity = $derived(
-    typeof this.#getProps().fillOpacity === 'number'
-      ? (this.#getProps().fillOpacity as number)
-      : undefined
+    typeof this.#props.fillOpacity === 'number' ? (this.#props.fillOpacity as number) : undefined
   );
   staticStroke = $derived(
-    typeof this.#getProps().stroke === 'string' ? (this.#getProps().stroke as string) : undefined
+    typeof this.#props.stroke === 'string' ? (this.#props.stroke as string) : undefined
   );
   staticStrokeWidth = $derived(
-    typeof this.#getProps().strokeWidth === 'number'
-      ? (this.#getProps().strokeWidth as number)
-      : undefined
+    typeof this.#props.strokeWidth === 'number' ? (this.#props.strokeWidth as number) : undefined
   );
   staticOpacity = $derived(
-    typeof this.#getProps().opacity === 'number'
-      ? (this.#getProps().opacity as number)
-      : undefined
+    typeof this.#props.opacity === 'number' ? (this.#props.opacity as number) : undefined
   );
   staticClassName = $derived(
-    typeof this.#getProps().class === 'string' ? (this.#getProps().class as string) : undefined
+    typeof this.#props.class === 'string' ? (this.#props.class as string) : undefined
   );
   staticBorderWidth = $derived.by(() => {
-    const props = this.#getProps();
+    const props = this.#props;
     if (typeof props.strokeWidth === 'number') return `${props.strokeWidth}px`;
     if (typeof props.stroke === 'string') return '1px';
     return undefined;
@@ -180,22 +225,22 @@ export class EllipseState {
 
     this.#motionCx = createMotion(
       initialCx,
-      () => (typeof getProps().cx === 'number' ? (getProps().cx as number) : 0),
+      () => (typeof this.#props.cx === 'number' ? (this.#props.cx as number) : 0),
       initial.motion
     );
     this.#motionCy = createMotion(
       initialCy,
-      () => (typeof getProps().cy === 'number' ? (getProps().cy as number) : 0),
+      () => (typeof this.#props.cy === 'number' ? (this.#props.cy as number) : 0),
       initial.motion
     );
     this.#motionRx = createMotion(
       initialRx,
-      () => (typeof getProps().rx === 'number' ? (getProps().rx as number) : 1),
+      () => (typeof this.#props.rx === 'number' ? (this.#props.rx as number) : 1),
       initial.motion
     );
     this.#motionRy = createMotion(
       initialRy,
-      () => (typeof getProps().ry === 'number' ? (getProps().ry as number) : 1),
+      () => (typeof this.#props.ry === 'number' ? (this.#props.ry as number) : 1),
       initial.motion
     );
 
@@ -204,7 +249,7 @@ export class EllipseState {
       const motionMap = this.#dataMotionMap;
       $effect(() => {
         if (!this.dataMode) return;
-        const props = getProps();
+        const props = this.#props;
         const keyFn = props.key ?? defaultKey;
         const activeKeys = new Set<any>();
         for (let i = 0; i < this.#resolvedData.length; i++) {

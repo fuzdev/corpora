@@ -17,10 +17,11 @@ import {
 	collect_middleware_errors,
 	env_schema_to_surface,
 	events_to_surface
-} from '$lib/http/surface.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
-import type { MiddlewareSpec } from '$lib/http/middleware_spec.ts';
-import type { EventSpec } from '$lib/realtime/sse.ts';
+} from '#lib/http/surface.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+import type { MiddlewareSpec } from '#lib/http/middleware_spec.ts';
+import type { EventSpec } from '#lib/realtime/sse.ts';
+import type { WsEndpointSpec } from '#lib/actions/ws_endpoint_spec.ts';
 
 const noop_handler = async (c: any) => c.json({ ok: true });
 const noop_middleware = async (_c: any, next: any) => next();
@@ -323,7 +324,7 @@ describe('generate_app_surface', () => {
 		]);
 	});
 
-	test('ws_endpoints empty allowed_origins surface as empty array (any-origin)', () => {
+	test('ws_endpoints empty allowed_origins surface as an empty array', () => {
 		const surface = generate_app_surface({
 			route_specs: [],
 			middleware_specs: [],
@@ -331,6 +332,18 @@ describe('generate_app_surface', () => {
 		});
 
 		assert.deepStrictEqual(surface.ws_endpoints[0]!.allowed_origins, []);
+	});
+
+	test('ws_endpoints must be resolved — an origin-less spec is a type error', () => {
+		const unresolved: WsEndpointSpec = { path: '/api/ws', actions: [] };
+		assert.throws(() =>
+			generate_app_surface({
+				route_specs: [],
+				middleware_specs: [],
+				// @ts-expect-error an unresolved spec has no `allowed_origins` to record
+				ws_endpoints: [unresolved]
+			})
+		);
 	});
 });
 
@@ -426,6 +439,19 @@ describe('env_schema_to_surface', () => {
 
 		assert.strictEqual(entries[0]!.sensitivity, 'secret');
 		assert.strictEqual(entries[0]!.description, 'The API key');
+	});
+
+	test('reads sensitivity and description under wrappers', () => {
+		const schema = z.strictObject({
+			OPTIONAL_KEY: z.string().meta({ sensitivity: 'secret', description: 'Optional' }).optional(),
+			DEFAULT_KEY: z.string().meta({ sensitivity: 'secret', description: 'Default' }).default('x'),
+			NULLABLE_KEY: z.string().meta({ sensitivity: 'secret', description: 'Nullable' }).nullable()
+		});
+
+		for (const entry of env_schema_to_surface(schema)) {
+			assert.strictEqual(entry.sensitivity, 'secret', entry.name);
+			assert.notStrictEqual(entry.description, '', entry.name);
+		}
 	});
 
 	test('non-sensitive fields default to sensitivity=null', () => {

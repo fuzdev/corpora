@@ -5,8 +5,9 @@
  * is interpreted by view shape. Parent→child membership and named
  * relationships live in two sibling tables — `cell_item` (ordered
  * children, fractional-indexing keyed) and `cell_field` (named edges).
- * `refs text[]` carries `blake3:` fact hashes auto-extracted from `data`
- * by application code on every write.
+ * `refs text[]` carries the fact hashes derived from `data` (string values
+ * that are exactly a fact hash, `derive_cell_refs`) by application code on
+ * every `data` write.
  *
  * Soft delete via `deleted_at`. Most indexes are partial on
  * `deleted_at IS NULL` so active-cell queries skip tombstones.
@@ -29,14 +30,17 @@
  *
  * **Single-migration shape**: `full_cell_schema` creates the canonical
  * cell + cell_grant + cell_field + cell_item layout in one shot from the
- * live exported constants. The dormant `cell_history` table lives in the
- * separate `fuz_cell_history` namespace (`cell_history_ddl.ts`).
+ * live exported constants.
  *
  * @module
  */
 
 import type { Db } from './db.ts';
-import type { Migration, MigrationNamespace } from './migrate.ts';
+import {
+	create_spine_migration_namespace,
+	type Migration,
+	type MigrationNamespace
+} from './migrate.ts';
 
 /**
  * `cell_visibility` enum — access-control axis for a cell. Lives as a
@@ -51,7 +55,7 @@ import type { Migration, MigrationNamespace } from './migrate.ts';
  * Wrapped in a `DO` block so the migration can replay idempotently —
  * `CREATE TYPE` has no `IF NOT EXISTS` variant in PostgreSQL.
  */
-export const CELL_VISIBILITY_TYPE = `
+const CELL_VISIBILITY_TYPE = `
 DO $$ BEGIN
 	CREATE TYPE cell_visibility AS ENUM ('private', 'public');
 EXCEPTION WHEN duplicate_object THEN NULL;
@@ -86,8 +90,16 @@ END $$`;
  * (nullable text — `pending` / `approved` / `rejected`; `NULL` = unmoderated)
  * is the approval-lifecycle marker, peer to `visibility` (a control field with
  * a non-author writer — see `auth/cell_actions.ts`), never inside `data`.
+ *
+ * `policy` (nullable JSONB) is a root's contribution policy — an object opaque
+ * to the spine, read by the consumer's create authorizer (`NULL` = its floor
+ * governs). The table CHECK holds it to roots (`parent_id IS NULL`) and to JSON
+ * objects (`policy @> '{}'` holds for an object and for nothing else — the
+ * object test every driver runs, where `jsonb_typeof` is not on pglet). A
+ * manage-tier control field: written at a root's create and by
+ * `cell_policy_set`, never through `data`, which an editor grant can write.
  */
-export const CELL_SCHEMA = `
+const CELL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS cell (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	data JSONB NOT NULL,
@@ -98,11 +110,13 @@ CREATE TABLE IF NOT EXISTS cell (
 	parent_id UUID REFERENCES cell(id) ON DELETE SET NULL,
 	root_id UUID REFERENCES cell(id) ON DELETE SET NULL,
 	moderation TEXT,
+	policy JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	updated_at TIMESTAMPTZ,
 	deleted_at TIMESTAMPTZ,
 	created_by UUID REFERENCES actor(id) ON DELETE SET NULL,
-	updated_by UUID REFERENCES actor(id) ON DELETE SET NULL
+	updated_by UUID REFERENCES actor(id) ON DELETE SET NULL,
+	CHECK (policy IS NULL OR (parent_id IS NULL AND policy @> '{}'::jsonb))
 )`;
 
 /**
@@ -125,7 +139,7 @@ CREATE TABLE IF NOT EXISTS cell (
  * Parent↔child membership and named relations live in sibling tables;
  * see `CELL_ITEM_INDEXES` / `CELL_FIELD_INDEXES` below.
  */
-export const CELL_INDEXES: Array<string> = [
+const CELL_INDEXES: Array<string> = [
 	`CREATE INDEX IF NOT EXISTS idx_cell_active ON cell(created_at)
 		WHERE deleted_at IS NULL`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_cell_path_unique
@@ -154,7 +168,7 @@ export const CELL_INDEXES: Array<string> = [
  * The single-principal arm is actor-grain (`actor_id` FK); the other arm is
  * role-shaped (`(role, scope_id)`). The CHECK enforces exactly one arm.
  */
-export const CELL_GRANT_SCHEMA = `
+const CELL_GRANT_SCHEMA = `
 CREATE TABLE IF NOT EXISTS cell_grant (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	cell_id UUID NOT NULL REFERENCES cell(id) ON DELETE CASCADE,
@@ -184,7 +198,7 @@ CREATE TABLE IF NOT EXISTS cell_grant (
  *   semantics would let duplicate null-scope role grants slip past the
  *   re-share UPSERT path. Requires PostgreSQL 15+ (pglite tracks PG 16).
  */
-export const CELL_GRANT_INDEXES: Array<string> = [
+const CELL_GRANT_INDEXES: Array<string> = [
 	`CREATE INDEX IF NOT EXISTS idx_cell_grant_cell ON cell_grant(cell_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_cell_grant_actor
 		ON cell_grant(actor_id) WHERE actor_id IS NOT NULL`,
@@ -203,7 +217,7 @@ export const CELL_GRANT_INDEXES: Array<string> = [
  * is expressed by composition (`foo.tags = collection_cell` whose `items[]`
  * are the tags), not by allowing duplicate `(source_id, name)` rows.
  */
-export const CELL_FIELD_SCHEMA = `
+const CELL_FIELD_SCHEMA = `
 CREATE TABLE IF NOT EXISTS cell_field (
 	source_id UUID NOT NULL REFERENCES cell(id) ON DELETE CASCADE,
 	name TEXT NOT NULL,
@@ -224,7 +238,7 @@ CREATE TABLE IF NOT EXISTS cell_field (
  * here on `deleted_at` (would force index churn on cell soft-delete
  * toggles, and the join filter is sufficient).
  */
-export const CELL_FIELD_INDEXES: Array<string> = [
+const CELL_FIELD_INDEXES: Array<string> = [
 	`CREATE INDEX IF NOT EXISTS idx_cell_field_target ON cell_field(target_id)`
 ];
 
@@ -235,7 +249,7 @@ export const CELL_FIELD_INDEXES: Array<string> = [
  * primitive is JSON-array-shaped — ordered multiset, not set). Domain
  * dedup rules ride on top in helpers.
  */
-export const CELL_ITEM_SCHEMA = `
+const CELL_ITEM_SCHEMA = `
 CREATE TABLE IF NOT EXISTS cell_item (
 	parent_id UUID NOT NULL REFERENCES cell(id) ON DELETE CASCADE,
 	position TEXT NOT NULL,
@@ -252,7 +266,7 @@ CREATE TABLE IF NOT EXISTS cell_item (
  * - `idx_cell_item_child` covers reverse lookup ("which parents contain
  *   this child?").
  */
-export const CELL_ITEM_INDEXES: Array<string> = [
+const CELL_ITEM_INDEXES: Array<string> = [
 	`CREATE INDEX IF NOT EXISTS idx_cell_item_parent_position ON cell_item(parent_id, position)`,
 	`CREATE INDEX IF NOT EXISTS idx_cell_item_child ON cell_item(child_id)`
 ];
@@ -261,7 +275,7 @@ export const CELL_ITEM_INDEXES: Array<string> = [
 export const CELL_DROP_TABLES = ['cell_field', 'cell_item', 'cell_grant', 'cell'] as const;
 
 /** Cell migrations. */
-export const CELL_MIGRATIONS: Array<Migration> = [
+const CELL_MIGRATIONS: Array<Migration> = [
 	{
 		name: 'full_cell_schema',
 		up: async (db: Db): Promise<void> => {
@@ -287,10 +301,13 @@ export const CELL_MIGRATIONS: Array<Migration> = [
 ];
 
 /** Namespace identifier for cell migrations. */
-export const CELL_MIGRATION_NAMESPACE = 'fuz_cell';
+const CELL_MIGRATION_NAMESPACE = 'fuz_cell';
 
-/** Migration namespace consumed by `run_migrations`. */
-export const CELL_MIGRATION_NS: MigrationNamespace = {
-	namespace: CELL_MIGRATION_NAMESPACE,
-	migrations: CELL_MIGRATIONS
-};
+/**
+ * Migration namespace consumed by `run_migrations` — the spine's own, so splice
+ * this object itself (a copy is refused under the reserved name).
+ */
+export const CELL_MIGRATION_NS: MigrationNamespace = create_spine_migration_namespace(
+	CELL_MIGRATION_NAMESPACE,
+	CELL_MIGRATIONS
+);

@@ -13,7 +13,7 @@ import {
 } from './lexer.ts';
 
 /**
- * Hand-written HTML/XML lexer.
+ * HTML/XML lexer.
  *
  * Emits: flat `comment`, `processing_instruction`, `doctype`, `cdata`, and
  * `entity` (alias `named_entity` for the `&amp;`-style form); a `tag` container

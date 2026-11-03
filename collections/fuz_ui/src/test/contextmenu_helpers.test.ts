@@ -19,8 +19,8 @@ import {
 	contextmenu_resolve_popover_host,
 	CONTEXTMENU_DEFAULT_OPEN_OFFSET_X,
 	CONTEXTMENU_DEFAULT_OPEN_OFFSET_Y
-} from '$lib/contextmenu_helpers.ts';
-import { ContextmenuState, contextmenu_attachment } from '$lib/contextmenu_state.svelte.ts';
+} from '#lib/contextmenu_helpers.ts';
+import { ContextmenuState, contextmenu_attachment } from '#lib/contextmenu_state.svelte.ts';
 import {
 	create_contextmenu_event,
 	create_keyboard_event,

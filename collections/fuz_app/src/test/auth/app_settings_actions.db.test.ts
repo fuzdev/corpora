@@ -11,20 +11,21 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
 import {
 	app_settings_get_action_spec,
 	app_settings_update_action_spec
-} from '$lib/auth/admin_action_specs.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import { prefix_route_specs } from '$lib/http/route_spec.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_test_request_headers } from '#lib/testing/test_origin.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { prefix_route_specs } from '#lib/http/route_spec.ts';
+import { describe_db } from '../auth_db_default.ts';
 import {
 	RPC_PATH,
 	create_admin_route_specs_with,
-	describe_db,
 	session_options
 } from './admin_rpc_test_helpers.ts';
 
@@ -88,10 +89,7 @@ describe_db('app settings RPC actions', (get_db) => {
 				path: RPC_PATH,
 				spec: app_settings_get_action_spec,
 				params: {},
-				headers: {
-					host: 'localhost',
-					origin: 'http://localhost:5173'
-				}
+				headers: create_test_request_headers()
 			});
 			assert.ok(!r.ok);
 			assert.strictEqual(r.error.code, JSONRPC_ERROR_CODES.unauthenticated);

@@ -84,24 +84,30 @@ export const spawn_with_loader = (
 	invoke_path: string,
 	argv: Array<string>,
 	js_cli = JS_CLI_DEFAULT // TODO source from config when possible
-): Promise<SpawnResult> => {
+): Promise<SpawnResult> => spawn(js_cli, spawn_with_loader_args(loader_path, invoke_path, argv));
+
+/**
+ * The Node args that run `invoke_path` with Gro's loader registered.
+ */
+export const spawn_with_loader_args = (
+	loader_path: string,
+	invoke_path: string,
+	argv: Array<string>
+): Array<string> => {
 	const args = [
 		'--import',
-		// This does the same as `$lib/register.ts` but without the cost of importing another file.
+		// This does the same as `register.ts` but without the cost of importing another file.
 		`data:text/javascript,
 			import {register} from "node:module";
 			import {pathToFileURL} from "node:url";
 			register("${loader_path}", pathToFileURL("./"));`,
-		// @sync Node options to `$lib/gro.ts`
-		'--experimental-import-meta-resolve', // for `import.meta.resolve`
-		'--experimental-strip-types',
-		'--disable-warning',
-		'ExperimentalWarning'
+		// @sync Node options to `gro.ts`
+		'--experimental-import-meta-resolve' // for `import.meta.resolve`
 	];
 	// In almost all cases we want the exports condition to be `"development"`. Needed for `esm-env`.
 	if (process.env.NODE_ENV !== 'production') {
 		args.push('-C', 'development'); // same as `--conditions`
 	}
 	args.push(invoke_path, ...argv);
-	return spawn(js_cli, args);
+	return args;
 };

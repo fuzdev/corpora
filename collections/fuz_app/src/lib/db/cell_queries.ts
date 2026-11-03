@@ -4,11 +4,11 @@
  * Convention: `deps: QueryDeps` first, no audit side effects, mutations
  * return the affected row (or `null` for not-found).
  *
- * `cell.refs` is auto-extracted from `data` on every create and update via
- * `fact_hash_extract_refs` (depth-first walk for `blake3:`-prefixed strings). Callers
- * never pass `refs` directly — the column is a derived projection of
- * `data` for cells-by-fact discovery, mirroring what a fact store does for
- * JSON facts.
+ * `cell.refs` is derived from `data` on every create and update via
+ * `derive_cell_refs` (depth-first walk for string values that are exactly a
+ * fact hash). Callers never pass `refs` directly — the column is a derived
+ * projection of `data`, what fact serving admits a read through and what
+ * cell ref admission (`auth/cell_ref_admission.ts`) gates on a write.
  *
  * Soft delete via `deleted_at`. All `get` / `list` queries exclude
  * tombstones by default; `include_deleted: true` opts in for admin /
@@ -23,14 +23,27 @@
 
 import type { QueryDeps } from './query_deps.ts';
 import type { Json } from '@fuzdev/fuz_util/json.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { fact_hash_extract_refs } from '@fuzdev/fuz_util/fact_hash.ts';
-import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
+import type { Uuid } from '../primitive_schemas.ts';
+import { is_fact_hash, type FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
 import { assert_row } from './assert_row.ts';
-import { qualify_columns } from './sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from './sql_columns.ts';
+import {
+	CELL_MODERATION_APPROVED,
+	CELL_MODERATION_PENDING,
+	CELL_MODERATION_REJECTED,
+	cell_moderation_admits_audience_sql,
+	cell_moderation_is_stewardable_sql
+} from './cell_moderation.ts';
+import {
+	can_view_cell_sql,
+	caller_role_grants_cte,
+	cell_grant_admits_caller_sql,
+	cell_viewer_params,
+	type CellViewer
+} from './cell_view_sql.ts';
 
 import type { CellData } from '../auth/cell_data_schema.ts';
-import type { CellVisibility } from '../auth/cell_action_specs.ts';
+import type { CellPolicy, CellVisibility } from '../auth/cell_action_specs.ts';
 
 /**
  * Row shape returned by `cell` SELECTs. `data` is typed as `CellData` —
@@ -55,9 +68,10 @@ export interface CellRow {
 	parent_id: Uuid | null;
 	root_id: Uuid | null;
 	moderation: string | null;
-	created_at: Date;
-	updated_at: Date | null;
-	deleted_at: Date | null;
+	policy: CellPolicy | null;
+	created_at: string;
+	updated_at: string | null;
+	deleted_at: string | null;
 	created_by: Uuid | null;
 	updated_by: Uuid | null;
 	grant_count: number;
@@ -83,12 +97,16 @@ export const CELL_COLUMNS = [
 	'parent_id',
 	'root_id',
 	'moderation',
+	'policy',
 	'created_at',
 	'updated_at',
 	'deleted_at',
 	'created_by',
 	'updated_by'
 ] as const satisfies ReadonlyArray<Exclude<keyof CellRow, 'grant_count'>>;
+
+/** The `cell` timestamp override, by row qualifier — the one `cell_row_projection` is given. */
+const cell_expr = iso8601_timestamp_expr(CELL_COLUMNS, ['created_at', 'updated_at', 'deleted_at']);
 
 /**
  * The full `CellRow` projection — `CELL_COLUMNS` qualified by `alias` plus
@@ -108,7 +126,23 @@ export const CELL_COLUMNS = [
  * actually produces one.
  */
 export const cell_row_projection = (alias: string): string =>
-	`${qualify_columns(CELL_COLUMNS, alias)}, (SELECT COUNT(*)::int FROM cell_grant WHERE cell_id = ${alias}.id) AS grant_count`;
+	`${qualify_columns(CELL_COLUMNS, alias, cell_expr(alias))}, (SELECT COUNT(*)::int FROM cell_grant WHERE cell_id = ${alias}.id) AS grant_count`;
+
+/**
+ * The columns a view check reads (`can_view_cell`) — the `CELL_COLUMNS`
+ * subset `query_cell_view_load_many` projects, typed against `CELL_COLUMNS`
+ * so the base const's drift guard covers it. Twin of `fuz_cell`'s
+ * `CELL_VIEW_COLUMNS`.
+ */
+export const CELL_VIEW_COLUMNS = [
+	'id',
+	'visibility',
+	'moderation',
+	'created_by'
+] as const satisfies ReadonlyArray<(typeof CELL_COLUMNS)[number]>;
+
+/** A cell read for its view check alone — the `CELL_VIEW_COLUMNS` projection. */
+export type CellViewRow = Pick<CellRow, (typeof CELL_VIEW_COLUMNS)[number]>;
 
 /**
  * Input for `query_cell_create`. `refs` is derived from `data`. `kind` is
@@ -117,7 +151,9 @@ export const cell_row_projection = (alias: string): string =>
  * `parent_id` / `root_id` / `moderation` are the directory-tree + lifecycle
  * columns the handler derives (parent containment, governing root, the
  * create-authorizer verdict) — likewise write-once / control-gated, never on
- * `CellUpdatePatch`.
+ * `CellUpdatePatch`. `policy` is a root's contribution policy (the table CHECK
+ * refuses one beside a `parent_id`), changed later only by
+ * `query_cell_set_policy`.
  */
 export interface CellCreateQueryInput {
 	data: Json;
@@ -127,6 +163,7 @@ export interface CellCreateQueryInput {
 	parent_id?: Uuid | null;
 	root_id?: Uuid | null;
 	moderation?: string | null;
+	policy?: CellPolicy | null;
 	created_by?: Uuid | null;
 }
 
@@ -167,11 +204,11 @@ export const query_cell_create = async (
 	deps: QueryDeps,
 	input: CellCreateQueryInput
 ): Promise<CellRow> => {
-	const refs = derive_refs(input.data);
+	const refs = derive_cell_refs(input.data);
 	const row = await deps.db.query_one<CellRow>(
 		`INSERT INTO cell
-		   (data, kind, visibility, path, refs, parent_id, root_id, moderation, created_by)
-		 VALUES ($1::jsonb, $2, COALESCE($3::cell_visibility, 'private'::cell_visibility), $4, $5::text[], $6, $7, $8, $9)
+		   (data, kind, visibility, path, refs, parent_id, root_id, moderation, policy, created_by)
+		 VALUES ($1::jsonb, $2, COALESCE($3::cell_visibility, 'private'::cell_visibility), $4, $5::text[], $6, $7, $8, $9::jsonb, $10)
 		 RETURNING ${cell_row_projection('cell')}`,
 		[
 			JSON.stringify(input.data),
@@ -182,6 +219,7 @@ export const query_cell_create = async (
 			input.parent_id ?? null,
 			input.root_id ?? null,
 			input.moderation ?? null,
+			input.policy == null ? null : JSON.stringify(input.policy),
 			input.created_by ?? null
 		]
 	);
@@ -235,11 +273,10 @@ export const query_cell_get_by_path = async (
 };
 
 /**
- * Bulk-load active cell rows by id, **no visibility filter applied**. Used
- * by the strict relation-read filter (`auth/cell_relation_visibility.ts`'s
- * `filter_visible_target_ids`), which runs `can_view_cell` per row in
- * memory rather than in SQL. Soft-deleted rows are excluded so relations
- * to tombstones never surface.
+ * Bulk-load active cell rows by id, **no visibility filter applied** — the
+ * full rows, for a caller that copies or returns them (the deep-clone walk).
+ * A caller that needs only the view check reads `query_cell_view_load_many`.
+ * Soft-deleted rows are excluded so relations to tombstones never surface.
  *
  * @param deps - query deps
  * @param ids - cell ids to load (duplicates are harmless)
@@ -252,6 +289,30 @@ export const query_cell_load_many = async (
 	if (ids.length === 0) return [];
 	return deps.db.query<CellRow>(
 		`SELECT ${cell_row_projection('cell')}
+		 FROM cell
+		 WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+		[ids]
+	);
+};
+
+/**
+ * Bulk-load the active cells among `ids` for a view check — the
+ * `CELL_VIEW_COLUMNS` alone, never the payload. Backs the strict
+ * relation-read filter (`auth/cell_relation_visibility.ts`'s
+ * `filter_visible_target_ids`), which runs `can_view_cell` per row in memory
+ * rather than in SQL. Soft-deleted rows and ids with no row are absent.
+ *
+ * @param deps - query deps
+ * @param ids - cell ids to load (duplicates are harmless)
+ * @returns active rows in arbitrary order (caller indexes by `id`)
+ */
+export const query_cell_view_load_many = async (
+	deps: QueryDeps,
+	ids: ReadonlyArray<Uuid>
+): Promise<Array<CellViewRow>> => {
+	if (ids.length === 0) return [];
+	return deps.db.query<CellViewRow>(
+		`SELECT ${columns_sql(CELL_VIEW_COLUMNS)}
 		 FROM cell
 		 WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
 		[ids]
@@ -277,7 +338,7 @@ export const query_cell_update = async (
 	patch: CellUpdatePatch
 ): Promise<CellRow | null> => {
 	const data_provided = patch.data !== undefined;
-	const refs = data_provided ? derive_refs(patch.data as Json) : null;
+	const refs = data_provided ? derive_cell_refs(patch.data as Json) : null;
 	const visibility_provided = patch.visibility !== undefined;
 	const row = await deps.db.query_one<CellRow>(
 		`UPDATE cell SET
@@ -335,9 +396,15 @@ export const query_cell_delete = async (
 
 /**
  * Transition a contribution's `moderation` marker (the `cell_moderate` verb's
- * write). On `set_visibility_public` (an approval) it also flips `visibility`
- * to `'public'` so the approved contribution goes live; a rejection leaves
- * visibility untouched (stays private). `updated_at` / `updated_by` are stamped.
+ * write). The `WHERE` carries the allowed from-states: an approval moves only a
+ * `'pending'` row, and a rejection a `'pending'` or `'approved'` one (the
+ * moderator's takedown). A rejected or unmoderated cell never moves, and nothing
+ * already approved is approved again — without the from-state an approval would
+ * force any cell its caller can reach public. On `set_visibility_public` (an
+ * approval) it also flips `visibility` to `'public'` so the approved
+ * contribution goes live; a rejection leaves visibility untouched — a pending
+ * post stays as its author set it, and a taken-down one keeps its visibility,
+ * hidden by the marker alone. `updated_at` / `updated_by` are stamped.
  *
  * `moderation` is deliberately **not** writable through `query_cell_update`
  * (it's absent from `CellUpdatePatch`) — gating the transition on a dedicated
@@ -348,7 +415,7 @@ export const query_cell_delete = async (
  * @param id - cell id
  * @param moderation - the terminal marker to write (`'approved'` | `'rejected'`)
  * @param options - `set_visibility_public` flips visibility on approval; `updated_by` records the moderator
- * @returns the updated row, or `null` when no active row matched (raced delete)
+ * @returns the updated row, or `null` when no active row in an allowed from-state matched (a raced delete or decision, or a refused transition)
  * @mutates `cell` - sets `moderation` (+ maybe `visibility`) on one row
  */
 export const query_cell_set_moderation = async (
@@ -364,10 +431,71 @@ export const query_cell_set_moderation = async (
 		   updated_by = $4,
 		   updated_at = NOW()
 		 WHERE id = $1 AND deleted_at IS NULL
+		   AND (moderation = '${CELL_MODERATION_PENDING}'
+		     OR ($2::text = '${CELL_MODERATION_REJECTED}' AND moderation = '${CELL_MODERATION_APPROVED}'))
 		 RETURNING ${cell_row_projection('cell')}`,
 		[id, moderation, options.set_visibility_public, options.updated_by ?? null]
 	);
 	return row ?? null;
+};
+
+/** What `query_cell_set_policy` answers: the updated root and the policy it replaced. */
+export interface CellSetPolicyResult {
+	cell: CellRow;
+	/** The root's `policy` as the `UPDATE` found it, under the row lock it writes with. */
+	previous_policy: CellPolicy | null;
+}
+
+/**
+ * Replace a root's contribution `policy` (the `cell_policy_set` verb's write);
+ * `null` clears it.
+ *
+ * The `WHERE` carries `parent_id IS NULL`, so only a root ever takes a policy
+ * — the table CHECK's rule restated where the write is. `updated_at` /
+ * `updated_by` are stamped.
+ *
+ * The replaced policy is read by the statement that writes, from a
+ * `FOR UPDATE` subquery: a concurrent set waits on that row lock and then
+ * reads the committed value, so the audit's `previous_policy` is the value
+ * this write replaced, never one a racing set already overwrote.
+ *
+ * `policy` is deliberately **not** writable through `query_cell_update` (it's
+ * absent from `CellUpdatePatch`): `data` writes gate on edit authority, which
+ * an editor grant carries, and the policy decides who may contribute under the
+ * root, so it changes only through this query behind the handler's
+ * manage-tier check.
+ *
+ * @param deps - query deps
+ * @param id - the root's id
+ * @param policy - the new policy, or `null` to clear it
+ * @param options - `updated_by` records the manager
+ * @returns the updated row and the policy it replaced, or `null` when no active root
+ *   matched (a raced delete)
+ * @mutates `cell` - sets `policy` on one root
+ */
+export const query_cell_set_policy = async (
+	deps: QueryDeps,
+	id: Uuid,
+	policy: CellPolicy | null,
+	options: { updated_by?: Uuid | null }
+): Promise<CellSetPolicyResult | null> => {
+	const row = await deps.db.query_one<CellRow & { previous_policy: CellPolicy | null }>(
+		`UPDATE cell SET
+		   policy = $2::jsonb,
+		   updated_by = $3,
+		   updated_at = NOW()
+		 FROM (
+		   SELECT p.id, p.policy AS previous_policy FROM cell p
+		   WHERE p.id = $1 AND p.deleted_at IS NULL AND p.parent_id IS NULL
+		   FOR UPDATE
+		 ) prev
+		 WHERE cell.id = prev.id
+		 RETURNING ${cell_row_projection('cell')}, prev.previous_policy`,
+		[id, policy === null ? null : JSON.stringify(policy), options.updated_by ?? null]
+	);
+	if (!row) return null;
+	const { previous_policy, ...cell } = row;
+	return { cell, previous_policy };
 };
 
 /**
@@ -389,32 +517,9 @@ export const query_cell_list_by_kind = async (
 		 FROM cell
 		 WHERE kind = $1
 		   AND deleted_at IS NULL
-		 ORDER BY created_at DESC
+		 ORDER BY cell.created_at DESC
 		 LIMIT $2 OFFSET $3`,
 		[kind, options?.limit ?? null, options?.offset ?? 0]
-	);
-
-/**
- * List active cells created by an actor, newest first. Backed by the
- * `idx_cell_created_by` partial index.
- *
- * @param deps - query deps
- * @param actor_id - the creator's actor id
- * @param options - pagination
- * @returns matching active rows
- */
-export const query_cell_list_by_creator = async (
-	deps: QueryDeps,
-	actor_id: Uuid,
-	options?: Pick<CellListOptions, 'limit' | 'offset'>
-): Promise<Array<CellRow>> =>
-	deps.db.query<CellRow>(
-		`SELECT ${cell_row_projection('cell')}
-		 FROM cell
-		 WHERE created_by = $1 AND deleted_at IS NULL
-		 ORDER BY created_at DESC
-		 LIMIT $2 OFFSET $3`,
-		[actor_id, options?.limit ?? null, options?.offset ?? 0]
 	);
 
 /**
@@ -425,14 +530,23 @@ export const query_cell_list_by_creator = async (
  * dimension — keep it simple) plus an optional viewer-aware visibility
  * predicate.
  *
- * The visibility predicate mirrors `can_view_cell` in SQL form:
+ * The visibility predicate mirrors `can_view_cell || can_steward_cell` in SQL
+ * form:
  *
  * ```
- * (viewer_is_admin
- *  OR cell.visibility = 'public'
- *  OR (viewer_actor_id IS NOT NULL AND created_by = viewer_actor_id)
- *  OR (viewer_actor_id IS NOT NULL AND <grant admits caller>))
+ * (viewer.is_admin
+ *  OR (viewer.actor_id IS NOT NULL AND created_by = viewer.actor_id)
+ *  OR (<moderation admits an audience> AND (
+ *       cell.visibility = 'public'
+ *       OR (viewer.actor_id IS NOT NULL AND <grant admits caller>)))
+ *  OR (viewer.actor_id IS NOT NULL AND <pending or rejected contribution>
+ *      AND <viewer owns its live governing root>))
  * ```
+ *
+ * The moderation rules are `cell_moderation_admits_audience_sql` and
+ * `cell_moderation_is_stewardable_sql` (`db/cell_moderation.ts`). The last arm
+ * is the steward arm (`auth/cell_steward.ts`) — a root owner reads the
+ * moderation queue under their root; a global admin is already admitted.
  *
  * The grants branch closes parity with `can_view_cell`: a SQL `EXISTS`
  * over `cell_grant`, parameterized by the caller's `actor_id` and the
@@ -455,7 +569,9 @@ export const query_cell_list_by_creator = async (
  * owner-excluding, but the explicit `created_by IS DISTINCT FROM caller`
  * guards against any future deviation. The shared_with branch does NOT
  * bypass for admin: an admin asking "what's shared with me" wants their
- * own grant footprint, not every cell.
+ * own grant footprint, not every cell. A grant admits there only while the
+ * cell's moderation admits an audience, as in `can_view_cell`, and the steward
+ * arm doesn't apply — a grant footprint is not a moderation queue.
  *
  * Soft-deleted rows are excluded by default; opt-in via `include_deleted`.
  *
@@ -470,23 +586,6 @@ export const query_cell_list = async (
 	const order_column = params.order_by === 'updated_at' ? 'updated_at' : 'created_at';
 	const order_direction = params.order_direction === 'asc' ? 'ASC' : 'DESC';
 
-	// Caller's actor + role_grants feed the `cell_grant` predicate. Empty
-	// arrays (not NULL) keep the SQL uniform — the `caller_role_grants` CTE
-	// yields zero rows for an empty role_grant set, no special-casing needed.
-	const caller_actor_id = params.caller_actor_id ?? null;
-	const role_grant_roles = params.caller_role_grant_roles ?? [];
-	const role_grant_scope_ids = params.caller_role_grant_scope_ids ?? [];
-	// Parallel-array invariant. `unnest(text[], uuid[])` null-pads on
-	// length mismatch — a longer roles array would silently widen
-	// role-grant admits with NULL `scope_id`s (treated as any-scope by
-	// the predicate). Security-relevant; assert at the SQL boundary
-	// rather than trusting every caller.
-	if (role_grant_roles.length !== role_grant_scope_ids.length) {
-		throw new Error(
-			`query_cell_list: caller_role_grant_roles (len=${role_grant_roles.length}) and ` +
-				`caller_role_grant_scope_ids (len=${role_grant_scope_ids.length}) must be parallel arrays`
-		);
-	}
 	const shared_with_caller_only = params.shared_with_caller_only === true;
 
 	// Column references and `$N::type` placeholders are interpolated; user
@@ -496,7 +595,9 @@ export const query_cell_list = async (
 	// supplied wildcards (`%`, `_`, `\`) match literally — Postgres 11+ has
 	// the function and pglite/PG 16 supports it.
 	//
-	// Two SQL shapes share the same 16-param positional layout:
+	// Two SQL shapes share the same 15-param positional layout, the viewer at
+	// `$6`–`$9` (`cell_viewer_params`, which refuses non-parallel role-grant
+	// arrays — `unnest` would null-pad them into any-scope grants):
 	//
 	// - `shared_with_caller_only: false` — cell-driven scan with the
 	//   visibility predicate (admin / public / owner / grant-admits).
@@ -514,14 +615,10 @@ export const query_cell_list = async (
 		params.ref ?? null,
 		params.created_by ?? null,
 		params.path_prefix ?? null,
-		params.viewer_is_admin,
-		params.viewer_actor_id ?? null,
+		...cell_viewer_params(params.viewer),
 		params.limit ?? null,
 		params.offset ?? 0,
 		params.ids && params.ids.length > 0 ? params.ids : null,
-		caller_actor_id,
-		role_grant_roles,
-		role_grant_scope_ids,
 		params.visibility ?? null,
 		params.root_id ?? null,
 		params.moderation ?? null
@@ -529,61 +626,40 @@ export const query_cell_list = async (
 };
 
 /**
- * The `cell_grant` admits-caller predicate, factored once and reused by
- * both SQL shapes (general visibility branch + shared-with-me semi-join).
- *
- * Resolves true when the grant row at `g_alias` admits the caller via
- * either an actor-shaped principal (`g.actor_id = $11`) or a
- * role-shaped principal whose `(role, scope_id)` matches a row in the
- * `caller_role_grants` CTE. NULL `g.scope_id` matches any scope, mirroring
- * `grant_admits` in `auth/cell_authorize.ts`.
+ * The caller's `(role, scope_id)` role_grant pairs, materialized once per
+ * query so the role-grant predicate doesn't re-scan `unnest()` per outer row.
+ * Shared by both SQL shapes.
  */
-const grant_admits_caller_predicate = (g_alias: string): string => `(
-	     ($11::uuid IS NOT NULL AND ${g_alias}.actor_id = $11)
-	     OR (
-	       ${g_alias}.role IS NOT NULL
-	       AND EXISTS (
-	         SELECT 1 FROM caller_role_grants p
-	         WHERE p.role = ${g_alias}.role
-	           AND (${g_alias}.scope_id IS NULL OR p.scope_id IS NOT DISTINCT FROM ${g_alias}.scope_id)
-	       )
-	     )
-	   )`;
+const CALLER_ROLE_GRANTS_CTE = `WITH ${caller_role_grants_cte('$8', '$9')}`;
 
 /**
- * Materialize the caller's `(role, scope_id)` role_grant pairs once per
- * query so the role-grant predicate doesn't re-scan `unnest()` per
- * outer row. PG 12+ inlines non-recursive single-use CTEs, so this is
- * planner-equivalent to a subquery — the form is for clarity.
+ * General `cell_list` SQL: cell-driven scan, full visibility predicate — the
+ * `can_view_cell` arms (`can_view_cell_sql`), then the steward arm
+ * (`can_steward_cell`: the caller owns the live governing root of a pending or
+ * rejected contribution; a global admin is already in through `$6`).
  */
-const CALLER_ROLE_GRANTS_CTE = `WITH caller_role_grants AS (
-	   SELECT role, scope_id FROM unnest($12::text[], $13::uuid[]) AS p(role, scope_id)
-	 )`;
-
-/** General `cell_list` SQL: cell-driven scan, full visibility predicate. */
 const build_general_sql = (order_column: string, order_direction: string): string =>
 	`${CALLER_ROLE_GRANTS_CTE}
 	 SELECT ${cell_row_projection('c')} FROM cell c
 	 WHERE ($1::bool OR c.deleted_at IS NULL)
 	   AND ($2::text IS NULL OR c.kind = $2::text)
-	   AND ($14::cell_visibility IS NULL OR c.visibility = $14::cell_visibility)
+	   AND ($13::cell_visibility IS NULL OR c.visibility = $13::cell_visibility)
 	   AND ($3::text IS NULL OR c.refs @> ARRAY[$3]::text[])
 	   AND ($4::uuid IS NULL OR c.created_by = $4)
 	   AND ($5::text IS NULL OR starts_with(c.path, $5))
-	   AND ($10::uuid[] IS NULL OR c.id = ANY($10))
-	   AND ($15::uuid IS NULL OR c.root_id = $15)
-	   AND ($16::text IS NULL OR c.moderation = $16::text)
+	   AND ($12::uuid[] IS NULL OR c.id = ANY($12))
+	   AND ($14::uuid IS NULL OR c.root_id = $14)
+	   AND ($15::text IS NULL OR c.moderation = $15::text)
 	   AND (
-	     $6::bool
-	     OR c.visibility = 'public'
-	     OR ($7::uuid IS NOT NULL AND c.created_by = $7)
-	     OR ($7::uuid IS NOT NULL AND EXISTS (
-	       SELECT 1 FROM cell_grant g
-	       WHERE g.cell_id = c.id AND ${grant_admits_caller_predicate('g')}
-	     ))
+	     ${can_view_cell_sql('c', { is_admin: '$6', actor_id: '$7' })}
+	     OR ($7::uuid IS NOT NULL AND c.root_id IS NOT NULL AND ${cell_moderation_is_stewardable_sql('c')}
+	       AND EXISTS (
+	         SELECT 1 FROM cell r
+	         WHERE r.id = c.root_id AND r.deleted_at IS NULL AND r.created_by = $7
+	       ))
 	   )
 	 ORDER BY c.${order_column} ${order_direction} NULLS LAST
-	 LIMIT $8 OFFSET $9`;
+	 LIMIT $10 OFFSET $11`;
 
 /**
  * Shared-with-me `cell_list` SQL: grant-driven semi-join. The `IN
@@ -606,26 +682,27 @@ const build_shared_with_sql = (order_column: string, order_direction: string): s
 	 SELECT ${cell_row_projection('c')} FROM cell c
 	 WHERE ($1::bool OR c.deleted_at IS NULL)
 	   AND ($2::text IS NULL OR c.kind = $2::text)
-	   AND ($14::cell_visibility IS NULL OR c.visibility = $14::cell_visibility)
+	   AND ($13::cell_visibility IS NULL OR c.visibility = $13::cell_visibility)
 	   AND ($3::text IS NULL OR c.refs @> ARRAY[$3]::text[])
 	   AND ($4::uuid IS NULL OR c.created_by = $4)
 	   AND ($5::text IS NULL OR starts_with(c.path, $5))
-	   AND ($10::uuid[] IS NULL OR c.id = ANY($10))
-	   AND ($15::uuid IS NULL OR c.root_id = $15)
-	   AND ($16::text IS NULL OR c.moderation = $16::text)
+	   AND ($12::uuid[] IS NULL OR c.id = ANY($12))
+	   AND ($14::uuid IS NULL OR c.root_id = $14)
+	   AND ($15::text IS NULL OR c.moderation = $15::text)
 	   AND $7::uuid IS NOT NULL
 	   AND c.created_by IS DISTINCT FROM $7
+	   AND ${cell_moderation_admits_audience_sql('c')}
 	   AND c.id IN (
 	     SELECT g.cell_id FROM cell_grant g
-	     WHERE ${grant_admits_caller_predicate('g')}
+	     WHERE ${cell_grant_admits_caller_sql('g', '$7')}
 	   )
-	   -- $6 (viewer_is_admin) intentionally not consulted: an admin
+	   -- $6 (viewer.is_admin) intentionally not consulted: an admin
 	   -- asking "what's shared with me" wants their grant footprint, not
 	   -- every cell. Cast-only reference keeps the param's type known to
-	   -- the planner so the shared 16-param positional layout stays valid.
+	   -- the planner so the shared 15-param positional layout stays valid.
 	   AND $6::bool IS NOT NULL
 	 ORDER BY c.${order_column} ${order_direction} NULLS LAST
-	 LIMIT $8 OFFSET $9`;
+	 LIMIT $10 OFFSET $11`;
 
 /** Parameters for `query_cell_list`. All filter dimensions are optional. */
 export interface CellListParams {
@@ -654,11 +731,10 @@ export interface CellListParams {
 	 * Filter by moderation lifecycle marker (`'pending'` drives the mod queue via
 	 * `idx_cell_moderation_pending`).
 	 *
-	 * Note: the visibility predicate still applies, so a `'pending'` (private)
-	 * queue surfaces only to viewers it admits — admin / owner / grant. A
-	 * non-admin container manager won't see pending children here until a
-	 * manager-scoped visibility branch is added, so for now the queue is an admin
-	 * surface (`cell_moderate` of a known id still works regardless).
+	 * The visibility predicate still applies, so `{root_id, moderation:
+	 * 'pending'}` is the queue for the callers who moderate it — a global admin,
+	 * and the governing root's owner through the steward arm — while each author
+	 * sees only their own entries.
 	 */
 	moderation?: string;
 	/**
@@ -670,44 +746,17 @@ export interface CellListParams {
 	 */
 	ids?: Array<Uuid>;
 	/**
-	 * Viewer actor for the visibility predicate. Pass `null` for
-	 * unauthenticated callers — only `cell.visibility === 'public'` rows
-	 * are admitted then.
+	 * The caller the visibility predicate binds — one value for the owner,
+	 * admin, grant and steward arms, so visibility and grant admission can't
+	 * be read for two different callers. `cell_viewer_from_auth` builds it
+	 * from a request context; `CELL_VIEWER_ANONYMOUS` admits public rows
+	 * alone, `CELL_VIEWER_UNRESTRICTED` every row.
 	 */
-	viewer_actor_id: Uuid | null;
-	/**
-	 * When `true`, the visibility predicate is dropped (admin sees all).
-	 * When `false`, rows pass when public, owned by the viewer, or
-	 * admitted by a `cell_grant` row.
-	 */
-	viewer_is_admin: boolean;
-	/**
-	 * Caller's `actor_id` for the actor-shaped grant branch. NULL =
-	 * anonymous (actor-grants can never admit). Kept distinct from
-	 * `viewer_actor_id` for the predicate's clarity (the visibility branch
-	 * and the grant branch are independent concerns even when they
-	 * currently agree).
-	 */
-	caller_actor_id?: Uuid | null;
-	/**
-	 * Caller's role_grant roles, parallel-array projection of `auth.role_grants`
-	 * (active-only — middleware filters). Pair-wise aligned with
-	 * `caller_role_grant_scope_ids`. Empty array (or omitted) admits no
-	 * role-shaped grants. The two arrays MUST have equal length —
-	 * `unnest(text[], uuid[])` null-pads on length mismatch and would
-	 * silently widen role-grant admits.
-	 */
-	caller_role_grant_roles?: ReadonlyArray<string>;
-	/**
-	 * Caller's role_grant scope ids, parallel-array projection. NULLs in the
-	 * array mark global (any-scope) role_grants — `IS NOT DISTINCT FROM`
-	 * handles them per design.
-	 */
-	caller_role_grant_scope_ids?: ReadonlyArray<Uuid | null>;
+	viewer: CellViewer;
 	/**
 	 * When `true`, narrow to cells admitting the caller via a
 	 * `cell_grant` row AND that the caller does not own. Authenticated
-	 * only (`viewer_actor_id` must be set). Combine with `kind` /
+	 * only (`viewer.actor_id` must be set). Combine with `kind` /
 	 * `path_prefix` etc. to scope further.
 	 */
 	shared_with_caller_only?: boolean;
@@ -724,20 +773,45 @@ export interface CellListParams {
 }
 
 /**
- * Derive the `refs` array column value from a cell's `data`.
+ * Derive the `refs` array column value from a cell's `data`: the string
+ * values that are exactly a fact hash, deduped and sorted.
+ *
+ * A ref is a **whole** string value matching the wire fact-hash grammar —
+ * `blake3:` followed by exactly sixty-four lowercase hex characters
+ * (`is_fact_hash`, `FACT_HASH_EXACT`). A hash inside prose or markup, an
+ * uppercase-hex digest, or a `blake3:` string of any other length is not a
+ * ref. Refs are what fact serving admits a read through and what cell ref
+ * admission gates on a write, so the grammar is exact: a string either is an
+ * address or isn't one. Object keys are not walked — only values. (A fact's
+ * own `fact_ref` edges are never derived from its bytes — they are the refs its
+ * put declares.)
  *
  * Returns `null` (rather than `[]`) when no refs are present — the column
  * is nullable and the `idx_cell_refs` partial index is `WHERE refs IS NOT
  * NULL`, so an empty array would force every cell into the index.
  *
- * Sorts the deduped refs lexicographically so the stored `text[]` is
- * deterministic and byte-identical to the Rust twin (`fuz_cell`'s
- * `extract_refs`, which sorts the same `blake3:`-prefixed element form).
- * The shared `fact_hash_extract_refs` deliberately preserves traversal
- * order per its contract, so the sort lives here at the storage boundary,
- * not in the util.
+ * Sorts the deduped refs so the stored `text[]` is deterministic and
+ * byte-identical to the Rust twin (`fuz_cell`'s `extract_refs`); every ref is
+ * ASCII, so the code-unit sort here and the byte sort there agree.
+ *
+ * @param data - the cell's `data`
+ * @returns the sorted refs, or `null` when there are none
  */
-const derive_refs = (data: Json): Array<FactHash> | null => {
-	const refs = fact_hash_extract_refs(data);
-	return refs.length > 0 ? refs.sort() : null;
+export const derive_cell_refs = (data: Json): Array<FactHash> | null => {
+	const found: Set<FactHash> = new Set();
+	collect_cell_refs(data, found);
+	return found.size > 0 ? [...found].sort() : null;
+};
+
+const collect_cell_refs = (value: Json, found: Set<FactHash>): void => {
+	if (typeof value === 'string') {
+		if (is_fact_hash(value)) found.add(value);
+		return;
+	}
+	if (value === null || typeof value !== 'object') return;
+	if (Array.isArray(value)) {
+		for (const item of value) collect_cell_refs(item, found);
+		return;
+	}
+	for (const v of Object.values(value)) collect_cell_refs(v, found);
 };

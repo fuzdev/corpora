@@ -1,7 +1,16 @@
 <script lang="ts">
+	import { DEV } from 'esm-env';
 	import { resolve } from '$app/paths';
 
-	import { mdz_classify_link, mdz_is_void_element } from './mdz_helpers.ts';
+	import {
+		mdz_classify_link,
+		mdz_is_void_element,
+		mdz_filter_element_attributes,
+		mdz_filter_component_attributes,
+		mdz_component_config,
+		mdz_format_unregistered_attributes,
+		ALLOWED_ELEMENT_ATTRIBUTES
+	} from './mdz_helpers.ts';
 	import {
 		mdz_components_context,
 		mdz_elements_context,
@@ -10,7 +19,7 @@
 		mdz_codeblock_context
 	} from './mdz_contexts.ts';
 	import type { MdzStreamNode } from './mdz_stream_state.svelte.ts';
-	import type { MdzTableAlign } from './mdz.ts';
+	import type { MdzAttribute, MdzTableAlign } from './mdz.ts';
 
 	const {
 		node,
@@ -27,6 +36,11 @@
 	const get_code = mdz_code_context.get_maybe();
 	const get_codeblock = mdz_codeblock_context.get_maybe();
 
+	// `resolve()`'s pathname branch, widened to runtime strings: the app's `Path` union
+	// only types known routes, and mdz references are authored content. Sound because
+	// `mdz_classify_link` strips the leading slash, so the call never takes the route-id branch.
+	const resolve_pathname = resolve as (pathname: string) => string;
+
 	// While a Code/Codeblock container is open, streamed text accumulates in
 	// `children`; `MdzStreamState` collapses it into `content` at close. Joining
 	// the children makes the content visible as it streams instead of popping in
@@ -34,6 +48,11 @@
 	// it's identical, the children are just retained in the render tree).
 	const streaming_content = (n: MdzStreamNode): string =>
 		n.content || n.children.map((c) => c.content).join('');
+
+	// the boundary renders the placeholder silently, so surface the cause in DEV
+	const on_component_error = DEV
+		? (error: unknown) => console.error('mdz: component failed to render', error)
+		: undefined;
 </script>
 
 <!-- The tree renders through recursive snippets rather than recursive
@@ -48,30 +67,48 @@ tree instead of per node. -->
 {#snippet render_node(node: MdzStreamNode)}
 	{#if node.type === 'Element'}
 		{@const element_config = get_elements?.()?.get(node.name ?? '')}
-		{#if element_config !== undefined}
+		{#if element_config === true}
+			{@const attrs = mdz_filter_element_attributes(
+				node.name ?? '',
+				node.attributes ?? [],
+				ALLOWED_ELEMENT_ATTRIBUTES
+			)}
 			{#if mdz_is_void_element(node.name ?? '')}
 				<!-- void elements cannot have content — any parsed children are dropped -->
-				<svelte:element this={node.name} />
+				<svelte:element this={node.name} {...attrs} />
 			{:else}
-				<svelte:element this={node.name}>
+				<svelte:element this={node.name} {...attrs}>
 					{#if node.children.length > 0}
 						{@render render_children(node.children)}
 					{/if}
 				</svelte:element>
 			{/if}
 		{:else}
-			{@render render_unregistered_tag(node.name ?? '', node.children)}
+			{@render render_unregistered_tag(node.name ?? '', node.attributes ?? [], node.children)}
 		{/if}
 	{:else if node.type === 'Component'}
-		{@const Component = get_components?.()?.get(node.name ?? '')}
-		{#if Component}
-			<Component>
-				{#if node.children.length > 0}
-					{@render render_children(node.children)}
-				{/if}
-			</Component>
+		{@const entry = get_components?.()?.get(node.name ?? '')}
+		{#if entry}
+			{@const config = mdz_component_config(entry)}
+			{@const props = mdz_filter_component_attributes(
+				node.name ?? '',
+				node.attributes ?? [],
+				config.props
+			)}
+			<!-- a per-node boundary: a component that throws (say on an unexpected prop
+			value) degrades to its literal placeholder instead of taking down the tree -->
+			<svelte:boundary onerror={on_component_error}>
+				<config.component {...props}>
+					{#if node.children.length > 0}
+						{@render render_children(node.children)}
+					{/if}
+				</config.component>
+				{#snippet failed()}
+					{@render render_unregistered_tag(node.name ?? '', node.attributes ?? [], node.children)}
+				{/snippet}
+			</svelte:boundary>
 		{:else}
-			{@render render_unregistered_tag(node.name ?? '', node.children)}
+			{@render render_unregistered_tag(node.name ?? '', node.attributes ?? [], node.children)}
 		{/if}
 	{:else if node.type === 'Text'}
 		{node.content}
@@ -94,13 +131,14 @@ tree instead of per node. -->
 		{#if link.kind === 'unsafe'}
 			{@render render_children(node.children)}
 		{:else if link.kind === 'resolve'}
-			<a href={resolve(link.href as any)}>{@render render_children(node.children)}</a>
+			<a href={resolve_pathname(link.path)}>{@render render_children(node.children)}</a>
 		{:else if link.kind === 'external'}
 			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-			<a href={link.href} target="_blank" rel="noopener">{@render render_children(node.children)}</a
-			>
+			<a href={link.href} target="_blank" rel="noopener">
+				{@render render_children(node.children)}
+			</a>
 		{:else}
-			<!-- fragment/query/relative/bare references skip resolve() (it accepts only absolute paths) -->
+			<!-- fragment/query/relative/bare references aren't under the base, so they skip resolve() -->
 			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
 			<a href={link.href}>{@render render_children(node.children)}</a>
 		{/if}
@@ -128,14 +166,18 @@ tree instead of per node. -->
 		<table>
 			{#if header_row}
 				<thead>
-					<tr>{@render render_cells(header_row, 'th', align)}</tr>
+					<tr>
+						{@render render_cells(header_row, 'th', align)}
+					</tr>
 				</thead>
 			{/if}
 			{#if node.children.length > (header_row ? 1 : 0)}
 				<tbody>
 					{#each node.children as row (row.id)}
 						{#if !row.header}
-							<tr>{@render render_cells(row, 'td', align)}</tr>
+							<tr>
+								{@render render_cells(row, 'td', align)}
+							</tr>
 						{/if}
 					{/each}
 				</tbody>
@@ -174,12 +216,17 @@ tree instead of per node. -->
 	{/each}
 {/snippet}
 
-{#snippet render_unregistered_tag(name: string, children: Array<MdzStreamNode>)}
+{#snippet render_unregistered_tag(
+	name: string,
+	attributes: Array<MdzAttribute>,
+	children: Array<MdzStreamNode>
+)}
+	{@const formatted = mdz_format_unregistered_attributes(attributes)}
 	{#if children.length > 0}
-		<code class="color_c_50">&lt;{name}&gt;</code>{@render render_children(children)}<code
-			class="color_c_50">&lt;/{name}&gt;</code
-		>
+		<code class="color_c_50">&lt;{name}{formatted}&gt;</code>{@render render_children(
+			children
+		)}<code class="color_c_50">&lt;/{name}&gt;</code>
 	{:else}
-		<code class="color_c_50">&lt;{name} /&gt;</code>
+		<code class="color_c_50">&lt;{name}{formatted} /&gt;</code>
 	{/if}
 {/snippet}

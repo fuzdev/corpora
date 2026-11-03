@@ -2,27 +2,33 @@
  * Integration tests for scope-aware role_grant offer flows — cross-cutting
  * behavior spanning create and accept where the `scope_id` invariant
  * matters (scoped role_grant materialization; sibling offers in different
- * scopes don't supersede each other).
+ * scopes don't supersede each other). Over an admin-grantable app role, since
+ * builtin roles are global-only.
  *
  * @module
  */
 
 import { describe, test, assert } from 'vitest';
 
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
 import {
 	role_grant_offer_create_action_spec,
 	role_grant_offer_accept_action_spec
-} from '$lib/auth/role_grant_offer_action_specs.ts';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
+} from '#lib/auth/role_grant_offer_action_specs.ts';
+import { create_uuid } from '#lib/primitive_schemas.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { describe_db } from '../auth_db_default.ts';
 import {
 	RPC_PATH,
-	create_route_specs,
-	describe_db,
+	TEST_APP_ROLE,
+	create_app_role_route_specs,
 	session_options
 } from './role_grant_offer_test_helpers.ts';
+
+// Scoped offers use an admin-grantable app role — builtin roles are
+// global-only, refused with a scope on every grant path.
+const create_route_specs = create_app_role_route_specs();
 
 describe_db('role_grant_offer_actions.scoped', (get_db) => {
 	describe('scoped offers', () => {
@@ -41,7 +47,7 @@ describe_db('role_grant_offer_actions.scoped', (get_db) => {
 				spec: role_grant_offer_create_action_spec,
 				params: {
 					to_account_id: recipient.account.id,
-					role: ROLE_ADMIN,
+					role: TEST_APP_ROLE,
 					scope_kind: 'classroom',
 					scope_id
 				},
@@ -80,7 +86,7 @@ describe_db('role_grant_offer_actions.scoped', (get_db) => {
 				spec: role_grant_offer_create_action_spec,
 				params: {
 					to_account_id: recipient.account.id,
-					role: ROLE_ADMIN,
+					role: TEST_APP_ROLE,
 					scope_kind: 'classroom',
 					scope_id: scope_a
 				},
@@ -94,7 +100,7 @@ describe_db('role_grant_offer_actions.scoped', (get_db) => {
 				spec: role_grant_offer_create_action_spec,
 				params: {
 					to_account_id: recipient.account.id,
-					role: ROLE_ADMIN,
+					role: TEST_APP_ROLE,
 					scope_kind: 'classroom',
 					scope_id: scope_b
 				},

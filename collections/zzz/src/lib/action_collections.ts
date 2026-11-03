@@ -21,8 +21,14 @@ export const ActionSpecs = {
 	session_load: specs.session_load_action_spec,
 	filer_change: specs.filer_change_action_spec,
 	diskfile_update: specs.diskfile_update_action_spec,
+	diskfile_create: specs.diskfile_create_action_spec,
 	diskfile_delete: specs.diskfile_delete_action_spec,
 	directory_create: specs.directory_create_action_spec,
+	media_finalize: specs.media_finalize_action_spec,
+	transcription_create: specs.transcription_create_action_spec,
+	transcription_progress: specs.transcription_progress_action_spec,
+	job_cancel: specs.job_cancel_action_spec,
+	job_changed: specs.job_changed_action_spec,
 	completion_create: specs.completion_create_action_spec,
 	completion_progress: specs.completion_progress_action_spec,
 	toggle_main_menu: specs.toggle_main_menu_action_spec,
@@ -30,6 +36,7 @@ export const ActionSpecs = {
 	terminal_create: specs.terminal_create_action_spec,
 	terminal_data_send: specs.terminal_data_send_action_spec,
 	terminal_data: specs.terminal_data_action_spec,
+	terminal_ack: specs.terminal_ack_action_spec,
 	terminal_resize: specs.terminal_resize_action_spec,
 	terminal_close: specs.terminal_close_action_spec,
 	terminal_exited: specs.terminal_exited_action_spec,
@@ -46,8 +53,14 @@ export interface ActionSpecs {
 	session_load: typeof specs.session_load_action_spec;
 	filer_change: typeof specs.filer_change_action_spec;
 	diskfile_update: typeof specs.diskfile_update_action_spec;
+	diskfile_create: typeof specs.diskfile_create_action_spec;
 	diskfile_delete: typeof specs.diskfile_delete_action_spec;
 	directory_create: typeof specs.directory_create_action_spec;
+	media_finalize: typeof specs.media_finalize_action_spec;
+	transcription_create: typeof specs.transcription_create_action_spec;
+	transcription_progress: typeof specs.transcription_progress_action_spec;
+	job_cancel: typeof specs.job_cancel_action_spec;
+	job_changed: typeof specs.job_changed_action_spec;
 	completion_create: typeof specs.completion_create_action_spec;
 	completion_progress: typeof specs.completion_progress_action_spec;
 	toggle_main_menu: typeof specs.toggle_main_menu_action_spec;
@@ -55,6 +68,7 @@ export interface ActionSpecs {
 	terminal_create: typeof specs.terminal_create_action_spec;
 	terminal_data_send: typeof specs.terminal_data_send_action_spec;
 	terminal_data: typeof specs.terminal_data_action_spec;
+	terminal_ack: typeof specs.terminal_ack_action_spec;
 	terminal_resize: typeof specs.terminal_resize_action_spec;
 	terminal_close: typeof specs.terminal_close_action_spec;
 	terminal_exited: typeof specs.terminal_exited_action_spec;
@@ -79,8 +93,14 @@ export const ActionInputs = {
 	session_load: specs.session_load_action_spec.input,
 	filer_change: specs.filer_change_action_spec.input,
 	diskfile_update: specs.diskfile_update_action_spec.input,
+	diskfile_create: specs.diskfile_create_action_spec.input,
 	diskfile_delete: specs.diskfile_delete_action_spec.input,
 	directory_create: specs.directory_create_action_spec.input,
+	media_finalize: specs.media_finalize_action_spec.input,
+	transcription_create: specs.transcription_create_action_spec.input,
+	transcription_progress: specs.transcription_progress_action_spec.input,
+	job_cancel: specs.job_cancel_action_spec.input,
+	job_changed: specs.job_changed_action_spec.input,
 	completion_create: specs.completion_create_action_spec.input,
 	completion_progress: specs.completion_progress_action_spec.input,
 	toggle_main_menu: specs.toggle_main_menu_action_spec.input,
@@ -88,6 +108,7 @@ export const ActionInputs = {
 	terminal_create: specs.terminal_create_action_spec.input,
 	terminal_data_send: specs.terminal_data_send_action_spec.input,
 	terminal_data: specs.terminal_data_action_spec.input,
+	terminal_ack: specs.terminal_ack_action_spec.input,
 	terminal_resize: specs.terminal_resize_action_spec.input,
 	terminal_close: specs.terminal_close_action_spec.input,
 	terminal_exited: specs.terminal_exited_action_spec.input,
@@ -104,8 +125,14 @@ export interface ActionInputs {
 	session_load: z.infer<typeof specs.session_load_action_spec.input>;
 	filer_change: z.infer<typeof specs.filer_change_action_spec.input>;
 	diskfile_update: z.infer<typeof specs.diskfile_update_action_spec.input>;
+	diskfile_create: z.infer<typeof specs.diskfile_create_action_spec.input>;
 	diskfile_delete: z.infer<typeof specs.diskfile_delete_action_spec.input>;
 	directory_create: z.infer<typeof specs.directory_create_action_spec.input>;
+	media_finalize: z.infer<typeof specs.media_finalize_action_spec.input>;
+	transcription_create: z.infer<typeof specs.transcription_create_action_spec.input>;
+	transcription_progress: z.infer<typeof specs.transcription_progress_action_spec.input>;
+	job_cancel: z.infer<typeof specs.job_cancel_action_spec.input>;
+	job_changed: z.infer<typeof specs.job_changed_action_spec.input>;
 	completion_create: z.infer<typeof specs.completion_create_action_spec.input>;
 	completion_progress: z.infer<typeof specs.completion_progress_action_spec.input>;
 	toggle_main_menu: z.infer<typeof specs.toggle_main_menu_action_spec.input>;
@@ -113,6 +140,7 @@ export interface ActionInputs {
 	terminal_create: z.infer<typeof specs.terminal_create_action_spec.input>;
 	terminal_data_send: z.infer<typeof specs.terminal_data_send_action_spec.input>;
 	terminal_data: z.infer<typeof specs.terminal_data_action_spec.input>;
+	terminal_ack: z.infer<typeof specs.terminal_ack_action_spec.input>;
 	terminal_resize: z.infer<typeof specs.terminal_resize_action_spec.input>;
 	terminal_close: z.infer<typeof specs.terminal_close_action_spec.input>;
 	terminal_exited: z.infer<typeof specs.terminal_exited_action_spec.input>;
@@ -135,8 +163,14 @@ export const ActionOutputs = {
 	session_load: specs.session_load_action_spec.output,
 	filer_change: specs.filer_change_action_spec.output,
 	diskfile_update: specs.diskfile_update_action_spec.output,
+	diskfile_create: specs.diskfile_create_action_spec.output,
 	diskfile_delete: specs.diskfile_delete_action_spec.output,
 	directory_create: specs.directory_create_action_spec.output,
+	media_finalize: specs.media_finalize_action_spec.output,
+	transcription_create: specs.transcription_create_action_spec.output,
+	transcription_progress: specs.transcription_progress_action_spec.output,
+	job_cancel: specs.job_cancel_action_spec.output,
+	job_changed: specs.job_changed_action_spec.output,
 	completion_create: specs.completion_create_action_spec.output,
 	completion_progress: specs.completion_progress_action_spec.output,
 	toggle_main_menu: specs.toggle_main_menu_action_spec.output,
@@ -144,6 +178,7 @@ export const ActionOutputs = {
 	terminal_create: specs.terminal_create_action_spec.output,
 	terminal_data_send: specs.terminal_data_send_action_spec.output,
 	terminal_data: specs.terminal_data_action_spec.output,
+	terminal_ack: specs.terminal_ack_action_spec.output,
 	terminal_resize: specs.terminal_resize_action_spec.output,
 	terminal_close: specs.terminal_close_action_spec.output,
 	terminal_exited: specs.terminal_exited_action_spec.output,
@@ -160,8 +195,14 @@ export interface ActionOutputs {
 	session_load: z.infer<typeof specs.session_load_action_spec.output>;
 	filer_change: z.infer<typeof specs.filer_change_action_spec.output>;
 	diskfile_update: z.infer<typeof specs.diskfile_update_action_spec.output>;
+	diskfile_create: z.infer<typeof specs.diskfile_create_action_spec.output>;
 	diskfile_delete: z.infer<typeof specs.diskfile_delete_action_spec.output>;
 	directory_create: z.infer<typeof specs.directory_create_action_spec.output>;
+	media_finalize: z.infer<typeof specs.media_finalize_action_spec.output>;
+	transcription_create: z.infer<typeof specs.transcription_create_action_spec.output>;
+	transcription_progress: z.infer<typeof specs.transcription_progress_action_spec.output>;
+	job_cancel: z.infer<typeof specs.job_cancel_action_spec.output>;
+	job_changed: z.infer<typeof specs.job_changed_action_spec.output>;
 	completion_create: z.infer<typeof specs.completion_create_action_spec.output>;
 	completion_progress: z.infer<typeof specs.completion_progress_action_spec.output>;
 	toggle_main_menu: z.infer<typeof specs.toggle_main_menu_action_spec.output>;
@@ -169,6 +210,7 @@ export interface ActionOutputs {
 	terminal_create: z.infer<typeof specs.terminal_create_action_spec.output>;
 	terminal_data_send: z.infer<typeof specs.terminal_data_send_action_spec.output>;
 	terminal_data: z.infer<typeof specs.terminal_data_action_spec.output>;
+	terminal_ack: z.infer<typeof specs.terminal_ack_action_spec.output>;
 	terminal_resize: z.infer<typeof specs.terminal_resize_action_spec.output>;
 	terminal_close: z.infer<typeof specs.terminal_close_action_spec.output>;
 	terminal_exited: z.infer<typeof specs.terminal_exited_action_spec.output>;
@@ -207,6 +249,11 @@ export interface ActionEventDatas {
 		ActionInputs['diskfile_update'],
 		ActionOutputs['diskfile_update']
 	>;
+	diskfile_create: ActionEventRequestResponseData<
+		'diskfile_create',
+		ActionInputs['diskfile_create'],
+		ActionOutputs['diskfile_create']
+	>;
 	diskfile_delete: ActionEventRequestResponseData<
 		'diskfile_delete',
 		ActionInputs['diskfile_delete'],
@@ -217,6 +264,26 @@ export interface ActionEventDatas {
 		ActionInputs['directory_create'],
 		ActionOutputs['directory_create']
 	>;
+	media_finalize: ActionEventRequestResponseData<
+		'media_finalize',
+		ActionInputs['media_finalize'],
+		ActionOutputs['media_finalize']
+	>;
+	transcription_create: ActionEventRequestResponseData<
+		'transcription_create',
+		ActionInputs['transcription_create'],
+		ActionOutputs['transcription_create']
+	>;
+	transcription_progress: ActionEventRemoteNotificationData<
+		'transcription_progress',
+		ActionInputs['transcription_progress']
+	>;
+	job_cancel: ActionEventRequestResponseData<
+		'job_cancel',
+		ActionInputs['job_cancel'],
+		ActionOutputs['job_cancel']
+	>;
+	job_changed: ActionEventRemoteNotificationData<'job_changed', ActionInputs['job_changed']>;
 	completion_create: ActionEventRequestResponseData<
 		'completion_create',
 		ActionInputs['completion_create'],
@@ -247,6 +314,11 @@ export interface ActionEventDatas {
 		ActionOutputs['terminal_data_send']
 	>;
 	terminal_data: ActionEventRemoteNotificationData<'terminal_data', ActionInputs['terminal_data']>;
+	terminal_ack: ActionEventRequestResponseData<
+		'terminal_ack',
+		ActionInputs['terminal_ack'],
+		ActionOutputs['terminal_ack']
+	>;
 	terminal_resize: ActionEventRequestResponseData<
 		'terminal_resize',
 		ActionInputs['terminal_resize'],

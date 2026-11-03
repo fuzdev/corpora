@@ -6,8 +6,8 @@
  * whose members follow one template are built by loop from the variant lists
  * and value tables in `variable_data.ts` and the emitters in `ramps.ts`, then
  * spread into `default_variables` in place - array order is the order the CSS
- * renders in, so a family's spread sits where its members used to be
- * declared. What lives here is the assembly: the loop templates, the units
+ * renders in, so a family's spread sits where its members belong in the
+ * cascade. What lives here is the assembly: the loop templates, the units
  * and `calc()` wrappers the tables' unitless numbers get dressed in, and the
  * one-off variables that belong to no family.
  *
@@ -15,11 +15,13 @@
  */
 
 import type { StyleVariable } from './variable.ts';
+import { render_shadow_css } from './shadow_css.ts';
 import {
 	BORDER_RADII,
 	DISTANCES,
 	DURATIONS,
 	FONT_SIZES,
+	TYPE_SCALE_RATIO,
 	ICON_SIZES,
 	LINE_HEIGHTS,
 	OVERLAY_ALPHAS,
@@ -47,6 +49,7 @@ import {
 } from './variable_data.ts';
 import {
 	NEUTRAL_CHROMA,
+	SHADE_CHROMA_00,
 	BORDER_CHROMA_MULTIPLIER,
 	BORDER_COLOR_LIGHTNESS,
 	PALETTE_CHROMA_KNOBS,
@@ -63,6 +66,9 @@ import {
 	render_lightness_stop_css,
 	render_neutral_stop_css,
 	render_ramp_color_css,
+	to_chroma_shape_name,
+	to_lightness_stop_name,
+	to_palette_chroma_name,
 	type LightnessRampKnobs,
 	type RampFamily
 } from './ramps.ts';
@@ -71,7 +77,7 @@ import {
 
 TODO lots of things here to address:
 
-- the alpha families (`border_color_*`, `fg_*`/`bg_*`, `darken_*`/`lighten_*`, shadows)
+- the alpha families (`border_color_*`, `ink_*`/`paper_*`, `darken_*`/`lighten_*`, shadows)
 	are alpha by design, but the base-case compositing cost is unmeasured
 	- maybe move all shadows out of the base theme?
 - lots of inconsistencies, like the relationship between base and modified values
@@ -96,37 +102,37 @@ const lightness_ramp_variables = (
 ): Array<StyleVariable> => [
 	{
 		name: `${family}_lightness_00`,
-		light: String(knobs.light.lightness_00),
+		base: String(knobs.light.lightness_00),
 		dark: String(knobs.dark.lightness_00)
 	},
 	{
 		name: `${family}_lightness_100`,
-		light: String(knobs.light.lightness_100),
+		base: String(knobs.light.lightness_100),
 		dark: String(knobs.dark.lightness_100)
 	},
 	{
 		name: `${family}_lightness_curve`,
-		light: String(knobs.light.curve),
+		base: String(knobs.light.curve),
 		dark: String(knobs.dark.curve)
 	},
 	...derived_lightness_stops.map((stop) => ({
-		name: `${family}_lightness_${stop}`,
-		light: render_lightness_stop_css(family, stop)
+		name: to_lightness_stop_name(family, stop),
+		base: render_lightness_stop_css(family, stop)
 	}))
 ];
 
-// a full 13-stop color scale for one hue slot - a palette letter or an intent
+// the full stop scale for one hue slot - a palette letter or an intent
 const ramp_color_variables = (slot: PaletteVariant | IntentVariant): Array<StyleVariable> =>
 	numeric_scale_variants.map((stop) => ({
 		name: `${slot}_${stop}`,
-		light: render_ramp_color_css(slot, stop)
+		base: render_ramp_color_css(slot, stop)
 	}));
 
 // a neutral (shade/text) scale, riding the palette's chroma shape
 const neutral_scale_variables = (family: Exclude<RampFamily, 'palette'>): Array<StyleVariable> =>
 	numeric_scale_variants.map((stop) => ({
 		name: `${family}_${stop}`,
-		light: render_neutral_stop_css(family, stop)
+		base: render_neutral_stop_css(family, stop)
 	}));
 
 /*
@@ -136,12 +142,13 @@ colors
 The color system is derived: the hue knobs plus a handful of curve knobs
 produce every palette/shade/text stop at computed-value time in pure CSS.
 The fitted default knob values, the formulas, and the CSS emitters live in
-`ramps.ts` (a faithful port of the previous HSL palette); tests gate the
+`ramps.ts`; tests gate the
 defaults for gamut, ramp monotonicity, and contrast.
 
-Layers, each derivable from the one above and each overridable per stop:
-curve knobs → ramp stops (`--palette_lightness_50`, `--palette_chroma_50`)
-→ color stops (`--palette_a_50`) → utility classes (`.color_a_50`).
+Layers, each derivable from the one above: curve knobs → private ramp
+intermediates (`--_palette_lightness_50`, `--_palette_chroma_50`) → color
+stops (`--palette_a_50`) → utility classes (`.color_a_50`). A theme sets
+the knobs and may pin a color stop; the intermediates aren't settable.
 
 */
 
@@ -162,28 +169,28 @@ consistent contrast. Unlike the adaptive shade scale, these don't flip.
 const overlay_variables = (family: 'darken' | 'lighten', rgb: string): Array<StyleVariable> =>
 	numeric_scale_variants.map((stop) => {
 		const { hex, percent } = OVERLAY_ALPHAS[stop];
-		return { name: `${family}_${stop}`, light: rgb + hex, summary: percent };
+		return { name: `${family}_${stop}`, base: rgb + hex, summary: percent };
 	});
 
 /*
 
-fg/bg - adaptive alpha overlays
+ink/paper - adaptive alpha overlays
 
 Color-scheme-adaptive overlays that swap direction per color scheme:
-- fg (foreground direction) = toward contrast (darkens in light mode, lightens in dark mode)
-- bg (background direction) = toward surface (lightens in light mode, darkens in dark mode)
+- ink = a wash toward the text color (darkens in light mode, lightens in dark mode)
+- paper = a wash toward the ground (lightens in light mode, darkens in dark mode)
 
 Use for subtle backgrounds that work in both color schemes without explicit conditionals.
 These stack when nested (alpha accumulates), unlike the opaque shade scale.
 
 */
 
-const adaptive_overlay_variables = (family: 'fg' | 'bg'): Array<StyleVariable> => {
-	const toward = family === 'fg' ? 'darken' : 'lighten';
-	const away = family === 'fg' ? 'lighten' : 'darken';
+const adaptive_overlay_variables = (family: 'ink' | 'paper'): Array<StyleVariable> => {
+	const toward = family === 'ink' ? 'darken' : 'lighten';
+	const away = family === 'ink' ? 'lighten' : 'darken';
 	return numeric_scale_variants.map((stop) => ({
 		name: `${family}_${stop}`,
-		light: `var(--${toward}_${stop})`,
+		base: `var(--${toward}_${stop})`,
 		dark: `var(--${away}_${stop})`
 	}));
 };
@@ -207,33 +214,27 @@ const shadow_variables = (size: ShadowSizeVariant): Array<StyleVariable> => {
 	const { offset, blur, spread } = SHADOW_GEOMETRY[size];
 	const tail = `${blur}px ${spread}px`;
 	return [
-		{ name: `shadow_${size}`, light: `0 0 ${tail}` },
-		{ name: `shadow_top_${size}`, light: `0 -${offset}px ${tail}` },
-		{ name: `shadow_bottom_${size}`, light: `0 ${offset}px ${tail}` },
-		{ name: `shadow_inset_${size}`, light: `inset 0 0 ${tail}` },
-		{ name: `shadow_inset_top_${size}`, light: `inset 0 ${offset}px ${tail}` },
-		{ name: `shadow_inset_bottom_${size}`, light: `inset 0 -${offset}px ${tail}` }
+		{ name: `shadow_${size}`, base: `0 0 ${tail}` },
+		{ name: `shadow_top_${size}`, base: `0 -${offset}px ${tail}` },
+		{ name: `shadow_bottom_${size}`, base: `0 ${offset}px ${tail}` },
+		{ name: `shadow_inset_${size}`, base: `inset 0 0 ${tail}` },
+		{ name: `shadow_inset_top_${size}`, base: `inset 0 ${offset}px ${tail}` },
+		{ name: `shadow_inset_bottom_${size}`, base: `inset 0 -${offset}px ${tail}` }
 	];
 };
 
 // the inset direction flips per color scheme so the highlight always reads as
 // lit from above; `active` is `hover` inverted, pressing the button inward
-//
-// the umbra names `--shadow_color_umbra` outright rather than going through
-// the contextual `var(--shadow_color, ...)` the `.shadow_*` classes set: a
-// custom property's var()s substitute against the declaring element, and
-// these are declared on `:root`, so that indirection could never see a value
-// set further down the tree - it only ever resolved to the fallback
 const button_shadow_slots = (
 	size: ShadowSizeVariant,
 	alpha: NumericScaleVariant
-): { light: string; dark: string } => {
-	const umbra = (edge: string) =>
-		`var(--shadow_inset_${edge}_${size}) color-mix(in oklab, var(--shadow_color_umbra) var(--shadow_alpha_${alpha}), transparent)`;
-	const highlight = (edge: string) =>
-		`var(--shadow_inset_${edge}_${size}) color-mix(in oklab, var(--shadow_color_highlight) var(--shadow_alpha_${alpha}), transparent)`;
+): { base: string; dark: string } => {
+	const umbra = (edge: 'top' | 'bottom') =>
+		render_shadow_css(`shadow_inset_${edge}`, size, 'umbra', alpha);
+	const highlight = (edge: 'top' | 'bottom') =>
+		render_shadow_css(`shadow_inset_${edge}`, size, 'highlight', alpha);
 	return {
-		light: `${umbra('bottom')}, ${highlight('top')}`,
+		base: `${umbra('bottom')}, ${highlight('top')}`,
 		dark: `${umbra('top')}, ${highlight('bottom')}`
 	};
 };
@@ -248,7 +249,7 @@ export const default_variables: Array<StyleVariable> = [
 	// hue knobs - OKLCH hue angles; equal lightness/chroma across hues makes rotation safe
 	...palette_variants.map((letter) => ({
 		name: `hue_${letter}`,
-		light: String(PALETTE_HUES[letter]),
+		base: String(PALETTE_HUES[letter]),
 		summary: palette_glosses[letter].color
 	})),
 
@@ -257,7 +258,7 @@ export const default_variables: Array<StyleVariable> = [
 	// setting; at or below 1 stays inside the gamut caps, above 1 knowingly clips
 	...palette_variants.map((letter) => ({
 		name: `palette_${letter}_chroma_scale`,
-		light: String(PALETTE_CHROMA_MULTIPLIERS[letter]),
+		base: String(PALETTE_CHROMA_MULTIPLIERS[letter]),
 		summary:
 			letter === 'f'
 				? 'mutes the brown slot - brown is low-chroma orange, unreachable by hue alone'
@@ -267,7 +268,7 @@ export const default_variables: Array<StyleVariable> = [
 	// global color-character knobs
 	{
 		name: 'chroma_scale',
-		light: '1',
+		base: '1',
 		summary:
 			'0 makes the palette grayscale (the neutral scales have their own knob), above 1 is vivid and can clip past the sRGB gamut caps'
 	},
@@ -279,12 +280,18 @@ export const default_variables: Array<StyleVariable> = [
 	than a neutral_00-100 family
 
 	*/
-	{ name: 'hue_neutral', light: 'var(--hue_f)' },
+	{ name: 'hue_neutral', base: 'var(--hue_f)' },
 	{
 		name: 'neutral_chroma',
-		light: String(NEUTRAL_CHROMA.light),
+		base: String(NEUTRAL_CHROMA.light),
 		dark: String(NEUTRAL_CHROMA.dark),
 		summary: 'peak chroma of the neutral scales, applied through the shared chroma shape'
+	},
+	{
+		name: 'shade_chroma_00',
+		base: String(SHADE_CHROMA_00),
+		summary:
+			'the page ground chroma, fading over the near-ground shade stops - the shared chroma shape is 0 at the ground, so this tints it and the surfaces raised off it'
 	},
 
 	/*
@@ -295,24 +302,24 @@ export const default_variables: Array<StyleVariable> = [
 	rotating --hue_accent recolors links, focus, selection, and selected states
 	in one move. The letters stay abstract palette slots. Intent stops derive
 	through the same ramps as the palette, so they respond to every curve knob;
-	full 13-stop scales derive per intent, mirroring the palette
+	full stop scales derive per intent, mirroring the palette
 	scales, and tree-shake like everything else - unused stops cost nothing.
 
 	*/
 	{
 		name: 'hue_accent',
-		light: 'var(--hue_a)',
+		base: 'var(--hue_a)',
 		summary: 'links, focus, selection, selected states'
 	},
-	{ name: 'hue_positive', light: 'var(--hue_b)', summary: 'success affordances' },
-	{ name: 'hue_negative', light: 'var(--hue_c)', summary: 'errors, destructive actions' },
-	{ name: 'hue_caution', light: 'var(--hue_h)', summary: 'warnings' },
-	{ name: 'hue_info', light: 'var(--hue_i)', summary: 'informational callouts' },
+	{ name: 'hue_positive', base: 'var(--hue_b)', summary: 'success affordances' },
+	{ name: 'hue_negative', base: 'var(--hue_c)', summary: 'errors, destructive actions' },
+	{ name: 'hue_caution', base: 'var(--hue_h)', summary: 'warnings' },
+	{ name: 'hue_info', base: 'var(--hue_i)', summary: 'informational callouts' },
 	// intent chroma-character twins - an intent hue binding shares only the
 	// angle, so binding an intent to a muted palette slot needs the twin set too
 	...intent_variants.map((intent) => ({
 		name: `${intent}_chroma_scale`,
-		light: '1',
+		base: '1',
 		summary: intent_chroma_summary
 	})),
 	// intent stops - the full scales derive through the shared ramps
@@ -335,17 +342,17 @@ export const default_variables: Array<StyleVariable> = [
 	*/
 	{
 		name: 'palette_chroma_min',
-		light: String(PALETTE_CHROMA_KNOBS.light.chroma_min),
+		base: String(PALETTE_CHROMA_KNOBS.light.chroma_min),
 		dark: String(PALETTE_CHROMA_KNOBS.dark.chroma_min)
 	},
 	{
 		name: 'palette_chroma_max',
-		light: String(PALETTE_CHROMA_KNOBS.light.chroma_max),
+		base: String(PALETTE_CHROMA_KNOBS.light.chroma_max),
 		dark: String(PALETTE_CHROMA_KNOBS.dark.chroma_max)
 	},
 	{
 		name: 'chroma_curve',
-		light: String(PALETTE_CHROMA_KNOBS.light.curve),
+		base: String(PALETTE_CHROMA_KNOBS.light.curve),
 		dark: String(PALETTE_CHROMA_KNOBS.dark.curve),
 		summary: 'falloff of the chroma peak, shared by the palette ramp and the neutral scales'
 	},
@@ -353,14 +360,14 @@ export const default_variables: Array<StyleVariable> = [
 	// normalized chroma shape per stop - 0 at the endpoints, 1 at the midpoint;
 	// shared by the palette chroma ramp and the neutral scales
 	...numeric_scale_variants.map((stop) => ({
-		name: `chroma_shape_${stop}`,
-		light: render_chroma_shape_css(stop)
+		name: to_chroma_shape_name(stop),
+		base: render_chroma_shape_css(stop)
 	})),
 
 	// capped palette chroma stops (per-scheme caps)
 	...numeric_scale_variants.map((stop) => ({
-		name: `palette_chroma_${stop}`,
-		light: render_chroma_stop_css(stop, PALETTE_CHROMA_CAPS.light[stop]),
+		name: to_palette_chroma_name(stop),
+		base: render_chroma_stop_css(stop, PALETTE_CHROMA_CAPS.light[stop]),
 		dark: render_chroma_stop_css(stop, PALETTE_CHROMA_CAPS.dark[stop])
 	})),
 
@@ -368,7 +375,7 @@ export const default_variables: Array<StyleVariable> = [
 	...palette_variants.flatMap((letter) =>
 		numeric_scale_variants.map((stop) => ({
 			name: `palette_${letter}_${stop}`,
-			light: render_ramp_color_css(letter, stop)
+			base: render_ramp_color_css(letter, stop)
 		}))
 	),
 
@@ -376,15 +383,14 @@ export const default_variables: Array<StyleVariable> = [
 
 	shade scale - the primary system for backgrounds and surfaces
 
-	Derived from the shade lightness knobs (see ramps.ts). The old alpha-derived
-	S-curve was flattened into the pow ramp in the OKLCH migration - uniform OKLCH
-	lightness steps are perceptually even, so the compositing compensation had no
-	reason to survive.
+	Derived from the shade lightness knobs (see ramps.ts): a pow ramp, since
+	uniform OKLCH lightness steps are perceptually even and need no
+	compositing compensation.
 
 	*/
 	// Untinted adaptive extremes
-	{ name: 'shade_min', light: '#fff', dark: '#000' },
-	{ name: 'shade_max', light: '#000', dark: '#fff' },
+	{ name: 'shade_min', base: '#fff', dark: '#000' },
+	{ name: 'shade_max', base: '#000', dark: '#fff' },
 	...lightness_ramp_variables('shade', SHADE_LIGHTNESS_KNOBS),
 	// Tinted shade scale (00-100)
 	...neutral_scale_variables('shade'),
@@ -394,8 +400,8 @@ export const default_variables: Array<StyleVariable> = [
 	...overlay_variables('lighten', '#ffffff'),
 
 	// adaptive alpha overlays (see `adaptive_overlay_variables`)
-	...adaptive_overlay_variables('fg'),
-	...adaptive_overlay_variables('bg'),
+	...adaptive_overlay_variables('ink'),
+	...adaptive_overlay_variables('paper'),
 
 	/*
 
@@ -411,14 +417,14 @@ export const default_variables: Array<StyleVariable> = [
 	*/
 	{
 		name: 'border_color_lightness',
-		light: String(BORDER_COLOR_LIGHTNESS.light),
+		base: String(BORDER_COLOR_LIGHTNESS.light),
 		dark: String(BORDER_COLOR_LIGHTNESS.dark),
 		summary: 'OKLCH lightness of the border color family'
 	},
 	{
 		name: 'border_color_chroma',
 		// stronger tint than the surfaces so borders read at low alpha
-		light: `calc(var(--neutral_chroma) * ${BORDER_CHROMA_MULTIPLIER.light})`,
+		base: `calc(var(--neutral_chroma) * ${BORDER_CHROMA_MULTIPLIER.light})`,
 		dark: `calc(var(--neutral_chroma) * ${BORDER_CHROMA_MULTIPLIER.dark})`,
 		summary: "the border family's chroma, derived from the neutral's"
 	},
@@ -428,8 +434,8 @@ export const default_variables: Array<StyleVariable> = [
 		const light = render_border_color_stop_css(stop, 'light');
 		const dark = render_border_color_stop_css(stop, 'dark');
 		return dark === light
-			? { name: `border_color_${stop}`, light }
-			: { name: `border_color_${stop}`, light, dark };
+			? { name: `border_color_${stop}`, base: light }
+			: { name: `border_color_${stop}`, base: light, dark };
 	}),
 
 	/*
@@ -442,97 +448,121 @@ export const default_variables: Array<StyleVariable> = [
 	/* text colors don't use alpha because it affects performance too much */
 
 	// Untinted text extremes (parallel to shade_min/shade_max)
-	{ name: 'text_min', light: '#fff', dark: '#000' },
-	{ name: 'text_max', light: '#000', dark: '#fff' },
+	{ name: 'text_min', base: '#fff', dark: '#000' },
+	{ name: 'text_max', base: '#000', dark: '#fff' },
 
-	{ name: 'text_color', light: 'var(--text_80)' },
+	{ name: 'text_color', base: 'var(--text_80)' },
 	...lightness_ramp_variables('text', TEXT_LIGHTNESS_KNOBS),
 	...neutral_scale_variables('text'),
-	{ name: 'text_disabled', light: 'var(--text_50)' },
+	{ name: 'text_disabled', base: 'var(--text_50)' },
 
 	/* decoration */
 	// hook on the page background (`:root`) for gradient skies, vignettes, and
 	// textures - the minimal decoration channel themes kept hitting walls on
-	{ name: 'background_image', light: 'none' },
+	{ name: 'background_image', base: 'none' },
 
 	/* fonts */
 	{
 		name: 'font_family_sans',
-		light:
-			"-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji'"
+		base: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji'"
 	},
-	{ name: 'font_family_serif', light: 'Georgia, serif' },
-	{ name: 'font_family_mono', light: 'ui-monospace, monospace' },
+	{ name: 'font_family_serif', base: 'Georgia, serif' },
+	{ name: 'font_family_mono', base: 'ui-monospace, monospace' },
 	// the body font, kept apart from the three stacks so retargeting it doesn't
 	// make one of them mean something it isn't
-	{ name: 'font_family', light: 'var(--font_family_sans)', summary: 'the body font' },
-	{ name: 'font_weight', light: '400', summary: 'base body font weight' },
-	{ name: 'heading_font_family', light: 'var(--font_family_serif)' },
+	{ name: 'font_family', base: 'var(--font_family_sans)', summary: 'the body font' },
+	{ name: 'font_weight', base: '400', summary: 'base body font weight' },
+	{ name: 'heading_font_family', base: 'var(--font_family_serif)' },
+	{
+		name: 'heading_letter_spacing',
+		base: 'normal',
+		summary: 'heading tracking, best in em so it follows each tier'
+	},
 	// `--heading_font_weight` is a hook consumed by `style.css` with per-tier
 	// fallbacks (h1 300 … h5 900), not a declared variable - setting it flattens
 	// the heading weight ladder deliberately (display-heavy themes); see `knobs.ts`
 
 	/* sizes like font-size */
-	...font_size_variants.map((size) => ({
-		name: `font_size_${size}`,
-		light: `${FONT_SIZES[size]}rem`
-	})),
+	// two orthogonal knobs: `font_size_scale` sets where the ladder starts -
+	// every step, body (`md`) and small text included, so captions keep their
+	// proportion to body text - and `type_scale_ratio` sets how steeply the
+	// steps above `md` climb, so a theme flattens or dramatizes the heading
+	// hierarchy without moving body text
+	{
+		name: 'font_size_scale',
+		base: '1',
+		summary: 'multiplies every font size, body text included - above 1 is larger'
+	},
+	{
+		name: 'type_scale_ratio',
+		base: String(TYPE_SCALE_RATIO),
+		summary: 'the ratio between font size steps above md'
+	},
+	...font_size_variants.map((size, i) => {
+		// steps counted from `md`, the size the scale grows from
+		const step = i - font_size_variants.indexOf('md');
+		return {
+			name: `font_size_${size}`,
+			base:
+				step > 0
+					? `calc(${FONT_SIZES.md}rem * var(--font_size_scale) * pow(var(--type_scale_ratio), ${step}))`
+					: `calc(${FONT_SIZES[size]}rem * var(--font_size_scale))`
+		};
+	}),
 
 	...line_height_variants.map((size) => ({
 		name: `line_height_${size}`,
-		light: String(LINE_HEIGHTS[size])
+		base: String(LINE_HEIGHTS[size])
 	})),
 
 	/* links */
-	{ name: 'link_color', light: 'var(--accent_60)' },
-	{ name: 'text_decoration', light: 'none' },
-	{ name: 'text_decoration_hover', light: 'underline' },
-	{ name: 'text_decoration_selected', light: 'underline' },
-	{ name: 'link_color_selected', light: 'var(--text_color)' },
-	// ports the old bespoke selection lightness in both schemes (light stop 20,
-	// dark stop 80) while following the accent intent and every ramp knob
+	{ name: 'link_color', base: 'var(--accent_60)' },
+	{ name: 'text_decoration', base: 'none' },
+	{ name: 'text_decoration_hover', base: 'underline' },
+	{ name: 'text_decoration_selected', base: 'underline' },
+	{ name: 'link_color_selected', base: 'var(--text_color)' },
+	// a light tint in both schemes (light stop 20, dark stop 80), following
+	// the accent intent and every ramp knob
 	{
 		name: 'selection_color',
-		light: render_ramp_color_css('accent', '20', '40%'),
+		base: render_ramp_color_css('accent', '20', '40%'),
 		dark: render_ramp_color_css('accent', '80', '40%')
 	},
 
-	/* spacings, rounded to pixels for the default 16px case (at the default scale factor of 1) */
+	/* spacings, rounded to pixels for the default 16px case (at the default space scale of 1) */
 	{
-		name: 'scale_factor',
-		light: '1',
+		name: 'space_scale',
+		base: '1',
 		summary: 'multiplies the space scale, below 1 is tighter and above 1 is more spacious'
 	},
 	...space_variants.map((size) => ({
 		name: `space_${size}`,
-		light: `calc(${SPACE_SIZES[size]}rem * var(--scale_factor))`
+		base: `calc(${SPACE_SIZES[size]}rem * var(--space_scale))`
 	})),
 	...distance_variants.map((size) => ({
 		name: `distance_${size}`,
-		light: `${DISTANCES[size]}px`
+		base: `${DISTANCES[size]}px`
 	})),
 
 	/* borders and outlines */
-	{ name: 'border_color', light: 'var(--shade_30)' },
-	{ name: 'border_style', light: 'solid' },
-	{ name: 'border_width', light: 'var(--border_width_1)' },
+	{ name: 'border_color', base: 'var(--shade_30)' },
+	{ name: 'border_style', base: 'solid' },
+	{ name: 'border_width', base: 'var(--border_width_1)' },
 	// These use numbers instead of named size variants because
 	// they more directly map to how I think about border widths.
 	// But maye this could be expanded/rethought.
 	...border_width_variants.map((width) => ({
 		name: `border_width_${width}`,
-		light: `${width}px`
+		base: `${width}px`
 	})),
-	{ name: 'outline_width', light: '0' },
-	// TODO maybe rename _2 to `focus`
-	{ name: 'outline_width_focus', light: 'var(--border_width_2)' },
-	// TODO maybe rename _3 to `active`
-	{ name: 'outline_width_active', light: 'var(--border_width_1)' },
-	{ name: 'outline_style', light: 'solid' },
-	{ name: 'outline_color', light: 'var(--accent_50)' },
+	{ name: 'outline_width', base: '0' },
+	{ name: 'outline_width_focus', base: 'var(--border_width_2)' },
+	{ name: 'outline_width_active', base: 'var(--border_width_1)' },
+	{ name: 'outline_style', base: 'solid' },
+	{ name: 'outline_color', base: 'var(--accent_50)' },
 	{
 		name: 'outline_offset',
-		light: '1px',
+		base: '1px',
 		summary: 'the gap between an element border and its focus ring'
 	},
 
@@ -541,84 +571,120 @@ export const default_variables: Array<StyleVariable> = [
 		pinning an individual token opts that tier out of the scale */
 	{
 		name: 'radius_scale',
-		light: '1',
+		base: '1',
 		summary: '0 is sharp, below 1 is squarer, above 1 is rounder'
+	},
+	// a floor under every tier, so a theme can lift the small corners onto a
+	// common radius while `radius_scale` compresses the rest; a length, since
+	// `max()` can't compare a unitless 0 against the rem tiers
+	{
+		name: 'border_radius_min',
+		base: '0rem',
+		summary: 'the smallest radius any tier rounds to'
 	},
 	...border_radius_variants.map((size) => ({
 		name: `border_radius_${size}`,
-		light: `calc(${BORDER_RADII[size]}rem * var(--radius_scale))`
+		base: `max(var(--border_radius_min), calc(${BORDER_RADII[size]}rem * var(--radius_scale)))`
 	})),
+	// the radius controls (buttons, text inputs, selects, textareas) read,
+	// apart from the surface tiers, so a theme rounds its controls without
+	// rounding its panels - the checkbox keeps the `xs` tier, since a pill
+	// checkbox reads as a radio; resolves at `:root`, so a contextual
+	// `--border_radius_sm` override doesn't reach controls
+	{
+		name: 'control_radius',
+		base: 'var(--border_radius_sm)',
+		summary: 'the corner radius of buttons and form fields'
+	},
 
 	/* buttons - the raised/pressed affordance, which no other element has, so
 		the border style splits from `--border_style` here rather than globally */
-	{ name: 'button_border_style', light: 'var(--border_style)' },
+	{ name: 'button_border_style', base: 'var(--border_style)' },
 	{
 		name: 'button_border_style_active',
-		light: 'var(--button_border_style)',
+		base: 'var(--button_border_style)',
 		summary: 'the pressed border style, e.g. `inset` against an `outset` rest state'
 	},
 	{ name: 'button_shadow', ...button_shadow_slots('xs', '30') },
 	{ name: 'button_shadow_hover', ...button_shadow_hover_slots },
 	{
 		name: 'button_shadow_active',
-		light: button_shadow_hover_slots.dark,
-		dark: button_shadow_hover_slots.light
+		base: button_shadow_hover_slots.dark,
+		dark: button_shadow_hover_slots.base
+	},
+
+	/* surfaces */
+	// the floating `.pane` and the embedded `.panel`
+	{
+		name: 'pane_shadow',
+		base: render_shadow_css('shadow_bottom', 'md', 'umbra', '50'),
+		summary: 'the shadow under a floating `.pane`'
+	},
+	{
+		name: 'panel_fill',
+		base: 'var(--ink_10)',
+		summary: 'the fill of an embedded `.panel`, a translucent ink step over whatever holds it'
+	},
+	{
+		name: 'panel_shadow',
+		base: 'none',
+		summary: 'the shadow of an embedded `.panel`, none by default'
 	},
 
 	/* inputs */
-	{ name: 'input_fill', light: 'var(--bg_80)' },
-	{ name: 'input_padding_y', light: '0' },
-	{ name: 'input_padding_x', light: 'var(--space_lg)' },
-	{ name: 'input_width_min', light: '100px' },
-	{ name: 'input_height', light: 'var(--space_xl5)' },
-	{ name: 'input_height_compact', light: 'var(--space_xl4)' },
+	{ name: 'input_fill', base: 'var(--paper_80)' },
+	{ name: 'input_padding_y', base: '0' },
+	{ name: 'input_padding_x', base: 'var(--space_lg)' },
+	{ name: 'input_width_min', base: '100px' },
+	{ name: 'input_height', base: 'var(--space_xl5)' },
+	{ name: 'input_height_compact', base: 'var(--space_xl4)' },
 
 	/* micro-surfaces */
-	{ name: 'caret_color', light: 'var(--accent_50)' },
-	{ name: 'scrollbar_thumb_color', light: 'var(--shade_40)' },
-	{ name: 'scrollbar_track_color', light: 'transparent' },
-	{ name: 'backdrop_color', light: 'var(--darken_60)', summary: 'the dim behind an open dialog' },
+	{ name: 'caret_color', base: 'var(--accent_50)' },
+	{ name: 'scrollbar_thumb_color', base: 'var(--shade_40)' },
+	{ name: 'scrollbar_track_color', base: 'transparent' },
+	{ name: 'backdrop_color', base: 'var(--darken_60)', summary: 'the dim behind an open dialog' },
 
 	/* shadows (see `SHADOW_GEOMETRY`) */
 	...shadow_size_variants.flatMap((size) => shadow_variables(size)),
-	{ name: 'shadow_color_umbra', light: '#000', dark: render_shadow_tint_css('dim') },
-	{ name: 'shadow_color_highlight', light: render_shadow_tint_css('bright'), dark: '#000' },
+	{ name: 'shadow_color_umbra', base: '#000', dark: render_shadow_tint_css('dim') },
+	{ name: 'shadow_color_highlight', base: render_shadow_tint_css('bright'), dark: '#000' },
 	{
 		name: 'shadow_color_glow',
-		light: render_shadow_tint_css('bright'),
+		base: render_shadow_tint_css('bright'),
 		dark: render_shadow_tint_css('dim')
 	},
-	{ name: 'shadow_color_shroud', light: '#000' },
+	{ name: 'shadow_color_shroud', base: '#000' },
 	// the stops multiply their base alphas (see `SHADOW_ALPHAS`) by the shadow
 	// alpha scale, so "flat" is one knob move (button shadows follow too, via
 	// their alpha-stop references); calc() results clamp to the valid range at
 	// computed-value time
 	{
 		name: 'shadow_alpha_scale',
-		light: '1',
+		base: '1',
 		summary: '0 flattens all shadows including button shadows, above 1 deepens them'
 	},
 	...numeric_scale_variants.map((stop) => {
 		const { light: light_alpha, dark: dark_alpha } = SHADOW_ALPHAS[stop];
 		const name = `shadow_alpha_${stop}`;
 		// zero is zero at any scale, so it stays a literal
-		if (!light_alpha && !dark_alpha) return { name, light: '0%' };
+		if (!light_alpha && !dark_alpha) return { name, base: '0%' };
 		const scaled = (alpha: number): string => `calc(${alpha}% * var(--shadow_alpha_scale))`;
 		return light_alpha === dark_alpha
-			? { name, light: scaled(light_alpha) }
-			: { name, light: scaled(light_alpha), dark: scaled(dark_alpha) };
+			? { name, base: scaled(light_alpha) }
+			: { name, base: scaled(light_alpha), dark: scaled(dark_alpha) };
 	}),
 
 	/* icons (see `ICON_SIZES`) */
 	...icon_size_variants.map((size) => ({
 		name: `icon_size_${size}`,
-		light: `${ICON_SIZES[size]}px`
+		base: `${ICON_SIZES[size]}px`
 	})),
 
 	/* durations */
 	// TODO maybe change the scale from xs-xl, and add an xs here around 0.04s or 0.03s (2 frames at 60fps)
 	// TODO docs
-	...duration_variants.map((n) => ({ name: `duration_${n}`, light: `${DURATIONS[n]}s` })),
+	...duration_variants.map((n) => ({ name: `duration_${n}`, base: `${DURATIONS[n]}s` })),
 
-	{ name: 'disabled_opacity', light: '60%' }
+	{ name: 'disabled_opacity', base: '60%' }
 ];

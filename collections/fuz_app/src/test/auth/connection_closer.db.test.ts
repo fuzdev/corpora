@@ -1,29 +1,40 @@
 /**
- * Wiring coverage for the `connection_closer` capability across
- * self-service account actions, admin revoke-all actions, and the REST
- * logout / password routes.
+ * Coverage for the connection closes every revocation makes — the self-service
+ * account actions, the admin revoke-all / delete / purge actions, the REST
+ * login / logout / password routes, the session and token caps, and the role
+ * revokes (`role_grant_revoke`, a `self_service_role_set` disable), which close
+ * only the connections gated on the revoked role, with
+ * `WS_CLOSE_PERMISSION_REVOKED`, and nothing for a scoped grant.
  *
  * Asserts that:
- * 1. Every gated handler calls the appropriate `close_sockets_for_*`
- *    method when the capability is injected. Per-test assertions use
- *    the `assert_close_call(calls[n], method, id)` helper — it pins
- *    `{method, id}` only, leaving the sequence-number authority to the
- *    dedicated ordering test (see #2).
- * 2. The eager close fires BEFORE the audit emit at the handler call
- *    site. Verified by the dedicated `audit emit ordering — close fires
- *    before audit.emit at the call site` block below, which hot-patches
- *    the `AppDeps.audit.emit` slot on the live backend to record into
- *    the same sequence-numbered array the closer pushes into. Audit
- *    emit is fire-and-forget so its DB-write timing isn't observable
- *    from the closer's sequence counter on the other tests — that's
- *    why those tests use the helper instead of pinning `at: N`.
- * 3. Failure outcomes (revoked=false from IDOR mismatch or
- *    cross-account probe) do NOT trigger eager close — same shape the
- *    listener uses, attackers cannot target arbitrary sessions/tokens
+ * 1. Every revoking handler closes the right connections through
+ *    `deps.connection_closer` — `assert_close_call(calls[n], target)` pins
+ *    the `ConnectionCloseTarget` each close was given.
+ * 2. The close runs **after the handler's transaction commits**. The
+ *    `every revocation site` block drives each site over a `create_gated_db`
+ *    and has its closer probe record two things at the moment it is called:
+ *    how many transactions are open (zero), and what a read through the
+ *    *pool* sees (the revocation, committed). On the in-memory drivers a pool read during an
+ *    open transaction would queue behind it, so the open-transaction count is
+ *    what discriminates there; on real Postgres the pool read does too.
+ * 3. A handler that throws closes nothing — its transaction rolled back, so
+ *    the revocation never happened.
+ * 4. A failed audit INSERT still closes — the close does not ride on the
+ *    fail-open audit write. A role-gated socket on a hand-mounted endpoint,
+ *    with no revocation guard registered, closes on the handler's close alone.
+ * 5. The close reaches both transports: a real `ConnectionRegistry`
+ *    socket and a real audit-stream `SseRegistry` stream registered
+ *    under the revoked identity both end, and a bystander's do not.
+ * 6. Failure outcomes (revoked=false from IDOR mismatch or cross-account
+ *    probe) close nothing — attackers cannot target arbitrary sessions/tokens
  *    by guessing ids OR by passing real other-account ids.
- * 4. When `connection_closer` is absent, handlers run cleanly and the
- *    audit listener remains the only close seam (backwards compat).
- * 5. Every test runs under the `beforeEach`/`afterEach` audit-drift
+ * 7. The close does not wait for the audit write either — with the audit
+ *    INSERT held in flight, an HTTP revocation's close has run, and a
+ *    WebSocket that revoked its own sessions is closed and dispatches nothing
+ *    more.
+ * 8. An RPC revocation that committed but whose result cannot be serialized
+ *    still closes — the response failure is not read as a rollback.
+ * 9. Every test runs under the `beforeEach`/`afterEach` audit-drift
  *    guard at the top of `describe_db`: if any handler emits metadata
  *    that fails `audit_metadata_schemas`, the process-wide counter in
  *    `audit_log_queries.ts` bumps and the after-each assertion fails.
@@ -31,93 +42,150 @@
  *    that production would swallow (the schema validation is
  *    fail-open in `query_audit_log`).
  *
- * Mirrors `zzz_server`'s handler-side `close_sockets_for_*` calls
- * landed 2026-05-16.
+ * The interleaving the post-commit order exists for — a connection admitted
+ * while a revocation's transaction is still open — needs two database
+ * connections, so it lives in `connection_closer.admission.db.test.ts`, on
+ * real Postgres only.
  *
  * @module
  */
 
 import { describe, test, assert } from 'vitest';
+import { Hono, type Context } from 'hono';
+import { z } from 'zod';
+import { Logger } from '@fuzdev/fuz_util/log.ts';
+import { create_uuid, type Uuid } from '#lib/primitive_schemas.ts';
+import { wait } from '@fuzdev/fuz_util/async.ts';
 
-import { SessionId } from '$lib/auth/account_schema.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
-import { create_admin_actions } from '$lib/auth/admin_actions.ts';
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
+import { SessionId } from '#lib/auth/account_schema.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
+import { create_admin_actions } from '#lib/auth/admin_actions.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
+import { create_role_grant_offer_actions } from '#lib/auth/role_grant_offer_actions.ts';
+import { create_self_service_role_actions } from '#lib/auth/self_service_role_actions.ts';
 import {
 	account_session_revoke_action_spec,
 	account_session_revoke_all_action_spec,
 	account_token_revoke_action_spec
-} from '$lib/auth/account_action_specs.ts';
+} from '#lib/auth/account_action_specs.ts';
 import {
 	admin_session_revoke_all_action_spec,
 	admin_token_revoke_all_action_spec
-} from '$lib/auth/admin_action_specs.ts';
+} from '#lib/auth/admin_action_specs.ts';
 import {
 	ERROR_CREDENTIAL_TYPE_REQUIRED,
 	ERROR_ACCOUNT_NOT_FOUND
-} from '$lib/http/error_schemas.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import type { ConnectionCloser } from '$lib/actions/connection_closer.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { DEFAULT_TEST_PASSWORD } from '$lib/testing/test_credentials.ts';
-import { create_test_account_with_actor } from '$lib/testing/db_entities.ts';
+} from '#lib/http/error_schemas.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { rpc_action } from '#lib/actions/action_types.ts';
+import type { RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
 import {
-	auth_integration_truncate_tables,
-	create_describe_db,
-	create_pglite_factory
-} from '$lib/testing/db.ts';
-import { rpc_call_for_spec, rpc_call } from '$lib/testing/rpc_helpers.ts';
-import { find_auth_route } from '$lib/testing/integration_helpers.ts';
+	queue_connection_close,
+	type ConnectionCloser,
+	type ConnectionCloseTarget
+} from '#lib/actions/connection_closer.ts';
+import { register_action_ws } from '#lib/actions/register_action_ws.ts';
+import { ConnectionRegistry } from '#lib/actions/connection_registry.ts';
 import {
-	install_audit_drift_guard,
-	create_emit_ordering_audit_factory
-} from '$lib/testing/audit_drift_guard.ts';
-import { create_audit_emitter } from '$lib/auth/audit_emitter.ts';
+	WS_CLOSE_PERMISSION_REVOKED,
+	WS_CLOSE_PERMISSION_REVOKED_REASON,
+	WS_CLOSE_SESSION_REVOKED,
+	WS_CLOSE_SESSION_REVOKED_REASON
+} from '#lib/actions/transports.ts';
+import { require_audit_sse } from '#lib/server/app_server.ts';
+import { create_test_app, type TestApp } from '#lib/testing/app_server.ts';
+import { create_test_request_headers } from '#lib/testing/test_origin.ts';
+import { DEFAULT_TEST_PASSWORD } from '#lib/testing/test_credentials.ts';
+import { create_test_account_with_actor } from '#lib/testing/db_entities.ts';
+import { rpc_call_for_spec, rpc_call } from '#lib/testing/rpc_helpers.ts';
+import { find_auth_route } from '#lib/testing/integration_helpers.ts';
+import { install_audit_drift_guard } from '#lib/testing/audit_drift_guard.ts';
+import {
+	create_audit_emitter,
+	get_audit_write_failures,
+	reset_audit_write_failures
+} from '#lib/auth/audit_emitter.ts';
 import {
 	assert_close_call,
 	create_recording_closer
-} from '$lib/testing/connection_closer_helpers.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import { prefix_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
-import { ROLE_ADMIN, ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { AuditLogEvent } from '$lib/auth/audit_log_schema.ts';
+} from '#lib/testing/connection_closer_helpers.ts';
+import { create_fake_ws, create_stub_upgrade, type FakeWs } from '#lib/testing/ws_round_trip.ts';
+import { build_request_context, REQUEST_CONTEXT_KEY } from '#lib/auth/request_context.ts';
+import { query_session_revoke_all_for_account } from '#lib/auth/session_queries.ts';
+import { RESOLVED_AUTH_KEY } from '#lib/hono_context.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { Db, no_nested_transaction } from '#lib/db/db.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import { prefix_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
+import { create_role_schema, ROLE_ADMIN, ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import { GRANT_PATH_ADMIN, GRANT_PATH_SELF_SERVICE } from '#lib/auth/grant_path_schema.ts';
+import { query_create_role_grant } from '#lib/auth/role_grant_queries.ts';
+import type { AuditLogEvent } from '#lib/auth/audit_log_schema.ts';
+import type { SseNotification, SseStream } from '#lib/realtime/sse.ts';
+
+import { create_mock_stream } from '../realtime/sse_test_helpers.ts';
+import { describe_db } from '../db_fixture.ts';
+import { create_gated_db, is_audit_insert, type GatedDb } from '../gated_db.ts';
+import { create_test_identity } from '../actions/connection_identity_helpers.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
+/** The role the mounted `self_service_role_set` toggles. */
+const SELF_SERVICE_ROLE = 'helper';
+/** An admin-grantable app role, grantable at a scope (builtin roles are global-only). */
+const APP_ROLE = 'teacher';
+const test_roles = create_role_schema([
+	{ name: SELF_SERVICE_ROLE, grant_paths: [GRANT_PATH_SELF_SERVICE] },
+	{ name: APP_ROLE, grant_paths: [GRANT_PATH_ADMIN] }
+]);
+const log = new Logger('test', { level: 'off' });
 
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
+/** Poll until `predicate` holds, failing with `message` after two seconds. */
+const until = async (predicate: () => boolean, message: string): Promise<void> => {
+	const deadline = Date.now() + 2000;
+	while (!predicate()) {
+		assert.ok(Date.now() < deadline, message);
+		await wait(5);
+	}
 };
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
+/**
+ * The account routes and the account, admin, role-grant-offer, and
+ * self-service role actions, built from `ctx.deps` the way a consumer builds
+ * them, with `closer` added to the backend's `connection_closer` so the test
+ * sees every close the handlers make.
+ */
 const make_create_route_specs =
-	(closer: ConnectionCloser | null) =>
-	(ctx: AppServerContext): Array<RouteSpec> => [
-		...prefix_route_specs(
-			'/api/account',
-			create_account_route_specs(ctx.deps, {
-				session_options,
-				login_ip_rate_limiter: ctx.login_ip_rate_limiter,
-				login_account_rate_limiter: ctx.login_account_rate_limiter,
-				login_fail_floor_ms: 0,
-				connection_closer: closer
+	(closer: ConnectionCloser, options: { max_sessions?: number; max_tokens?: number } = {}) =>
+	(ctx: AppServerContext): Array<RouteSpec> => {
+		ctx.deps.connection_closer.add(closer);
+		return [
+			...prefix_route_specs(
+				'/api/account',
+				create_account_route_specs(ctx.deps, {
+					session_options,
+					login_ip_rate_limiter: ctx.login_ip_rate_limiter,
+					login_account_rate_limiter: ctx.login_account_rate_limiter,
+					login_fail_floor_ms: 0,
+					max_sessions: options.max_sessions
+				})
+			),
+			...create_rpc_endpoint({
+				action_ip_rate_limiter: null,
+				action_account_rate_limiter: null,
+				path: RPC_PATH,
+				actions: [
+					...create_account_actions(ctx.deps, { max_tokens: options.max_tokens }),
+					...create_admin_actions(ctx.deps),
+					...create_role_grant_offer_actions(ctx.deps, { roles: test_roles }),
+					...create_self_service_role_actions(ctx.deps, { roles: test_roles })
+				],
+				log: ctx.deps.log
 			})
-		),
-		...create_rpc_endpoint({
-			path: RPC_PATH,
-			actions: [
-				...create_account_actions(ctx.deps, { connection_closer: closer }),
-				...create_admin_actions(ctx.deps, { connection_closer: closer })
-			],
-			log: ctx.deps.log
-		})
-	];
+		];
+	};
 
 describe_db('connection_closer wiring', (get_db) => {
 	// Audit-drift guard — fails any test whose audit emits land an
@@ -126,7 +194,9 @@ describe_db('connection_closer wiring', (get_db) => {
 	// silently swallow the same regressions). See
 	// `testing/audit_drift_guard.ts`. `await_pending_effects: true` on
 	// the test app guarantees fire-and-forget audit writes have completed
-	// by response time, so the after-each check observes final state.
+	// by response time, so the after-each check observes final state. The
+	// same flush runs the post-commit queue, so every close a handler queued
+	// has run by the time its response is in hand.
 	install_audit_drift_guard();
 
 	describe('account_actions (self-service)', () => {
@@ -168,7 +238,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			});
 			assert.strictEqual(res.ok, true);
 			assert.strictEqual(calls.length, 1, 'connection_closer called exactly once');
-			assert_close_call(calls[0], 'session', session_id);
+			assert_close_call(calls[0], { kind: 'session', session_hash: session_id });
 
 			// Audit emit fires fire-and-forget; with `await_pending_effects: true`,
 			// it lands by response time.
@@ -217,7 +287,7 @@ describe_db('connection_closer wiring', (get_db) => {
 				'closer must NOT fire on failed revoke — attacker-guessable ids'
 			);
 			// Pin the failure-outcome audit row — without it, a regression dropping
-			// BOTH the eager close AND the failure audit would slip past the close-
+			// BOTH the close AND the failure audit would slip past the close-
 			// only assertion above. The attacker-supplied `session_id` echoes back
 			// into metadata so forensics can spot enumeration attempts.
 			const failure_audits = audit_events.filter(
@@ -339,7 +409,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			if (res.ok)
 				assert.strictEqual(res.result.count, 1, 'bootstrap session was the only active session');
 			assert.strictEqual(calls.length, 1);
-			assert_close_call(calls[0], 'account', test_app.backend.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: test_app.backend.account.id });
 			await test_app.cleanup();
 		});
 
@@ -369,14 +439,14 @@ describe_db('connection_closer wiring', (get_db) => {
 			// the reset) but silently emit a spurious close call for every
 			// new token. The reset below would mask the regression.
 			assert.strictEqual(calls.length, 0, 'token_create must NOT fire the closer');
-			// Reset call log so we only capture the revoke's eager close.
+			// Reset call log so we only capture the revoke's close.
 			calls.length = 0;
 
 			const res = await rpc_call_for_spec({
 				app: test_app.app,
 				path: RPC_PATH,
 				spec: account_token_revoke_action_spec,
-				params: { token_id: token_id as never },
+				params: { token_id },
 				headers: test_app.create_session_headers()
 			});
 			assert.strictEqual(res.ok, true);
@@ -385,7 +455,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			// still fired the close would pass (`calls.length === 1`) silently.
 			if (res.ok) assert.strictEqual(res.result.revoked, true);
 			assert.strictEqual(calls.length, 1);
-			assert_close_call(calls[0], 'token', token_id);
+			assert_close_call(calls[0], { kind: 'token', api_token_id: token_id });
 			await test_app.cleanup();
 		});
 
@@ -458,7 +528,7 @@ describe_db('connection_closer wiring', (get_db) => {
 				app: test_app.app,
 				path: RPC_PATH,
 				spec: account_token_revoke_action_spec,
-				params: { token_id: target_token_id as never },
+				params: { token_id: target_token_id },
 				headers: test_app.create_session_headers()
 			});
 			assert.strictEqual(res.ok, true);
@@ -519,13 +589,10 @@ describe_db('connection_closer wiring', (get_db) => {
 			});
 			assert.strictEqual(res.ok, true);
 			assert.strictEqual(calls.length, 1);
-			// Close-vs-audit ordering isn't load-bearing here — `deps.audit.emit`
-			// is fire-and-forget and can't throw synchronously, so what matters
-			// is *inclusion* (close runs in the handler at all) not relative
-			// position. The audit success-shape assertions below pin the row's
+			// The audit success-shape assertions below pin the row's
 			// `target_account_id` + `metadata.count` so a refactor that dropped
 			// either would surface.
-			assert_close_call(calls[0], 'account', target.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: target.account.id });
 			const success_audits = audit_events.filter(
 				(e) => e.event_type === 'session_revoke_all' && e.outcome === 'success'
 			);
@@ -557,7 +624,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			});
 			assert.strictEqual(res.ok, true);
 			assert.strictEqual(calls.length, 1);
-			assert_close_call(calls[0], 'account', target.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: target.account.id });
 			// Mirror the session-revoke-all success-shape assertions above —
 			// pin `target_account_id` populated and `metadata.count` set.
 			const success_audits = audit_events.filter(
@@ -673,7 +740,7 @@ describe_db('connection_closer wiring', (get_db) => {
 
 		test('admin_session_revoke_all closes the target account when count is zero', async () => {
 			// Pins the close-fires-when-count-zero contract: a target account
-			// that exists but has no active sessions still triggers the eager
+			// that exists but has no active sessions still triggers the
 			// close. The handler returns count: 0 and the closer records a single
 			// account-wide call. Without this test, a refactor that gated the
 			// close on `if (count > 0)` (a plausible micro-optimization) would
@@ -700,7 +767,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			assert.strictEqual(res.ok, true);
 			if (res.ok) assert.strictEqual(res.result.count, 0);
 			assert.strictEqual(calls.length, 1, 'close fires unconditionally on the success path');
-			assert_close_call(calls[0], 'account', target.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: target.account.id });
 			await test_app.cleanup();
 		});
 
@@ -726,7 +793,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			assert.strictEqual(res.ok, true);
 			if (res.ok) assert.strictEqual(res.result.count, 0);
 			assert.strictEqual(calls.length, 1);
-			assert_close_call(calls[0], 'account', target.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: target.account.id });
 			await test_app.cleanup();
 		});
 	});
@@ -746,32 +813,29 @@ describe_db('connection_closer wiring', (get_db) => {
 			assert.ok(logout_route, 'logout route registered');
 			const res = await test_app.app.request(logout_route.path, {
 				method: 'POST',
-				headers: test_app.create_session_headers(),
+				headers: test_app.create_session_headers({ 'content-type': 'application/json' }),
 				body: null
 			});
 			assert.strictEqual(res.status, 200);
 			assert.strictEqual(calls.length, 1, 'closer fired once');
-			// Eager close is ACCOUNT-WIDE — matches the Rust `account_logout`
+			// The close is ACCOUNT-WIDE — matches the Rust `account_logout`
 			// handler and the sibling `/password` handler. Only the current
-			// session ROW is deleted (token-hash-scoped), but the socket close is
-			// account-grain — the same scope the `create_ws_logout_closer` audit
-			// listener applies, so the eager + listener seams converge.
-			assert_close_call(calls[0], 'account', test_app.backend.account.id);
+			// session ROW is deleted (token-hash-scoped), but the close is
+			// account-grain — the scope `logout` declares in
+			// `audit_event_revocation_scopes`, so the handler's close and the
+			// audit listeners' converge.
+			assert_close_call(calls[0], { kind: 'account', account_id: test_app.backend.account.id });
 			// Pin `event_type: 'logout'` (NOT `session_revoke`) on the audit row.
-			// This is the central invariant of the dual-seam WS close architecture:
-			// `ws_disconnect_event_types` in `transports_ws_auth_guard.ts` excludes
-			// `logout` deliberately so `create_ws_auth_guard` does not fire here.
-			// The listener-based seam for logout is the SEPARATE `create_ws_logout_closer`,
-			// which also closes account-wide. A refactor that emitted `session_revoke`
-			// here would silently swap which listener fires — catastrophic for
-			// SSE-stream-revocation logic and admin forensics.
+			// The listeners close by the scope the event type declares: a refactor
+			// that emitted `session_revoke` here would narrow the listener close
+			// to one session, and mislabel the row for admin forensics.
 			const logout_audits = audit_events.filter((e) => e.event_type === 'logout');
 			assert.strictEqual(logout_audits.length, 1, 'logout emits exactly one logout audit row');
 			const stray_session_revoke = audit_events.filter((e) => e.event_type === 'session_revoke');
 			assert.strictEqual(
 				stray_session_revoke.length,
 				0,
-				'logout must NOT emit a session_revoke event — see ws_disconnect_event_types'
+				'logout must NOT emit a session_revoke event — see audit_event_revocation_scopes'
 			);
 			await test_app.cleanup();
 		});
@@ -801,11 +865,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			});
 			assert.strictEqual(res.status, 200);
 			assert.strictEqual(calls.length, 1, 'closer fired once for the account-wide revoke');
-			// Audit-vs-close ordering isn't load-bearing here — audit emit is
-			// fire-and-forget. The inclusion contract is what matters; the
-			// dedicated ordering test at the bottom of this file proves the
-			// pre-emit sequencing.
-			assert_close_call(calls[0], 'account', test_app.backend.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: test_app.backend.account.id });
 			// Pin the defense-in-depth `credential_type` field on the
 			// success-path audit metadata (see `docs/security.md`
 			// §Credential-channel gating). A refactor that drops the field
@@ -855,7 +915,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			assert.ok(logout_route, 'logout route registered');
 			const res = await test_app.app.request(logout_route.path, {
 				method: 'POST',
-				headers: test_app.create_bearer_headers(),
+				headers: test_app.create_bearer_headers({ 'content-type': 'application/json' }),
 				body: null
 			});
 			assert.strictEqual(res.status, 403);
@@ -898,7 +958,7 @@ describe_db('connection_closer wiring', (get_db) => {
 			});
 			assert.strictEqual(res.status, 401);
 			assert.strictEqual(calls.length, 0, 'closer must not fire on wrong-password failure');
-			// Pin the failure audit so a regression that dropped both the eager
+			// Pin the failure audit so a regression that dropped both the
 			// close AND the failure audit would surface here. `credential_type`
 			// is the defense-in-depth field from `docs/security.md` §Credential-
 			// channel gating — present on every outcome of `password_change`.
@@ -912,38 +972,41 @@ describe_db('connection_closer wiring', (get_db) => {
 		});
 	});
 
-	describe('standard_rpc_actions bundle wires connection_closer', () => {
+	describe('standard_rpc_actions bundle closes through deps.connection_closer', () => {
 		// The per-factory tests above exercise `create_account_actions` and
 		// `create_admin_actions` directly. The `create_standard_rpc_actions`
-		// bundle spreads its options object into all three sub-factories via
-		// structural typing — `connection_closer` flows to admin + account
-		// today, role-grant-offer ignores it. A refactor to per-sub-factory
-		// option picks that forgot to thread `connection_closer` would
-		// silently disable the closer for consumers using the bundle. Two
-		// assertions — one account-side, one admin-side — guard against
-		// asymmetric regressions where only one of the two sub-factory
-		// option threads breaks.
+		// bundle hands its `deps` to all three sub-factories — admin + account
+		// read `connection_closer` off it, role-grant-offer ignores it. A
+		// refactor to per-sub-factory dep picks that forgot to thread
+		// `connection_closer` would silently disable the closes for consumers
+		// using the bundle. Two assertions — one account-side, one admin-side —
+		// guard against asymmetric regressions where only one of the two
+		// sub-factory threads breaks.
 		test('account + admin handlers both fire the closer when wired via the bundle', async () => {
 			const { closer, calls } = create_recording_closer();
 			const test_app = await create_test_app({
 				session_options,
-				create_route_specs: (ctx: AppServerContext): Array<RouteSpec> => [
-					...prefix_route_specs(
-						'/api/account',
-						create_account_route_specs(ctx.deps, {
-							session_options,
-							login_ip_rate_limiter: ctx.login_ip_rate_limiter,
-							login_account_rate_limiter: ctx.login_account_rate_limiter,
-							login_fail_floor_ms: 0,
-							connection_closer: closer
+				create_route_specs: (ctx: AppServerContext): Array<RouteSpec> => {
+					ctx.deps.connection_closer.add(closer);
+					return [
+						...prefix_route_specs(
+							'/api/account',
+							create_account_route_specs(ctx.deps, {
+								session_options,
+								login_ip_rate_limiter: ctx.login_ip_rate_limiter,
+								login_account_rate_limiter: ctx.login_account_rate_limiter,
+								login_fail_floor_ms: 0
+							})
+						),
+						...create_rpc_endpoint({
+							action_ip_rate_limiter: null,
+							action_account_rate_limiter: null,
+							path: RPC_PATH,
+							actions: create_standard_rpc_actions(ctx.deps),
+							log: ctx.deps.log
 						})
-					),
-					...create_rpc_endpoint({
-						path: RPC_PATH,
-						actions: create_standard_rpc_actions(ctx.deps, { connection_closer: closer }),
-						log: ctx.deps.log
-					})
-				],
+					];
+				},
 				db: get_db(),
 				roles: [ROLE_KEEPER, ROLE_ADMIN]
 			});
@@ -967,7 +1030,7 @@ describe_db('connection_closer wiring', (get_db) => {
 				1,
 				'standard bundle wired closer into admin_session_revoke_all'
 			);
-			assert_close_call(calls[0], 'account', target.account.id);
+			assert_close_call(calls[0], { kind: 'account', account_id: target.account.id });
 
 			// account-side: discover the bootstrap session id, then revoke
 			// it. Sits after the admin call because revoking the bootstrap
@@ -999,270 +1062,1054 @@ describe_db('connection_closer wiring', (get_db) => {
 				1,
 				'standard bundle wired closer into account_session_revoke'
 			);
-			assert_close_call(calls[0], 'session', session_id);
+			assert_close_call(calls[0], { kind: 'session', session_hash: session_id });
 
 			await test_app.cleanup();
 		});
 	});
 
-	describe('absent closer (backwards compat)', () => {
-		// Each gated handler must still complete cleanly without a closer —
-		// the pre-belt+suspenders configuration that pure listener-based
-		// close represents. Without per-handler coverage, a regression that
-		// drops `connection_closer ?? null` into `connection_closer!.…`
-		// silently survives the existing single-handler smoke test. These
-		// tests pin the no-closer contract on every site that wired the
-		// capability.
+	describe('every revocation site', () => {
+		// Each site is driven four ways against one harness: the close lands
+		// after the commit, a thrown handler closes nothing, a failed audit
+		// write still closes, and the close reaches a real socket and a real
+		// stream (asserted inside the first and third).
 
-		test('account_session_revoke_all completes without a connection_closer', async () => {
+		/** One close, as its `ConnectionCloser` call saw the world. */
+		interface ProbedClose {
+			target: ConnectionCloseTarget;
+			/** Transactions open on the request's `Db` when the close was called. */
+			open_transactions: number;
+			/** Whether a pool read, issued when the close was called, saw the revocation. */
+			committed: Promise<boolean>;
+		}
+
+		/** The identity a site's connection opens under. */
+		interface VictimIdentity {
+			account_id: Uuid;
+			session_hash?: string;
+			api_token_id?: string;
+			required_roles?: Array<string>;
+		}
+
+		/** A live connection of one identity, on both transports. */
+		interface LiveConnection {
+			ws: FakeWs;
+			stream: SseStream<SseNotification> & { closed: boolean };
+		}
+
+		interface SiteHarness {
+			test_app: TestApp;
+			/** The raw pool — a read here is outside every request transaction. */
+			db: Db;
+			/** The gate the backend's `Db` runs through — its stall holds a pool write. */
+			gated: GatedDb;
+			closes: Array<ProbedClose>;
+			/**
+			 * Open a connection of `identity` on the real registry and the real
+			 * audit stream registry. `required_roles` gates the socket's endpoint;
+			 * the stream is gated on the audit stream's role (`audit_role`).
+			 */
+			connect: (identity: VictimIdentity) => LiveConnection;
+			/** The role the audit stream registry is gated on. */
+			audit_role: string;
+			/** Failure injection, off until a test flips it. */
+			failing: {
+				/** The handler's next success `audit.emit` throws — the handler fails after its revoke. */
+				emit: boolean;
+				/**
+				 * The audit INSERT rejects: a fail-open pool write is lost, and an
+				 * in-transaction write fails the handler.
+				 */
+				audit_write: boolean;
+				/** The probed close throws, after recording itself — one registry failing. */
+				close: boolean;
+			};
+			/** What "the revocation committed" means for the site under test. */
+			committed: { read: ((db: Db) => Promise<boolean>) | null };
+		}
+
+		const create_site_harness = async (
+			db: Db,
+			options: { max_sessions?: number; max_tokens?: number } = {}
+		): Promise<SiteHarness> => {
+			const gated: GatedDb = create_gated_db(db);
+			const closes: Array<ProbedClose> = [];
+			const failing = { emit: false, audit_write: false, close: false };
+			const committed: SiteHarness['committed'] = { read: null };
+			const probe: ConnectionCloser = {
+				close_connections: (target) => {
+					closes.push({
+						target,
+						open_transactions: gated.open_transactions(),
+						committed: committed.read ? committed.read(db) : Promise.resolve(false)
+					});
+					if (failing.close) throw new Error('injected close failure');
+					return 0;
+				},
+				close_all_connections: () => {
+					throw new Error('a revocation never closes every connection');
+				}
+			};
+			const registry = new ConnectionRegistry({ log });
 			const test_app = await create_test_app({
 				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db()
+				db: gated.db,
+				roles: [ROLE_KEEPER, ROLE_ADMIN],
+				// `create_app_server` adds the audit stream registry to the
+				// backend's closer; the registry is added by hand below, the way
+				// a `ws_endpoints` mount adds its own
+				app_options: { audit_log_sse: true },
+				create_route_specs: (ctx) => {
+					ctx.deps.connection_closer.add(registry);
+					return make_create_route_specs(probe, options)(ctx);
+				},
+				audit_factory: ({ db: pool, log: audit_log }) =>
+					create_audit_emitter({
+						// the emitter's own pool handle, so its INSERT can be failed
+						// without touching the handlers' queries
+						db: new Db({
+							client: {
+								query: (text, values) =>
+									failing.audit_write && text.includes('INSERT INTO audit_log')
+										? Promise.reject(new Error('audit write failed'))
+										: pool.client.query(text, values)
+							},
+							transaction: (fn) => pool.transaction(fn)
+						}),
+						log: audit_log,
+						emit_decorator: (inner) => (ctx, input) => {
+							if (failing.emit && input.outcome !== 'failure') {
+								throw new Error('injected handler failure');
+							}
+							// a success row inside a transaction is written through the
+							// request's `db`, so its INSERT is failed there
+							if (failing.audit_write && ctx.db.in_transaction) {
+								const tx = ctx.db;
+								return inner(
+									{
+										...ctx,
+										db: new Db({
+											client: {
+												query: (text, values) =>
+													text.includes('INSERT INTO audit_log')
+														? Promise.reject(new Error('audit write failed'))
+														: tx.client.query(text, values)
+											},
+											transaction: no_nested_transaction
+										})
+									},
+									input
+								);
+							}
+							return inner(ctx, input);
+						}
+					})
 			});
+			const sse = require_audit_sse(test_app.server);
+			return {
+				test_app,
+				db,
+				gated,
+				closes,
+				failing,
+				committed,
+				audit_role: sse.required_role,
+				connect: (identity) => {
+					const ws = create_fake_ws();
+					registry.add_connection(
+						ws.ws,
+						create_test_identity({
+							session_hash: identity.session_hash ?? null,
+							account_id: identity.account_id,
+							api_token_id: identity.api_token_id ?? null,
+							required_roles: identity.required_roles ?? []
+						})
+					);
+					const stream = create_mock_stream<SseNotification>();
+					sse.registry.subscribe(stream, {
+						scope: identity.session_hash,
+						groups: identity.api_token_id
+							? [identity.account_id, identity.api_token_id]
+							: [identity.account_id]
+					});
+					return { ws, stream };
+				}
+			};
+		};
+
+		const exists = async (db: Db, sql: string, params: Array<unknown>): Promise<boolean> =>
+			(await db.query(sql, params)).length > 0;
+
+		const session_ids = async (h: SiteHarness): Promise<Array<string>> => {
 			const res = await rpc_call({
-				app: test_app.app,
+				app: h.test_app.app,
 				path: RPC_PATH,
-				method: 'account_session_revoke_all',
-				headers: test_app.create_session_headers()
+				method: 'account_session_list',
+				headers: h.test_app.create_session_headers()
 			});
 			assert.strictEqual(res.ok, true);
-			await test_app.cleanup();
+			return res.ok
+				? (res.result as { sessions: Array<{ id: string }> }).sessions.map((s) => s.id)
+				: [];
+		};
+
+		const token_ids = async (h: SiteHarness): Promise<Array<string>> => {
+			const res = await rpc_call({
+				app: h.test_app.app,
+				path: RPC_PATH,
+				method: 'account_token_list',
+				headers: h.test_app.create_session_headers()
+			});
+			assert.strictEqual(res.ok, true);
+			return res.ok
+				? (res.result as { tokens: Array<{ id: string }> }).tokens.map((t) => t.id)
+				: [];
+		};
+
+		const rpc = async (h: SiteHarness, method: string, params?: unknown): Promise<boolean> =>
+			(
+				await rpc_call({
+					app: h.test_app.app,
+					path: RPC_PATH,
+					method,
+					params,
+					headers: h.test_app.create_session_headers()
+				})
+			).ok;
+
+		/** What one site revokes and how to drive it. */
+		interface Arranged {
+			/** The connection identity the revocation must close. */
+			victim: VictimIdentity;
+			expected: ConnectionCloseTarget;
+			/** True once the revocation is visible to a read through the pool. */
+			committed: (db: Db) => Promise<boolean>;
+			/** Make the revoking request; resolves whether it succeeded. */
+			act: () => Promise<boolean>;
+		}
+
+		interface Site {
+			name: string;
+			/**
+			 * The route opens its own transaction around just its writes (no route
+			 * transaction), and closes straight after that commits.
+			 */
+			own_transaction?: boolean;
+			max_sessions?: number;
+			max_tokens?: number;
+			/**
+			 * The site writes no revocation audit row (a cap eviction), so the
+			 * revocation guard has nothing to repeat: the handler's close is the
+			 * only one.
+			 */
+			no_revocation_row?: boolean;
+			arrange: (h: SiteHarness) => Promise<Arranged>;
+		}
+
+		const keeper_id = (h: SiteHarness): Uuid => h.test_app.backend.account.id;
+
+		const no_sessions = (db: Db, account_id: Uuid): Promise<boolean> =>
+			exists(db, 'SELECT 1 FROM auth_session WHERE account_id = $1', [account_id]).then((v) => !v);
+
+		const no_tokens = (db: Db, account_id: Uuid): Promise<boolean> =>
+			exists(db, 'SELECT 1 FROM api_token WHERE account_id = $1', [account_id]).then((v) => !v);
+
+		/** The account's active global grant of `role`. */
+		const global_grant = async (
+			db: Db,
+			account_id: Uuid,
+			role: string
+		): Promise<{ id: Uuid; actor_id: Uuid }> => {
+			const [grant] = await db.query<{ id: Uuid; actor_id: Uuid }>(
+				`SELECT rg.id, rg.actor_id FROM role_grant rg JOIN actor a ON a.id = rg.actor_id
+				 WHERE a.account_id = $1 AND rg.role = $2 AND rg.scope_id IS NULL AND rg.revoked_at IS NULL`,
+				[account_id, role]
+			);
+			assert.ok(grant, `the account holds a global ${role} grant`);
+			return grant;
+		};
+
+		const grant_revoked = (db: Db, role_grant_id: Uuid): Promise<boolean> =>
+			exists(db, 'SELECT 1 FROM role_grant WHERE id = $1 AND revoked_at IS NOT NULL', [
+				role_grant_id
+			]);
+
+		const sites: Array<Site> = [
+			{
+				name: 'account_session_revoke',
+				arrange: async (h) => {
+					const [session_id] = await session_ids(h);
+					assert.ok(session_id);
+					return {
+						victim: { account_id: keeper_id(h), session_hash: session_id },
+						expected: { kind: 'session', session_hash: session_id },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM auth_session WHERE id = $1', [session_id])),
+						act: () => rpc(h, 'account_session_revoke', { session_id })
+					};
+				}
+			},
+			{
+				name: 'account_session_revoke_all',
+				arrange: async (h) => {
+					const [session_id] = await session_ids(h);
+					return {
+						victim: { account_id: keeper_id(h), session_hash: session_id },
+						expected: { kind: 'account', account_id: keeper_id(h) },
+						committed: (db) => no_sessions(db, keeper_id(h)),
+						act: () => rpc(h, 'account_session_revoke_all')
+					};
+				}
+			},
+			{
+				name: 'account_token_revoke',
+				arrange: async (h) => {
+					const [token_id] = await token_ids(h);
+					assert.ok(token_id);
+					return {
+						victim: { account_id: keeper_id(h), api_token_id: token_id },
+						expected: { kind: 'token', api_token_id: token_id },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM api_token WHERE id = $1', [token_id])),
+						act: () => rpc(h, 'account_token_revoke', { token_id })
+					};
+				}
+			},
+			{
+				// the token cap: minting one past it evicts the oldest, whose
+				// connections must end with it
+				name: 'account_token_create (cap eviction)',
+				no_revocation_row: true,
+				max_tokens: 1,
+				arrange: async (h) => {
+					const [evicted_id] = await token_ids(h);
+					assert.ok(evicted_id);
+					return {
+						victim: { account_id: keeper_id(h), api_token_id: evicted_id },
+						expected: { kind: 'token', api_token_id: evicted_id },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM api_token WHERE id = $1', [evicted_id])),
+						act: () =>
+							rpc(h, 'account_token_create', {
+								name: 'one past the cap',
+								scope: { kind: 'full' },
+								lifetime: { kind: 'eternal' }
+							})
+					};
+				}
+			},
+			{
+				name: 'admin_session_revoke_all',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({ username: 'site_target' });
+					return {
+						victim: { account_id: target.account.id, session_hash: 'target-session-hash' },
+						expected: { kind: 'account', account_id: target.account.id },
+						committed: (db) => no_sessions(db, target.account.id),
+						act: () => rpc(h, 'admin_session_revoke_all', { account_id: target.account.id })
+					};
+				}
+			},
+			{
+				name: 'admin_token_revoke_all',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({ username: 'site_target' });
+					return {
+						victim: { account_id: target.account.id, api_token_id: 'tok_targettarget' },
+						expected: { kind: 'account', account_id: target.account.id },
+						committed: (db) => no_tokens(db, target.account.id),
+						act: () => rpc(h, 'admin_token_revoke_all', { account_id: target.account.id })
+					};
+				}
+			},
+			{
+				name: 'account_delete',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({ username: 'site_target' });
+					return {
+						victim: { account_id: target.account.id, session_hash: 'target-session-hash' },
+						expected: { kind: 'account', account_id: target.account.id },
+						committed: (db) =>
+							exists(db, 'SELECT 1 FROM account WHERE id = $1 AND deleted_at IS NOT NULL', [
+								target.account.id
+							]),
+						act: () => rpc(h, 'account_delete', { account_id: target.account.id })
+					};
+				}
+			},
+			{
+				name: 'account_purge',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({ username: 'site_target' });
+					return {
+						victim: { account_id: target.account.id, session_hash: 'target-session-hash' },
+						expected: { kind: 'account', account_id: target.account.id },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM account WHERE id = $1', [target.account.id])),
+						// purge is gated to the daemon-token credential, which the
+						// middleware discards beside an `Origin` header
+						act: async () =>
+							(
+								await rpc_call({
+									app: h.test_app.app,
+									path: RPC_PATH,
+									method: 'account_purge',
+									params: { account_id: target.account.id, confirm: true },
+									suppress_default_origin: true,
+									headers: h.test_app.create_daemon_token_headers()
+								})
+							).ok
+					};
+				}
+			},
+			{
+				name: 'POST /logout',
+				arrange: async (h) => {
+					const [session_id] = await session_ids(h);
+					assert.ok(session_id);
+					return {
+						victim: { account_id: keeper_id(h), session_hash: session_id },
+						expected: { kind: 'account', account_id: keeper_id(h) },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM auth_session WHERE id = $1', [session_id])),
+						act: async () =>
+							(
+								await h.test_app.app.request('/api/account/logout', {
+									method: 'POST',
+									headers: h.test_app.create_session_headers({
+										'content-type': 'application/json'
+									}),
+									body: null
+								})
+							).ok
+					};
+				}
+			},
+			{
+				name: 'POST /password',
+				own_transaction: true,
+				arrange: async (h) => {
+					const [session_id] = await session_ids(h);
+					return {
+						victim: { account_id: keeper_id(h), session_hash: session_id },
+						expected: { kind: 'account', account_id: keeper_id(h) },
+						committed: async (db) =>
+							(await no_sessions(db, keeper_id(h))) && (await no_tokens(db, keeper_id(h))),
+						act: async () =>
+							(
+								await h.test_app.app.request('/api/account/password', {
+									method: 'POST',
+									headers: {
+										...h.test_app.create_session_headers(),
+										'Content-Type': 'application/json'
+									},
+									body: JSON.stringify({
+										current_password: DEFAULT_TEST_PASSWORD,
+										new_password: 'new-test-password-xyz'
+									})
+								})
+							).ok
+					};
+				}
+			},
+			{
+				// the session cap: a login past it evicts the oldest session, whose
+				// connections must end with it
+				name: 'POST /login (cap eviction)',
+				no_revocation_row: true,
+				own_transaction: true,
+				max_sessions: 1,
+				arrange: async (h) => {
+					const [evicted_hash] = await session_ids(h);
+					assert.ok(evicted_hash);
+					return {
+						victim: { account_id: keeper_id(h), session_hash: evicted_hash },
+						expected: { kind: 'session', session_hash: evicted_hash },
+						committed: async (db) =>
+							!(await exists(db, 'SELECT 1 FROM auth_session WHERE id = $1', [evicted_hash])),
+						act: async () =>
+							(
+								await h.test_app.app.request('/api/account/login', {
+									method: 'POST',
+									headers: create_test_request_headers({
+										'Content-Type': 'application/json'
+									}),
+									body: JSON.stringify({ username: 'keeper', password: DEFAULT_TEST_PASSWORD })
+								})
+							).ok
+					};
+				}
+			},
+			{
+				// an admin revoking another account's global `admin`: the role the
+				// audit stream is gated on, so the account's streams end with its
+				// role-gated sockets
+				name: 'role_grant_revoke',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({
+						username: 'site_target',
+						roles: [ROLE_ADMIN]
+					});
+					const grant = await global_grant(h.db, target.account.id, ROLE_ADMIN);
+					return {
+						victim: {
+							account_id: target.account.id,
+							session_hash: 'target-session-hash',
+							required_roles: [ROLE_ADMIN]
+						},
+						expected: { kind: 'role', account_id: target.account.id, role: ROLE_ADMIN },
+						committed: (db) => grant_revoked(db, grant.id),
+						act: () =>
+							rpc(h, 'role_grant_revoke', { role_grant_id: grant.id, actor_id: grant.actor_id })
+					};
+				}
+			},
+			{
+				// an admin revoking another account's global app role: a role the
+				// audit stream is not gated on, so only the role-gated socket ends —
+				// and the close names the revoked grant's role, not a fixed one
+				name: 'role_grant_revoke (app role)',
+				arrange: async (h) => {
+					const target = await h.test_app.create_account({ username: 'site_target' });
+					const grant = await query_create_role_grant(
+						{ db: h.db },
+						{ actor_id: target.actor.id, role: APP_ROLE, expires_at: null, granted_by: null }
+					);
+					return {
+						victim: {
+							account_id: target.account.id,
+							session_hash: 'target-session-hash',
+							required_roles: [APP_ROLE]
+						},
+						expected: { kind: 'role', account_id: target.account.id, role: APP_ROLE },
+						committed: (db) => grant_revoked(db, grant.id),
+						act: () =>
+							rpc(h, 'role_grant_revoke', { role_grant_id: grant.id, actor_id: target.actor.id })
+					};
+				}
+			},
+			{
+				// the caller disabling its own self-service role: a role the audit
+				// stream is not gated on, so only the role-gated socket ends
+				name: 'self_service_role_set (disable)',
+				arrange: async (h) => {
+					assert.strictEqual(
+						await rpc(h, 'self_service_role_set', { role: SELF_SERVICE_ROLE, enabled: true }),
+						true
+					);
+					const grant = await global_grant(h.db, keeper_id(h), SELF_SERVICE_ROLE);
+					return {
+						victim: {
+							account_id: keeper_id(h),
+							session_hash: 'keeper-session-hash',
+							required_roles: [SELF_SERVICE_ROLE]
+						},
+						expected: { kind: 'role', account_id: keeper_id(h), role: SELF_SERVICE_ROLE },
+						committed: (db) => grant_revoked(db, grant.id),
+						act: () => rpc(h, 'self_service_role_set', { role: SELF_SERVICE_ROLE, enabled: false })
+					};
+				}
+			}
+		];
+
+		/** Arrange a site and open its victim, a sibling under another credential, and a bystander. */
+		const arrange_site = async (
+			site: Site,
+			db: Db
+		): Promise<{
+			h: SiteHarness;
+			arranged: Arranged;
+			victim: LiveConnection;
+			sibling: LiveConnection;
+			bystander: LiveConnection;
+		}> => {
+			const h = await create_site_harness(db, site);
+			const arranged = await site.arrange(h);
+			h.committed.read = arranged.committed;
+			const bystander_account = await h.test_app.create_account({ username: 'site_bystander' });
+			return {
+				h,
+				arranged,
+				victim: h.connect(arranged.victim),
+				// same account, a credential the site does not name
+				sibling: h.connect({
+					account_id: arranged.victim.account_id,
+					session_hash: 'sibling-session-hash'
+				}),
+				bystander: h.connect({
+					account_id: bystander_account.account.id,
+					session_hash: 'bystander-session-hash'
+				})
+			};
+		};
+
+		const assert_closed = (connection: LiveConnection, label: string): void => {
+			assert.deepStrictEqual(
+				connection.ws.closes,
+				[{ code: WS_CLOSE_SESSION_REVOKED, reason: WS_CLOSE_SESSION_REVOKED_REASON }],
+				`${label}: the socket closed with the revocation code`
+			);
+			assert.ok(connection.stream.closed, `${label}: the stream closed`);
+		};
+
+		const assert_open = (connection: LiveConnection, label: string): void => {
+			assert.deepStrictEqual(connection.ws.closes, [], `${label}: the socket stays open`);
+			assert.ok(!connection.stream.closed, `${label}: the stream stays open`);
+		};
+
+		/**
+		 * The close the site made, the connections it ended, and the ones it left.
+		 *
+		 * The probe is a member of the backend's closer, so the revocation guard
+		 * the server registers on that closer repeats the handler's close when the
+		 * audit row is announced: two closes of the same target, or the handler's
+		 * alone when no row was announced (`only_handler`).
+		 */
+		const assert_site_closed = (
+			h: SiteHarness,
+			arranged: Arranged,
+			connections: { victim: LiveConnection; sibling: LiveConnection; bystander: LiveConnection },
+			only_handler = false
+		): void => {
+			const { closes } = h;
+			if (only_handler) assert.strictEqual(closes.length, 1, 'the handler closed, alone');
+			else assert.strictEqual(closes.length, 2, "the handler's close and the guard's repeat");
+			for (const close of closes) {
+				assert_close_call(close.target, arranged.expected);
+			}
+			const { expected } = arranged;
+			if (expected.kind === 'role') {
+				// the role-gated socket closes with the permission code, the
+				// credential still good; the account's streams end only when the
+				// stream's gate is the revoked role, the sibling's included, and
+				// the sibling's ungated socket stays
+				assert.deepStrictEqual(
+					connections.victim.ws.closes,
+					[{ code: WS_CLOSE_PERMISSION_REVOKED, reason: WS_CLOSE_PERMISSION_REVOKED_REASON }],
+					'victim: the role-gated socket closed with the permission code'
+				);
+				const stream_gated = expected.role === h.audit_role;
+				for (const [label, connection] of [
+					['victim', connections.victim],
+					['sibling', connections.sibling]
+				] as const) {
+					assert.strictEqual(
+						connection.stream.closed,
+						stream_gated,
+						`${label}: the stream ${stream_gated ? 'closed' : 'stays open'}`
+					);
+				}
+				assert.deepStrictEqual(connections.sibling.ws.closes, [], 'sibling: the socket stays open');
+			} else {
+				assert_closed(connections.victim, 'victim');
+				// an account-wide close takes the sibling with it; a session- or
+				// token-scoped one must not
+				if (expected.kind === 'account') assert_closed(connections.sibling, 'sibling');
+				else assert_open(connections.sibling, 'sibling');
+			}
+			assert_open(connections.bystander, 'bystander');
+		};
+
+		for (const site of sites) {
+			describe(site.name, () => {
+				test('closes after its transaction commits', async () => {
+					const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+					assert.strictEqual(await arranged.act(), true);
+
+					assert_site_closed(h, arranged, connections, site.no_revocation_row);
+					for (const close of h.closes) {
+						assert.strictEqual(
+							close.open_transactions,
+							0,
+							'the close ran with no transaction open — after the commit'
+						);
+						assert.strictEqual(
+							await close.committed,
+							true,
+							'a pool read made when the close ran saw the revocation'
+						);
+					}
+					await h.test_app.cleanup();
+				});
+
+				test.skipIf(site.own_transaction)('a handler that throws closes nothing', async () => {
+					const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+					h.failing.emit = true;
+					assert.strictEqual(await arranged.act(), false, 'the request failed');
+					h.failing.emit = false;
+
+					assert.deepStrictEqual(h.closes, [], 'no close for a revocation that rolled back');
+					assert.strictEqual(await arranged.committed(h.db), false, 'and nothing was revoked');
+					assert_open(connections.victim, 'victim');
+					assert_open(connections.sibling, 'sibling');
+					assert_open(connections.bystander, 'bystander');
+					await h.test_app.cleanup();
+				});
+
+				test('a failed commit closes nothing', async () => {
+					const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+					const held = h.gated.hold_commit();
+					const acting = arranged.act();
+					await held.reached;
+					held.fail(new Error('injected commit failure'));
+					assert.strictEqual(await acting, false, 'the request failed');
+
+					assert.deepStrictEqual(h.closes, [], 'no close for a revocation that rolled back');
+					assert.strictEqual(await arranged.committed(h.db), false, 'and nothing was revoked');
+					assert_open(connections.victim, 'victim');
+					assert_open(connections.sibling, 'sibling');
+					assert_open(connections.bystander, 'bystander');
+					await h.test_app.cleanup();
+				});
+
+				test.runIf(site.own_transaction)(
+					'a handler that throws after its commit still closes',
+					async () => {
+						const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+						h.failing.emit = true;
+						assert.strictEqual(await arranged.act(), false, 'the request failed');
+						h.failing.emit = false;
+
+						// the revocation committed before the throw, so the close it owes
+						// has run — a queued one would have been dropped with the throw
+						assert.strictEqual(await arranged.committed(h.db), true, 'the revocation stands');
+						// the throw was the success row's emit, so no row was announced
+						assert_site_closed(h, arranged, connections, true);
+						await h.test_app.cleanup();
+					}
+				);
+
+				test('a close that throws after the commit still answers and still closes the rest', async () => {
+					const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+					h.failing.close = true;
+					// one registry failing to close must not fail a revocation that
+					// committed: the response, the audit row, and the other
+					// transports' closes all still follow it
+					assert.strictEqual(await arranged.act(), true, 'the committed revocation still answers');
+					h.failing.close = false;
+
+					assert.strictEqual(await arranged.committed(h.db), true, 'the revocation stands');
+					assert_site_closed(h, arranged, connections, site.no_revocation_row);
+					await h.test_app.cleanup();
+				});
+
+				test.skipIf(site.own_transaction)(
+					'a failed audit write rolls the revocation back and closes nothing',
+					async () => {
+						const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+						// the success row is written in the request transaction, so its
+						// INSERT failing fails the handler and takes the revocation with it
+						h.failing.audit_write = true;
+						assert.strictEqual(await arranged.act(), false, 'the request failed');
+						h.failing.audit_write = false;
+						assert.strictEqual(get_audit_write_failures(), 0, 'no pool write was lost');
+
+						assert.deepStrictEqual(h.closes, [], 'no close for a revocation that rolled back');
+						assert.strictEqual(
+							await arranged.committed(h.db),
+							false,
+							'the revocation rolled back with its row'
+						);
+						assert_open(connections.victim, 'victim');
+						assert_open(connections.sibling, 'sibling');
+						assert_open(connections.bystander, 'bystander');
+						await h.test_app.cleanup();
+					}
+				);
+
+				test.runIf(site.own_transaction)('a failed audit write still closes', async () => {
+					const { h, arranged, ...connections } = await arrange_site(site, get_db());
+
+					h.failing.audit_write = true;
+					assert.strictEqual(await arranged.act(), true, 'the audit write is fail-open');
+					h.failing.audit_write = false;
+					// the lost row was counted; it was lost on purpose, so clear the
+					// count before the drift guard's after-each check reads it
+					assert.ok(get_audit_write_failures() > 0, 'the failed audit write was counted');
+					reset_audit_write_failures();
+
+					assert.strictEqual(await arranged.committed(h.db), true);
+					// no audit row was written, so no listener ran: the handler's own
+					// close is what ended the connections
+					assert_site_closed(h, arranged, connections, true);
+					await h.test_app.cleanup();
+				});
+			});
+		}
+
+		test('a scoped role_grant_revoke closes nothing', async () => {
+			// a role gate admits on global grants alone, so revoking a scoped grant
+			// leaves a socket gated on the role open — here the account still
+			// holds the role globally, so a close would take a connection the
+			// gate still admits
+			const h = await create_site_harness(get_db());
+			const target = await h.test_app.create_account({ username: 'site_target' });
+			const grant = (scope_id: Uuid | null) =>
+				query_create_role_grant(
+					{ db: h.db },
+					{
+						actor_id: target.actor.id,
+						role: APP_ROLE,
+						scope_kind: scope_id ? 'classroom' : null,
+						scope_id,
+						expires_at: null,
+						granted_by: null
+					}
+				);
+			await grant(null);
+			const scoped = await grant(create_uuid());
+			const victim = h.connect({
+				account_id: target.account.id,
+				session_hash: 'target-session-hash',
+				required_roles: [APP_ROLE]
+			});
+
+			assert.strictEqual(
+				await rpc(h, 'role_grant_revoke', { role_grant_id: scoped.id, actor_id: target.actor.id }),
+				true
+			);
+
+			assert.strictEqual(await grant_revoked(h.db, scoped.id), true, 'the scoped grant is revoked');
+			assert.deepStrictEqual(h.closes, [], 'no close for a scoped grant');
+			assert_open(victim, 'victim');
+			await h.test_app.cleanup();
 		});
 
-		test('account_session_revoke completes without a closer', async () => {
+		describe('the close does not wait for a pool audit write', () => {
+			// A success row written on the pool — `/password`, which commits its
+			// own transaction and then emits — is eager, so it can still be in
+			// flight once the revocation has committed. A close flushed behind it
+			// would leave the connection open on a credential already gone for
+			// as long as the write takes. The case holds the INSERT and requires
+			// the close while it is held. (A revocation inside a request
+			// transaction writes its row before the commit, so its close never
+			// sits behind it.)
+
+			test('over HTTP, the close has run while the audit INSERT is held', async () => {
+				const h = await create_site_harness(get_db());
+				const account_id = keeper_id(h);
+				const victim = h.connect({ account_id, session_hash: 'held-write-victim' });
+
+				const stalled = h.gated.stall(is_audit_insert);
+				const request = h.test_app.app.request('/api/account/password', {
+					method: 'POST',
+					headers: {
+						...h.test_app.create_session_headers(),
+						'Content-Type': 'application/json'
+					},
+					body: JSON.stringify({
+						current_password: DEFAULT_TEST_PASSWORD,
+						new_password: 'new-test-password-xyz'
+					})
+				});
+				await stalled.reached;
+				try {
+					await until(() => h.closes.length > 0, 'no close while the audit write was held');
+					assert.strictEqual(h.closes.length, 1);
+					assert_close_call(h.closes[0]?.target, { kind: 'account', account_id });
+					assert.strictEqual(h.closes[0]!.open_transactions, 0, 'after the commit');
+					assert.strictEqual(await no_sessions(h.db, account_id), true, 'the revoke committed');
+					assert_closed(victim, 'victim');
+				} finally {
+					stalled.release();
+				}
+				assert.strictEqual((await request).ok, true);
+				await h.test_app.cleanup();
+			});
+		});
+	});
+
+	describe('a hand-mounted role-gated endpoint with no revocation guard', () => {
+		// `create_app_server` registers the revocation guard only when it mounts
+		// a WS endpoint or the audit stream, so an endpoint mounted with
+		// `register_action_ws` beside it has no guard to close on a role row. The
+		// registry joins `deps.connection_closer`, which is what the role revokes
+		// close through themselves.
+		test('a self-service disable closes the role-gated socket', async () => {
+			const { closer, calls } = create_recording_closer();
 			const test_app = await create_test_app({
 				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db()
+				db: get_db(),
+				roles: [ROLE_KEEPER, ROLE_ADMIN],
+				create_route_specs: make_create_route_specs(closer)
 			});
-			// Same id-discovery dance as the closer-present test — see
-			// account_session_revoke happy-path comment above.
-			const list_res = await rpc_call({
+			const { deps } = test_app.backend;
+			const account_id = test_app.backend.account.id;
+			const call = async (method: string, params?: unknown): Promise<boolean> =>
+				(
+					await rpc_call({
+						app: test_app.app,
+						path: RPC_PATH,
+						method,
+						params,
+						headers: test_app.create_session_headers()
+					})
+				).ok;
+			assert.strictEqual(
+				await call('self_service_role_set', { role: SELF_SERVICE_ROLE, enabled: true }),
+				true
+			);
+			const sessions = await rpc_call({
 				app: test_app.app,
 				path: RPC_PATH,
 				method: 'account_session_list',
 				headers: test_app.create_session_headers()
 			});
-			assert.strictEqual(list_res.ok, true);
-			const listed = list_res.ok
-				? (list_res.result as { sessions: Array<{ id: string }> })
-				: { sessions: [] };
-			const session_id = listed.sessions[0]!.id;
-			const res = await rpc_call_for_spec({
-				app: test_app.app,
-				path: RPC_PATH,
-				spec: account_session_revoke_action_spec,
-				params: { session_id: session_id as never },
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(res.ok, true);
-			await test_app.cleanup();
-		});
+			assert.ok(sessions.ok);
+			const session_hash = (sessions.result as { sessions: Array<{ id: string }> }).sessions[0]?.id;
+			assert.ok(session_hash);
 
-		test('account_token_revoke completes without a closer', async () => {
-			const test_app = await create_test_app({
-				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db()
+			const stub = create_stub_upgrade();
+			register_action_ws({
+				action_ip_rate_limiter: null,
+				action_account_rate_limiter: null,
+				path: '/ws',
+				app: new Hono(),
+				upgradeWebSocket: stub.upgradeWebSocket,
+				allowed_origins: [],
+				actions: create_account_actions(deps),
+				db: deps.db,
+				connection_closer: deps.connection_closer,
+				required_roles: [SELF_SERVICE_ROLE],
+				receive_timeout: null,
+				log
 			});
-			const create_res = await rpc_call({
-				app: test_app.app,
-				path: RPC_PATH,
-				method: 'account_token_create',
-				params: {
-					name: 'absent_closer_target',
-					scope: { kind: 'full' },
-					lifetime: { kind: 'eternal' }
+			// what the auth middleware leaves on the context for a role-gated upgrade
+			const request_context = await build_request_context(
+				{ db: deps.db },
+				account_id,
+				test_app.backend.actor.id
+			);
+			assert.ok(request_context);
+			const vars: Record<string, unknown> = {
+				[RESOLVED_AUTH_KEY]: {
+					credential_type: 'session',
+					account_id,
+					session_hash,
+					credential_deadline: null
 				},
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(create_res.ok, true);
-			const created = create_res.ok ? (create_res.result as { id: string }) : { id: '' };
-			const res = await rpc_call_for_spec({
-				app: test_app.app,
-				path: RPC_PATH,
-				spec: account_token_revoke_action_spec,
-				params: { token_id: created.id as never },
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(res.ok, true);
-			await test_app.cleanup();
-		});
+				[REQUEST_CONTEXT_KEY]: request_context
+			};
+			const events = await stub.get_create_events()({
+				get: (key: string) => vars[key]
+			} as unknown as Context);
+			const socket = create_fake_ws();
+			// typed `void` by Hono, but `register_action_ws` returns the admission's promise
+			await (events.onOpen?.(new Event('open'), socket.ws) as Promise<void> | void);
+			assert.deepStrictEqual(socket.closes, [], 'admitted');
 
-		test('admin_session_revoke_all completes without a closer', async () => {
-			const test_app = await create_test_app({
-				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db(),
-				roles: [ROLE_KEEPER, ROLE_ADMIN]
-			});
-			const target = await test_app.create_account({ username: 'absentcloser1' });
-			const res = await rpc_call_for_spec({
-				app: test_app.app,
-				path: RPC_PATH,
-				spec: admin_session_revoke_all_action_spec,
-				params: { account_id: target.account.id },
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(res.ok, true);
-			await test_app.cleanup();
-		});
+			assert.strictEqual(
+				await call('self_service_role_set', { role: SELF_SERVICE_ROLE, enabled: false }),
+				true
+			);
 
-		test('admin_token_revoke_all completes without a closer', async () => {
-			const test_app = await create_test_app({
-				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db(),
-				roles: [ROLE_KEEPER, ROLE_ADMIN]
-			});
-			const target = await test_app.create_account({ username: 'absentcloser2' });
-			const res = await rpc_call_for_spec({
-				app: test_app.app,
-				path: RPC_PATH,
-				spec: admin_token_revoke_all_action_spec,
-				params: { account_id: target.account.id },
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(res.ok, true);
-			await test_app.cleanup();
-		});
-
-		test('REST logout completes without a closer', async () => {
-			const test_app = await create_test_app({
-				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db()
-			});
-			const logout_route = find_auth_route(test_app.route_specs, '/logout', 'POST');
-			assert.ok(logout_route, 'logout route registered');
-			const res = await test_app.app.request(logout_route.path, {
-				method: 'POST',
-				headers: test_app.create_session_headers(),
-				body: null
-			});
-			assert.strictEqual(res.status, 200);
-			await test_app.cleanup();
-		});
-
-		test('REST password change completes without a closer', async () => {
-			const test_app = await create_test_app({
-				session_options,
-				create_route_specs: make_create_route_specs(null),
-				db: get_db()
-			});
-			const password_route = find_auth_route(test_app.route_specs, '/password', 'POST');
-			assert.ok(password_route, 'password route registered');
-			const res = await test_app.app.request(password_route.path, {
-				method: 'POST',
-				headers: {
-					...test_app.create_session_headers(),
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({
-					current_password: DEFAULT_TEST_PASSWORD,
-					new_password: 'new-test-password-xyz'
-				})
-			});
-			assert.strictEqual(res.status, 200);
+			assert.deepStrictEqual(socket.closes, [
+				{ code: WS_CLOSE_PERMISSION_REVOKED, reason: WS_CLOSE_PERMISSION_REVOKED_REASON }
+			]);
+			// the handler's close alone — no guard repeated it
+			assert.strictEqual(calls.length, 1);
+			assert_close_call(calls[0], { kind: 'role', account_id, role: SELF_SERVICE_ROLE });
 			await test_app.cleanup();
 		});
 	});
 
-	describe('audit emit ordering — close fires before audit.emit at the call site', () => {
-		// The contract documented in `actions/connection_closer.ts` and in
-		// every handler is: the eager close runs SYNCHRONOUSLY BEFORE
-		// `deps.audit.emit(ctx, ...)` so the close lands even if the
-		// in-flight audit pool write fails. The `at: 0` assertions across
-		// this file only prove single-call inclusion on a fresh recording
-		// closer — they cannot pin the close-vs-emit ordering because the
-		// closer's sequence counter has no input from the audit emit path.
-		//
-		// This block wires `create_emit_ordering_audit_factory` through
-		// `create_test_app({audit_factory})`. The factory builds the real
-		// audit emitter with an `emit_decorator` that pushes a marker into
-		// the same sequence-numbered array the closer pushes into, so a
-		// refactor that moved the close BELOW the audit emit call site
-		// trips here. The decorator is captured by both `emit` and
-		// `emit_role_grant_target` inside `create_audit_emitter`, so
-		// ordering capture survives any future move of a close-firing
-		// handler from the lower-level `emit` to the role-grant-shape
-		// `emit_role_grant_target` wrapper.
-		//
-		// One representative test per handler family would be overkill —
-		// the ordering contract is the same source-level pattern in every
-		// handler. Pinning `account_session_revoke` is sufficient to
-		// catch a refactor that swept across all sites; per-family
-		// regressions would still be caught by the failure-outcome tests
-		// (`does NOT close on failure`) which fire if the close moved past
-		// any conditional gate.
-		test('account_session_revoke closes BEFORE audit.emit at the source level', async () => {
-			const seq = { value: 0 };
-			const events: Array<{ kind: 'close' | 'emit'; at: number }> = [];
-			// Bespoke session-only closer that pushes the `close` marker
-			// into the shared `events` array (rather than the
-			// `RecordedClose` shape `create_recording_closer` writes) so
-			// the close + emit markers compose without per-record shape
-			// reconciliation. The dedicated ordering test is the only
-			// site that needs this — every other test uses
-			// `create_recording_closer` + `assert_close_call`.
-			const closer: ConnectionCloser = {
-				close_sockets_for_session: () => {
-					events.push({ kind: 'close', at: seq.value++ });
-					return 1;
-				},
-				close_sockets_for_token: () => 0,
-				close_sockets_for_account: () => 0
-			};
-			// Decorate the real emitter at backend-build time via
-			// `audit_factory` — pushes `{kind: 'emit'}` markers into the
-			// shared `events` array on every `audit.emit` call (and on
-			// `audit.emit_role_grant_target`, since both route through the
-			// same closure-captured decorator inside `create_audit_emitter`)
-			// so close + emit ordering can be asserted against one
-			// sequence counter. Production handlers dereference
-			// `deps.audit.emit` at call time, so the decorator sees every
-			// subsequent handler invocation.
+	describe('a committed revocation whose RPC response cannot be built', () => {
+		// The RPC route runs with `transaction: false` — `perform_action` owns
+		// the transaction and has committed by the time the response is
+		// serialized. A throw there reaches the route wrapper, which reads a
+		// throw as a rollback and discards the post-commit queue.
+		const revoke_unserializable_spec = {
+			method: 'revoke_unserializable',
+			kind: 'request_response',
+			initiator: 'frontend',
+			auth: { account: 'required', actor: 'none' },
+			side_effects: true,
+			input: z.void(),
+			output: z.strictObject({ n: z.bigint() }),
+			async: true,
+			description: 'revoke every session of the caller, then return a value JSON cannot carry'
+		} satisfies RequestResponseActionSpec;
+
+		test('answers internal_error and still closes', async () => {
+			const { closer, calls } = create_recording_closer();
+			const db = get_db();
+			const test_app = await create_test_app({
+				session_options,
+				db,
+				create_route_specs: (ctx) => {
+					ctx.deps.connection_closer.add(closer);
+					return create_rpc_endpoint({
+						action_ip_rate_limiter: null,
+						action_account_rate_limiter: null,
+						path: RPC_PATH,
+						actions: [
+							rpc_action(revoke_unserializable_spec, async (_input, action_ctx) => {
+								const { id } = action_ctx.auth.account;
+								await query_session_revoke_all_for_account(action_ctx, id);
+								queue_connection_close(action_ctx, ctx.deps.connection_closer, {
+									kind: 'account',
+									account_id: id
+								});
+								return { n: 1n };
+							})
+						],
+						log: ctx.deps.log
+					});
+				}
+			});
+			const account_id = test_app.backend.account.id;
+
+			const res = await test_app.app.request(RPC_PATH, {
+				method: 'POST',
+				headers: test_app.create_session_headers({ 'Content-Type': 'application/json' }),
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 'unserializable',
+					method: 'revoke_unserializable'
+				})
+			});
+
+			// the revocation committed …
+			const sessions = await db.query('SELECT 1 FROM auth_session WHERE account_id = $1', [
+				account_id
+			]);
+			assert.deepStrictEqual(sessions, [], 'the sessions are gone');
+			// … so its close must have run
+			assert.strictEqual(calls.length, 1, 'the committed revocation closed');
+			assert_close_call(calls[0], { kind: 'account', account_id });
+			// and the caller is answered a JSON-RPC error, not a bare 500
+			assert.strictEqual(res.status, 500);
+			const body = (await res.json()) as { jsonrpc: string; id: string; error: { code: number } };
+			assert.strictEqual(body.jsonrpc, '2.0');
+			assert.strictEqual(body.id, 'unserializable');
+			assert.strictEqual(body.error.code, JSONRPC_ERROR_CODES.internal_error);
+			await test_app.cleanup();
+		});
+	});
+
+	describe('the caps close nothing when they evict nothing', () => {
+		test('a login under the session cap queues no close', async () => {
+			const { closer, calls } = create_recording_closer();
 			const test_app = await create_test_app({
 				session_options,
 				create_route_specs: make_create_route_specs(closer),
-				db: get_db(),
-				audit_factory: create_emit_ordering_audit_factory(seq, events)
+				db: get_db()
 			});
-
-			// Resolve the session id via the list RPC, then revoke it.
-			// The list call's read handler does not call audit.emit, so
-			// the events array stays empty up to the revoke call.
-			const list_res = await rpc_call({
-				app: test_app.app,
-				path: RPC_PATH,
-				method: 'account_session_list',
-				headers: test_app.create_session_headers()
+			const res = await test_app.app.request('/api/account/login', {
+				method: 'POST',
+				headers: create_test_request_headers({
+					'Content-Type': 'application/json'
+				}),
+				body: JSON.stringify({ username: 'keeper', password: DEFAULT_TEST_PASSWORD })
 			});
-			assert.strictEqual(list_res.ok, true);
-			const listed = list_res.ok
-				? (list_res.result as { sessions: Array<{ id: string }> })
-				: { sessions: [] };
-			const session_id = listed.sessions[0]!.id;
-			// Reset in case the list path ever gains an audit emit.
-			events.length = 0;
-			seq.value = 0;
-
-			const res = await rpc_call_for_spec({
-				app: test_app.app,
-				path: RPC_PATH,
-				spec: account_session_revoke_action_spec,
-				params: { session_id: session_id as never },
-				headers: test_app.create_session_headers()
-			});
-			assert.strictEqual(res.ok, true);
-
-			// Exactly two events: one close, one emit.
-			assert.strictEqual(events.length, 2, `expected close + emit, got ${JSON.stringify(events)}`);
-			// Ordering claim: close (at: 0) before emit (at: 1).
-			assert.deepStrictEqual(events[0], { kind: 'close', at: 0 });
-			assert.deepStrictEqual(events[1], { kind: 'emit', at: 1 });
-
+			assert.strictEqual(res.status, 200);
+			assert.deepStrictEqual(calls, []);
 			await test_app.cleanup();
 		});
 	});

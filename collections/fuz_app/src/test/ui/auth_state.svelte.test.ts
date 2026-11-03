@@ -11,7 +11,9 @@
 
 import { describe, test, assert, vi, beforeEach, afterEach } from 'vitest';
 
-import { AuthState } from '$lib/ui/auth_state.svelte.ts';
+import { AuthState, format_rate_limit_message } from '#lib/ui/auth_state.svelte.ts';
+import type { RoleGrantSummaryJson } from '#lib/auth/account_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 
 /** Create a mock Response with JSON body. */
 const json_response = (body: unknown, status = 200): Response =>
@@ -19,6 +21,25 @@ const json_response = (body: unknown, status = 200): Response =>
 		status,
 		headers: { 'Content-Type': 'application/json' }
 	});
+
+const SCOPE = '11111111-1111-4111-8111-111111111111' as Uuid;
+
+let next_grant = 0;
+
+/** Create a role grant as `GET /api/account/status` returns it; `scope_id: null` is global. */
+const make_grant = (
+	role: string,
+	scope_id: Uuid | null,
+	expires_at: string | null = null
+): RoleGrantSummaryJson => ({
+	id: `grant-${next_grant++}` as Uuid,
+	role,
+	scope_kind: scope_id === null ? null : 'classroom',
+	scope_id,
+	created_at: '2026-01-01T00:00:00Z',
+	expires_at,
+	granted_by: null
+});
 
 let fetch_mock: ReturnType<typeof vi.fn>;
 
@@ -29,6 +50,21 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+});
+
+describe('format_rate_limit_message', () => {
+	const cases: Array<[label: string, retry_after: unknown, expected: string]> = [
+		['an in-flight wait', 1, 'Too many attempts. Try again in a moment.'],
+		['five seconds', 5, 'Too many attempts. Try again in a moment.'],
+		['under a minute', 42, 'Too many attempts. Try again in 42 seconds.'],
+		['a minute', 60, 'Too many attempts. Try again in 1 minute.'],
+		['minutes, rounded up', 121, 'Too many attempts. Try again in 3 minutes.'],
+		['missing', undefined, 'Too many attempts. Try again in 1 minute.'],
+		['not a number', '5', 'Too many attempts. Try again in 1 minute.']
+	];
+	test.each(cases)('%s', (_label, retry_after, expected) => {
+		assert.strictEqual(format_rate_limit_message(retry_after), expected);
+	});
 });
 
 describe('check_session', () => {
@@ -151,6 +187,15 @@ describe('login', () => {
 		assert.strictEqual(result, false);
 		assert.ok(state.verify_error);
 		assert.ok(state.verify_error.includes('2 minutes'));
+	});
+
+	test('429 with a short retry_after reads as a moment, not a minute', async () => {
+		fetch_mock.mockResolvedValueOnce(json_response({ retry_after: 1 }, 429));
+
+		const state = new AuthState();
+		await state.login('alice', 'password');
+
+		assert.strictEqual(state.verify_error, 'Too many attempts. Try again in a moment.');
 	});
 
 	test('429 with default retry_after uses 1 minute', async () => {
@@ -415,5 +460,113 @@ describe('signup', () => {
 
 		assert.strictEqual(result, false);
 		assert.strictEqual(state.verify_error, 'Offline');
+	});
+});
+
+describe('global roles', () => {
+	test('a global admin grant is admin', () => {
+		const state = new AuthState();
+		state.role_grants = [make_grant('admin', null)];
+
+		assert.strictEqual(state.is_admin, true);
+		assert.strictEqual(state.has_global_role('admin'), true);
+		assert.deepEqual([...state.global_roles], ['admin']);
+	});
+
+	test('a scoped admin grant is not admin', () => {
+		const state = new AuthState();
+		state.role_grants = [make_grant('admin', SCOPE)];
+
+		// the grant is live, it just isn't global
+		assert.strictEqual(state.active_role_grants.length, 1);
+		assert.strictEqual(state.is_admin, false);
+		assert.strictEqual(state.has_global_role('admin'), false);
+		assert.strictEqual(state.global_roles.size, 0);
+	});
+
+	test('global_roles holds the globally held roles and no scoped one', () => {
+		const state = new AuthState();
+		state.role_grants = [
+			make_grant('educator', null),
+			make_grant('teacher', SCOPE),
+			make_grant('admin', SCOPE),
+			make_grant('keeper', null)
+		];
+
+		assert.deepEqual([...state.global_roles].sort(), ['educator', 'keeper']);
+		assert.strictEqual(state.has_global_role('educator'), true);
+		assert.strictEqual(state.has_global_role('teacher'), false);
+		assert.strictEqual(state.is_admin, false);
+	});
+
+	test('an expired global grant is not held', () => {
+		const state = new AuthState();
+		state.role_grants = [
+			make_grant('admin', null, '2000-01-01T00:00:00Z'),
+			make_grant('educator', null, '9999-01-01T00:00:00Z')
+		];
+
+		assert.strictEqual(state.is_admin, false);
+		assert.deepEqual([...state.global_roles], ['educator']);
+	});
+
+	test('a grant with no scope_id field is not read as global', async () => {
+		// both backends always send `scope_id`; a payload without it fails closed
+		fetch_mock.mockResolvedValueOnce(
+			json_response({
+				account: { id: 'acct-1', username: 'alice' },
+				role_grants: [
+					{ id: 'grant-x', role: 'admin', created_at: '2026-01-01T00:00:00Z', expires_at: null }
+				]
+			})
+		);
+		const state = new AuthState();
+		await state.check_session();
+
+		assert.strictEqual(state.active_role_grants.length, 1);
+		assert.strictEqual(state.is_admin, false);
+		assert.strictEqual(state.global_roles.size, 0);
+	});
+
+	test('nothing is held before a session loads', () => {
+		const state = new AuthState();
+
+		assert.strictEqual(state.is_admin, false);
+		assert.strictEqual(state.has_global_role('admin'), false);
+		assert.strictEqual(state.global_roles.size, 0);
+	});
+
+	test('follows role_grants as it changes', () => {
+		const state = new AuthState();
+		state.role_grants = [make_grant('admin', SCOPE)];
+		assert.strictEqual(state.is_admin, false);
+
+		state.role_grants = [make_grant('admin', SCOPE), make_grant('admin', null)];
+		assert.strictEqual(state.is_admin, true);
+		assert.strictEqual(state.has_global_role('admin'), true);
+
+		state.role_grants = [make_grant('admin', SCOPE)];
+		assert.strictEqual(state.is_admin, false);
+		assert.strictEqual(state.has_global_role('admin'), false);
+	});
+
+	test('check_session loads them and logout clears them', async () => {
+		fetch_mock.mockResolvedValueOnce(
+			json_response({
+				account: { id: 'acct-1', username: 'alice' },
+				role_grants: [make_grant('admin', null), make_grant('teacher', SCOPE)]
+			})
+		);
+		const state = new AuthState();
+		await state.check_session();
+
+		assert.strictEqual(state.is_admin, true);
+		assert.deepEqual([...state.global_roles], ['admin']);
+
+		fetch_mock.mockResolvedValueOnce(json_response({ ok: true }));
+		await state.logout();
+
+		assert.strictEqual(state.is_admin, false);
+		assert.strictEqual(state.global_roles.size, 0);
 	});
 });

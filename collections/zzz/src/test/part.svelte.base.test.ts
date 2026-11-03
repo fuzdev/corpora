@@ -1,13 +1,12 @@
 // @vitest-environment jsdom
 
 import { test, assert, describe, beforeEach } from 'vitest';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Part, TextPart, DiskfilePart } from '$lib/part.svelte.ts';
-import { DiskfileDirectoryPath, DiskfilePath } from '$lib/diskfile_types.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
-import { estimate_token_count } from '$lib/helpers.ts';
+import { Part, TextPart, DiskfilePart } from '#lib/part.svelte.ts';
+import { DiskfileDirectoryPath, DiskfilePath } from '#lib/diskfile_types.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
+import { estimate_token_count } from '#lib/helpers.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -132,7 +131,7 @@ describe('Part factory method', () => {
 		};
 
 		assert.throws(
-			() => Part.create(app, invalid_json as any),
+			() => Part.create(app, invalid_json),
 			/Missing required "type" field in part JSON/
 		);
 	});
@@ -257,12 +256,9 @@ describe('DiskfilePart specific behavior', () => {
 		assert.deepEqual(part.diskfile, diskfile);
 		assert.strictEqual(part.content, TEST_CONTENT.BASIC);
 
-		// Update content through part
-		part.content = TEST_CONTENT.SECONDARY;
-
-		// Verify both part and diskfile were updated
+		// the part reads through to the diskfile
+		diskfile.content = TEST_CONTENT.SECONDARY;
 		assert.strictEqual(part.content, TEST_CONTENT.SECONDARY);
-		assert.strictEqual(part.diskfile?.content, TEST_CONTENT.SECONDARY);
 	});
 
 	test('DiskfilePart handles null path properly', () => {

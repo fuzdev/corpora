@@ -7,11 +7,15 @@
  * @module
  */
 
-import { join } from 'node:path';
-import { hash_insecure } from '@fuzdev/fuz_util/hash.ts';
+import { hash as crypto_hash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ensure_end } from '@fuzdev/fuz_util/string.ts';
 
 import type { SourceLocation, ExtractionDiagnostic } from './diagnostics.ts';
-import type { ExtractionData } from './css_class_extractor.ts';
+import type { AcornPlugin, ExtractionData } from './css_class_extractor.ts';
 import type { CacheDeps } from './deps.ts';
 
 /**
@@ -20,34 +24,193 @@ import type { CacheDeps } from './deps.ts';
 export const DEFAULT_CACHE_DIR = '.fuz/cache/css';
 
 /**
- * CSS cache version. Bump when any of these change:
- * - `CachedExtraction` schema
- * - `extract_css_classes_with_locations()` logic or output
- * - `ExtractionDiagnostic` or `SourceLocation` structure
- *
- * v1: Initial version with classes and diagnostics
- * v2: Use null instead of empty arrays, add `explicit_classes`, `elements`, `css_variables`.
- * v3: Add `explicit_elements`, `explicit_variables` for `@fuz-elements`/`@fuz-variables` comments.
- * v4: Filter incomplete CSS variables in dynamic templates (e.g., `var(--prefix_{expr})`).
- * v5: Remove `css_variables` and `explicit_variables` (now detected via simple regex scan).
- * v6: Re-add `explicit_variables` for `@fuz-variables` comments (regex scan misses dynamic templates).
+ * Hex length of the cache's config-key and external-file-name digests: a
+ * SHA-256 prefix of 64 bits, wide enough that distinct inputs don't collide
+ * in practice.
  */
-// TODO: the cache key is `content_hash` + `CSS_CACHE_VERSION`, but extraction output
-// also depends on `acorn_plugins` (e.g. acorn-jsx), which isn't part of the key.
-// Changing that config without editing a file yields a stale cache hit. Acorn plugin
-// instances aren't stably serializable across processes, so a clean fingerprint isn't
-// cheap; revisit if config-change staleness bites (workaround: clear `.fuz/cache/css`).
-export const CSS_CACHE_VERSION = 6;
+const CACHE_DIGEST_LENGTH = 16;
+
+/**
+ * A truncated SHA-256 hex digest, for the cache's config key and
+ * external-file names.
+ */
+const to_cache_digest = (value: string): string =>
+	crypto_hash('sha256', value).slice(0, CACHE_DIGEST_LENGTH);
+
+/**
+ * Parses a `CI` environment variable value. Any value is CI except unset,
+ * empty, `false`, and `0` (case-insensitive, surrounding whitespace
+ * ignored), so `CI=false` turns CI behavior off rather than on.
+ *
+ * @param value - the `CI` environment variable, if set
+ * @returns whether the value marks a CI run
+ */
+export const parse_ci_value = (value: string | undefined): boolean => {
+	if (value === undefined) return false;
+	const normalized = value.trim().toLowerCase();
+	return normalized !== '' && normalized !== 'false' && normalized !== '0';
+};
+
+/**
+ * Whether this is a CI run, per `parse_ci_value` on `process.env.CI`:
+ * there's no point writing a cache the next run won't reuse.
+ *
+ * @internal Read by the generator for its cache and `on_error` defaults.
+ */
+export const is_ci = parse_ci_value(process.env.CI);
+
+/**
+ * Creates the extraction cache-path lookup: a file's cache path
+ * under `cache_dir` in `project_root`, or `null` on CI, where nothing is
+ * cached.
+ *
+ * @param cache_dir - the cache directory, relative to `project_root`
+ * @param project_root - the project root, with or without a trailing slash
+ * @returns a function from a file's absolute path to its cache path, or `null` when uncached
+ *
+ * @internal Used by the Vite plugin.
+ */
+export const create_cache_path_resolver = (
+	cache_dir: string,
+	project_root: string
+): ((file_id: string) => string | null) => {
+	const root = ensure_end(project_root, '/');
+	const resolved_cache_dir = join(root, cache_dir);
+	return (file_id) => (is_ci ? null : get_file_cache_path(file_id, resolved_cache_dir, root));
+};
+
+/**
+ * The packages whose versions decide what an extraction produces: fuz_css,
+ * whose extractor and cache format they cover, and the parsers it runs.
+ */
+const EXTRACTION_PACKAGES = ['@fuzdev/fuz_css', 'svelte', 'acorn', '@sveltejs/acorn-typescript'];
+
+/**
+ * Reads a package's version from the nearest `package.json` named `name`
+ * at or above `from`. A `package.json` with another name is passed over, so a
+ * nested one (a `"type"` marker in a subdirectory) or a bundling consumer's
+ * doesn't stand in for the package.
+ *
+ * @param name - the package name
+ * @param from - the directory to start from
+ * @returns the version, or `null` when no `package.json` above `from` names the package
+ *
+ * @internal Exported for testing.
+ */
+export const find_package_version = (name: string, from: string): string | null => {
+	let dir = from;
+	for (;;) {
+		try {
+			const package_json: unknown = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+			if (
+				typeof package_json === 'object' &&
+				package_json !== null &&
+				'name' in package_json &&
+				package_json.name === name &&
+				'version' in package_json &&
+				typeof package_json.version === 'string'
+			) {
+				return package_json.version;
+			}
+		} catch {
+			// no readable package.json here, keep climbing
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+};
+
+/**
+ * Where a package's version lookup starts: fuz_css's own module directory
+ * for fuz_css, and a dependency's resolved entry point otherwise, resolved
+ * from here so it's the copy the extractor imports.
+ */
+const to_package_dir = (name: string): string | null => {
+	try {
+		return name === '@fuzdev/fuz_css'
+			? dirname(fileURLToPath(import.meta.url))
+			: dirname(createRequire(import.meta.url).resolve(name));
+	} catch {
+		return null;
+	}
+};
+
+let extraction_versions: Record<string, string> | null = null;
+
+/**
+ * Reads the installed versions of fuz_css and its parsers, once per
+ * process. A version that can't be found reads as `'unknown'`, which still
+ * keys the cache - it never fails generation.
+ *
+ * @returns the versions by package name
+ *
+ * @internal Read by the cache for `to_cache_version`.
+ */
+export const load_extraction_versions = (): Record<string, string> => {
+	if (extraction_versions) return extraction_versions;
+	const versions: Record<string, string> = {};
+	for (const name of EXTRACTION_PACKAGES) {
+		const dir = to_package_dir(name);
+		versions[name] = (dir && find_package_version(name, dir)) ?? 'unknown';
+	}
+	return (extraction_versions = versions);
+};
+
+/**
+ * Computes the cache version every entry is written with and checked
+ * against: the versions of fuz_css and the parsers its extractor runs, so
+ * an upgrade of any of them invalidates the cache with no manual bump. In a
+ * checkout of fuz_css itself the version doesn't move between commits, so
+ * clear `.fuz/cache/css` and each example's own `.fuz` directory (or set
+ * `cache_salt`) after changing what extraction produces.
+ *
+ * @param versions - the versions by package name
+ * @returns the version string, like `@fuzdev/fuz_css@1.2.3 svelte@5.0.0 ...`
+ *
+ * @internal Shared by the cache's load and save.
+ */
+export const to_cache_version = (
+	versions: Record<string, string> = load_extraction_versions()
+): string =>
+	Object.entries(versions)
+		.map(([name, version]) => `${name}@${version}`)
+		.join(' ');
+
+/**
+ * Computes the part of the cache key that comes from configuration rather
+ * than file content: a fingerprint of the configured acorn plugins (their
+ * source text) and the consumer's `cache_salt`, or `null` when neither is
+ * set. A plugin's options live in its closure, where the source text can't
+ * see them, so a consumer who changes only a plugin's options bumps
+ * `cache_salt`.
+ *
+ * @param acorn_plugins - the extraction's acorn plugins, if any
+ * @param cache_salt - a consumer string folded into the key, if any
+ * @returns the key, or `null` for the default configuration
+ *
+ * @internal Used by the Vite plugin.
+ */
+export const to_extraction_cache_key = (
+	acorn_plugins: Array<AcornPlugin> | undefined,
+	cache_salt: string | undefined
+): string | null => {
+	const parts = (acorn_plugins ?? []).map((plugin) => 'plugin:' + plugin.toString());
+	if (cache_salt) parts.push('salt:' + cache_salt);
+	return parts.length ? to_cache_digest(parts.join('\0')) : null;
+};
 
 /**
  * Cached extraction result for a single file.
  * Uses `null` instead of empty arrays to avoid allocation overhead.
  */
 export interface CachedExtraction {
-	/** Cache version - invalidates cache when bumped */
-	v: number;
-	/** Content hash of the source file (BLAKE3 via `hash_blake3`) */
+	/** The `to_cache_version` the entry was written with - any other misses */
+	v: string;
+	/** Content hash of the source file */
 	content_hash: string;
+	/** The configuration part of the key (`to_extraction_cache_key`), or null for the default */
+	extraction_key: string | null;
 	/** Classes as [name, locations] tuples, or null if none */
 	classes: Array<[string, Array<SourceLocation>]> | null;
 	/** Classes from `@fuz-classes` comments, or null if none */
@@ -69,6 +232,7 @@ export interface CachedExtraction {
  * @param source_path - absolute path to the source file
  * @param cache_dir - absolute path to the cache directory
  * @param project_root - normalized project root (must end with `/`)
+ * @internal The inside-the-root case of `get_file_cache_path`.
  */
 export const get_cache_path = (
 	source_path: string,
@@ -85,7 +249,7 @@ export const get_cache_path = (
 /**
  * Computes cache path for a file, handling both internal and external paths.
  * Internal files use relative paths mirroring source tree.
- * External files (outside project root) use hashed absolute paths in `_external/`.
+ * External files (outside project root) are named by a digest of their absolute path in `_external/`.
  *
  * @param file_id - absolute path to the source file
  * @param cache_dir - absolute path to the cache directory
@@ -99,12 +263,13 @@ export const get_file_cache_path = (
 	const is_internal = file_id.startsWith(project_root);
 	return is_internal
 		? get_cache_path(file_id, cache_dir, project_root)
-		: join(cache_dir, '_external', hash_insecure(file_id).slice(0, 16) + '.json');
+		: join(cache_dir, '_external', to_cache_digest(file_id) + '.json');
 };
 
 /**
  * Loads a cached extraction result from disk.
- * Returns `null` if the cache is missing, corrupted, or has a version mismatch.
+ * Returns `null` if the cache is missing, corrupted, or was written by
+ * other versions of fuz_css or its parsers (`to_cache_version`).
  * This makes the cache self-healing: any error triggers re-extraction.
  *
  * @param deps - filesystem deps for dependency injection
@@ -121,7 +286,7 @@ export const load_cached_extraction = async (
 		const cached = JSON.parse(r.value) as CachedExtraction;
 
 		// Invalidate if version mismatch
-		if (cached.v !== CSS_CACHE_VERSION) {
+		if (cached.v !== to_cache_version()) {
 			return null;
 		}
 
@@ -133,22 +298,30 @@ export const load_cached_extraction = async (
 	}
 };
 
+export interface SaveCachedExtractionOptions {
+	/** Absolute path to the cache file. */
+	cache_path: string;
+	/** Content hash of the source file contents. */
+	content_hash: string;
+	/** The configuration part of the key, from `to_extraction_cache_key`. */
+	extraction_key: string | null;
+	/** Extraction data to cache. */
+	extraction: ExtractionData;
+}
+
 /**
  * Saves an extraction result to the cache.
  * Uses atomic write (temp file + rename) for crash safety.
  * Normalizes empty collections to null to avoid allocation overhead on load.
  *
  * @param deps - filesystem deps for dependency injection
- * @param cache_path - absolute path to the cache file
- * @param content_hash - content hash of the source file contents
- * @param extraction - extraction data to cache
+ * @param options - the cache file, its key parts, and the extraction to write
  */
 export const save_cached_extraction = async (
 	deps: CacheDeps,
-	cache_path: string,
-	content_hash: string,
-	extraction: ExtractionData
+	options: SaveCachedExtractionOptions
 ): Promise<void> => {
+	const { cache_path, content_hash, extraction_key, extraction } = options;
 	// Convert to null if empty to save allocation on load
 	const classes_array =
 		extraction.classes && extraction.classes.size > 0
@@ -172,8 +345,9 @@ export const save_cached_extraction = async (
 			: null;
 
 	const data: CachedExtraction = {
-		v: CSS_CACHE_VERSION,
+		v: to_cache_version(),
 		content_hash,
+		extraction_key,
 		classes: classes_array,
 		explicit_classes: explicit_array,
 		diagnostics: diagnostics_array,

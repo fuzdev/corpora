@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { icon_play, icon_add, icon_remove } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 
 	import type { TerminalPreset } from './terminal_preset.svelte.ts';
+	import { parse_terminal_command } from './terminal_helpers.ts';
 
 	const {
 		presets,
@@ -10,7 +11,7 @@
 		oncreate,
 		ondelete
 	}: {
-		presets: Array<TerminalPreset>;
+		presets: ReadonlyArray<TerminalPreset>;
 		onrun: (preset: TerminalPreset) => void;
 		oncreate?: (name: string, command: string, args: Array<string>) => void;
 		ondelete?: (preset: TerminalPreset) => void;
@@ -21,10 +22,9 @@
 	let new_command = $state.raw('');
 
 	const handle_add_submit = (): void => {
-		const trimmed = new_command.trim();
-		if (!trimmed) return;
-		const [command, ...args] = trimmed.split(/\s+/);
-		if (!command) return;
+		const parsed = parse_terminal_command(new_command);
+		if (!parsed) return;
+		const { command, args } = parsed;
 		oncreate?.(new_name.trim() || command, command, args);
 		new_name = '';
 		new_command = '';
@@ -44,7 +44,7 @@
 	{#each presets as preset (preset.id)}
 		<span class="preset-item">
 			<button type="button" onclick={() => onrun(preset)}>
-				<Svg data={icon_play} />
+				<Icon data={icon_play} />
 				{preset.name || preset.command}
 			</button>
 			{#if ondelete}
@@ -54,7 +54,7 @@
 					onclick={() => ondelete(preset)}
 					title="delete preset"
 				>
-					<Svg data={icon_remove} />
+					<Icon data={icon_remove} />
 				</button>
 			{/if}
 		</span>
@@ -77,12 +77,12 @@
 					class="preset-input preset-input-command"
 					onkeydown={handle_add_keydown}
 				/>
-				<button type="button" onclick={handle_add_submit}><Svg data={icon_add} /></button>
-				<button type="button" onclick={() => (adding = false)}><Svg data={icon_remove} /></button>
+				<button type="button" onclick={handle_add_submit}><Icon data={icon_add} /></button>
+				<button type="button" onclick={() => (adding = false)}><Icon data={icon_remove} /></button>
 			</span>
 		{:else}
 			<button type="button" onclick={() => (adding = true)} title="add preset">
-				<Svg data={icon_add} />
+				<Icon data={icon_add} />
 			</button>
 		{/if}
 	{/if}

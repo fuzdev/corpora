@@ -1,9 +1,7 @@
 // @slop Claude Opus 4
 
-import { z } from 'zod';
 import { goto } from '$app/navigation';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Page } from './page.svelte.ts';
 import type { Projects } from './projects.svelte.ts';
@@ -180,8 +178,6 @@ export class PageViewmodel {
 			this.current_page.updated = now;
 		}
 
-		void goto(resolve(`/projects/${this.project_id}/pages`));
+		void goto(resolve('/projects/[project_id]/pages', { project_id: this.project_id }));
 	}
 }
-
-export const PageViewmodelSchema = z.instanceof(PageViewmodel);

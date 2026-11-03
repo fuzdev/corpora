@@ -246,6 +246,19 @@ export interface WsClient {
 	 * in `testing/sse_round_trip.ts`.
 	 */
 	wait_for_close: (timeout_ms?: number) => Promise<boolean>;
+	/**
+	 * The close code of the connection once it has closed — the server's
+	 * (e.g. `WS_CLOSE_MESSAGE_TOO_BIG`), the test's own, or `1006` when the
+	 * connection dropped without a close frame. `null` while open.
+	 */
+	readonly close_code: number | null;
+	/**
+	 * The close reason of the connection once it has closed — the text sent
+	 * with `close_code` (e.g. `'connection limit'` with
+	 * `WS_CLOSE_CONNECTION_LIMIT`), empty when the close carried none. `null`
+	 * while open.
+	 */
+	readonly close_reason: string | null;
 	/** Every message the server has sent, in arrival order. */
 	readonly messages: ReadonlyArray<unknown>;
 	/**

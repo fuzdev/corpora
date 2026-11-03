@@ -1,12 +1,11 @@
 import { assert, describe, test } from 'vitest';
-import { TaskError } from '@fuzdev/gro';
 
-import { analyze_repos, validate_dependency_graph } from '$lib/graph_validation.ts';
+import { analyze_repos, validate_dependency_graph } from '#lib/graph_validation.ts';
 import { create_mock_repo } from './test_helpers.ts';
 
 describe('validate_dependency_graph', () => {
 	describe('basic functionality', () => {
-		test('builds graph and returns publishing order for simple chain', () => {
+		test('builds graph and returns the order for a simple chain', () => {
 			const repos = [
 				create_mock_repo({ name: 'lib', version: '1.0.0' }),
 				create_mock_repo({ name: 'app', version: '1.0.0', deps: { lib: '^1.0.0' } })
@@ -14,7 +13,7 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, ['lib', 'app']);
+			assert.deepEqual(result.order, ['lib', 'app']);
 			assert.deepEqual(result.production_cycles, []);
 			assert.deepEqual(result.dev_cycles, []);
 			assert.strictEqual(result.sort_error, undefined);
@@ -28,9 +27,9 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.strictEqual(result.publishing_order.length, 2);
-			assert.ok(result.publishing_order.includes('pkg-a'));
-			assert.ok(result.publishing_order.includes('pkg-b'));
+			assert.strictEqual(result.order.length, 2);
+			assert.ok(result.order.includes('pkg-a'));
+			assert.ok(result.order.includes('pkg-b'));
 			assert.deepEqual(result.production_cycles, []);
 			assert.deepEqual(result.dev_cycles, []);
 		});
@@ -38,7 +37,7 @@ describe('validate_dependency_graph', () => {
 		test('handles empty repos array', () => {
 			const result = validate_dependency_graph([]);
 
-			assert.deepEqual(result.publishing_order, []);
+			assert.deepEqual(result.order, []);
 			assert.deepEqual(result.production_cycles, []);
 			assert.deepEqual(result.dev_cycles, []);
 		});
@@ -58,82 +57,49 @@ describe('validate_dependency_graph', () => {
 			const result = validate_dependency_graph(repos);
 
 			// base must come first, top must come last
-			assert.strictEqual(result.publishing_order[0], 'base');
-			assert.strictEqual(result.publishing_order[3], 'top');
+			assert.strictEqual(result.order[0], 'base');
+			assert.strictEqual(result.order[3], 'top');
+			// the two mids don't depend on each other, so they share a level
+			assert.deepEqual(
+				result.levels.map((level) => [...level].sort()),
+				[['base'], ['mid-a', 'mid-b'], ['top']]
+			);
 			assert.deepEqual(result.production_cycles, []);
 		});
 	});
 
-	describe('production cycles with throw_on_prod_cycles=true', () => {
-		test('throws on simple production cycle', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			assert.throws(
-				() => validate_dependency_graph(repos, { throw_on_prod_cycles: true }),
-				TaskError
-			);
-			assert.throws(
-				() => validate_dependency_graph(repos, { throw_on_prod_cycles: true }),
-				/Cannot publish with production\/peer dependency cycles/
-			);
-		});
-
-		test('throws on peer dependency cycle', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', peer_deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', peer_deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			assert.throws(
-				() => validate_dependency_graph(repos, { throw_on_prod_cycles: true }),
-				TaskError
-			);
-		});
-
-		test('throws on mixed prod/peer cycle', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', peer_deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			assert.throws(
-				() => validate_dependency_graph(repos, { throw_on_prod_cycles: true }),
-				TaskError
-			);
-		});
-
-		test('throws on longer cycle (3+ packages)', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-c': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-c', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			assert.throws(
-				() => validate_dependency_graph(repos, { throw_on_prod_cycles: true }),
-				TaskError
-			);
-		});
-	});
-
-	describe('production cycles with throw_on_prod_cycles=false', () => {
+	describe('production cycles (reported, never thrown)', () => {
 		test('returns empty order and sort_error for simple production cycle', () => {
 			const repos = [
 				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
 				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, []);
+			assert.deepEqual(result.order, []);
 			assert.strictEqual(result.production_cycles.length, 1);
 			assert.ok(result.production_cycles[0]!.includes('pkg-a'));
 			assert.ok(result.production_cycles[0]!.includes('pkg-b'));
 			assert.match(result.sort_error!, /Failed to compute publishing order/);
 			assert.match(result.sort_error!, /cycle/);
+		});
+
+		test('reports a cycle of three or more packages', () => {
+			const repos = [
+				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
+				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-c': '^1.0.0' } }),
+				create_mock_repo({ name: 'pkg-c', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
+			];
+
+			const result = validate_dependency_graph(repos);
+
+			assert.deepEqual(result.order, []);
+			assert.strictEqual(result.production_cycles.length, 1);
+			for (const name of ['pkg-a', 'pkg-b', 'pkg-c']) {
+				assert.ok(result.production_cycles[0]!.includes(name));
+			}
+			assert.ok(result.sort_error);
 		});
 
 		test('captures multiple production cycles', () => {
@@ -146,9 +112,9 @@ describe('validate_dependency_graph', () => {
 				create_mock_repo({ name: 'pkg-d', version: '1.0.0', deps: { 'pkg-c': '^1.0.0' } })
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, []);
+			assert.deepEqual(result.order, []);
 			assert.strictEqual(result.production_cycles.length, 2);
 			assert.ok(result.sort_error !== undefined);
 		});
@@ -167,9 +133,9 @@ describe('validate_dependency_graph', () => {
 				})
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, []);
+			assert.deepEqual(result.order, []);
 			assert.strictEqual(result.production_cycles.length, 1);
 			assert.ok(result.sort_error !== undefined);
 		});
@@ -185,7 +151,7 @@ describe('validate_dependency_graph', () => {
 			const result = validate_dependency_graph(repos);
 
 			// Dev cycles don't block topological sort (dev deps excluded)
-			assert.strictEqual(result.publishing_order.length, 2);
+			assert.strictEqual(result.order.length, 2);
 			assert.deepEqual(result.production_cycles, []);
 			assert.strictEqual(result.dev_cycles.length, 1);
 			assert.ok(result.dev_cycles[0]!.includes('pkg-a'));
@@ -205,7 +171,7 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.strictEqual(result.publishing_order.length, 4);
+			assert.strictEqual(result.order.length, 4);
 			assert.deepEqual(result.production_cycles, []);
 			assert.strictEqual(result.dev_cycles.length, 2);
 		});
@@ -223,7 +189,7 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, ['lib', 'app']);
+			assert.deepEqual(result.order, ['lib', 'app']);
 			assert.deepEqual(result.dev_cycles, []);
 		});
 	});
@@ -239,11 +205,11 @@ describe('validate_dependency_graph', () => {
 				create_mock_repo({ name: 'dev-b', version: '1.0.0', dev_deps: { 'dev-a': '^1.0.0' } })
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
 			assert.strictEqual(result.production_cycles.length, 1);
 			assert.strictEqual(result.dev_cycles.length, 1);
-			assert.deepEqual(result.publishing_order, []); // blocked by prod cycle
+			assert.deepEqual(result.order, []); // blocked by prod cycle
 			assert.ok(result.sort_error !== undefined);
 		});
 
@@ -258,53 +224,9 @@ describe('validate_dependency_graph', () => {
 
 			// pkg-b must come first (pkg-a depends on it via prod dep)
 			// The dev dep from pkg-b to pkg-a is ignored in topological sort
-			assert.deepEqual(result.publishing_order, ['pkg-b', 'pkg-a']);
+			assert.deepEqual(result.order, ['pkg-b', 'pkg-a']);
 			assert.deepEqual(result.production_cycles, []);
 			assert.deepEqual(result.dev_cycles, []);
-		});
-	});
-
-	describe('logging options', () => {
-		test('respects log_cycles=false (no crashes)', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			// Should not crash even though we're passing undefined logger
-			const result = validate_dependency_graph(repos, {
-				throw_on_prod_cycles: false,
-				log_cycles: false
-			});
-
-			assert.strictEqual(result.production_cycles.length, 1);
-		});
-
-		test('respects log_order=false (no crashes)', () => {
-			const repos = [
-				create_mock_repo({ name: 'lib', version: '1.0.0' }),
-				create_mock_repo({ name: 'app', version: '1.0.0', deps: { lib: '^1.0.0' } })
-			];
-
-			const result = validate_dependency_graph(repos, { log_order: false });
-
-			assert.deepEqual(result.publishing_order, ['lib', 'app']);
-		});
-
-		test('works with all logging disabled', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', dev_deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', dev_deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			const result = validate_dependency_graph(repos, {
-				throw_on_prod_cycles: false,
-				log_cycles: false,
-				log_order: false
-			});
-
-			assert.strictEqual(result.dev_cycles.length, 1);
-			assert.strictEqual(result.publishing_order.length, 2);
 		});
 	});
 
@@ -314,7 +236,7 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, ['solo']);
+			assert.deepEqual(result.order, ['solo']);
 			assert.deepEqual(result.production_cycles, []);
 			assert.deepEqual(result.dev_cycles, []);
 		});
@@ -330,7 +252,7 @@ describe('validate_dependency_graph', () => {
 
 			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, ['app']);
+			assert.deepEqual(result.order, ['app']);
 			assert.deepEqual(result.production_cycles, []);
 		});
 
@@ -339,9 +261,9 @@ describe('validate_dependency_graph', () => {
 				create_mock_repo({ name: 'self-dep', version: '1.0.0', deps: { 'self-dep': '^1.0.0' } })
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
-			assert.deepEqual(result.publishing_order, []);
+			assert.deepEqual(result.order, []);
 			assert.strictEqual(result.production_cycles.length, 1);
 			assert.ok(result.sort_error !== undefined);
 		});
@@ -355,31 +277,7 @@ describe('validate_dependency_graph', () => {
 			const result = validate_dependency_graph(repos);
 
 			// Both included in order (graph_validation doesn't filter by private)
-			assert.deepEqual(result.publishing_order, ['private', 'public']);
-		});
-	});
-
-	describe('default options behavior', () => {
-		test('defaults to throw_on_prod_cycles=true', () => {
-			const repos = [
-				create_mock_repo({ name: 'pkg-a', version: '1.0.0', deps: { 'pkg-b': '^1.0.0' } }),
-				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
-			];
-
-			// Default behavior should throw
-			assert.throws(() => validate_dependency_graph(repos), TaskError);
-		});
-
-		test('defaults to log_cycles=true (no crash with undefined logger)', () => {
-			const repos = [
-				create_mock_repo({ name: 'lib', version: '1.0.0' }),
-				create_mock_repo({ name: 'app', version: '1.0.0', deps: { lib: '^1.0.0' } })
-			];
-
-			// Should not crash with undefined logger even though log_cycles defaults to true
-			const result = validate_dependency_graph(repos);
-
-			assert.deepEqual(result.publishing_order, ['lib', 'app']);
+			assert.deepEqual(result.order, ['private', 'public']);
 		});
 	});
 
@@ -403,7 +301,7 @@ describe('validate_dependency_graph', () => {
 				create_mock_repo({ name: 'pkg-b', version: '1.0.0', deps: { 'pkg-a': '^1.0.0' } })
 			];
 
-			const result = validate_dependency_graph(repos, { throw_on_prod_cycles: false });
+			const result = validate_dependency_graph(repos);
 
 			// Verify we can call graph methods
 			const { production_cycles } = result.graph.detect_cycles_by_type();
@@ -413,6 +311,14 @@ describe('validate_dependency_graph', () => {
 });
 
 describe('analyze_repos', () => {
+	test('levels are null under a production cycle', () => {
+		const repos = [
+			create_mock_repo({ name: 'a', version: '1.0.0', deps: { b: '^1.0.0' } }),
+			create_mock_repo({ name: 'b', version: '1.0.0', deps: { a: '^1.0.0' } })
+		];
+		assert.strictEqual(analyze_repos(repos).levels, null);
+	});
+
 	test('excludes non-npm (cargo) repos from the dependency graph', () => {
 		const repos = [
 			create_mock_repo({ name: 'lib', version: '1.0.0' }),
@@ -420,12 +326,12 @@ describe('analyze_repos', () => {
 			create_mock_repo({ name: 'rust-tool', version: '0.1.0', kind: 'cargo' })
 		];
 
-		const { graph, publishing_order } = analyze_repos(repos);
+		const { graph, levels } = analyze_repos(repos);
 
-		// The cargo repo is not a graph node, so it never enters the publishing order.
+		// The cargo repo is not a graph node, so it never enters the levels.
 		assert.ok(!graph.nodes.has('rust-tool'));
 		assert.ok(graph.nodes.has('lib'));
 		assert.ok(graph.nodes.has('app'));
-		assert.deepEqual(publishing_order, ['lib', 'app']);
+		assert.deepEqual(levels, [['lib'], ['app']]);
 	});
 });

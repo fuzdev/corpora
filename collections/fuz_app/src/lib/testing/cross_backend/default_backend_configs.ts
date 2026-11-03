@@ -3,8 +3,8 @@ import '../assert_dev_env.ts';
 /**
  * Family-shared `BackendConfig` builders for cross-process test backends.
  *
- * Two consumer-facing factories — {@link make_default_ts_backend_config}
- * and {@link make_default_rust_backend_config} — own the common shape
+ * Two consumer-facing factories — `make_default_ts_backend_config`
+ * and `make_default_rust_backend_config` — own the common shape
  * for the JS-runtime (Deno/Node on V8) and Rust families respectively.
  * Per-backend factories in consumer projects compose a small
  * declaration against one of these and add consumer-specific env vars
@@ -12,138 +12,185 @@ import '../assert_dev_env.ts';
  *
  * Defaults baked in by family:
  *
- * - **TS** — `'memory://'` PGlite, 30s startup window. Its shape notes
- *   (`ts_default_shape_notes`) record `trusted_proxy: false` /
- *   `login_rate_limit: false` — the TS canonical path leaves those limiters
- *   null in test mode.
- * - **Rust** — caller-supplied real Postgres URL (PGlite isn't reachable
- *   from `tokio-postgres`), 120s startup window (cargo first-build cost), the
- *   `FUZ_TESTING_RESET_DB_ON_STARTUP=true` self-wipe gate, and shape notes
- *   (`rust_default_shape_notes`) recording `trusted_proxy: true` +
- *   `login_rate_limit: true`.
+ * - **TS** — `'memory://'` (in-memory pglet), 30s startup window.
+ * - **Rust** — caller-supplied real Postgres URL (an in-process WASM database isn't reachable
+ *   from `tokio-postgres`), 120s startup window (cargo first-build cost),
+ *   and the `FUZ_TESTING_RESET_DB_ON_STARTUP=true` self-wipe gate.
  *
  * Both builders default `port_env_var` to `'PORT'`. Consumers whose
- * binary reads a different name (e.g. zzz's `ZZZ_PORT`) override.
+ * binary reads a different name (e.g. zzz's `ZZZ_PORT`) override. Both bind
+ * `HOST` to `DEFAULT_TEST_BACKEND_HOST` (`127.0.0.1`), and, given the name of
+ * the binary's daemon-token directory env var (`daemon_token_dir_env`), set it
+ * to the `{dir}` whose `{dir}/run/daemon_token` is the bootstrap's
+ * `daemon_token_path` (`to_daemon_token_dir`).
  *
  * Common across both families: `/api/rpc`, `/api/ws`, `/health`,
  * `/api/account/bootstrap`, `cookie_name: 'fuz_session'`, the standard
  * bootstrap block keyed off `default_test_*` constants. Builders call
- * `build_test_backend_paths(name)` internally when the optional `paths`
- * is omitted.
+ * `default_test_backend_paths(name)` (a repo-namespaced tmpdir) internally
+ * when the optional `paths` is omitted.
  *
  * @module
  */
 
+import { basename, dirname } from 'node:path';
+
 import type { BackendBootstrapConfig, BackendConfig } from './backend_config.ts';
-import type { BackendCapabilities, BackendShapeNotes } from './capabilities.ts';
-import { build_test_backend_paths, type TestBackendPaths } from './build_test_backend_paths.ts';
+import type { BackendCapabilities, FamilyDefaultCapabilities } from './capabilities.ts';
+import { default_test_backend_paths, type TestBackendPaths } from './build_test_backend_paths.ts';
 import {
 	default_test_bootstrap_token,
 	default_test_cookie_keys,
 	default_test_keeper_password,
 	default_test_keeper_username
 } from './default_secrets.ts';
+import {
+	ACTION_RATE_LIMIT_ENABLED_ENV,
+	ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV,
+	AUDIT_SSE_KEEP_ALIVE_MS_ENV,
+	SPINE_ACCOUNT_BOOTSTRAP_PATH,
+	SPINE_RPC_PATH,
+	SPINE_WS_PATH,
+	WS_RECEIVE_TIMEOUT_MS_ENV
+} from './spine_surface_constants.ts';
 
 /**
- * Env var both spine binaries read to enable their login rate limiters
- * (`'true'` on / unset off). The cross-language contract for the login-security
- * cross project: the TS binary reads it via `runtime.env_get` (a test-only flag,
- * not in `BaseServerEnv`); the Rust `testing_spine_stub` reads it via
- * `std::env::var` — so one backend-config option drives both impls. Shared home
- * here because both `ts_spine_backend_config` and `rust_spine_stub_backend_config`
- * already import this module. (The spawned TS binary re-declares the literal
- * locally — it can't import this module, which transitively pulls `vitest` —
- * mirroring how `testing_spine_server_node.ts` re-declares `TS_SPINE_DIR_ENV`.)
+ * The `HOST` both builders bind a backend to — loopback IPv4, since
+ * `localhost` can resolve to `::1` and a backend bound there misses a client
+ * that connects to `127.0.0.1` (the raw-socket suites, a git hook calling
+ * back). `base_url` stays `http://localhost:<port>`, which reaches it.
  */
-export const LOGIN_RATE_LIMIT_ENABLED_ENV = 'FUZ_LOGIN_RATE_LIMIT_ENABLED';
+export const DEFAULT_TEST_BACKEND_HOST = '127.0.0.1';
 
 /**
- * Capabilities shared by TS-family backends — same canonical implementation,
- * same feature set. The non-gating wiring facts (`bearer_auth` /
- * `trusted_proxy` / `login_rate_limit`) live in `ts_default_shape_notes`.
+ * The directory a binary writing its daemon token to `{dir}/run/daemon_token`
+ * is given, so the token lands at `daemon_token_path`.
+ *
+ * @param daemon_token_path - where the harness reads the token
+ * @returns the `{dir}` of that layout
+ * @throws Error when the path is not `.../run/daemon_token`, which no such
+ *   directory can produce
  */
-export const ts_default_capabilities: BackendCapabilities = Object.freeze({
-	ws: true,
-	sse: false,
-	cell_crud: true,
-	cell_relations: true,
+export const to_daemon_token_dir = (daemon_token_path: string): string => {
+	const run_dir = dirname(daemon_token_path);
+	if (basename(daemon_token_path) !== 'daemon_token' || basename(run_dir) !== 'run') {
+		throw new Error(
+			`daemon_token_dir_env needs a daemon_token_path of the form {dir}/run/daemon_token, ` +
+				`got ${daemon_token_path}`
+		);
+	}
+	return dirname(run_dir);
+};
+
+/**
+ * The env entry `daemon_token_dir_env` names, pointing the binary at the
+ * directory whose layout puts the token at the bootstrap's `daemon_token_path`.
+ */
+const daemon_token_dir_entry = (
+	daemon_token_dir_env: string | undefined,
+	bootstrap: BackendBootstrapConfig
+): Record<string, string> =>
+	daemon_token_dir_env === undefined
+		? {}
+		: { [daemon_token_dir_env]: to_daemon_token_dir(bootstrap.daemon_token_path) };
+
+/** Options for `action_rate_limit_env`. */
+export interface ActionRateLimitEnvOptions {
+	readonly enable_action_rate_limit?: boolean;
+	readonly action_rate_limit_max_attempts?: number;
+}
+
+/**
+ * The `extra_env` entries carrying the action rate-limit toggles, shared by the
+ * TS and Rust backend configs so one option pair drives both impls.
+ * `action_rate_limit_max_attempts` is passed through even without the enable
+ * flag, so the binary refuses the combination instead of the harness hiding it.
+ */
+export const action_rate_limit_env = (
+	options: ActionRateLimitEnvOptions
+): Record<string, string> => ({
+	...(options.enable_action_rate_limit ? { [ACTION_RATE_LIMIT_ENABLED_ENV]: 'true' } : {}),
+	...(options.action_rate_limit_max_attempts !== undefined
+		? { [ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV]: String(options.action_rate_limit_max_attempts) }
+		: {})
+});
+
+/** Options for `timing_env`. */
+export interface TimingEnvOptions {
+	/** The audit stream's keep-alive interval in ms (`AUDIT_SSE_KEEP_ALIVE_MS_ENV`). */
+	readonly audit_sse_keep_alive_ms?: number;
+	/** The WS endpoints' receive timeout in ms (`WS_RECEIVE_TIMEOUT_MS_ENV`). */
+	readonly ws_receive_timeout_ms?: number;
+	/** The pool checkout bound of a request in ms (`FUZ_DB_CHECKOUT_TIMEOUT_MS`). */
+	readonly db_checkout_timeout_ms?: number;
+	/** The pool checkout bound of an audit write in ms (`FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS`). */
+	readonly db_audit_checkout_timeout_ms?: number;
+}
+
+/**
+ * The `extra_env` entries carrying the timing overrides, shared by the TS and
+ * Rust backend configs so one option drives both impls. Each value is passed
+ * through as given, so the binary refuses a bad one instead of the harness
+ * hiding it.
+ */
+export const timing_env = (options: TimingEnvOptions): Record<string, string> => ({
+	...(options.audit_sse_keep_alive_ms !== undefined
+		? { [AUDIT_SSE_KEEP_ALIVE_MS_ENV]: String(options.audit_sse_keep_alive_ms) }
+		: {}),
+	...(options.ws_receive_timeout_ms !== undefined
+		? { [WS_RECEIVE_TIMEOUT_MS_ENV]: String(options.ws_receive_timeout_ms) }
+		: {}),
+	// production vars (`BaseServerEnv`), so no test-only constant names them
+	...(options.db_checkout_timeout_ms !== undefined
+		? { FUZ_DB_CHECKOUT_TIMEOUT_MS: String(options.db_checkout_timeout_ms) }
+		: {}),
+	...(options.db_audit_checkout_timeout_ms !== undefined
+		? { FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS: String(options.db_audit_checkout_timeout_ms) }
+		: {})
+});
+
+/**
+ * Capabilities shared by TS-family backends — only what the family
+ * guarantees: the declared spine surface's mounts and the behavior of its
+ * reference runtime, Node. Carries no `MountFlag` and no `testing_backdoors`;
+ * each backend config states those itself (`FamilyDefaultCapabilities`).
+ */
+export const ts_default_capabilities: FamilyDefaultCapabilities = Object.freeze({
+	// The account-lifecycle verbs are on the declared surface
+	// (`create_admin_actions`), which every TS backend running the standard
+	// suites mounts.
 	account_lifecycle: true,
-	fact_serving: true,
-	// Off by default like `sse` — a generic TS consumer backend may not mount
-	// `/ready`. fuz_app's own spine configs (`ts_spine_*`) opt in.
-	ready: false,
 	// `GET /api/account/status` is bundled into `create_account_route_specs`, so
 	// every TS backend mounting account routes serves it.
 	account_status: true,
-	// Node/Deno close the socket on an oversized-body reject (the default
-	// posture). A Bun-served consumer overrides to `false` (see the bun spine
-	// config) — fail-loud rather than silently skipping the smuggle detector.
-	oversized_reject_closes_connection: true,
-	// Off by default like `sse`/`ready`: the WS backend transport *can* initiate
-	// server→client requests (`BackendWebsocketTransport.request_connection`),
-	// but driving the full `peer/ping` suite also needs `peer/ping` mounted on
-	// the HTTP RPC endpoint (the no-transport case). The TS spine config opts in;
-	// a generic consumer enables it once it wires that mount.
-	peer_request: false,
-	// Off by default — the `cell_gated_create` test policy is a fuz_app test
-	// fixture, mounted only on the spine binaries (`ts_spine_*`), not generic
-	// consumers.
-	cell_gated_create: false
+	// Node (`ws`) and Deno hand frames pipelined with the upgrade request to the
+	// socket. A Bun-served backend overrides to `false` (see the bun spine
+	// config) — `Bun.serve` answers such a request `400` when the upgrade
+	// follows an asynchronous check.
+	ws_handshake_pipelining: true,
+	// `@hono/node-ws` drops a refused upgrade's body, so a Node-served backend
+	// sends none. A Deno- or Bun-served one overrides to `true`.
+	ws_refusal_body: false
 });
 
 /**
- * Capabilities for the Rust family. The non-gating wiring facts live in
- * `rust_default_shape_notes` (which records the family's `trusted_proxy` +
- * `login_rate_limit` differences from the TS family).
+ * Capabilities for the Rust family — only what the family guarantees, as with
+ * `ts_default_capabilities`: the declared spine surface's mounts and the
+ * behavior of hyper. Carries no `MountFlag` and no `testing_backdoors`.
  */
-export const rust_default_capabilities: BackendCapabilities = Object.freeze({
-	ws: true,
-	sse: false,
-	cell_crud: true,
-	cell_relations: true,
+export const rust_default_capabilities: FamilyDefaultCapabilities = Object.freeze({
+	// The account-lifecycle verbs are in the spine's admin action set, on the
+	// declared surface every Rust spine backend running the standard suites
+	// mounts.
 	account_lifecycle: true,
-	fact_serving: true,
-	// Off by default like `sse`; the spine-stub preset opts in (it mounts
-	// `/ready` over the env-supplied fixture path).
-	ready: false,
 	// The Rust `account_router` bundles `/status` into the account routes, so
 	// every Rust spine serving the account surface serves it.
 	account_status: true,
-	// hyper sends an RST on the oversized-body reject — the connection closes
-	// and the pipelined request is never reached.
-	oversized_reject_closes_connection: true,
-	// Server-initiated requests landed Rust-first canonical — the Rust spine
-	// drives the `peer/ping` round-trip, so the family opts into the suite.
-	peer_request: true,
-	// Off by default — the `testing_spine_stub` preset opts in (it mounts the
-	// `TestCellGatedCreateAuthorize` policy); a generic Rust consumer doesn't.
-	cell_gated_create: false
-});
-
-/**
- * Shape notes for TS-family backends — wiring facts, not gating flags.
- * `trusted_proxy: false` (the test binary doesn't enable proxy parsing) and
- * `login_rate_limit: false` (the TS canonical path leaves the limiter null in
- * test mode); bearer auth is always wired. Documentation only — see
- * `BackendShapeNotes`.
- */
-export const ts_default_shape_notes: BackendShapeNotes = Object.freeze({
-	bearer_auth: true,
-	trusted_proxy: false,
-	login_rate_limit: false
-});
-
-/**
- * Shape notes for Rust-family backends — wiring facts, not gating flags. Adds
- * `trusted_proxy: true` (the Rust spine's client-IP middleware is always wired;
- * the env-gate only chooses XFF vs the TCP peer IP) and `login_rate_limit: true`
- * (env-gated bucket on `/login` + `/password`). Documentation only — see
- * `BackendShapeNotes`.
- */
-export const rust_default_shape_notes: BackendShapeNotes = Object.freeze({
-	bearer_auth: true,
-	trusted_proxy: true,
-	login_rate_limit: true
+	// hyper hands bytes pipelined after the upgrade request to the upgraded
+	// stream, where they wait for the read loop that starts at admission.
+	ws_handshake_pipelining: true,
+	// axum sends a refused upgrade's response as built, body included.
+	ws_refusal_body: true
 });
 
 /** Bootstrap block built from the default secrets + supplied paths. */
@@ -160,19 +207,24 @@ const build_default_bootstrap = (
 });
 
 export interface MakeDefaultTsBackendConfigOptions {
-	/** Diagnostic label; also used as the tmpdir prefix when `paths` is omitted. */
+	/** Diagnostic label; also names the tmpdir (`default_test_backend_paths`) when `paths` is omitted. */
 	readonly name: string;
 	/** TCP port the binary listens on. */
 	readonly port: number;
 	/** argv passed to the spawn (first entry is the binary). */
 	readonly start_command: ReadonlyArray<string>;
-	/** Defaults to `'memory://'` (in-memory PGlite). */
+	/** Defaults to `'memory://'` (in-memory pglet). */
 	readonly database_url?: string;
 	/** Merged on top of the generic env baseline; later keys win. */
 	readonly extra_env?: Readonly<Record<string, string>>;
-	/** Defaults to `ts_default_capabilities`. */
-	readonly capabilities?: BackendCapabilities;
-	/** Pre-computed paths; defaults to `build_test_backend_paths(name)`. */
+	/**
+	 * Every capability, stated: spread `ts_default_capabilities` and add each
+	 * `MountFlag` and the `testing_backdoors` list. Required, so a mount flag or
+	 * the backdoor list left out is a type error rather than a suite that
+	 * silently skips.
+	 */
+	readonly capabilities: BackendCapabilities;
+	/** Pre-computed paths; defaults to `default_test_backend_paths(name)`. */
 	readonly paths?: TestBackendPaths;
 	/** Override individual bootstrap fields (username/password/token). */
 	readonly bootstrap_overrides?: Partial<BackendBootstrapConfig>;
@@ -190,11 +242,20 @@ export interface MakeDefaultTsBackendConfigOptions {
 	 * `create_account` path (e.g. fuz_forge uses `'fuz_forge_session'`).
 	 */
 	readonly cookie_name?: string;
+	/**
+	 * Env var naming the directory the binary writes its daemon token under
+	 * (`{dir}/run/daemon_token`), e.g. `'MY_APP_DAEMON_TOKEN_DIR'`. Given, it
+	 * is set to the directory that layout puts the token at the bootstrap's
+	 * `daemon_token_path` (`to_daemon_token_dir`) — the file `spawn_backend`
+	 * reads — and a path in another layout throws. Omit it for a binary that
+	 * derives the path otherwise.
+	 */
+	readonly daemon_token_dir_env?: string;
 }
 
 /**
  * Shared builder for TS-family backends (Deno + Node). Owns the common
- * env baseline (NODE_ENV, HOST, PORT, in-memory PGlite, cookie keys,
+ * env baseline (NODE_ENV, HOST, PORT, in-memory pglet, cookie keys,
  * bootstrap token path) so per-backend factories only declare what
  * genuinely differs.
  */
@@ -207,55 +268,66 @@ export const make_default_ts_backend_config = (
 		start_command,
 		database_url = 'memory://',
 		extra_env,
-		capabilities = ts_default_capabilities,
-		paths = build_test_backend_paths(name),
+		capabilities,
+		paths = default_test_backend_paths(name),
 		bootstrap_overrides,
 		port_env_var = 'PORT',
-		cookie_name = 'fuz_session'
+		cookie_name = 'fuz_session',
+		daemon_token_dir_env
 	} = opts;
+	const bootstrap = build_default_bootstrap(paths, bootstrap_overrides);
 	return {
 		name,
 		start_command,
 		base_url: `http://localhost:${port}`,
-		rpc_path: '/api/rpc',
-		ws_path: '/api/ws',
+		rpc_path: SPINE_RPC_PATH,
+		ws_path: SPINE_WS_PATH,
 		health_path: '/health',
-		bootstrap_path: '/api/account/bootstrap',
+		bootstrap_path: SPINE_ACCOUNT_BOOTSTRAP_PATH,
 		cookie_name,
 		startup_timeout_ms: 30_000,
 		env: {
 			NODE_ENV: 'development',
-			HOST: 'localhost',
+			HOST: DEFAULT_TEST_BACKEND_HOST,
 			[port_env_var]: String(port),
 			DATABASE_URL: database_url,
 			SECRET_FUZ_COOKIE_KEYS: default_test_cookie_keys,
 			FUZ_ALLOWED_ORIGINS: 'http://localhost:*',
+			// any port, so a harness can spawn on whichever is free — a wildcard,
+			// which boots only with the opt-in
+			FUZ_ALLOW_ORIGIN_WILDCARDS: 'true',
 			FUZ_BOOTSTRAP_TOKEN_PATH: paths.bootstrap_token_path,
+			...daemon_token_dir_entry(daemon_token_dir_env, bootstrap),
 			...extra_env
 		},
-		bootstrap: build_default_bootstrap(paths, bootstrap_overrides),
+		bootstrap,
 		capabilities
 	};
 };
 
 export interface MakeDefaultRustBackendConfigOptions {
-	/** Diagnostic label; also used as the tmpdir prefix when `paths` is omitted. */
+	/** Diagnostic label; also names the tmpdir (`default_test_backend_paths`) when `paths` is omitted. */
 	readonly name: string;
 	/** TCP port the binary listens on. */
 	readonly port: number;
 	/** argv passed to the spawn (first entry is the binary). */
 	readonly start_command: ReadonlyArray<string>;
 	/**
-	 * Required — Rust needs real Postgres (PGlite isn't reachable from
+	 * Required — Rust needs real Postgres (an in-process WASM database isn't reachable from
 	 * `tokio-postgres`). Consumers typically supply
 	 * `'postgres://localhost/{repo}_test_{name}'`.
 	 */
 	readonly database_url: string;
 	/** Merged on top of the generic env baseline; later keys win. */
 	readonly extra_env?: Readonly<Record<string, string>>;
-	/** Defaults to `rust_default_capabilities`. */
-	readonly capabilities?: BackendCapabilities;
-	/** Pre-computed paths; defaults to `build_test_backend_paths(name)`. */
+	/**
+	 * Every capability, stated: spread `rust_default_capabilities` and add each
+	 * `MountFlag` and the `testing_backdoors` list. Required, so a mount flag or
+	 * the backdoor list left out is a type error rather than a suite that
+	 * silently skips.
+	 */
+	readonly capabilities: BackendCapabilities;
+	/** Pre-computed paths; defaults to `default_test_backend_paths(name)`. */
 	readonly paths?: TestBackendPaths;
 	/** Override individual bootstrap fields (username/password/token). */
 	readonly bootstrap_overrides?: Partial<BackendBootstrapConfig>;
@@ -276,6 +348,15 @@ export interface MakeDefaultRustBackendConfigOptions {
 	 * Must match the consumer's session config (see the TS builder's note).
 	 */
 	readonly cookie_name?: string;
+	/**
+	 * Env var naming the directory the binary writes its daemon token under
+	 * (`{dir}/run/daemon_token`), e.g. `'MY_APP_DAEMON_TOKEN_DIR'`. Given, it
+	 * is set to the directory that layout puts the token at the bootstrap's
+	 * `daemon_token_path` (`to_daemon_token_dir`) — the file `spawn_backend`
+	 * reads — and a path in another layout throws. Omit it for a binary that
+	 * derives the path otherwise.
+	 */
+	readonly daemon_token_dir_env?: string;
 }
 
 /**
@@ -293,41 +374,47 @@ export const make_default_rust_backend_config = (
 		start_command,
 		database_url,
 		extra_env,
-		capabilities = rust_default_capabilities,
-		paths = build_test_backend_paths(name),
+		capabilities,
+		paths = default_test_backend_paths(name),
 		bootstrap_overrides,
 		port_env_var = 'PORT',
 		rust_log = 'info',
-		cookie_name = 'fuz_session'
+		cookie_name = 'fuz_session',
+		daemon_token_dir_env
 	} = opts;
+	const bootstrap = build_default_bootstrap(paths, bootstrap_overrides);
 	return {
 		name,
 		start_command,
 		base_url: `http://localhost:${port}`,
-		rpc_path: '/api/rpc',
-		ws_path: '/api/ws',
+		rpc_path: SPINE_RPC_PATH,
+		ws_path: SPINE_WS_PATH,
 		health_path: '/health',
-		bootstrap_path: '/api/account/bootstrap',
+		bootstrap_path: SPINE_ACCOUNT_BOOTSTRAP_PATH,
 		cookie_name,
 		startup_timeout_ms: 120_000,
 		env: {
 			RUST_LOG: rust_log,
-			HOST: 'localhost',
+			HOST: DEFAULT_TEST_BACKEND_HOST,
 			[port_env_var]: String(port),
 			DATABASE_URL: database_url,
 			SECRET_FUZ_COOKIE_KEYS: default_test_cookie_keys,
 			FUZ_ALLOWED_ORIGINS: 'http://localhost:*',
+			// any port, so a harness can spawn on whichever is free — a wildcard,
+			// which boots only with the opt-in
+			FUZ_ALLOW_ORIGIN_WILDCARDS: 'true',
 			FUZ_BOOTSTRAP_TOKEN_PATH: paths.bootstrap_token_path,
 			// Self-wipe the auth-namespace schema before migrations on every
-			// boot. Read by `fuz_testing::reset_db_on_startup_if_env_set`,
-			// which the consumer's test binary invokes from its
-			// `pre_migration_hook` between pool creation and
+			// boot. Read by the hook `fuz_testing::startup_reset_hook` builds,
+			// which the consumer's test binary passes as its
+			// `pre_migration_hook`, run between pool creation and
 			// `fuz_db::run_migrations`. The `_testing_reset` RPC action
 			// (per-test reset) is orthogonal.
 			FUZ_TESTING_RESET_DB_ON_STARTUP: 'true',
+			...daemon_token_dir_entry(daemon_token_dir_env, bootstrap),
 			...extra_env
 		},
-		bootstrap: build_default_bootstrap(paths, bootstrap_overrides),
+		bootstrap,
 		capabilities
 	};
 };

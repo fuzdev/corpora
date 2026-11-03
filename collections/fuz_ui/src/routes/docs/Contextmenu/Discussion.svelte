@@ -1,8 +1,8 @@
 <script lang="ts">
-	import MdnLink from '$lib/MdnLink.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
 	import RootComponentSelector from './RootComponentSelector.svelte';
 </script>
 
@@ -15,15 +15,15 @@
 	</p>
 	<p>
 		Use <DeclarationLink name="ContextmenuRoot" /> by default for better performance and haptic
-		feedback. Use
-		<DeclarationLink name="ContextmenuRootForSafariCompatibility" />
-		only if you need iOS Safari support.
+		feedback. Use <DeclarationLink name="ContextmenuRootForSafariCompatibility" /> only if you need
+		iOS Safari support.
 	</p>
 	<h4>ContextmenuRoot</h4>
 	<ul>
 		<li>standard, default implementation</li>
 		<li>
-			relies on the browser's <MdnLink path="Web/API/Element/contextmenu_event">
+			relies on the browser's
+			<MdnLink path="Web/API/Element/contextmenu_event">
 				<span class="font_family_mono">contextmenu</span> event
 			</MdnLink>
 		</li>
@@ -33,8 +33,7 @@
 		</li>
 		<li>
 			does not work on iOS Safari until
-			<a href="https://bugs.webkit.org/show_bug.cgi?id=213953">WebKit bug #213953</a>
-			is fixed
+			<a href="https://bugs.webkit.org/show_bug.cgi?id=213953">WebKit bug #213953</a> is fixed
 		</li>
 	</ul>
 	<h4>ContextmenuRootForSafariCompatibility</h4>
@@ -48,9 +47,8 @@
 		</li>
 		<li>
 			degraded experience because some browsers (including mobile Chrome) block
-			<code>navigator.vibrate</code>
-			haptic feedback due to the timeout-based gesture detection (because it's not a direct user
-			action)
+			<code>navigator.vibrate</code> haptic feedback due to the timeout-based gesture detection
+			(because it's not a direct user action)
 		</li>
 		<li>works on all devices including iOS Safari</li>
 		<li>

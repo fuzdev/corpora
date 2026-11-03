@@ -8,7 +8,7 @@ import type { PathId } from '@fuzdev/fuz_util/path.ts';
 import { each_concurrent, map_concurrent } from '@fuzdev/fuz_util/async.ts';
 import { fs_search } from '@fuzdev/fuz_util/fs.ts';
 
-import { print_path, to_root_path } from './paths.ts';
+import { paths, print_path, to_root_path, to_search_filters_relative } from './paths.ts';
 import type { GroConfig } from './gro_config.ts';
 import { load_default_svelte_config, type ParsedSvelteConfig } from './svelte_config.ts';
 import { load_modules, type LoadModulesFailure, type ModuleMeta } from './modules.ts';
@@ -19,13 +19,16 @@ import {
 	type ResolvedInputFile,
 	type ResolvedInputPath
 } from './input_path.ts';
-import type { Filer } from './filer.ts';
 import type { InvokeTask } from './task.ts';
 
 export const GEN_FILE_PATTERN_TEXT = 'gen';
 export const GEN_FILE_PATTERN = '.' + GEN_FILE_PATTERN_TEXT + '.';
 
-export const is_gen_path = (path: string): boolean => path.includes(GEN_FILE_PATTERN);
+/**
+ * Tests whether a path names a genfile by its file name,
+ * so a directory like `my.gen.x/` doesn't make every file under it a genfile.
+ */
+export const is_gen_path = (path: string): boolean => basename(path).includes(GEN_FILE_PATTERN);
 
 export interface GenResult {
 	origin_id: PathId;
@@ -38,16 +41,29 @@ export interface GenFile {
 	format: boolean;
 }
 
-export type GenDependencies = 'all' | GenDependenciesConfig | GenDependenciesResolver;
-
-export interface GenDependenciesConfig {
-	patterns?: Array<RegExp>;
-	files?: Array<PathId>;
-}
-
-export type GenDependenciesResolver = (
-	ctx: GenContext
-) => GenDependenciesConfig | 'all' | null | Promise<GenDependenciesConfig | 'all' | null>;
+/**
+ * What a genfile reads besides its imports, so `gro dev` reruns it when one changes:
+ * `'all'` for every change the dev watch reports,
+ * or files and patterns that add to its imports.
+ * Plain data, read from the genfile's `gen` export.
+ * `gro dev` sees changes only under `GroConfig.watch.dir` (default `src/`),
+ * so an input outside it is declared but doesn't trigger a rerun.
+ */
+export type GenInputs =
+	| 'all'
+	| {
+			/**
+			 * Exact paths, relative to the project root or absolute, possibly outside the root.
+			 */
+			files?: Array<string>;
+			/**
+			 * Gitignore-syntax patterns anchored at the project root, like a root `.gitignore`,
+			 * so `*.json` matches at any depth, `/package.json` only at the root,
+			 * and `!` excludes a file an earlier pattern matched.
+			 * They match only files inside the root.
+			 */
+			patterns?: Array<string>;
+	  };
 
 export type Gen = GenFunction | GenConfig;
 
@@ -56,7 +72,11 @@ export type GenFunction = (ctx: GenContext) => RawGenResult | Promise<RawGenResu
 // TODO add a GenConfigRaw variant and change `normalize_gen_config` to `gen_cook_config`
 export interface GenConfig {
 	generate: GenFunction;
-	dependencies?: GenDependencies;
+	/**
+	 * What the genfile reads besides its imports.
+	 * Changes to its imports and to the genfile itself always rerun it.
+	 */
+	inputs?: GenInputs;
 	// TODO think about what could be added
 	// cache?: boolean;
 }
@@ -68,7 +88,6 @@ export interface GenContext {
 	 * never pay to read the SvelteKit config.
 	 */
 	svelte_config: Promise<ParsedSvelteConfig>;
-	filer: Filer;
 	log: Logger;
 	timings: Timings;
 	invoke_task: InvokeTask;
@@ -80,40 +99,25 @@ export interface GenContext {
 	 * The `origin_id` relative to the root dir.
 	 */
 	origin_path: string;
-	/**
-	 * The file that triggered dependency checking.
-	 * Only available when resolving dependencies dynamically.
-	 * `undefined` during actual generation.
-	 */
-	changed_file_id: PathId | undefined;
 }
 
 /**
  * The `GenContext` values that are the same for every genfile in a run,
  * as opposed to the per-genfile ones `create_gen_context` derives.
  */
-export type GenContextBase = Pick<
-	GenContext,
-	'config' | 'filer' | 'log' | 'timings' | 'invoke_task'
->;
+export type GenContextBase = Pick<GenContext, 'config' | 'log' | 'timings' | 'invoke_task'>;
 
 /**
- * Builds a `GenContext` for one genfile, so generating and resolving dependencies
- * see the same context - notably the lazy `svelte_config`, which is a getter
- * rather than a value so a genfile that ignores it never resolves it.
+ * Builds a `GenContext` for one genfile, with a lazy `svelte_config`
+ * that's a getter rather than a value so a genfile that ignores it never resolves it.
  */
-export const create_gen_context = (
-	base: GenContextBase,
-	origin_id: PathId,
-	changed_file_id?: PathId
-): GenContext => ({
+export const create_gen_context = (base: GenContextBase, origin_id: PathId): GenContext => ({
 	...base,
 	get svelte_config() {
 		return load_default_svelte_config();
 	},
 	origin_id,
-	origin_path: to_root_path(origin_id),
-	changed_file_id
+	origin_path: to_root_path(origin_id)
 });
 
 // TODO consider other return data - metadata? effects? non-file build artifacts?
@@ -301,7 +305,6 @@ export const write_gen_results = async (
 
 export interface FoundGenfiles {
 	resolved_input_files: Array<ResolvedInputFile>;
-	resolved_input_files_by_root_dir: Map<PathId, Array<ResolvedInputFile>>;
 	resolved_input_paths: Array<ResolvedInputPath>;
 }
 
@@ -317,19 +320,20 @@ export type FindGenfilesFailure =
 			type: 'input_directories_with_no_files';
 			input_directories_with_no_files: Array<InputPath>;
 			resolved_input_files: Array<ResolvedInputFile>;
-			resolved_input_files_by_root_dir: Map<PathId, Array<ResolvedInputFile>>;
 			resolved_input_paths: Array<ResolvedInputPath>;
 			reasons: Array<string>;
 	  };
 
 /**
  * Finds modules from input paths. (see `input_path.ts` for more)
+ * @param root - the project root `config.search_filters` test paths relative to
  */
 export const find_genfiles = async (
 	input_paths: Array<InputPath>,
 	root_dirs: Array<PathId>,
 	config: GroConfig,
-	timings?: Timings
+	timings?: Timings,
+	root: PathId = paths.root
 ): Promise<FindGenfilesResult> => {
 	const extensions: Array<string> = [GEN_FILE_PATTERN];
 
@@ -357,16 +361,12 @@ export const find_genfiles = async (
 
 	// Find all of the files for any directories.
 	const timing_to_fs_search = timings?.start('find files');
-	const {
-		resolved_input_files,
-		resolved_input_files_by_root_dir,
-		input_directories_with_no_files
-	} = await resolve_input_files(
+	const { resolved_input_files, input_directories_with_no_files } = await resolve_input_files(
 		resolved_input_paths,
 		async (id) =>
 			await fs_search(id, {
-				filter: config.search_filters,
-				file_filter: (p) => extensions.some((e) => p.includes(e))
+				filter: to_search_filters_relative(config.search_filters, root, id),
+				file_filter: is_gen_path
 			})
 	);
 	timing_to_fs_search?.();
@@ -378,7 +378,6 @@ export const find_genfiles = async (
 			type: 'input_directories_with_no_files',
 			input_directories_with_no_files,
 			resolved_input_files,
-			resolved_input_files_by_root_dir,
 			resolved_input_paths,
 			reasons: input_directories_with_no_files.map((input_path) =>
 				st('red', `Input directory contains no matching files: ${print_path(input_path)}`)
@@ -390,7 +389,6 @@ export const find_genfiles = async (
 		ok: true,
 		value: {
 			resolved_input_files,
-			resolved_input_files_by_root_dir,
 			resolved_input_paths
 		}
 	};

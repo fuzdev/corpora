@@ -1,13 +1,13 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import TomeContent from '$lib/TomeContent.svelte';
-	import Details from '$lib/Details.svelte';
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import Details from '#lib/Details.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
 
 	const TOME_SLUG = 'Details';
 
@@ -19,8 +19,7 @@
 		<p>
 			The <DeclarationLink name="Details" /> component is an alternative to the
 			<MdnLink path="Web/HTML/Element/details" /> element. By default it's lazy, and you can pass
-			<code>eager</code>
-			to render the children immediately like the base element.
+			<code>eager</code> to render the children immediately like the base element.
 		</p>
 		<p>Benefits of lazy children:</p>
 		<ul>

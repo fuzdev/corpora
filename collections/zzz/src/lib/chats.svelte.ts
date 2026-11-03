@@ -1,19 +1,18 @@
 import { z } from 'zod';
 import { page } from '$app/state';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { Chat, ChatJson, type ChatJsonInput } from './chat.svelte.ts';
-import { HANDLED } from './cell_helpers.ts';
+import { create_collection_decoder } from './cell_helpers.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
 import { create_single_index, create_derived_index } from './indexed_collection_helpers.svelte.ts';
 import { to_reordered_list } from './list_helpers.ts';
 import { get_unique_name } from './helpers.ts';
-import { to_chats_url } from './nav_helpers.ts';
+import { goto_unless_current, to_chats_url } from './nav.ts';
 import { chat_template_defaults } from './config_defaults.ts';
 import type { ChatTemplate } from './chat_template.ts';
 import { CellJson } from './cell_types.ts';
-import { goto_unless_current } from './navigation_helpers.ts';
 
 export const ChatsJson = CellJson.extend({
 	items: z.array(ChatJson).default(() => []),
@@ -28,11 +27,11 @@ export interface ChatsOptions extends CellOptions<typeof ChatsJson> {}
 
 export class Chats extends Cell<typeof ChatsJson> {
 	readonly items: IndexedCollection<Chat> = new IndexedCollection({
+		dispose_item: (chat) => chat.dispose(),
 		indexes: [
 			create_single_index({
 				key: 'by_name',
-				extractor: (chat) => chat.name,
-				query_schema: z.string()
+				extractor: (chat) => chat.name
 			}),
 
 			create_derived_index({
@@ -73,24 +72,25 @@ export class Chats extends Cell<typeof ChatsJson> {
 		super(ChatsJson, options);
 
 		this.decoders = {
-			// TODO @many improve this API, maybe infer or create a helper, duplicated many places
-			items: (items) => {
-				if (Array.isArray(items)) {
-					this.items.clear();
-					for (const item_json of items) {
-						this.add(item_json);
-					}
-				}
-				return HANDLED;
-			}
+			items: create_collection_decoder(
+				() => this.items.clear(),
+				(json) => this.add(json)
+			)
 		};
 
 		// Initialize explicitly after all properties are defined
 		this.init();
 	}
 
+	/**
+	 * Adds a chat. Without a `name` it gets a unique default one that
+	 * auto-naming may replace; a given `name` is kept unless `json.autoname`
+	 * says otherwise.
+	 */
 	add(json?: ChatJsonInput, select?: boolean): Chat {
-		const j = !json?.name ? { ...json, name: this.generate_unique_name('new chat') } : json;
+		const j = !json?.name
+			? { ...json, name: this.generate_unique_name('new chat') }
+			: { autoname: false, ...json };
 		const chat = new Chat({ app: this.app, json: j });
 		return this.add_chat(chat, select);
 	}
@@ -105,6 +105,35 @@ export class Chats extends Cell<typeof ChatsJson> {
 			void this.select(chat.id);
 		}
 		return chat;
+	}
+
+	/**
+	 * Duplicates `chat` with a unique name and fresh, empty threads for the same
+	 * models — no threads or turns are shared with the original. The duplicate's
+	 * selected thread mirrors the original's by position, and it inherits
+	 * `autoname`, so auto-naming leaves its name alone unless the original's
+	 * was still a default one.
+	 * Threads whose model can't be found are skipped.
+	 *
+	 * @param chat - the chat to duplicate
+	 * @returns the new chat, unselected
+	 */
+	duplicate(chat: Chat): Chat {
+		const now = get_datetime_now();
+		const new_chat = this.add_chat(
+			chat.clone({
+				name: this.generate_unique_name(to_duplicate_base_name(chat.name, this.items_by_name)),
+				created: now,
+				updated: now,
+				thread_ids: [],
+				selected_thread_id: null
+			})
+		);
+		const { threads, selected_thread } = chat;
+		for (const thread of threads) {
+			if (thread.model) new_chat.add_thread(thread.model, thread === selected_thread);
+		}
+		return new_chat;
 	}
 
 	add_many(chats_json: Array<ChatJsonInput>, select?: boolean | number): Array<Chat> {
@@ -127,19 +156,36 @@ export class Chats extends Cell<typeof ChatsJson> {
 		return chats;
 	}
 
+	/**
+	 * Removes a chat, along with its threads unless another chat still has them —
+	 * which cancels their in-flight completions and removes their turns' parts.
+	 */
 	remove(id: Uuid): void {
-		const removed = this.items.remove(id);
-		if (removed && id === this.#selected_id) {
-			void this.select_next();
-		}
+		this.remove_many([id]);
 	}
 
+	/**
+	 * Removes chats — see `remove`.
+	 *
+	 * @returns the number of chats removed
+	 */
 	remove_many(ids: Array<Uuid>): number {
-		// Remove the chats
+		const thread_ids: Array<Uuid> = [];
+		for (const id of ids) {
+			const chat = this.items.by_id.get(id);
+			if (chat) thread_ids.push(...chat.thread_ids);
+		}
+
 		const removed_count = this.items.remove_many(ids);
+		this.app.threads.remove_unreferenced(thread_ids);
+
+		// nav links fall back to the last selected chat, which may be gone now
+		if (this.selected_id_last_non_null !== null && ids.includes(this.selected_id_last_non_null)) {
+			this.selected_id_last_non_null = null;
+		}
 
 		// If the selected chat was removed, select a new one
-		if (this.#selected_id !== null && ids.includes(this.#selected_id)) {
+		if (removed_count && this.#selected_id !== null && ids.includes(this.#selected_id)) {
 			void this.select_next();
 		}
 
@@ -189,4 +235,21 @@ export class Chats extends Cell<typeof ChatsJson> {
 	}
 }
 
-export const ChatsSchema = z.instanceof(Chats);
+/**
+ * Gets the base name to number a duplicate from, so duplicating `my chat 2`
+ * yields `my chat 3` rather than `my chat 2 2`. The numeric suffix is only
+ * stripped when the base name is itself an existing chat, so names that merely
+ * end in a number (like `gpt 4`) are kept whole.
+ *
+ * @param name - the name of the chat being duplicated
+ * @param existing_names - the names of existing chats
+ * @returns the base name for `get_unique_name`
+ */
+export const to_duplicate_base_name = (
+	name: string,
+	existing_names: { has: (name: string) => boolean }
+): string => {
+	if (!name) return 'new chat';
+	const base = name.replace(/ \d+$/, '');
+	return base !== name && existing_names.has(base) ? base : name;
+};

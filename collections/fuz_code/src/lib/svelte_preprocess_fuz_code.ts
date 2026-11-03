@@ -46,19 +46,26 @@ export interface PreprocessFuzCodeOptions {
 
 /**
  * Svelte preprocessor that compiles static `Code` component content at build time,
- * replacing runtime syntax highlighting with pre-rendered HTML.
+ * replacing runtime syntax styling with pre-rendered HTML.
  *
  * @param options - `PreprocessFuzCodeOptions` configuration
  * @returns a Svelte preprocessor group
  *
  * @example
  * ```ts
- * // svelte.config.js
+ * // vite.config.ts
+ * import {defineConfig} from 'vite';
+ * import {sveltekit} from '@sveltejs/kit/vite';
+ * import {vitePreprocess} from '@sveltejs/vite-plugin-svelte';
  * import {svelte_preprocess_fuz_code} from '@fuzdev/fuz_code/svelte_preprocess_fuz_code.ts';
  *
- * export default {
- *   preprocess: [svelte_preprocess_fuz_code(), vitePreprocess()],
- * };
+ * export default defineConfig({
+ *   plugins: [
+ *     sveltekit({
+ *       preprocess: [svelte_preprocess_fuz_code(), vitePreprocess()],
+ *     }),
+ *   ],
+ * });
  * ```
  */
 export const svelte_preprocess_fuz_code = (
@@ -72,8 +79,8 @@ export const svelte_preprocess_fuz_code = (
 		on_error = process.env.CI === 'true' ? 'throw' : 'log'
 	} = options;
 
-	// In-memory cache: content+lang hash → highlighted HTML
-	const highlight_cache: Map<string, string> = new Map();
+	// In-memory cache: content+lang hash → styled HTML
+	const stylize_cache: Map<string, string> = new Map();
 
 	return {
 		name: 'fuz-code',
@@ -102,7 +109,7 @@ export const svelte_preprocess_fuz_code = (
 
 			// Find Code component usages with static content
 			const transformations = find_code_usages(ast, syntax_styler, code_names, {
-				cache: cache ? highlight_cache : null,
+				cache: cache ? stylize_cache : null,
 				on_error,
 				filename,
 				source: content,
@@ -141,10 +148,10 @@ interface FindCodeUsagesOptions {
 }
 
 /**
- * Attempts to highlight content, using cache if available.
- * Returns the highlighted HTML, or `null` on error.
+ * Attempts to style content, using the cache if available.
+ * Returns the styled HTML, or `null` on error.
  */
-const try_highlight = (
+const try_stylize = (
 	text: string,
 	lang: string,
 	syntax_styler: SyntaxStyler,
@@ -207,7 +214,7 @@ const find_code_usages = (
 			// Try simple static string
 			const content_value = extract_static_string(content_attr.value, options.bindings);
 			if (content_value !== null) {
-				const html = try_highlight(content_value, lang_value, syntax_styler, options);
+				const html = try_stylize(content_value, lang_value, syntax_styler, options);
 				if (html === null || html === content_value) return;
 				transformations.push({
 					start: content_attr.start,
@@ -224,14 +231,14 @@ const find_code_usages = (
 				options.bindings
 			);
 			if (chain) {
-				// Highlight all branches
-				const highlighted: Array<{ html: string; original: string }> = [];
+				// Style all branches
+				const styled: Array<{ html: string; original: string }> = [];
 				let any_changed = false;
 				for (const branch of chain) {
-					const html = try_highlight(branch.value, lang_value, syntax_styler, options);
+					const html = try_stylize(branch.value, lang_value, syntax_styler, options);
 					if (html === null) return;
 					if (html !== branch.value) any_changed = true;
-					highlighted.push({ html, original: branch.value });
+					styled.push({ html, original: branch.value });
 				}
 				if (!any_changed) return;
 
@@ -241,7 +248,7 @@ const find_code_usages = (
 				let expr = '';
 				for (let i = 0; i < chain.length; i++) {
 					const branch = chain[i]!;
-					const html = highlighted[i]!.html;
+					const html = styled[i]!.html;
 					if (branch.test_source !== null) {
 						expr += `${branch.test_source} ? '${escape_js_string(html)}' : `;
 					} else {

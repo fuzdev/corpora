@@ -3,7 +3,7 @@
  */
 import { describe, test, assert, beforeEach, afterEach, vi } from 'vitest';
 
-import ContextmenuRoot from '$lib/ContextmenuRoot.svelte';
+import ContextmenuRoot from '#lib/ContextmenuRoot.svelte';
 import {
 	unmount_component,
 	create_contextmenu_event,
@@ -14,7 +14,7 @@ import {
 	mount_contextmenu_root,
 	setup_contextmenu_attachment
 } from './contextmenu_test_helpers.ts';
-import { CONTEXTMENU_DEFAULT_BYPASS_WINDOW } from '$lib/contextmenu_helpers.ts';
+import { CONTEXTMENU_DEFAULT_BYPASS_WINDOW } from '#lib/contextmenu_helpers.ts';
 
 // ResizeObserver is not currently available in jsdom
 class ResizeObserverMock {

@@ -1,6 +1,6 @@
 import { test, assert, describe } from 'vitest';
 
-import { csp_directive_specs, csp_directive_spec_by_name, type CspDirective } from '$lib/csp.ts';
+import { csp_directive_specs, csp_directive_spec_by_name, type CspDirective } from '#lib/csp.ts';
 
 // `csp_directive_specs` is consumed by the fuz_ui docs page (src/routes/docs/csp/+page.svelte).
 // These tests protect that public metadata: structural soundness and absence of cycles.

@@ -11,9 +11,9 @@
 import { test, assert, describe } from 'vitest';
 import { join } from 'node:path';
 
-import { analyze } from '$lib/analyze.ts';
-import type { SourceFileInfo } from '$lib/source.ts';
-import { createSourceOptions } from '$lib/source-config.ts';
+import { analyze } from '#lib/analyze.ts';
+import type { SourceFileInfo } from '#lib/source.ts';
+import { createSourceOptions } from '#lib/source-config.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -501,7 +501,11 @@ let {label}: {label: string} = $props();
 
 		await withTestProject(files, async (projectRoot) => {
 			const { sourceFiles, sourceOptions } = setupAnalysis(projectRoot, files);
-			const { modules, diagnostics } = await analyze({ sourceFiles, sourceOptions });
+			const { modules, diagnostics } = await analyze({
+				sourceFiles,
+				sourceOptions,
+				onDuplicates: 'diagnostic'
+			});
 
 			const barrel = modules.find((m) => m.path === 'barrel.ts')!;
 			assert.deepStrictEqual(barrel.reExports, [
@@ -615,6 +619,28 @@ export const Foo = 1;
 			assert.deepStrictEqual(indexModule.starExports, []);
 			// no declarations synthesized for any of these
 			assert.deepStrictEqual(indexModule.declarations, []);
+		});
+	});
+
+	test('a value and a type-only star over one target record it once', async () => {
+		const files = {
+			'node_modules/extpkg/package.json': `{"name": "extpkg", "version": "1.0.0", "main": "./index.js", "types": "./index.d.ts"}`,
+			'node_modules/extpkg/index.d.ts': `export declare const ext: number;\n`,
+			'node_modules/extpkg/index.js': `export const ext = 1;\n`,
+			'src/lib/b.ts': `export const b = 1;\n`,
+			'src/lib/index.ts': `export * from './b.ts';\nexport type * from './b.ts';\nexport * from 'extpkg';\nexport type * from 'extpkg';\n`
+		};
+
+		await withTestProject(files, async (projectRoot) => {
+			const { sourceFiles, sourceOptions } = setupAnalysis(projectRoot, {
+				'src/lib/b.ts': files['src/lib/b.ts'],
+				'src/lib/index.ts': files['src/lib/index.ts']
+			});
+			const { modules } = await analyze({ sourceFiles, sourceOptions });
+
+			const indexModule = modules.find((m) => m.path === 'index.ts')!;
+			assert.deepStrictEqual(indexModule.starExports, ['b.ts']);
+			assert.deepStrictEqual(indexModule.externalStarExports, ['extpkg']);
 		});
 	});
 

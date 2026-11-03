@@ -1,3 +1,8 @@
+<!--
+@component
+
+@cssprop --max_width - maximum width of the summary
+-->
 <script lang="ts">
 	import { page } from '$app/state';
 	import type { Snippet } from 'svelte';

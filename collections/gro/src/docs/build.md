@@ -2,6 +2,9 @@
 
 > these docs are for production builds, for development see [dev.md](dev.md)
 
+> Where it's going: on the [runtime](runtime.md), builds keep this command and its cache,
+> with Vite as a confined subprocess until Gro bundles on its own host.
+
 ## usage
 
 The `gro build` task produces outputs for production:
@@ -20,19 +23,25 @@ forwarding any [`-- vite [...]` args](https://vitejs.dev/config/):
 gro build -- vite --config my-config.js
 ```
 
-### sync and install
+### sync, install, and gen
 
 By default, `gro build` runs `gro sync` before building
-to generate code and update `package.json` exports,
-and installs packages if needed:
+(an install unless `--no-install`, `svelte-kit sync`, and `package.json` exports),
+then `gro gen`:
 
 ```bash
-gro build               # runs sync + install + build
+gro build               # runs sync + install + gen + build
 gro build --no-sync     # skip sync step
 gro build --no-install  # skip package install
+gro build --no-gen      # skip gen
 ```
 
 Note: `--no-sync` is ignored if install runs (install requires sync to generate exports).
+
+If the install changes the installed version of Gro or any of its dependencies,
+the build stops with an error naming them, and re-running the command continues
+with the new versions. The running process already loaded the old versions,
+so carrying on would mix old and new modules.
 
 ## build caching
 
@@ -40,13 +49,28 @@ Gro caches builds to skip expensive rebuilds when nothing has changed.
 
 ### cache key
 
-The cache key has two components:
+The cache key has these components:
 
-- **git commit hash** - tracks code, dependencies, and config files
+- **git commit hash** - tracks committed code, `package.json`, the lockfile, and config files
 - **`build_cache_config` hash** - optional, for tracking external inputs like environment variables
   or feature flags (see [cache configuration](#cache-configuration))
+- **Gro version** - from the running Gro's `package.json`
+- **Node version** - `process.version`
+- **installed packages** - a hash of `node_modules/.package-lock.json`,
+  the hidden lockfile npm rewrites when it changes what's installed
 
-The cache invalidates when either component changes.
+The cache invalidates when any component changes.
+
+The installed-packages hash catches a re-resolved `npm install` that leaves
+the committed lockfile alone. It misses:
+
+- setups without `node_modules/.package-lock.json` in the project root, like other package
+  managers or an npm workspace member (npm writes the file at the workspace root);
+  without the file the component is `null` and installed-package drift goes undetected
+- edits made directly inside `node_modules`, like copying a locally built package over an installed one
+- a Gro rebuilt in place without a version change, like a linked development checkout
+
+Use `--force_build` after any of these.
 
 When the cache is valid:
 
@@ -94,6 +118,8 @@ For reliable caching:
 - **commit before building for production** - cache requires a clean workspace
 - **use `build_cache_config` for external inputs** - environment variables,
   remote configs, or feature flags that affect the build but aren't in git
+- **use `--force_build` after editing `node_modules` by hand** - the cache key
+  sees npm's record of what's installed, not the files
 - **use `gro check --workspace` in CI** - enforces clean git state before building
 - **avoid concurrent builds** - multiple simultaneous `gro build` processes can conflict
 
@@ -116,6 +142,7 @@ This usually indicates a plugin or build step is incorrectly modifying source fi
 ```
 
 This ensures build reproducibility and prevents plugins from corrupting source code.
+`gro build --allow_dirty` skips the check.
 
 ### CI/CD integration
 
@@ -135,7 +162,7 @@ gro build              # build (uses cache if valid)
 Cache not working as expected?
 
 - **workspace must be clean** - check `git status`
-- **enable debug logging** - `LOG_LEVEL=debug gro build`
+- **enable debug logging** - `PUBLIC_LOG_LEVEL=debug gro build`
 - **corrupted cache** - delete `.gro/build.json` and rebuild
 - **platform differences** - add platform/arch to `build_cache_config`
 - **non-deterministic builds** - builds with timestamps/UUIDs/random data invalidate cache every run
@@ -172,7 +199,9 @@ export default {
 } satisfies GroConfig;
 ```
 
-The config is hashed and never logged to protect sensitive values.
+The config is hashed and never logged, and only the hash is stored.
+The hash hides only high-entropy values, so see
+[security considerations](config.md#security-considerations) before including secrets.
 Any change triggers a rebuild.
 
 See [config.md](config.md#build_cache_config) for more details on `build_cache_config`.
@@ -202,7 +231,7 @@ See [`build.task.ts`](../lib/build.task.ts) for integration with the build pipel
 > implementation details for advanced debugging
 
 The build cache ([`src/lib/build_cache.ts`](../lib/build_cache.ts)) validates builds are current
-by tracking git commits and optional user config.
+by tracking git commits, optional user config, the Gro and Node versions, and the installed packages.
 
 ### how caching works
 
@@ -217,7 +246,7 @@ flowchart TD
 
     Dirty -->|yes| Load{cache exists?}
     Load -->|no| Rebuild
-    Load -->|yes| Keys{git commit +<br/>config match?}
+    Load -->|yes| Keys{cache key<br/>matches?}
 
     Keys -->|no| Rebuild
     Keys -->|yes| Valid{files valid?}
@@ -251,15 +280,18 @@ The `.gro/build.json` file stores:
 
 ```json
 {
-	"version": "1", // schema version
+	"version": "2", // schema version
 	"git_commit": "abc123...", // commit at build time
-	"build_cache_config_hash": "...", // SHA-256 of user config
+	"build_cache_config_hash": "...", // BLAKE3 of user config
+	"gro_version": "...", // version of the Gro that ran the build
+	"node_version": "v24.0.0", // process.version
+	"package_lock_hash": "...", // BLAKE3 of node_modules/.package-lock.json, null when missing
 	"timestamp": "ISO-8601", // build completion time
 	"outputs": [
 		// all output files with hashes and stats
 		{
 			"path": "build/index.html",
-			"hash": "...", // SHA-256 of file contents
+			"hash": "...", // BLAKE3 of file contents
 			"size": 1024, // file size in bytes
 			"mtime": 1729512000000, // modification time (ms since epoch)
 			"ctime": 1729512000000, // change/creation time (ms since epoch)
@@ -282,13 +314,14 @@ The `.gro/build.json` file stores:
 The cache validates builds through several checks:
 
 1. load `.gro/build.json` - missing/corrupt = rebuild
-2. check version = "1" - mismatch = rebuild
+2. check version = "2" - mismatch = rebuild
 3. compare git commit - different = rebuild
 4. compare config hash - different = rebuild
-5. verify files exist - missing = rebuild
-6. check file sizes - mismatch = rebuild (fast path optimization)
-7. hash files in parallel - mismatch = rebuild
-8. all pass = use cache
+5. compare Gro version, Node version, and installed-packages hash - different = rebuild
+6. verify files exist - missing = rebuild
+7. check file sizes - mismatch = rebuild (fast path optimization)
+8. hash files in parallel - mismatch = rebuild
+9. all pass = use cache
 
 The hashing is usually fast but adds overhead proportional to output size.
 
@@ -302,7 +335,7 @@ The cache automatically discovers all build output directories:
 
 Within these directories:
 
-- **regular files** - hashed with SHA-256 and validated on cache checks
+- **regular files** - hashed with BLAKE3 and validated on cache checks
 - **symlinks** - skipped (not hashed or tracked)
 - **directories** - recursively scanned for regular files
 
@@ -311,13 +344,15 @@ while avoiding issues with symlink handling across platforms.
 
 ### security
 
-The cache uses SHA-256 cryptographic hashing for:
+The cache uses BLAKE3 hashing for:
 
-- **output file integrity** - detects tampering or corruption
-- **config protection** - `build_cache_config` is hashed, never logged raw (may contain secrets)
+- **output file integrity** - detects corruption and edits to outputs
+- **config change detection** - `build_cache_config` is stored only as a hash and never logged raw;
+  the hash is unkeyed, so it hides only high-entropy values
+  (see [security considerations](config.md#security-considerations))
 - **cache key stability** - deterministic hashes ensure consistent cache behavior
 
-Hashes are computed via Node's `webcrypto.subtle.digest()`.
+Hashes are computed with `hash_blake3` from `@fuzdev/fuz_util`.
 
 ## plugins
 

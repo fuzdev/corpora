@@ -2,12 +2,16 @@
 
 import { test, describe, beforeEach, assert } from 'vitest';
 import { z } from 'zod';
-import { create_uuid, UuidWithDefault, type Uuid } from '@fuzdev/fuz_util/id.ts';
-import { DatetimeNow } from '@fuzdev/fuz_util/datetime.ts';
+import {
+	create_uuid,
+	DatetimeNow,
+	type Uuid,
+	UuidWithDefault
+} from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Sortable, type Sorter, sort_by_text, sort_by_numeric } from '$lib/sortable.svelte.ts';
-import { Cell } from '$lib/cell.svelte.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
+import { Sortable, type Sorter, sort_by_text, sort_by_numeric } from '#lib/sortable.svelte.ts';
+import { Cell } from '#lib/cell.svelte.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -76,14 +80,10 @@ describe('Sortable', () => {
 
 	describe('constructor', () => {
 		test('initializes with default values', () => {
-			const sortable = new Sortable(
-				() => items,
-				() => sorters
-			);
+			const sortable = new Sortable(() => sorters);
 
 			const first_sorter = sorters[0];
 			assert.isDefined(first_sorter);
-			assert.strictEqual(sortable.items, items);
 			assert.strictEqual(sortable.sorters, sorters);
 			assert.strictEqual(sortable.active_key, first_sorter.key);
 			assert.strictEqual(sortable.active_sorter, first_sorter);
@@ -92,7 +92,6 @@ describe('Sortable', () => {
 
 		test('uses default key when provided', () => {
 			const sortable = new Sortable(
-				() => items,
 				() => sorters,
 				() => 'value'
 			);
@@ -106,7 +105,6 @@ describe('Sortable', () => {
 
 		test('falls back to first sorter when default key is invalid', () => {
 			const sortable = new Sortable(
-				() => items,
 				() => sorters,
 				() => 'invalid_key'
 			);
@@ -118,10 +116,7 @@ describe('Sortable', () => {
 		});
 
 		test('handles empty sorters array', () => {
-			const sortable = new Sortable(
-				() => items,
-				() => []
-			);
+			const sortable = new Sortable(() => []);
 
 			assert.strictEqual(sortable.active_key, '');
 			assert.ok(sortable.active_sorter === undefined);
@@ -132,10 +127,7 @@ describe('Sortable', () => {
 	describe('update_active_key', () => {
 		test('updates key when sorters change', () => {
 			let current_sorters = $state([...sorters]);
-			const sortable = new Sortable(
-				() => items,
-				() => current_sorters
-			);
+			const sortable = new Sortable(() => current_sorters);
 
 			const first_sorter = sorters[0];
 			assert.isDefined(first_sorter);
@@ -154,10 +146,7 @@ describe('Sortable', () => {
 
 		test('preserves active key if still valid after sorters change', () => {
 			let current_sorters = [...sorters];
-			const sortable = new Sortable(
-				() => items,
-				() => current_sorters
-			);
+			const sortable = new Sortable(() => current_sorters);
 
 			const sorter_at_1 = sorters[1];
 			const sorter_at_2 = sorters[2];
@@ -179,11 +168,7 @@ describe('Sortable', () => {
 		test('sorts text values in ascending order', () => {
 			const sorter_0 = sorters[0];
 			assert.isDefined(sorter_0);
-			const sortable = new Sortable(
-				() => items,
-				() => [sorter_0]
-			);
-			const sorted = sortable.sorted_items;
+			const sorted = [...items].sort(sorter_0.fn);
 
 			const item0 = sorted[0];
 			const item1 = sorted[1];
@@ -207,11 +192,7 @@ describe('Sortable', () => {
 		test('sorts text values in descending order', () => {
 			const sorter_1 = sorters[1];
 			assert.isDefined(sorter_1);
-			const sortable = new Sortable(
-				() => items,
-				() => [sorter_1]
-			);
-			const sorted = sortable.sorted_items;
+			const sorted = [...items].sort(sorter_1.fn);
 
 			const item0 = sorted[0];
 			const item1 = sorted[1];
@@ -237,11 +218,7 @@ describe('Sortable', () => {
 		test('sorts numeric values in ascending order', () => {
 			const sorter_2 = sorters[2];
 			assert.isDefined(sorter_2);
-			const sortable = new Sortable(
-				() => items,
-				() => [sorter_2]
-			);
-			const sorted = sortable.sorted_items;
+			const sorted = [...items].sort(sorter_2.fn);
 
 			const item0 = sorted[0];
 			const item1 = sorted[1];
@@ -261,11 +238,7 @@ describe('Sortable', () => {
 		test('sorts numeric values in descending order', () => {
 			const sorter_3 = sorters[3];
 			assert.isDefined(sorter_3);
-			const sortable = new Sortable(
-				() => items,
-				() => [sorter_3]
-			);
-			const sorted = sortable.sorted_items;
+			const sorted = [...items].sort(sorter_3.fn);
 
 			const item0 = sorted[0];
 			const item1 = sorted[1];
@@ -291,11 +264,7 @@ describe('Sortable', () => {
 			];
 
 			const equal_sorter = sort_by_numeric<TestCell>('value', 'Value', 'value');
-			const sortable = new Sortable(
-				() => equal_items,
-				() => [equal_sorter]
-			);
-			const sorted = sortable.sorted_items;
+			const sorted = [...equal_items].sort(equal_sorter.fn);
 
 			const item0 = sorted[0];
 			const item1 = sorted[1];
@@ -312,48 +281,14 @@ describe('Sortable', () => {
 	});
 
 	describe('reactivity', () => {
-		test('updates sorted_items when source items change', () => {
-			// Need a reactive reference to items that we can update
-			let current_items = $state([...items]);
-			const sortable = new Sortable(
-				() => current_items,
-				() => sorters
-			);
+		test('the active sorter follows active_key', () => {
+			const sortable = new Sortable(() => sorters);
+			assert.strictEqual(sortable.active_sort_fn, sorters[0]?.fn);
 
-			// Start with 4 items
-			assert.strictEqual(sortable.sorted_items.length, 4);
-
-			// Add a new item
-			const new_item = new TestCell(app, create_uuid(), 'Dragonfruit', 25, 50);
-
-			// Update the items array reference so the derived getter gets the new value
-			current_items = [...current_items, new_item];
-
-			// Now we should see 5 items
-			assert.strictEqual(sortable.sorted_items.length, 5);
-			assert.ok(sortable.sorted_items.some((item) => item.cid === 50));
-		});
-
-		test('updates when active_key changes', () => {
-			const sortable = new Sortable(
-				() => items,
-				() => sorters
-			);
-
-			const first_item = sortable.sorted_items[0];
-			assert.isDefined(first_item);
-
-			// Initially sorted by name (first sorter)
-			assert.strictEqual(first_item.name, 'Apple');
-
-			// Change to sort by value
 			sortable.active_key = 'value';
 
-			const first_item_after = sortable.sorted_items[0];
-			assert.isDefined(first_item_after);
-
-			// Should now be sorted by value
-			assert.strictEqual(first_item_after.value, 5);
+			assert.strictEqual(sortable.active_sorter, sorters[2]);
+			assert.strictEqual(sortable.active_sort_fn, sorters[2]?.fn);
 		});
 	});
 });

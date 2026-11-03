@@ -15,9 +15,8 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, Username } from '../primitive_schemas.ts';
 
-import { Username } from '../primitive_schemas.ts';
 import { Password } from './password.ts';
 import type { RouteSpec } from '../http/route_spec.ts';
 import {
@@ -54,6 +53,7 @@ export const bootstrap_route_shape = {
 	method: 'POST',
 	path: '/bootstrap',
 	auth: { account: 'none', actor: 'none' },
+	mints_credential: true,
 	description: 'Create initial keeper account (one-shot)',
 	transaction: false, // bootstrap_account manages its own transaction
 	input: BootstrapInput,

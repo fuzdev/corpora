@@ -33,6 +33,9 @@
 
 	const docs_links = docs_links_context.get();
 
+	// the tag renders through `svelte:element`, so declare it for fuz_css extraction
+	// @fuz-elements h2 h3 h4
+
 	// Auto-detect tag based on depth if not explicitly provided
 	const depth = section_depth_context.get();
 	const final_tag = $derived(tag ?? (depth === 1 ? 'h2' : depth === 2 ? 'h3' : 'h4'));

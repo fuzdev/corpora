@@ -1,18 +1,17 @@
 import { z } from 'zod';
 import { page } from '$app/state';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { Prompt, PromptJson, type PromptJsonInput } from './prompt.svelte.ts';
-import { HANDLED } from './cell_helpers.ts';
+import { create_collection_decoder } from './cell_helpers.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
 import { create_single_index, create_derived_index } from './indexed_collection_helpers.svelte.ts';
 import { to_reordered_list } from './list_helpers.ts';
-import type { PartUnion } from './part.svelte.ts';
+import type { DiskfilePath } from './diskfile_types.ts';
 import { get_unique_name } from './helpers.ts';
-import { to_prompts_url } from './nav_helpers.ts';
+import { goto_unless_current, to_prompts_url } from './nav.ts';
 import { CellJson } from './cell_types.ts';
-import { goto_unless_current } from './navigation_helpers.ts';
 
 export const PromptsJson = CellJson.extend({
 	items: z.array(PromptJson).default(() => []),
@@ -27,19 +26,17 @@ export interface PromptsOptions extends CellOptions<typeof PromptsJson> {}
 export class Prompts extends Cell<typeof PromptsJson> {
 	// Initialize items with proper typing and unified indexes
 	readonly items: IndexedCollection<Prompt> = new IndexedCollection({
+		dispose_item: (prompt) => prompt.dispose(),
 		indexes: [
 			create_single_index({
 				key: 'by_name',
-				extractor: (prompt) => prompt.name,
-				query_schema: z.string()
+				extractor: (prompt) => prompt.name
 			}),
 
 			create_derived_index({
 				key: 'recent_prompts',
-				compute: (collection) =>
-					collection.values
-						.slice()
-						.sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime()),
+				compute: (collection) => collection.values,
+				sort: (a, b) => new Date(b.created).getTime() - new Date(a.created).getTime(),
 				onadd: (items, item) => {
 					// Insert at the right position based on creation date
 					const index = items.findIndex(
@@ -85,24 +82,24 @@ export class Prompts extends Cell<typeof PromptsJson> {
 		super(PromptsJson, options);
 
 		this.decoders = {
-			// TODO @many improve this API, maybe infer or create a helper, duplicated many places
-			items: (items) => {
-				if (Array.isArray(items)) {
-					this.items.clear();
-					for (const item_json of items) {
-						this.add(item_json);
-					}
-				}
-				return HANDLED;
-			}
+			items: create_collection_decoder(
+				() => this.items.clear(),
+				(json) => this.add(json)
+			)
 		};
 
 		this.init();
 	}
 
-	filter_by_part(part: PartUnion): Array<Prompt> {
-		const { id } = part;
-		return this.ordered_items.filter((p) => p.parts.some((b) => b.id === id)); // TODO add an index?
+	/**
+	 * The prompts with a diskfile part for `path`. A prompt owns its part
+	 * instances, so a file is matched by path, not by part identity.
+	 */
+	filter_by_diskfile_path(path: DiskfilePath): Array<Prompt> {
+		// TODO add an index?
+		return this.ordered_items.filter((prompt) =>
+			prompt.parts.some((part) => part.type === 'diskfile' && part.path === path)
+		);
 	}
 
 	add(json?: PromptJsonInput): Prompt {
@@ -135,14 +132,20 @@ export class Prompts extends Cell<typeof PromptsJson> {
 		return prompts;
 	}
 
+	/**
+	 * Removes a prompt, disposing it with its parts — see `remove_many`.
+	 */
 	remove(prompt: Prompt): void {
-		const removed = this.items.remove(prompt.id);
-		if (removed && prompt.id === this.selected_id) {
-			void this.select_next();
-		}
+		this.remove_many([prompt.id]);
 	}
 
 	// TODO @many look into making these more generic, less manual bookkeeping
+	/**
+	 * Removes prompts, selecting another if the selected one went, and forgetting
+	 * the last selected one if it went.
+	 *
+	 * @returns the number of prompts removed
+	 */
 	remove_many(prompt_ids: Array<Uuid>): number {
 		// Store the current selected id
 		const current_selected = this.selected_id;
@@ -150,8 +153,16 @@ export class Prompts extends Cell<typeof PromptsJson> {
 		// Remove the prompts
 		const removed_count = this.items.remove_many(prompt_ids);
 
+		// nav links fall back to the last selected prompt, which may be gone now
+		if (
+			this.selected_id_last_non_null !== null &&
+			prompt_ids.includes(this.selected_id_last_non_null)
+		) {
+			this.selected_id_last_non_null = null;
+		}
+
 		// If the selected prompt was removed, select a new one
-		if (current_selected !== null && prompt_ids.includes(current_selected)) {
+		if (removed_count && current_selected !== null && prompt_ids.includes(current_selected)) {
 			void this.select_next();
 		}
 
@@ -179,11 +190,6 @@ export class Prompts extends Cell<typeof PromptsJson> {
 		this.items.indexes.manual_order = to_reordered_list(this.ordered_items, from_index, to_index);
 	}
 
-	remove_part(part_id: Uuid): void {
-		if (!this.selected) return;
-		this.selected.remove_part(part_id);
-	}
-
 	/**
 	 * Toggles the visibility of sort controls in the prompts list.
 	 */
@@ -191,5 +197,3 @@ export class Prompts extends Cell<typeof PromptsJson> {
 		this.show_sort_controls = value;
 	}
 }
-
-export const PromptsSchema = z.instanceof(Prompts);

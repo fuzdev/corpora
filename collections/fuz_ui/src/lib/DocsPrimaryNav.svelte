@@ -45,7 +45,7 @@
 	.scrolled {
 		box-shadow: var(--shadow_bottom_xs)
 			color-mix(
-				in hsl,
+				in oklab,
 				var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha_30),
 				transparent
 			);

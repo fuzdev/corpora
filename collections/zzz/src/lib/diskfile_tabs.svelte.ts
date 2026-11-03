@@ -2,7 +2,7 @@
 
 import { z } from 'zod';
 import { SvelteMap } from 'svelte/reactivity';
-import { create_uuid, Uuid } from '@fuzdev/fuz_util/id.ts';
+import { create_uuid, Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
@@ -26,7 +26,16 @@ export type DiskfileTabsJsonInput = z.input<typeof DiskfileTabsJson>;
 export type DiskfileTabsOptions = CellOptions<typeof DiskfileTabsJson>;
 
 /**
- * Manages tabs for diskfiles in the editor with preview behavior.
+ * How many closed tabs `DiskfileTabs` remembers, both for reopening
+ * (`recently_closed_tabs`) and for back/forward navigation to them
+ * (`closed_tab_diskfiles`) — the oldest are forgotten first.
+ */
+export const DISKFILE_TABS_CLOSED_MAX = 50;
+
+/**
+ * Manages tabs for diskfiles in the editor with preview behavior. A diskfile
+ * has at most one tab (`by_diskfile_id`): opening, previewing, reopening, and
+ * navigating back to a file that's open select its tab.
  */
 export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	selected_tab_id: Uuid | null = $state.raw()!;
@@ -35,7 +44,10 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	recent_tab_ids: Array<Uuid> = $state.raw()!;
 	max_tab_history: number = $state.raw()!;
 
-	items: IndexedCollection<DiskfileTab> = new IndexedCollection();
+	items: IndexedCollection<DiskfileTab> = new IndexedCollection({
+		// closed tabs kept in `recently_closed_tabs` are only read for their `diskfile_id`
+		dispose_item: (tab) => tab.dispose()
+	});
 
 	/**
 	 * Map for looking up tabs by their associated diskfile_id.
@@ -95,10 +107,13 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 		return result;
 	});
 
-	/** Recently closed tabs for potential reopening. */
+	/** Recently closed tabs for potential reopening, oldest first, at most `DISKFILE_TABS_CLOSED_MAX`. */
 	recently_closed_tabs: Array<DiskfileTab> = $state([]);
 
-	/** Map of closed tab ids to their diskfile ids - used for browser navigation. */
+	/**
+	 * Map of closed tab ids to their diskfile ids - used for browser navigation.
+	 * Holds the `DISKFILE_TABS_CLOSED_MAX` most recently closed.
+	 */
 	readonly closed_tab_diskfiles: SvelteMap<Uuid, Uuid> = new SvelteMap();
 
 	constructor(options: DiskfileTabsOptions) {
@@ -145,7 +160,6 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	 * Sets the selected tab.
 	 */
 	select_tab(tab_id: Uuid): void {
-		console.log('DiskfileTabs.select_tab', { tab_id });
 		this.selected_tab_id = tab_id;
 		this.#update_tab_history(tab_id);
 	}
@@ -227,7 +241,9 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 			}
 
 			// Update the tab content
+			const previous_diskfile_id = current_preview.diskfile_id;
 			current_preview.diskfile_id = diskfile_id;
+			this.#notify_if_detached(previous_diskfile_id);
 
 			return { tab: current_preview, is_new: false };
 		}
@@ -248,8 +264,6 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	 * If a preview tab for this file already exists, it just selects it.
 	 */
 	preview_diskfile(diskfile_id: Uuid): DiskfileTab {
-		console.log('DiskfileTabs.preview_diskfile', { diskfile_id });
-
 		const previously_selected_id = this.selected_tab_id;
 		const previous_preview_diskfile_id = this.preview_tab?.diskfile_id;
 		const { tab, is_new } = this.#get_or_create_tab(diskfile_id, 'preview');
@@ -277,8 +291,6 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	 * If the file is already in a preview tab, promotes it to permanent.
 	 */
 	open_diskfile(diskfile_id: Uuid): DiskfileTab {
-		console.log('DiskfileTabs.open_diskfile', { diskfile_id });
-
 		const { tab } = this.#get_or_create_tab(diskfile_id, 'permanent');
 
 		// Select the tab
@@ -293,7 +305,6 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	 * @returns true if a tab was promoted, false otherwise
 	 */
 	promote_preview_to_permanent(): boolean {
-		console.log('DiskfileTabs.promote_preview_to_permanent');
 		if (this.preview_tab_id) {
 			this.preview_tab_id = null;
 			return true;
@@ -305,12 +316,11 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 	 * Closes a tab by id.
 	 */
 	close_tab(tab_id: Uuid): void {
-		console.log('DiskfileTabs.close_tab', { tab_id });
 		const tab_to_close = this.items.by_id.get(tab_id);
 		if (!tab_to_close) return;
 
 		// Remember the diskfile id for this tab in case we navigate back to it
-		this.closed_tab_diskfiles.set(tab_id, tab_to_close.diskfile_id);
+		this.#remember_closed_tab(tab_id, tab_to_close.diskfile_id);
 
 		const was_selected = tab_id === this.selected_tab_id;
 		const was_preview = tab_id === this.preview_tab_id;
@@ -341,7 +351,7 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 		}
 
 		// Store a copy for reopening later
-		this.recently_closed_tabs.push(tab_to_close);
+		this.#push_recently_closed([tab_to_close]);
 
 		// Remove tab from collections and state
 		this.tab_order = this.tab_order.filter((id) => id !== tab_id);
@@ -354,85 +364,143 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 		if (was_preview) {
 			this.preview_tab_id = null;
 		}
+
+		this.#notify_if_detached(tab_to_close.diskfile_id);
 	}
 
 	/**
-	 * Navigates to a tab by id. If the tab doesn't exist but was previously closed,
-	 * creates a preview tab for that diskfile.
+	 * Adds closed tabs to the reopen stack (`recently_closed_tabs`, the last
+	 * reopened first), forgetting the oldest past `DISKFILE_TABS_CLOSED_MAX`.
+	 */
+	#push_recently_closed(closed: Array<DiskfileTab>): void {
+		this.recently_closed_tabs.push(...closed);
+		const excess = this.recently_closed_tabs.length - DISKFILE_TABS_CLOSED_MAX;
+		if (excess > 0) this.recently_closed_tabs.splice(0, excess);
+	}
+
+	/** Records a closed tab for back/forward navigation, forgetting the oldest past the cap. */
+	#remember_closed_tab(tab_id: Uuid, diskfile_id: Uuid): void {
+		const map = this.closed_tab_diskfiles;
+		// re-inserted so the map stays in closing order
+		map.delete(tab_id);
+		map.set(tab_id, diskfile_id);
+		while (map.size > DISKFILE_TABS_CLOSED_MAX) {
+			const oldest = map.keys().next();
+			if (oldest.done) break;
+			map.delete(oldest.value);
+		}
+	}
+
+	/**
+	 * Tells `Diskfiles` when a diskfile has no tab left, so one kept only for its
+	 * tab (deleted on disk with unsaved edits) can be released.
+	 */
+	#notify_if_detached(diskfile_id: Uuid): void {
+		if (!this.by_diskfile_id.has(diskfile_id)) {
+			this.app.diskfiles.handle_diskfile_detached(diskfile_id);
+		}
+	}
+
+	/**
+	 * Navigates to a tab by id. If the tab doesn't exist but was previously
+	 * closed, selects its diskfile's tab if the file is open again, else
+	 * previews the diskfile.
 	 *
 	 * @param tab_id - the tab id to navigate to
-	 * @returns object containing the resulting tab id and a boolean indicating if a new tab was created
+	 * @returns the id of the resulting tab, `null` for an unknown tab
 	 */
-	navigate_to_tab(tab_id: Uuid): { resulting_tab_id: Uuid | null; created_preview: boolean } {
-		console.log('DiskfileTabs.navigate_to_tab', { tab_id });
-
+	navigate_to_tab(tab_id: Uuid): Uuid | null {
 		// If the tab still exists, just select it
 		if (this.items.by_id.has(tab_id)) {
 			this.select_tab(tab_id);
-			return { resulting_tab_id: tab_id, created_preview: false };
+			return tab_id;
 		}
 
-		// If the tab was closed but we know what diskfile it pointed to, create a preview
+		// If the tab was closed but we know what diskfile it pointed to, select or preview it
 		const diskfile_id = this.closed_tab_diskfiles.get(tab_id);
-		if (diskfile_id) {
-			// Create a new preview tab for this diskfile
-			const preview_tab = this.preview_diskfile(diskfile_id);
-			return { resulting_tab_id: preview_tab.id, created_preview: true };
+		if (!diskfile_id) return null;
+		const open_tab = this.by_diskfile_id.get(diskfile_id);
+		if (open_tab) {
+			this.select_tab(open_tab.id);
+			return open_tab.id;
 		}
-
-		// Tab doesn't exist and we don't know what diskfile it was for
-		return { resulting_tab_id: null, created_preview: false };
+		return this.preview_diskfile(diskfile_id).id;
 	}
 
 	/**
-	 * Opens (makes permanent) a tab by id.
+	 * Opens a tab by id: makes it permanent if it's the preview tab, and selects it.
+	 * No-op for an unknown tab.
 	 */
 	open_tab(tab_id: Uuid): void {
-		console.log('DiskfileTabs.open_tab', { tab_id });
+		if (!this.items.by_id.has(tab_id)) return;
 		if (tab_id === this.preview_tab_id) {
 			this.preview_tab_id = null;
 		}
+		this.select_tab(tab_id);
 	}
 
 	/**
 	 * Reorders tabs by dragging.
 	 */
 	reorder_tabs(from_index: number, to_index: number): void {
-		console.log('DiskfileTabs.reorder_tabs', { from_index, to_index });
 		this.tab_order = to_reordered_list(this.tab_order, from_index, to_index);
 	}
 
 	/**
-	 * Reopens the last closed tab.
+	 * Reopens the most recently closed tab whose file isn't open, as a
+	 * permanent tab, and selects it. Like VS Code's "reopen closed editor", a
+	 * closed tab whose file is open again (in any tab) is skipped and dropped,
+	 * so a reopen never duplicates a tab.
+	 *
+	 * @returns the reopened tab, or `null` when there's none to reopen
 	 */
-	reopen_last_closed_tab(): void {
-		console.log('DiskfileTabs.reopen_last_closed_tab');
-		if (this.recently_closed_tabs.length > 0) {
-			const tab_to_reopen = this.recently_closed_tabs.pop();
-			if (tab_to_reopen) {
-				// Recreate the tab with the same properties
-				const new_tab = this.#create_tab(tab_to_reopen.diskfile_id);
+	reopen_last_closed_tab(): DiskfileTab | null {
+		let closed_tab: DiskfileTab | undefined;
+		while ((closed_tab = this.recently_closed_tabs.pop())) {
+			if (this.by_diskfile_id.has(closed_tab.diskfile_id)) continue;
+			const new_tab = this.#create_tab(closed_tab.diskfile_id);
+			this.select_tab(new_tab.id);
+			return new_tab;
+		}
+		return null;
+	}
 
-				// Always select the reopened tab
-				this.selected_tab_id = new_tab.id;
-				this.#update_tab_history(new_tab.id);
-			}
+	/**
+	 * Removes every trace of a diskfile that no longer exists: closes its tab
+	 * (selection moves as with `close_tab`) and drops it from the reopen and
+	 * back-navigation history, so neither can resurrect a tab pointing at it.
+	 */
+	remove_diskfile(diskfile_id: Uuid): void {
+		const tab = this.by_diskfile_id.get(diskfile_id);
+		if (tab) this.close_tab(tab.id);
+
+		this.recently_closed_tabs = this.recently_closed_tabs.filter(
+			(tab) => tab.diskfile_id !== diskfile_id
+		);
+		const closed_tab_ids: Array<Uuid> = [];
+		for (const [tab_id, closed_diskfile_id] of this.closed_tab_diskfiles) {
+			if (closed_diskfile_id === diskfile_id) closed_tab_ids.push(tab_id);
+		}
+		for (const tab_id of closed_tab_ids) {
+			this.closed_tab_diskfiles.delete(tab_id);
 		}
 	}
 
 	/**
-	 * Closes all tabs.
+	 * Closes all tabs. Like VS Code's "close all editors", they join the
+	 * reopen stack on top of the earlier closed tabs — pushed last-to-first,
+	 * so reopening them one by one restores their order.
 	 */
 	close_all_tabs(): void {
-		console.log('DiskfileTabs.close_all_tabs');
+		const closed = this.ordered_tabs;
 
 		// Remember diskfile ids for all tabs before clearing
-		for (const tab of this.ordered_tabs) {
-			this.closed_tab_diskfiles.set(tab.id, tab.diskfile_id);
+		for (const tab of closed) {
+			this.#remember_closed_tab(tab.id, tab.diskfile_id);
 		}
 
 		// Store all tabs for potential reopening
-		this.recently_closed_tabs = [...this.ordered_tabs];
+		this.#push_recently_closed([...closed].reverse());
 
 		// Clear all state
 		this.selected_tab_id = null;
@@ -441,8 +509,10 @@ export class DiskfileTabs extends Cell<typeof DiskfileTabsJson> {
 		this.recent_tab_ids = [];
 
 		// Clear all tabs
+		const diskfile_ids = new Set(this.items.values.map((tab) => tab.diskfile_id));
 		this.items.clear();
+		for (const diskfile_id of diskfile_ids) {
+			this.#notify_if_detached(diskfile_id);
+		}
 	}
 }
-
-export const DiskfileTabsSchema = z.instanceof(DiskfileTabs);

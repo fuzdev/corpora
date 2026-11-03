@@ -5,7 +5,7 @@ import { describe, test, assert, vi, afterEach } from 'vitest';
 import { flushSync } from 'svelte';
 
 import './dialog_test_helpers.ts'; // polyfills `<dialog>` modal methods for jsdom
-import Dialog from '$lib/Dialog.svelte';
+import Dialog from '#lib/Dialog.svelte';
 import { mount_component, unmount_component, create_mouse_event } from './test_helpers.ts';
 
 let mounted: { instance: any; container: HTMLElement } | null = null;

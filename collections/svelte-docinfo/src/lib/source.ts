@@ -1,12 +1,9 @@
 /**
- * Source file type predicates and path helpers.
- *
- * Pure functions for detecting file types by extension and extracting
- * component names from paths. No configuration dependency — these are
- * the building blocks used by `source-config.ts`.
+ * Source file shapes (`SourceFileInfo`, `AnalyzerType`), extension predicates,
+ * and svelte2tsx virtual-path and generated-name helpers. No configuration
+ * dependency; the building blocks under `source-config.ts`.
  *
  * @see `source-config.ts` for configuration-aware functions (`isSource`, `extractPath`, etc.)
- * @see `analyze.ts` for consumers (`analyze`, `analyzeFromFiles`)
  *
  * @module
  */
@@ -27,22 +24,26 @@ export type AnalyzerType = 'typescript' | 'svelte' | 'css' | 'json';
  * Provides file content to analysis functions from any source:
  * file system, build pipeline, or in-memory.
  *
- * Note: `content` is required to keep analysis functions pure (no hidden I/O).
- * Callers are responsible for reading file content before analysis.
+ * Note: `content` is required so callers control what the checker sees for
+ * the files they supply. Files they don't (context-closure files,
+ * `node_modules`, other unowned imports) are read from disk.
  */
 export interface SourceFileInfo {
-	/** Absolute path to the file. */
+	/**
+	 * Absolute path to the file. Native paths are fine at the boundary — ids
+	 * are posixified at ingest (see `paths.ts`).
+	 */
 	id: string;
-	/** File content (required - analysis functions don't read from disk). */
+	/** File content (required — the checker sees this, not the disk, for ingested files). */
 	content: string;
 	/**
 	 * Pre-resolved absolute file paths of modules this file imports.
 	 *
 	 * **Opt-in optimization** — when supplied, the session treats this as the
 	 * authoritative dependency set for the file and skips its own lex+resolve
-	 * pass for this entry. Build-tool integrations (e.g., Gro's filer) that
-	 * already maintain a dependency graph can hand it over directly instead of
-	 * paying the lex+resolve cost twice.
+	 * pass for this entry. Build-tool integrations that already maintain a
+	 * dependency graph can hand it over directly instead of paying the
+	 * lex+resolve cost twice.
 	 *
 	 * **Omit (undefined) → default behavior** — the session lexes import
 	 * specifiers from `content` and resolves them via its `ImportResolver`.
@@ -60,21 +61,22 @@ export interface SourceFileInfo {
 	 * supply this field own the correctness of the graph they hand over.
 	 *
 	 * Type-only imports (`import type {...}`) are the most common asymmetry
-	 * versus the lex+resolve path: the default lex (`es-module-lexer`) keeps
-	 * them; pre-resolved callers backed by a Gro-style filer typically drop
-	 * them. Both are intentional within their respective contracts.
+	 * versus the lex+resolve path: the default lex (`lexImports`) keeps
+	 * type-only imports and re-exports; pre-resolved callers backed by a
+	 * build tool's import graph often drop them. Both are intentional within
+	 * their respective contracts.
 	 *
 	 * Cache semantics: the session compares this array element-wise (shallow
 	 * equality) against the snapshot stored from the prior call — a fresh
 	 * array with identical contents cache-hits, while any length, element, or
 	 * order difference invalidates. Callers that produce fresh arrays per
-	 * call (e.g., Gro's `[...filer.dependencies.keys()]`) reuse the cache
-	 * cleanly across persistent-session calls.
+	 * call (e.g., `[...dependencies.keys()]` from a graph's `Map`) reuse the
+	 * cache cleanly across persistent-session calls.
 	 *
 	 * Order is significant. Reordering without a content change is treated
 	 * as a real change — sort upstream if you want order-insensitive caching.
-	 * Map-iteration-order callers (e.g., a Gro filer emitting
-	 * `[...filer.dependencies.keys()]`) are naturally stable across calls for
+	 * Map-iteration-order callers (e.g., a module graph emitting
+	 * `[...dependencies.keys()]`) are naturally stable across calls for
 	 * the same content, so no defensive sort is needed there.
 	 */
 	dependencies?: ReadonlyArray<string>;
@@ -84,7 +86,7 @@ export interface SourceFileInfo {
  * Default analyzer resolver based on file extension.
  *
  * - `.svelte` → `'svelte'`
- * - `.ts`, `.js` → `'typescript'`
+ * - `.ts`, `.mts`, `.tsx` (not `.d.ts`/`.d.mts`), `.js`, `.mjs`, `.jsx` → `'typescript'`
  * - `.css` → `'css'`
  * - `.json` → `'json'`
  * - Other extensions → `null` (skip)
@@ -109,14 +111,24 @@ export const getDefaultAnalyzer = (path: string): AnalyzerType | null => {
 export const getComponentName = (modulePath: string): string =>
 	modulePath.replace(/^.*\//, '').replace(/\.svelte$/, '');
 
+const TYPESCRIPT_EXTENSIONS = ['.ts', '.mts', '.tsx'];
+const JAVASCRIPT_EXTENSIONS = ['.js', '.mjs', '.jsx'];
+
 /**
- * Check if a path is a TypeScript or JS file.
+ * Check if a path is a TypeScript or JS file: `.ts`, `.mts`, `.tsx`, `.js`,
+ * `.mjs`, or `.jsx`.
  *
- * Includes both `.ts` and `.js` files since JS files are valid in TS projects.
- * Excludes `.d.ts` declaration files — use a custom `getAnalyzerType` to include them.
+ * JS files count since JS is valid in TS projects; the analysis program reads
+ * them with `allowJs` forced on (see `createAnalysisLanguageService`).
+ * CommonJS extensions (`.cjs`, `.cts`) are left out, since CommonJS exports
+ * aren't modeled (`commonjs_unsupported`). Excludes `.d.ts` and `.d.mts`
+ * declaration files — use a custom `getAnalyzerType` to include them.
  */
 export const isTypescript = (path: string): boolean =>
-	(path.endsWith('.ts') && !path.endsWith('.d.ts')) || path.endsWith('.js');
+	JAVASCRIPT_EXTENSIONS.some((ext) => path.endsWith(ext)) ||
+	(TYPESCRIPT_EXTENSIONS.some((ext) => path.endsWith(ext)) &&
+		!path.endsWith('.d.ts') &&
+		!path.endsWith('.d.mts'));
 
 /** Check if a path is a Svelte component file. */
 export const isSvelte = (path: string): boolean => path.endsWith('.svelte');
@@ -166,10 +178,20 @@ export const SVELTE_COMPONENT_ALIAS_SUFFIX = '__SvelteComponent_';
 
 /**
  * Whether a symbol name is an internal svelte2tsx identifier — a generated
- * name that must not appear in documentation output: `$$ComponentProps`,
- * `$$render`, `__sveltets_Render`, and the synthesized component class/type
- * alias `<ComponentName>__SvelteComponent_`. Building block for
+ * name that never documents as a declaration: `$$ComponentProps`, `$$render`,
+ * `__sveltets_Render`, and the synthesized component class/type alias
+ * `<ComponentName>__SvelteComponent_`. Building block for
  * `isSvelte2tsxGeneratedExport`, which adds the `default` slot.
+ *
+ * Beyond export filtering, the `TypeJson` builder treats an alias with one of
+ * these names declared in a Svelte virtual or svelte2tsx's shims as no alias
+ * at all (`linkableAliasSymbol` in `typescript-extract-type-json.ts`), so
+ * `$$ComponentProps` and `__sveltets_2_PropsWithChildren` never reach a tree
+ * and don't mask a project alias over them. Flat type strings are the
+ * checker's rendering and still carry these names
+ * (`Component<$$ComponentProps, {}, "">`,
+ * `__sveltets_2_IsomorphicComponent<…>`), as do terminal `text` nodes nested
+ * in them and the generic-component interface `$$IsomorphicComponent`.
  */
 export const isSvelte2tsxInternal = (name: string): boolean =>
 	name.startsWith('$$') ||

@@ -5,37 +5,85 @@
  * the `createEvents` callback, then feeds onOpen/onMessage/onClose with a fake
  * Hono context and a fake `WSContext`. Exercises: envelope parsing, batch
  * rejection, per-action auth, input validation, handler dispatch, DEV output
- * validation, socket-scoped notify, per-socket signal, transport bookkeeping.
+ * validation, socket-scoped notify, per-socket signal, registry bookkeeping,
+ * the message size cap, the per-account connection cap, the socket lifecycle
+ * hooks, self-revocation (reply before close), the drop of every frame on a
+ * socket the server closed, the frame queue while a socket is opening, the
+ * server heartbeat, and the per-action rate limit.
  *
  * @module
  */
 
 import { afterEach, describe, assert, test, vi } from 'vitest';
 import { Hono } from 'hono';
+import { WSContext } from 'hono/ws';
 import { z } from 'zod';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
+import { create_uuid } from '#lib/primitive_schemas.ts';
+import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
 
 import {
+	DEFAULT_WS_RECEIVE_TIMEOUT,
 	register_action_ws,
+	WS_RECEIVE_TIMEOUT_MAX
+} from '#lib/actions/register_action_ws.ts';
+import {
+	ERROR_DUPLICATE_REQUEST_ID,
+	MAX_INBOUND_DISPATCHES_PER_CONNECTION,
+	PRE_ADMISSION_QUEUE_BYTES_FACTOR,
+	WS_INBOUND_DISPATCH_OVERFLOW_MESSAGE,
 	type SocketCloseContext,
 	type SocketOpenContext
-} from '$lib/actions/register_action_ws.ts';
-import type { ActionContext } from '$lib/actions/action_rpc.ts';
-import type { ActionSpecUnion, RequestResponseActionSpec } from '$lib/actions/action_spec.ts';
-import { BackendWebsocketTransport } from '$lib/actions/transports_ws_backend.ts';
-import { WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT } from '$lib/actions/transports.ts';
-import { type CredentialType } from '$lib/hono_context.ts';
-import { JSONRPC_ERROR_CODES } from '$lib/http/jsonrpc_errors.ts';
-import { RateLimiter } from '$lib/rate_limiter.ts';
-import { create_stub_db } from '$lib/testing/stubs.ts';
+} from '#lib/actions/ws_socket_session.ts';
+import type { ActionContext } from '#lib/actions/action_types.ts';
+import type { ActionSpecUnion, RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
+import {
+	ConnectionRegistry,
+	DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT
+} from '#lib/actions/connection_registry.ts';
+import {
+	DEFAULT_WS_MAX_MESSAGE_BYTES,
+	WS_CLOSE_CONNECTION_LIMIT,
+	WS_CLOSE_CONNECTION_LIMIT_REASON,
+	WS_CLOSE_CONNECTION_UNREGISTERED_REASON,
+	WS_CLOSE_INTERNAL_ERROR,
+	WS_CLOSE_MESSAGE_TOO_BIG,
+	WS_CLOSE_POLICY_VIOLATION,
+	WS_CLOSE_PRE_ADMISSION_OVERFLOW_REASON,
+	WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT,
+	WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT_REASON,
+	WS_CLOSE_SESSION_REVOKED
+} from '#lib/actions/transports.ts';
+import type { BuiltinCredentialType } from '#lib/auth/credential_type_schema.ts';
+import { JSONRPC_ERROR_CODES } from '#lib/http/jsonrpc_errors.ts';
+import { ERROR_INSUFFICIENT_PERMISSIONS, ERROR_PARAMS_PROTO_KEY } from '#lib/http/error_schemas.ts';
+import { RateLimiter } from '#lib/rate_limiter.ts';
+import type { EffectErrorContext } from '#lib/http/pending_effects.ts';
+import { create_stub_db } from '#lib/testing/stubs.ts';
+import { create_test_audit_event } from '#lib/testing/entities.ts';
+import {
+	create_realtime_closer,
+	create_revocation_guard,
+	queue_connection_close
+} from '#lib/actions/connection_closer.ts';
+import { SessionId } from '#lib/auth/account_schema.ts';
+import { create_audit_emitter } from '#lib/auth/audit_emitter.ts';
+import type { AuditLogEvent } from '#lib/auth/audit_log_schema.ts';
+import { hash_session_token } from '#lib/auth/session_queries.ts';
 import {
 	create_fake_hono_context,
 	create_fake_ws,
 	create_stub_upgrade,
+	create_ws_test_harness,
 	dispatch_ws_message,
 	type FakeWs
-} from '$lib/testing/ws_round_trip.ts';
+} from '#lib/testing/ws_round_trip.ts';
+
+import {
+	ForeignRpcError,
+	SecondCopyThrownJsonrpcError
+} from '../http/thrown_jsonrpc_error_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 
@@ -99,7 +147,7 @@ const specs: Array<ActionSpecUnion> = [echo_spec, no_input_spec, keeper_spec, ro
 // --- harness -------------------------------------------------------------
 
 interface Harness {
-	transport: BackendWebsocketTransport;
+	registry: ConnectionRegistry;
 	fake: FakeWs;
 	/** Returns a promise for async hooks; existing callers can still ignore it. */
 	on_open: () => Promise<void>;
@@ -110,35 +158,39 @@ interface Harness {
 
 const build_harness = async (opts: {
 	handlers: Record<string, (input: unknown, ctx: ActionContext) => unknown>;
-	credential_type?: CredentialType;
+	credential_type?: BuiltinCredentialType;
 	role?: string;
-	artificial_delay?: number;
 	on_socket_open?: (ctx: SocketOpenContext) => void | Promise<void>;
 	on_socket_close?: (ctx: SocketCloseContext) => void | Promise<void>;
-	heartbeat?: boolean | { timeout?: number };
+	receive_timeout?: number | null;
 	actions?: Array<{
 		spec: ActionSpecUnion;
 		handler?: (input: unknown, ctx: ActionContext) => unknown;
 	}>;
 	action_ip_rate_limiter?: RateLimiter | null;
 	action_account_rate_limiter?: RateLimiter | null;
+	max_message_bytes?: number;
+	on_effect_error?: (error: unknown, context: EffectErrorContext) => void;
 }): Promise<Harness> => {
 	const stub = create_stub_upgrade();
 	const actions =
 		opts.actions ?? specs.map((spec) => ({ spec, handler: opts.handlers[spec.method] }));
 	const stub_db = create_stub_db();
-	const { transport } = register_action_ws({
+	const { registry } = register_action_ws({
 		path: '/ws',
+		connection_closer: null,
 		app: new Hono(),
 		upgradeWebSocket: stub.upgradeWebSocket,
+		allowed_origins: [],
 		actions,
 		db: stub_db,
-		artificial_delay: opts.artificial_delay,
 		on_socket_open: opts.on_socket_open,
 		on_socket_close: opts.on_socket_close,
-		heartbeat: opts.heartbeat ?? false,
-		action_ip_rate_limiter: opts.action_ip_rate_limiter,
-		action_account_rate_limiter: opts.action_account_rate_limiter,
+		receive_timeout: opts.receive_timeout ?? null,
+		action_ip_rate_limiter: opts.action_ip_rate_limiter ?? null,
+		action_account_rate_limiter: opts.action_account_rate_limiter ?? null,
+		max_message_bytes: opts.max_message_bytes,
+		on_effect_error: opts.on_effect_error,
 		log
 	});
 
@@ -150,7 +202,7 @@ const build_harness = async (opts: {
 	const fake = create_fake_ws();
 
 	return {
-		transport,
+		registry,
 		fake,
 		on_open: async () => {
 			await (events.onOpen?.(new Event('open'), fake.ws) as Promise<void> | void);
@@ -294,12 +346,16 @@ describe('register_action_ws', () => {
 		const stub = create_stub_upgrade();
 		const stub_db = create_stub_db();
 		register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/ws',
+			connection_closer: null,
 			app: new Hono(),
 			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
 			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
 			db: stub_db,
-			heartbeat: false,
+			receive_timeout: null,
 			log
 		});
 		const events = await stub.get_create_events()(
@@ -313,11 +369,69 @@ describe('register_action_ws', () => {
 		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.parse_error);
 	});
 
+	test('a result that cannot be serialized answers internal_error, and the dispatch does not reject', async () => {
+		// the adapter does not await `onMessage`, so a rejection here would be unhandled
+		const h = await build_harness({ handlers: { echo: () => ({ value: 1n }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 7, method: 'echo', params: { value: 'x' } });
+		assert.strictEqual(h.fake.sends.length, 1);
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 7);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.internal_error);
+	});
+
 	test('silently drops JSON-RPC notifications (method + no id)', async () => {
 		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
 		await h.on_open();
 		await h.on_message({ jsonrpc: '2.0', method: 'echo', params: { value: 'x' } });
 		assert.strictEqual(h.fake.sends.length, 0);
+	});
+
+	// Envelope version — a frame that does not carry `jsonrpc: '2.0'` is
+	// answered, not dropped. The Rust twin's `classify` checks the version
+	// first (version → id → method → params), so a versionless or 1.0 frame
+	// that would otherwise read as a notification is `invalid_request` there.
+	test('a frame without jsonrpc: 2.0 returns invalid_request, not a silent drop', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ method: 'echo', params: { value: 'x' } });
+		await h.on_message({ jsonrpc: '1.0', method: 'echo', params: { value: 'x' } });
+
+		assert.strictEqual(h.fake.sends.length, 2);
+		for (const sent of h.fake.sends) {
+			const res = parse_json(sent);
+			assert.strictEqual(res.id, null);
+			assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+		}
+	});
+
+	test('a versionless frame with a usable id echoes it', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '1.0', id: 4, method: 'echo', params: { value: 'x' } });
+
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 4);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	test('a non-object frame is invalid_request with id: null', async () => {
+		// A scalar frame carries no id to echo — reading it as its own id
+		// would answer `id: 5` to the frame `5`, where the Rust `classify`
+		// answers `id: null`.
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message(5);
+		// A raw string is passed through to the socket verbatim, so this is
+		// the JSON document `"echo"` — a string body, not a frame.
+		await h.on_message('"echo"');
+
+		assert.strictEqual(h.fake.sends.length, 2);
+		for (const sent of h.fake.sends) {
+			const res = parse_json(sent);
+			assert.strictEqual(res.id, null);
+			assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+		}
 	});
 
 	test('invalid envelope (not request, not notification) returns invalid_request', async () => {
@@ -327,6 +441,228 @@ describe('register_action_ws', () => {
 
 		const res = parse_json(h.fake.sends[0]!);
 		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	// Peer-response demux shape — the twin's `classify` routes a frame to
+	// its response arm only in the no-`method` branch, and only for a
+	// string/number id carrying exactly one of `result` / `error`. A looser
+	// demux swallows these hybrids, answering nothing where Rust answers.
+	test('a frame with method + result dispatches — it is a request, not a peer response', async () => {
+		const h = await build_harness({
+			handlers: {
+				echo: (input) => ({ value: `hi ${(input as { value: string }).value}` })
+			}
+		});
+		await h.on_open();
+		await h.on_message({
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'echo',
+			params: { value: 'world' },
+			result: {}
+		});
+
+		assert.strictEqual(h.fake.sends.length, 1);
+		const res = parse_json(h.fake.sends[0]!);
+		assert.deepStrictEqual(res, { jsonrpc: '2.0', id: 1, result: { value: 'hi world' } });
+	});
+
+	test('a frame carrying both result and error → invalid_request with the id echoed', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, result: 1, error: { code: -1, message: 'x' } });
+
+		assert.strictEqual(h.fake.sends.length, 1);
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 1);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	test('a response-shaped frame with a boolean id → invalid_request with id: null', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: true, result: 1 });
+
+		assert.strictEqual(h.fake.sends.length, 1);
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, null);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	// Non-string `method` — the twin reads `method` through
+	// `Value::as_str`, so a present-but-non-string `method` counts as
+	// absent and the frame takes the no-`method` branch of `classify`.
+	// The three cases below pin each arm of that branch.
+	test('a non-string method with a response shape demuxes as a peer response', async () => {
+		// Rust: `Classified::Response` → no pending request matches the id →
+		// dropped and audited, no frame. Reading `method: 123` as a request
+		// would answer `invalid_request` where the twin answers nothing.
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, method: 123, result: {} });
+
+		assert.strictEqual(h.fake.sends.length, 0);
+	});
+
+	test('a null method with an error shape demuxes as a peer response', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, method: null, error: { code: -1, message: 'x' } });
+
+		assert.strictEqual(h.fake.sends.length, 0);
+	});
+
+	test('a non-string method with no id → invalid_request, not a silent notification', async () => {
+		// No id and neither `result` nor `error`, so the twin's no-`method`
+		// branch falls to `Classified::Invalid` with `id: null`.
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', method: 123 });
+
+		assert.strictEqual(h.fake.sends.length, 1);
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, null);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	// Envelope validation — the WS path runs the same `JsonrpcRequest`
+	// schema the HTTP POST path does, so a malformed envelope answers
+	// `invalid_request` on both transports rather than reaching the
+	// dispatcher and surfacing as `invalid_params`.
+	test('params: null → invalid_request with the id echoed', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 7, method: 'echo', params: null });
+
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 7);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	test('array params → invalid_request (not invalid_params)', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 8, method: 'echo', params: [1, 2] });
+
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 8);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+	});
+
+	test('a non-string, non-number id → invalid_request with id: null', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: null, method: 'echo', params: { value: 'x' } });
+		await h.on_message({ jsonrpc: '2.0', id: true, method: 'echo', params: { value: 'x' } });
+
+		for (const sent of h.fake.sends) {
+			const res = parse_json(sent);
+			assert.strictEqual(res.id, null);
+			assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_request);
+		}
+		assert.strictEqual(h.fake.sends.length, 2);
+	});
+
+	test('absent params dispatches (the empty-body convention)', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 9, method: 'echo' });
+
+		const res = parse_json(h.fake.sends[0]!);
+		// Reaches the dispatcher — `echo` requires `value`, so it is the
+		// input schema (not the envelope) that answers.
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_params);
+	});
+
+	test('an empty params object dispatches', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 10, method: 'echo', params: {} });
+
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.invalid_params);
+	});
+
+	test('a void input answers absent params and {} alike, and refuses a declared key', async () => {
+		// the published socket client sends `{}` for a parameterless call — a
+		// `z.void()` method must read it as the no-arg call over WS too
+		const void_spec: RequestResponseActionSpec = {
+			...no_input_spec,
+			method: 'void_ping',
+			input: z.void(),
+			output: z.strictObject({ ok: z.literal(true) })
+		};
+		const received: Array<unknown> = [];
+		const h = await build_harness({
+			handlers: {},
+			actions: [
+				{
+					spec: void_spec,
+					handler: (input) => {
+						received.push(input);
+						return { ok: true };
+					}
+				}
+			]
+		});
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, method: 'void_ping' });
+		await h.on_message({ jsonrpc: '2.0', id: 2, method: 'void_ping', params: {} });
+		await h.on_message({ jsonrpc: '2.0', id: 3, method: 'void_ping', params: { nope: 1 } });
+
+		const [absent, empty, declared] = h.fake.sends.map(parse_json);
+		assert.deepStrictEqual(absent.result, { ok: true });
+		assert.deepStrictEqual(empty.result, { ok: true });
+		assert.strictEqual(declared.error.code, JSONRPC_ERROR_CODES.invalid_params);
+		assert.deepStrictEqual(received, [undefined, undefined]);
+	});
+
+	test('an own __proto__ params key is refused on a void and a strict input', async () => {
+		// the frame is handed on as parsed, so the key reaches the input schema
+		// as the Rust twin sees it — a rebuilt copy dropped it, reading
+		// `{"__proto__": …}` as `{}`
+		const void_spec: RequestResponseActionSpec = {
+			...no_input_spec,
+			method: 'void_ping',
+			input: z.void(),
+			output: z.strictObject({ ok: z.literal(true) })
+		};
+		const received: Array<unknown> = [];
+		const record = (input: unknown) => {
+			received.push(input);
+			return { ok: true, value: 'x' };
+		};
+		const h = await build_harness({
+			handlers: {},
+			actions: [
+				{ spec: void_spec, handler: record },
+				{ spec: echo_spec, handler: record }
+			]
+		});
+		await h.on_open();
+		await h.on_message(
+			'{"jsonrpc":"2.0","id":1,"method":"void_ping","params":{"__proto__":{"x":1}}}'
+		);
+		await h.on_message(
+			'{"jsonrpc":"2.0","id":2,"method":"echo","params":{"value":"x","__proto__":{"x":1}}}'
+		);
+
+		const [void_res, strict_res] = h.fake.sends.map(parse_json);
+		assert.strictEqual(void_res.error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		assert.strictEqual(strict_res.error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		assert.deepStrictEqual(void_res.error?.data, { reason: ERROR_PARAMS_PROTO_KEY });
+		assert.deepStrictEqual(strict_res.error?.data, { reason: ERROR_PARAMS_PROTO_KEY });
+		assert.deepStrictEqual(received, []);
+	});
+
+	test('a cancel notification with junk params silently no-ops', async () => {
+		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
+		await h.on_open();
+		// The notification / cancel block runs before envelope validation, so
+		// this is dropped rather than answered.
+		await h.on_message({ jsonrpc: '2.0', method: 'cancel', params: [1, 2] });
+		await h.on_message({ jsonrpc: '2.0', method: 'cancel', params: null });
+		assert.strictEqual(h.fake.sends.length, 0);
 	});
 
 	test('method_not_found for unknown method', async () => {
@@ -399,7 +735,11 @@ describe('register_action_ws', () => {
 
 		const res = parse_json(h.fake.sends[0]!);
 		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.forbidden);
-		assert.match(res.error.message, /requires role: admin/i);
+		assert.strictEqual(res.error.message, 'forbidden');
+		assert.deepEqual(res.error.data, {
+			reason: ERROR_INSUFFICIENT_PERMISSIONS,
+			required_roles: ['admin']
+		});
 	});
 
 	test('invalid params return invalid_params with issues', async () => {
@@ -426,6 +766,47 @@ describe('register_action_ws', () => {
 		const res = parse_json(h.fake.sends[0]!);
 		assert.strictEqual(res.id, 77);
 		assert.ok(res.error);
+	});
+
+	test('a foreign error class carrying a JSON-RPC code answers internal_error, its data dropped', async () => {
+		const h = await build_harness({
+			handlers: {
+				echo: () => {
+					throw new ForeignRpcError(JSONRPC_ERROR_CODES.invalid_params, 'bad', {
+						secret: 'hunter2'
+					});
+				}
+			}
+		});
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 78, method: 'echo', params: { value: 'x' } });
+
+		assert.notInclude(String(h.fake.sends[0]), 'hunter2');
+		const res = parse_json(h.fake.sends[0]!);
+		assert.strictEqual(res.id, 78);
+		assert.strictEqual(res.error.code, JSONRPC_ERROR_CODES.internal_error);
+		assert.isUndefined(res.error.data);
+	});
+
+	test('a ThrownJsonrpcError from a second fuz_app copy keeps its code and data', async () => {
+		const h = await build_harness({
+			handlers: {
+				echo: () => {
+					throw new SecondCopyThrownJsonrpcError(JSONRPC_ERROR_CODES.conflict, 'taken', {
+						reason: 'name_taken'
+					});
+				}
+			}
+		});
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 79, method: 'echo', params: { value: 'x' } });
+
+		const res = parse_json(h.fake.sends[0]!);
+		assert.deepStrictEqual(res.error, {
+			code: JSONRPC_ERROR_CODES.conflict,
+			message: 'taken',
+			data: { reason: 'name_taken' }
+		});
 	});
 
 	test('handler receives unified ActionContext (auth + db + connection_id + signal)', async () => {
@@ -458,50 +839,382 @@ describe('register_action_ws', () => {
 		assert.ok(captured.value.connection_id, 'connection_id should be set on WS handlers');
 	});
 
-	test('artificial_delay waits before dispatching', async () => {
-		let dispatched_at = 0;
-		const h = await build_harness({
-			handlers: {
-				echo: (input) => {
-					dispatched_at = Date.now();
-					return { value: (input as { value: string }).value };
-				}
-			},
-			artificial_delay: 30
-		});
-		await h.on_open();
-		const sent_at = Date.now();
-		await h.on_message({ jsonrpc: '2.0', id: 1, method: 'echo', params: { value: 'x' } });
-		assert.ok(
-			dispatched_at - sent_at >= 25,
-			`expected ≥25ms delay, got ${dispatched_at - sent_at}ms`
-		);
-	});
-
-	test('transport tracks connections on open and removes on close', async () => {
+	test('registry tracks connections on open and removes on close', async () => {
 		const h = await build_harness({ handlers: { echo: () => ({ value: 'x' }) } });
-		assert.strictEqual(h.transport.is_ready(), false);
+		assert.strictEqual(h.registry.connection_count() > 0, false);
 		await h.on_open();
-		assert.strictEqual(h.transport.is_ready(), true);
+		assert.strictEqual(h.registry.connection_count() > 0, true);
 		await h.on_close();
-		assert.strictEqual(h.transport.is_ready(), false);
+		assert.strictEqual(h.registry.connection_count() > 0, false);
 	});
 
-	test('returns the supplied transport when provided', async () => {
-		const supplied = new BackendWebsocketTransport();
+	test('close removes the connection when the adapter hands onClose its own WSContext', async () => {
+		// `@hono/bun` builds a `WSContext` per event, so the one `onClose` gets is
+		// not the one `onOpen` registered
+		const stub = create_stub_upgrade();
+		const { registry } = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+			db: create_stub_db(),
+			receive_timeout: null,
+			log
+		});
+		const events = await stub.get_create_events()(
+			create_fake_hono_context({ credential_type: 'session' })
+		);
+		await (events.onOpen?.(new Event('open'), create_fake_ws().ws) as Promise<void> | void);
+		assert.strictEqual(registry.connection_count(), 1);
+
+		await (events.onClose?.(new CloseEvent('close'), create_fake_ws().ws) as Promise<void> | void);
+		assert.strictEqual(registry.connection_count(), 0);
+	});
+
+	test('returns the supplied registry when provided', async () => {
+		const supplied = new ConnectionRegistry();
 		const stub = create_stub_upgrade();
 		const stub_db = create_stub_db();
 		const result = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: '/ws',
+			connection_closer: null,
 			app: new Hono(),
 			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
 			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
 			db: stub_db,
-			transport: supplied,
-			heartbeat: false,
+			registry: supplied,
+			receive_timeout: null,
 			log
 		});
-		assert.strictEqual(result.transport, supplied);
+		assert.strictEqual(result.registry, supplied);
+	});
+});
+
+describe('register_action_ws effect flush', () => {
+	test('a rejected pending effect reaches on_effect_error after the reply', async () => {
+		const timeline: Array<string> = [];
+		const errors: Array<{ error: unknown; context: EffectErrorContext }> = [];
+		const h = await build_harness({
+			handlers: {
+				echo: (_input, ctx) => {
+					ctx.pending_effects.push(Promise.reject(new Error('effect failed')));
+					return { value: 'ok' };
+				}
+			},
+			on_effect_error: (error, context) => {
+				timeline.push(`error after ${h.fake.sends.length} sends`);
+				errors.push({ error, context });
+			}
+		});
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, method: 'echo', params: { value: 'x' } });
+
+		assert.strictEqual(errors.length, 1);
+		const { error, context } = errors[0]!;
+		assert.ok(error instanceof Error);
+		assert.strictEqual(error.message, 'effect failed');
+		assert.deepStrictEqual(context, { transport: 'ws', method: 'echo', path: '/ws' });
+		// the reply is sent before the frame's effects flush
+		assert.deepStrictEqual(timeline, ['error after 1 sends']);
+		assert.deepStrictEqual(parse_json(h.fake.sends[0]!), {
+			jsonrpc: '2.0',
+			id: 1,
+			result: { value: 'ok' }
+		});
+	});
+});
+
+describe('register_action_ws max_message_bytes', () => {
+	test('an oversized message closes the socket with 1009 before dispatch', async () => {
+		let handled = false;
+		const h = await build_harness({
+			handlers: {
+				echo: () => {
+					handled = true;
+					return { value: 'x' };
+				}
+			},
+			max_message_bytes: 256
+		});
+		await h.on_open();
+		await h.on_message({
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'echo',
+			params: { value: '€'.repeat(100) } // under 256 characters, over 256 bytes
+		});
+		assert.ok(!handled);
+		assert.strictEqual(h.fake.sends.length, 0, 'no per-message reply');
+		assert.strictEqual(h.fake.closes.length, 1);
+		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_MESSAGE_TOO_BIG);
+	});
+
+	test('a message within the cap dispatches', async () => {
+		const h = await build_harness({
+			handlers: { echo: (input) => input },
+			max_message_bytes: 256
+		});
+		await h.on_open();
+		await h.on_message({ jsonrpc: '2.0', id: 1, method: 'echo', params: { value: 'small' } });
+		assert.strictEqual(h.fake.closes.length, 0);
+		assert.strictEqual(h.fake.sends.length, 1);
+	});
+
+	test('defaults to DEFAULT_WS_MAX_MESSAGE_BYTES', async () => {
+		const h = await build_harness({ handlers: { echo: (input) => input } });
+		await h.on_open();
+		await h.on_message({
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'echo',
+			params: { value: 'x'.repeat(DEFAULT_WS_MAX_MESSAGE_BYTES) }
+		});
+		assert.strictEqual(h.fake.closes[0]?.code, WS_CLOSE_MESSAGE_TOO_BIG);
+	});
+});
+
+describe('register_action_ws max_connections_per_account', () => {
+	/** Open one socket on the endpoint for the stub account; returns its fake + close driver. */
+	const open_socket = async (
+		stub: ReturnType<typeof create_stub_upgrade>
+	): Promise<{ fake: FakeWs; on_close: () => Promise<void> }> => {
+		const events = await stub.get_create_events()(
+			create_fake_hono_context({ credential_type: 'session' })
+		);
+		const fake = create_fake_ws();
+		await (events.onOpen?.(new Event('open'), fake.ws) as Promise<void> | void);
+		return {
+			fake,
+			on_close: async () => {
+				await (events.onClose?.(new CloseEvent('close'), fake.ws) as Promise<void> | void);
+			}
+		};
+	};
+
+	test('configures the created registry — past it the oldest socket closes with 4004', async () => {
+		const stub = create_stub_upgrade();
+		const closed: Array<SocketCloseContext> = [];
+		const opened: Array<SocketOpenContext> = [];
+		const { registry } = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+			db: create_stub_db(),
+			max_connections_per_account: 1,
+			on_socket_open: (ctx) => {
+				opened.push(ctx);
+			},
+			on_socket_close: (ctx) => {
+				closed.push(ctx);
+			},
+			receive_timeout: null,
+			log
+		});
+
+		const first = await open_socket(stub);
+		assert.deepStrictEqual(first.fake.closes, []);
+		const second = await open_socket(stub);
+		assert.deepStrictEqual(first.fake.closes, [
+			{ code: WS_CLOSE_CONNECTION_LIMIT, reason: WS_CLOSE_CONNECTION_LIMIT_REASON }
+		]);
+		assert.deepStrictEqual(second.fake.closes, []);
+		assert.strictEqual(registry.connection_count(), 1);
+		// the evicted socket's handlers are cancelled at eviction, not when its
+		// close handshake lands
+		assert.strictEqual(opened[0]!.signal.aborted, true);
+
+		// the adapter fires onClose for the evicted socket: its hook still runs,
+		// with the identity captured at open, and the newer socket stays tracked
+		await first.on_close();
+		assert.strictEqual(closed.length, 1);
+		assert.strictEqual(closed[0]!.connection_id, opened[0]!.connection_id);
+		assert.strictEqual(closed[0]!.identity.account_id, 'acc_1');
+		assert.strictEqual(opened[0]!.signal.aborted, true);
+		assert.strictEqual(registry.connection_count(), 1);
+		assert.strictEqual(opened[1]!.signal.aborted, false);
+
+		await second.on_close();
+		assert.strictEqual(closed.length, 2);
+		assert.strictEqual(closed[1]!.connection_id, opened[1]!.connection_id);
+		assert.strictEqual(registry.connection_count(), 0);
+	});
+
+	test('passes its logger to the created registry, which logs the eviction', async () => {
+		const infos: Array<Array<unknown>> = [];
+		const spy_log = new Logger('test', { level: 'off' });
+		spy_log.info = (...args: Array<unknown>) => {
+			infos.push(args);
+		};
+		const stub = create_stub_upgrade();
+		register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+			db: create_stub_db(),
+			max_connections_per_account: 1,
+			receive_timeout: null,
+			log: spy_log
+		});
+
+		await open_socket(stub);
+		assert.deepStrictEqual(infos, []);
+		await open_socket(stub);
+		assert.deepStrictEqual(infos, [
+			['ws: connection cap closed oldest', { account_id: 'acc_1', closed: 1, max: 1 }]
+		]);
+	});
+
+	test('through the harness: the evicted client sees the close, the rest keep dispatching', async () => {
+		const harness = create_ws_test_harness({
+			actions: [{ spec: echo_spec, handler: (input) => input }],
+			registry: new ConnectionRegistry({ max_connections_per_account: 2 })
+		});
+		const account_id = create_uuid();
+		const first = await harness.connect({ account_id });
+		const second = await harness.connect({ account_id });
+		// another account's socket takes no slot
+		const other = await harness.connect();
+		assert.strictEqual(first.close_code, null);
+		assert.strictEqual(first.close_reason, null);
+
+		const third = await harness.connect({ account_id });
+		assert.ok(await first.wait_for_close());
+		assert.strictEqual(first.close_code, WS_CLOSE_CONNECTION_LIMIT);
+		assert.strictEqual(first.close_reason, WS_CLOSE_CONNECTION_LIMIT_REASON);
+		await assert_rejects(() => first.send({ jsonrpc: '2.0', id: 1, method: 'echo' }));
+
+		for (const client of [second, third, other]) {
+			assert.strictEqual(client.close_code, null);
+			assert.deepStrictEqual(await client.request(1, 'echo', { value: 'hi' }), { value: 'hi' });
+		}
+		assert.strictEqual(harness.registry.connection_count(), 3);
+	});
+
+	test('null disables the cap on the created registry', async () => {
+		const stub = create_stub_upgrade();
+		const { registry } = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+			db: create_stub_db(),
+			max_connections_per_account: null,
+			receive_timeout: null,
+			log
+		});
+
+		const sockets = [];
+		for (let i = 0; i < DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT + 1; i++) {
+			sockets.push(await open_socket(stub));
+		}
+		assert.ok(sockets.every((s) => s.fake.closes.length === 0));
+		assert.strictEqual(registry.connection_count(), DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT + 1);
+	});
+
+	test('defaults to DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT', async () => {
+		const stub = create_stub_upgrade();
+		const { registry } = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+			db: create_stub_db(),
+			receive_timeout: null,
+			log
+		});
+
+		const sockets = [];
+		for (let i = 0; i < DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT + 1; i++) {
+			sockets.push(await open_socket(stub));
+		}
+		assert.deepStrictEqual(sockets[0]!.fake.closes, [
+			{ code: WS_CLOSE_CONNECTION_LIMIT, reason: WS_CLOSE_CONNECTION_LIMIT_REASON }
+		]);
+		assert.ok(sockets.slice(1).every((s) => s.fake.closes.length === 0));
+		assert.strictEqual(registry.connection_count(), DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT);
+	});
+
+	test('throws alongside a supplied registry, which carries its own cap', () => {
+		const stub = create_stub_upgrade();
+		for (const max_connections_per_account of [1, null]) {
+			assert.throws(
+				() =>
+					register_action_ws({
+						action_ip_rate_limiter: null,
+						action_account_rate_limiter: null,
+						path: '/ws',
+						connection_closer: null,
+						app: new Hono(),
+						upgradeWebSocket: stub.upgradeWebSocket,
+						allowed_origins: [],
+						actions: [{ spec: echo_spec, handler: () => ({ value: 'x' }) }],
+						db: create_stub_db(),
+						registry: new ConnectionRegistry(),
+						max_connections_per_account,
+						receive_timeout: null,
+						log
+					}),
+				/max_connections_per_account configures the registry created for \/ws/
+			);
+		}
+	});
+});
+
+describe('register_action_ws connection_closer', () => {
+	const mount = (
+		actions: Array<{ spec: ActionSpecUnion; handler?: () => unknown }>,
+		connection_closer: ReturnType<typeof create_realtime_closer>
+	) =>
+		register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer,
+			app: new Hono(),
+			upgradeWebSocket: create_stub_upgrade().upgradeWebSocket,
+			allowed_origins: [],
+			actions,
+			db: create_stub_db(),
+			receive_timeout: null,
+			log
+		});
+
+	test('a successful mount adds its registry', () => {
+		const closer = create_realtime_closer();
+		mount([{ spec: echo_spec, handler: () => ({ value: 'x' }) }], closer);
+		assert.strictEqual(closer.member_count(), 1);
+	});
+
+	test('a mount whose registry fails to compile adds nothing', () => {
+		const closer = create_realtime_closer();
+		const action = { spec: echo_spec, handler: () => ({ value: 'x' }) };
+		assert.throws(() => mount([action, action], closer), /Duplicate WS action method/);
+		assert.strictEqual(closer.member_count(), 0);
 	});
 });
 
@@ -524,22 +1237,22 @@ describe('register_action_ws socket lifecycle hooks', () => {
 		assert.strictEqual(typeof ctx.connection_id, 'string');
 		assert.ok(ctx.connection_id.length > 0);
 		assert.strictEqual(ctx.identity.account_id, 'acc_1'); // from create_fake_hono_context
-		assert.strictEqual(typeof ctx.identity.token_hash, 'string'); // session credential
+		assert.strictEqual(typeof ctx.identity.session_hash, 'string'); // session credential
 		assert.strictEqual(ctx.identity.api_token_id, null);
 		assert.strictEqual(typeof ctx.notify, 'function');
 		assert.ok(ctx.signal instanceof AbortSignal);
 	});
 
-	test('on_socket_open runs after add_connection — transport is ready inside the hook', async () => {
+	test('on_socket_open runs after add_connection — registry is ready inside the hook', async () => {
 		let is_ready_inside: boolean | null = null;
-		let captured_transport: BackendWebsocketTransport | null = null;
+		let captured_registry: ConnectionRegistry | null = null;
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
 			on_socket_open: () => {
-				is_ready_inside = captured_transport!.is_ready();
+				is_ready_inside = captured_registry!.connection_count() > 0;
 			}
 		});
-		captured_transport = h.transport;
+		captured_registry = h.registry;
 
 		await h.on_open();
 		assert.strictEqual(is_ready_inside, true);
@@ -637,36 +1350,67 @@ describe('register_action_ws socket lifecycle hooks', () => {
 		assert.strictEqual(h.fake.closes[0]!.code, 1011);
 	});
 
-	test('on_socket_close fires with connection_id + identity before transport.remove_connection', async () => {
+	test('on_socket_close fires with connection_id + identity after registry.remove_connection', async () => {
+		let open_seen_connection_id: string | null = null;
 		let close_seen_connection_id: string | null = null;
 		let close_seen_account_id: string | null = null;
 		let transport_ready_inside_close: boolean | null = null;
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
+			on_socket_open: (ctx) => {
+				open_seen_connection_id = ctx.connection_id;
+			},
 			on_socket_close: (ctx) => {
 				close_seen_connection_id = ctx.connection_id;
 				close_seen_account_id = ctx.identity.account_id;
-				transport_ready_inside_close = h.transport.is_ready();
+				transport_ready_inside_close = h.registry.connection_count() > 0;
 			}
 		});
 
 		await h.on_open();
-		assert.strictEqual(h.transport.is_ready(), true);
+		assert.strictEqual(h.registry.connection_count() > 0, true);
 		await h.on_close();
 
-		// the hook saw a valid connection_id and saw the transport while it still
-		// held the connection (remove_connection runs after the hook returns).
+		// the hook saw the open-time connection_id and identity, with the
+		// connection already gone from the registry
 		assert.strictEqual(typeof close_seen_connection_id, 'string');
+		assert.strictEqual(close_seen_connection_id, open_seen_connection_id);
 		assert.strictEqual(close_seen_account_id, 'acc_1');
-		assert.strictEqual(transport_ready_inside_close, true);
-		assert.strictEqual(h.transport.is_ready(), false);
+		assert.strictEqual(transport_ready_inside_close, false);
+		assert.strictEqual(h.registry.connection_count() > 0, false);
 	});
 
-	test('on_socket_close identity stays readable after audit-revocation wipes transport state', async () => {
-		// Models the audit-guard path: `transport.close_sockets_for_account`
-		// clears the transport's internal identity map and calls `ws.close()`.
+	test('a slow on_socket_close never holds the closed connection in the registry', async () => {
+		// a dead entry would still be broadcast to and still count toward the
+		// per-account cap for as long as the hook runs
+		let release!: () => void;
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let hook_started = false;
+		const h = await build_harness({
+			handlers: { echo: () => ({ value: 'x' }) },
+			on_socket_close: async () => {
+				hook_started = true;
+				await released;
+			}
+		});
+
+		await h.on_open();
+		const closing = h.on_close();
+		assert.strictEqual(hook_started, true);
+		assert.strictEqual(h.registry.connection_count(), 0);
+
+		release();
+		await closing;
+		assert.strictEqual(h.registry.connection_count(), 0);
+	});
+
+	test('on_socket_close identity stays readable after audit-revocation wipes registry state', async () => {
+		// Models the audit-guard path: `registry.close_connections` with an `account` target
+		// clears the registry's internal identity map and calls `ws.close()`.
 		// Hono then fires onClose. The hook must still see the identity because
-		// it was captured at open time, independently of the transport.
+		// it was captured at open time, independently of the registry.
 		let close_identity_account: string | null = null;
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
@@ -677,17 +1421,17 @@ describe('register_action_ws socket lifecycle hooks', () => {
 
 		await h.on_open();
 		// audit guard path — clears identity map and calls ws.close()
-		const closed = h.transport.close_sockets_for_account('acc_1' as never);
+		const closed = h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never });
 		assert.strictEqual(closed, 1);
-		assert.strictEqual(h.transport.is_ready(), false); // identity map already cleared
+		assert.strictEqual(h.registry.connection_count() > 0, false); // identity map already cleared
 		// Hono would fire onClose in response to ws.close(); simulate that.
 		await h.on_close();
 
-		// Identity still valid inside the hook despite transport having been wiped.
+		// Identity still valid inside the hook despite registry having been wiped.
 		assert.strictEqual(close_identity_account, 'acc_1');
 	});
 
-	test('on_socket_close error is logged and swallowed (transport still cleans up)', async () => {
+	test('on_socket_close error is logged and swallowed (registry still cleans up)', async () => {
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
 			on_socket_close: () => {
@@ -696,10 +1440,10 @@ describe('register_action_ws socket lifecycle hooks', () => {
 		});
 
 		await h.on_open();
-		assert.strictEqual(h.transport.is_ready(), true);
+		assert.strictEqual(h.registry.connection_count() > 0, true);
 		// Must not throw despite the hook throwing.
 		await h.on_close();
-		assert.strictEqual(h.transport.is_ready(), false);
+		assert.strictEqual(h.registry.connection_count() > 0, false);
 	});
 
 	test('on_socket_close is skipped when the socket never opened', async () => {
@@ -718,9 +1462,581 @@ describe('register_action_ws socket lifecycle hooks', () => {
 	});
 });
 
-describe('register_action_ws server heartbeat', () => {
+describe('register_action_ws self-revocation', () => {
+	// A socket can revoke the credential it is running on —
+	// `account_session_revoke_all` over the session's own socket, say. The
+	// caller must read its reply before the socket is closed, so the reply is
+	// sent before the per-message queues flush: the handler's close is on the
+	// post-commit queue, and so is the audit listeners'.
+
+	const SESSION_ID = 's1'; // what `create_fake_hono_context` registers a session socket under
+
+	const revoke_self_spec: RequestResponseActionSpec = {
+		method: 'revoke_self',
+		kind: 'request_response',
+		initiator: 'frontend',
+		auth: { account: 'required', actor: 'none' },
+		side_effects: true,
+		input: z.void(),
+		output: z.strictObject({ revoked: z.boolean() }),
+		async: true,
+		description: 'revoke the session this socket is on'
+	};
+
+	/** Mount `revoke_self` and open one socket whose sends and closes land on one timeline. */
+	const open_self_revoking_socket = async (
+		handler: (ctx: ActionContext, registry: ConnectionRegistry) => void | Promise<void>
+	): Promise<{ timeline: Array<string>; request: () => Promise<void> }> => {
+		const stub = create_stub_upgrade();
+		const { registry } = register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [
+				{
+					spec: revoke_self_spec,
+					handler: async (_input: unknown, ctx: ActionContext) => {
+						await handler(ctx, registry);
+						return { revoked: true };
+					}
+				}
+			],
+			db: create_stub_db(),
+			receive_timeout: null,
+			log
+		});
+		const events = await stub.get_create_events()(
+			create_fake_hono_context({ credential_type: 'session', auth_session_id: SESSION_ID })
+		);
+		const timeline: Array<string> = [];
+		const ws = new WSContext({
+			readyState: 1,
+			send: (data) => {
+				const message = JSON.parse(data as string) as { id?: unknown; result?: unknown };
+				timeline.push(`reply ${String(message.id)} ${JSON.stringify(message.result)}`);
+			},
+			close: (code) => {
+				timeline.push(`close ${code}`);
+			}
+		});
+		await (events.onOpen?.(new Event('open'), ws) as Promise<void> | void);
+		return {
+			timeline,
+			request: async () => {
+				const event = new MessageEvent('message', {
+					data: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'revoke_self' })
+				});
+				if (events.onMessage) await dispatch_ws_message(events.onMessage, event, ws);
+			}
+		};
+	};
+
+	test('a handler that closes its own socket post-commit is answered first', async () => {
+		const { timeline, request } = await open_self_revoking_socket((ctx, registry) => {
+			queue_connection_close(ctx, registry, {
+				kind: 'session',
+				session_hash: hash_session_token(SESSION_ID)
+			});
+		});
+
+		await request();
+
+		assert.deepStrictEqual(timeline, [
+			'reply 1 {"revoked":true}',
+			`close ${WS_CLOSE_SESSION_REVOKED}`
+		]);
+	});
+
+	test('an audit listener that closes the socket is behind the reply too', async () => {
+		// the listener-only wiring: nothing in the handler closes, the WS auth
+		// guard does when the `session_revoke` row is announced
+		const audit_event: AuditLogEvent = create_test_audit_event({
+			event_type: 'session_revoke',
+			metadata: { session_id: hash_session_token(SESSION_ID) }
+		});
+		const audit = create_audit_emitter({
+			db: {
+				query: () => Promise.resolve([audit_event]),
+				query_one: () => Promise.resolve()
+			} as any,
+			log
+		});
+		let guarded = false;
+		const { timeline, request } = await open_self_revoking_socket(async (ctx, registry) => {
+			if (!guarded) {
+				guarded = true;
+				audit.add_listener(create_revocation_guard(registry, log));
+			}
+			await audit.emit(ctx, {
+				event_type: 'session_revoke',
+				metadata: { session_id: SessionId.parse(hash_session_token(SESSION_ID)) }
+			});
+		});
+
+		await request();
+
+		assert.deepStrictEqual(timeline, [
+			'reply 1 {"revoked":true}',
+			`close ${WS_CLOSE_SESSION_REVOKED}`
+		]);
+	});
+});
+
+describe('register_action_ws a server-closed socket dispatches nothing', () => {
+	// A runtime adapter can keep delivering inbound frames after the server
+	// calls `ws.close(…)`, until the close handshake completes (`@hono/node-ws`
+	// does, up to the `ws` close timeout when the client withholds its close
+	// frame). The fake `WSContext` models exactly that client: it records the
+	// close and keeps accepting `on_message`.
+	const echo_request = { jsonrpc: '2.0', id: 1, method: 'echo', params: { value: 'x' } };
+
+	/** A harness whose `echo` handler counts its runs. */
+	const build_counting_harness = async (
+		opts: Partial<Parameters<typeof build_harness>[0]> = {}
+	): Promise<{ h: Harness; runs: () => number }> => {
+		let runs = 0;
+		const h = await build_harness({
+			...opts,
+			handlers: {
+				echo: (input) => {
+					runs++;
+					return input;
+				}
+			}
+		});
+		return { h, runs: () => runs };
+	};
+
+	test('after a revocation', async () => {
+		const { h, runs } = await build_counting_harness();
+		await h.on_open();
+		await h.on_message(echo_request);
+		assert.strictEqual(runs(), 1);
+		assert.strictEqual(h.fake.sends.length, 1);
+
+		assert.strictEqual(
+			h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never }),
+			1
+		);
+		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_SESSION_REVOKED);
+
+		// the client withholds its close frame and keeps sending
+		await h.on_message(echo_request);
+		await h.on_message({ jsonrpc: '2.0', id: 2, method: 'nope' });
+		await h.on_message('not json');
+
+		assert.strictEqual(runs(), 1, 'the revoked socket ran no further handler');
+		assert.strictEqual(h.fake.sends.length, 1, 'and got no further reply, error replies included');
+	});
+
+	test('an oversized frame on a revoked socket sends no second close', async () => {
+		const { h, runs } = await build_counting_harness({ max_message_bytes: 256 });
+		await h.on_open();
+		h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never });
+		assert.strictEqual(h.fake.closes.length, 1);
+
+		await h.on_message({
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'echo',
+			params: { value: 'x'.repeat(300) }
+		});
+
+		assert.strictEqual(runs(), 0);
+		assert.deepStrictEqual(
+			h.fake.closes.map((close) => close.code),
+			[WS_CLOSE_SESSION_REVOKED],
+			'the socket is already ended — nothing more is read from it, the size check included'
+		);
+	});
+
+	test('after a cap eviction', async () => {
+		const stub = create_stub_upgrade();
+		const runs: Array<string> = [];
+		register_action_ws({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
+			path: '/ws',
+			connection_closer: null,
+			app: new Hono(),
+			upgradeWebSocket: stub.upgradeWebSocket,
+			allowed_origins: [],
+			actions: [
+				{
+					spec: echo_spec,
+					handler: (input) => {
+						runs.push((input as { value: string }).value);
+						return input;
+					}
+				}
+			],
+			db: create_stub_db(),
+			max_connections_per_account: 1,
+			receive_timeout: null,
+			log
+		});
+		const open = async (): Promise<{ fake: FakeWs; send: (value: string) => Promise<void> }> => {
+			const events = await stub.get_create_events()(
+				create_fake_hono_context({ credential_type: 'session' })
+			);
+			const fake = create_fake_ws();
+			await (events.onOpen?.(new Event('open'), fake.ws) as Promise<void> | void);
+			return {
+				fake,
+				send: async (value) => {
+					const event = new MessageEvent('message', {
+						data: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'echo', params: { value } })
+					});
+					if (events.onMessage) await dispatch_ws_message(events.onMessage, event, fake.ws);
+				}
+			};
+		};
+
+		const oldest = await open();
+		const newest = await open();
+		assert.strictEqual(oldest.fake.closes[0]!.code, WS_CLOSE_CONNECTION_LIMIT);
+
+		await oldest.send('from the evicted socket');
+		await newest.send('from the live socket');
+
+		assert.deepStrictEqual(runs, ['from the live socket']);
+		assert.deepStrictEqual(oldest.fake.sends, []);
+	});
+
+	test('after a heartbeat timeout, which also unregisters the connection', async () => {
+		vi.useFakeTimers();
+		try {
+			const { h, runs } = await build_counting_harness({ receive_timeout: 200 });
+			await h.on_open();
+			assert.strictEqual(h.registry.connection_count(), 1);
+
+			vi.advanceTimersByTime(250);
+			assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT);
+			assert.strictEqual(
+				h.registry.connection_count(),
+				0,
+				'a socket the server closed is no longer a broadcast target'
+			);
+
+			await h.on_message(echo_request);
+			assert.strictEqual(runs(), 0);
+			assert.deepStrictEqual(h.fake.sends, []);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test('after an oversized message', async () => {
+		const { h, runs } = await build_counting_harness({ max_message_bytes: 256 });
+		await h.on_open();
+		await h.on_message({
+			jsonrpc: '2.0',
+			id: 1,
+			method: 'echo',
+			params: { value: 'x'.repeat(300) }
+		});
+		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_MESSAGE_TOO_BIG);
+		assert.strictEqual(h.registry.connection_count(), 0);
+
+		await h.on_message(echo_request);
+		assert.strictEqual(runs(), 0);
+		assert.deepStrictEqual(h.fake.sends, []);
+	});
+
+	test('after a failed on_socket_open', async () => {
+		const { h, runs } = await build_counting_harness({
+			on_socket_open: () => {
+				throw new Error('bootstrap boom');
+			}
+		});
+		await h.on_open();
+		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_INTERNAL_ERROR);
+		assert.strictEqual(h.registry.connection_count(), 0);
+		const sends_at_close = h.fake.sends.length;
+
+		await h.on_message(echo_request);
+		assert.strictEqual(runs(), 0);
+		assert.strictEqual(h.fake.sends.length, sends_at_close);
+	});
+
+	test('a connection removed from the registry without a close is ended on its next frame', async () => {
+		const captured: { open: SocketOpenContext | null } = { open: null };
+		const { h, runs } = await build_counting_harness({
+			on_socket_open: (ctx) => {
+				captured.open = ctx;
+			}
+		});
+		await h.on_open();
+		assert.ok(captured.open);
+
+		// removal alone — no close frame, no abort: the registry is the
+		// authority, and the socket must not linger reading and never answering
+		h.registry.remove_connection(captured.open.connection_id);
+		assert.deepStrictEqual(h.fake.closes, []);
+		await h.on_message(echo_request);
+
+		assert.strictEqual(runs(), 0);
+		assert.deepStrictEqual(h.fake.sends, []);
+		assert.deepStrictEqual(h.fake.closes, [
+			{ code: WS_CLOSE_INTERNAL_ERROR, reason: WS_CLOSE_CONNECTION_UNREGISTERED_REASON }
+		]);
+		assert.strictEqual(captured.open.signal.aborted, true);
+
+		// ended: later frames are dropped without a second close
+		await h.on_message(echo_request);
+		assert.strictEqual(h.fake.closes.length, 1);
+	});
+
+	test('an unregistered socket is ended even with the receive timeout off, however chatty', async () => {
+		vi.useFakeTimers();
+		try {
+			const captured: { open: SocketOpenContext | null } = { open: null };
+			const { h, runs } = await build_counting_harness({
+				receive_timeout: null,
+				on_socket_open: (ctx) => {
+					captured.open = ctx;
+				}
+			});
+			await h.on_open();
+			h.registry.remove_connection(captured.open!.connection_id);
+
+			for (let i = 0; i < 5; i++) {
+				vi.advanceTimersByTime(1000);
+				await h.on_message(echo_request);
+			}
+
+			assert.strictEqual(runs(), 0);
+			assert.deepStrictEqual(
+				h.fake.closes.map((close) => close.code),
+				[WS_CLOSE_INTERNAL_ERROR],
+				'ended on the first frame, not left open for the client to keep feeding'
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test('an in-flight handler sees its signal abort at revocation, before the close lands', async () => {
+		const started = Promise.withResolvers<AbortSignal>();
+		const release = Promise.withResolvers<void>();
+		const h = await build_harness({
+			handlers: {
+				echo: async (input, ctx) => {
+					started.resolve(ctx.signal);
+					await release.promise;
+					return input;
+				}
+			}
+		});
+		await h.on_open();
+		const in_flight = h.on_message(echo_request);
+		const signal = await started.promise;
+		assert.strictEqual(signal.aborted, false);
+
+		h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never });
+		// no `on_close` yet — the close handshake has not landed
+		assert.strictEqual(signal.aborted, true);
+
+		release.resolve();
+		await in_flight;
+	});
+
+	test('an in-flight handler sees its signal abort at a heartbeat timeout', async () => {
+		vi.useFakeTimers();
+		try {
+			const captured: { signal: AbortSignal | null } = { signal: null };
+			const h = await build_harness({
+				handlers: { echo: () => ({ value: 'x' }) },
+				receive_timeout: 200,
+				on_socket_open: (ctx) => {
+					captured.signal = ctx.signal;
+				}
+			});
+			await h.on_open();
+			assert.ok(captured.signal);
+			assert.strictEqual(captured.signal.aborted, false);
+
+			vi.advanceTimersByTime(250);
+
+			assert.strictEqual(captured.signal.aborted, true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+describe('register_action_ws frames during on_socket_open', () => {
+	const PRE_OPEN_OVERFLOW_CLOSE = {
+		code: WS_CLOSE_POLICY_VIOLATION,
+		reason: WS_CLOSE_PRE_ADMISSION_OVERFLOW_REASON
+	};
+
+	/**
+	 * A harness whose `on_socket_open` holds the socket in its opening phase
+	 * until `release` — admitted, hook not yet returned, inbound frames queued.
+	 */
+	const build_opening_harness = async (
+		max_message_bytes: number
+	): Promise<{
+		h: Harness;
+		handled: Array<string>;
+		opening: Promise<void>;
+		release: () => void;
+	}> => {
+		const hook = Promise.withResolvers<void>();
+		const handled: Array<string> = [];
+		const h = await build_harness({
+			handlers: {
+				echo: (input) => {
+					handled.push((input as { value: string }).value);
+					return input;
+				}
+			},
+			max_message_bytes,
+			on_socket_open: () => hook.promise
+		});
+		const opening = h.on_open();
+		return { h, handled, opening, release: hook.resolve };
+	};
+
+	/** An `echo` request frame of exactly `bytes` UTF-8 bytes, its value mostly `fill`. */
+	// each frame takes a fresh id — frames queued together run concurrently
+	// once dispatched, and a request reusing a live id is refused
+	let next_frame_id = 0;
+	const frame_of = (bytes: number, fill = 'x'): string => {
+		const encoder = new TextEncoder();
+		const id = ++next_frame_id;
+		const build = (value: string): string =>
+			JSON.stringify({ jsonrpc: '2.0', id, method: 'echo', params: { value } });
+		const room = bytes - encoder.encode(build('')).length;
+		const fill_bytes = encoder.encode(fill).length;
+		const frame = build(fill.repeat(Math.floor(room / fill_bytes)) + 'x'.repeat(room % fill_bytes));
+		assert.strictEqual(encoder.encode(frame).length, bytes);
+		return frame;
+	};
+
+	test('the queue admits frames up to the byte budget, and the frame past it closes the socket', async () => {
+		const max_message_bytes = 1000;
+		const { h, handled, opening, release } = await build_opening_harness(max_message_bytes);
+		const budget = PRE_ADMISSION_QUEUE_BYTES_FACTOR * max_message_bytes;
+
+		// four full-size frames fill the budget exactly — far below the frame cap
+		const queued: Array<Promise<void>> = [];
+		for (let i = 0; i < PRE_ADMISSION_QUEUE_BYTES_FACTOR; i++) {
+			queued.push(h.on_message(frame_of(max_message_bytes)));
+		}
+		assert.strictEqual(PRE_ADMISSION_QUEUE_BYTES_FACTOR * max_message_bytes, budget);
+		assert.deepStrictEqual(h.fake.closes, [], 'exactly the budget is admitted');
+
+		// one small frame more passes it
+		await h.on_message(frame_of(100));
+
+		assert.deepStrictEqual(h.fake.closes, [PRE_OPEN_OVERFLOW_CLOSE]);
+		assert.strictEqual(h.registry.connection_count(), 0);
+		release();
+		await opening;
+		await Promise.all(queued);
+		assert.deepStrictEqual(handled, [], 'the queued frames are dropped with the socket');
+	});
+
+	test('the byte budget counts UTF-8 bytes, not characters', async () => {
+		const max_message_bytes = 1000;
+		const { h, opening, release } = await build_opening_harness(max_message_bytes);
+
+		// each frame is under the message cap in bytes and well under it in
+		// characters: five of them fit a character count of the budget, not a
+		// byte count
+		const frame = frame_of(999, '€');
+		assert.ok(frame.length * 5 < PRE_ADMISSION_QUEUE_BYTES_FACTOR * max_message_bytes);
+		const queued: Array<Promise<void>> = [];
+		for (let i = 0; i < PRE_ADMISSION_QUEUE_BYTES_FACTOR; i++) queued.push(h.on_message(frame));
+		assert.deepStrictEqual(h.fake.closes, []);
+
+		await h.on_message(frame);
+
+		assert.deepStrictEqual(h.fake.closes, [PRE_OPEN_OVERFLOW_CLOSE]);
+		release();
+		await opening;
+		await Promise.all(queued);
+	});
+
+	test('frames within the budget dispatch once the hook returns, and no budget applies after', async () => {
+		const max_message_bytes = 1000;
+		const { h, handled, opening, release } = await build_opening_harness(max_message_bytes);
+
+		const queued = [h.on_message(frame_of(900)), h.on_message(frame_of(900))];
+		release();
+		await opening;
+		await Promise.all(queued);
+		assert.strictEqual(handled.length, 2);
+
+		// open now: frames dispatch directly and no queue budget applies
+		for (let i = 0; i < 6; i++) await h.on_message(frame_of(900));
+		assert.strictEqual(handled.length, 8);
+		assert.deepStrictEqual(h.fake.closes, []);
+	});
+
+	test('a reply to a request the hook awaits on its own connection waits for the hook', async () => {
+		const outcomes: { awaited: unknown; detached: Promise<unknown> | null } = {
+			awaited: null,
+			detached: null
+		};
+		const holder: { registry: ConnectionRegistry | null } = { registry: null };
+		const h = await build_harness({
+			handlers: { echo: (input) => input },
+			on_socket_open: async (ctx) => {
+				const registry = holder.registry!;
+				// started without awaiting — resolves once the hook has returned
+				outcomes.detached = registry.request_connection(ctx.connection_id, 'peer/ping', {
+					nonce: 1
+				});
+				// awaited — the client's reply is queued behind this very hook
+				outcomes.awaited = await registry.request_connection(
+					ctx.connection_id,
+					'peer/ping',
+					{ nonce: 2 },
+					{ timeout_ms: 60 }
+				);
+			}
+		});
+		holder.registry = h.registry;
+
+		const opening = h.on_open();
+		// let the hook run up to its await
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		// the client answers both server-initiated requests at once
+		const requests = h.fake.sends.map((frame) => parse_json(frame));
+		assert.deepStrictEqual(
+			requests.map((request) => request.method),
+			['peer/ping', 'peer/ping']
+		);
+		const replies = requests.map((request) =>
+			h.on_message({ jsonrpc: '2.0', id: request.id, result: { nonce: request.params.nonce } })
+		);
+		await opening;
+		await Promise.all(replies);
+
+		assert.deepStrictEqual(
+			outcomes.awaited,
+			{ ok: false, error: { kind: 'timeout' } },
+			'the awaited self-request never sees its reply'
+		);
+		assert.deepStrictEqual(await outcomes.detached, { ok: true, value: { nonce: 1 } });
+	});
+});
+
+describe('register_action_ws receive timeout', () => {
 	afterEach(() => {
 		vi.useRealTimers();
+	});
+
+	test('DEFAULT_WS_RECEIVE_TIMEOUT is 60 s', () => {
+		// the Rust spine's `DEFAULT_WS_RECEIVE_TIMEOUT` — a client tunes its heartbeat to either
+		assert.strictEqual(DEFAULT_WS_RECEIVE_TIMEOUT, 60_000);
 	});
 
 	test('silent socket past timeout closes with 4003 (server heartbeat timeout)', async () => {
@@ -729,7 +2045,7 @@ describe('register_action_ws server heartbeat', () => {
 		// open evaluates silence and closes.
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
-			heartbeat: { timeout: 200 }
+			receive_timeout: 200
 		});
 		await h.on_open();
 		assert.strictEqual(h.fake.closes.length, 0);
@@ -738,14 +2054,14 @@ describe('register_action_ws server heartbeat', () => {
 
 		assert.strictEqual(h.fake.closes.length, 1);
 		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT);
-		assert.strictEqual(h.fake.closes[0]!.reason, 'server heartbeat timeout');
+		assert.strictEqual(h.fake.closes[0]!.reason, WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT_REASON);
 	});
 
 	test('incoming message resets the receive-silence window', async () => {
 		vi.useFakeTimers();
 		const h = await build_harness({
 			handlers: { echo: (input) => ({ value: (input as { value: string }).value }) },
-			heartbeat: { timeout: 400 }
+			receive_timeout: 400
 		});
 		await h.on_open();
 
@@ -769,7 +2085,7 @@ describe('register_action_ws server heartbeat', () => {
 		vi.useFakeTimers();
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
-			heartbeat: { timeout: 400 }
+			receive_timeout: 400
 		});
 		await h.on_open();
 
@@ -783,11 +2099,32 @@ describe('register_action_ws server heartbeat', () => {
 		assert.strictEqual(h.fake.closes[0]!.code, WS_CLOSE_SERVER_HEARTBEAT_TIMEOUT);
 	});
 
-	test('heartbeat: false disables the timer (silent socket stays open)', async () => {
+	test('a receive_timeout that is not positive or past the timer max throws at registration', async () => {
+		for (const receive_timeout of [
+			0,
+			-1,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			WS_RECEIVE_TIMEOUT_MAX + 1
+		]) {
+			await assert_rejects(
+				() => build_harness({ handlers: {}, receive_timeout }),
+				/receive_timeout must be a positive number of ms up to 2147483647/
+			);
+		}
+	});
+
+	test('WS_RECEIVE_TIMEOUT_MAX itself registers', async () => {
+		// the longest delay a timer honors — 2³¹ − 1 ms
+		assert.strictEqual(WS_RECEIVE_TIMEOUT_MAX, 2 ** 31 - 1);
+		await build_harness({ handlers: {}, receive_timeout: WS_RECEIVE_TIMEOUT_MAX });
+	});
+
+	test('receive_timeout: null disables the timer (silent socket stays open)', async () => {
 		vi.useFakeTimers();
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
-			heartbeat: false
+			receive_timeout: null
 		});
 		await h.on_open();
 
@@ -796,11 +2133,54 @@ describe('register_action_ws server heartbeat', () => {
 		assert.strictEqual(h.fake.closes.length, 0);
 	});
 
+	test('a socket revoked in the tick after admission starts no receive timer', async () => {
+		vi.useFakeTimers();
+		const h = await build_harness({
+			handlers: { echo: () => ({ value: 'x' }) },
+			receive_timeout: 200
+		});
+		// `onOpen` admits synchronously here and resumes a microtask later; a
+		// revocation lands in between
+		const opening = h.on_open();
+		assert.strictEqual(
+			h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never }),
+			1
+		);
+		await opening;
+
+		vi.advanceTimersByTime(2000);
+
+		assert.deepStrictEqual(
+			h.fake.closes.map((close) => close.code),
+			[WS_CLOSE_SESSION_REVOKED],
+			'no receive timeout fires on a socket that already ended'
+		);
+		assert.strictEqual(vi.getTimerCount(), 0, 'and no interval is left running');
+	});
+
+	test('onClose leaves no receive timer behind on a socket that ended before it', async () => {
+		vi.useFakeTimers();
+		const h = await build_harness({
+			handlers: { echo: () => ({ value: 'x' }) },
+			receive_timeout: 200
+		});
+		const opening = h.on_open();
+		h.registry.close_connections({ kind: 'account', account_id: 'acc_1' as never });
+		await opening;
+
+		await h.on_close();
+
+		assert.strictEqual(vi.getTimerCount(), 0);
+		const closes = h.fake.closes.length;
+		vi.advanceTimersByTime(2000);
+		assert.strictEqual(h.fake.closes.length, closes);
+	});
+
 	test('timer is stopped on close', async () => {
 		vi.useFakeTimers();
 		const h = await build_harness({
 			handlers: { echo: () => ({ value: 'x' }) },
-			heartbeat: { timeout: 400 }
+			receive_timeout: 400
 		});
 		await h.on_open();
 		await h.on_close();
@@ -844,12 +2224,16 @@ describe('register_action_ws rate limit', () => {
 		assert.throws(
 			() =>
 				register_action_ws({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: '/ws',
+					connection_closer: null,
 					app: new Hono(),
 					upgradeWebSocket: stub.upgradeWebSocket,
+					allowed_origins: [],
 					actions: [{ spec: bad_spec, handler: () => ({ value: 'x' }) }],
 					db: stub_db,
-					heartbeat: false,
+					receive_timeout: null,
 					log
 				}),
 			/auth\.account !== 'required'.*account-keyed/
@@ -860,7 +2244,7 @@ describe('register_action_ws rate limit', () => {
 		const limiter = make_limiter(2);
 		const h = await build_harness({
 			handlers: {},
-			actions: [{ spec: account_keyed_spec, handler: (input) => input as { value: string } }],
+			actions: [{ spec: account_keyed_spec, handler: (input) => input }],
 			action_account_rate_limiter: limiter
 		});
 		await h.on_open();
@@ -882,10 +2266,62 @@ describe('register_action_ws rate limit', () => {
 		assert.strictEqual(typeof r3.error?.data?.retry_after, 'number');
 	});
 
+	// The limiter runs ahead of param validation, matching the Rust
+	// dispatcher: malformed calls are charged too.
+	test('malformed params still charge the budget — third call is rate_limited', async () => {
+		const limiter = make_limiter(2);
+		const h = await build_harness({
+			handlers: {},
+			actions: [{ spec: account_keyed_spec, handler: (input) => input }],
+			action_account_rate_limiter: limiter
+		});
+		await h.on_open();
+
+		// `value` must be a string — every call is malformed.
+		const send = (id: number) =>
+			h.on_message({ jsonrpc: '2.0', method: 'throttled_echo', params: { value: 42 }, id });
+
+		await send(1);
+		await send(2);
+		await send(3);
+
+		assert.strictEqual(h.fake.sends.length, 3);
+		assert.strictEqual(
+			parse_json(h.fake.sends[0]!).error?.code,
+			JSONRPC_ERROR_CODES.invalid_params
+		);
+		assert.strictEqual(
+			parse_json(h.fake.sends[1]!).error?.code,
+			JSONRPC_ERROR_CODES.invalid_params
+		);
+		assert.strictEqual(parse_json(h.fake.sends[2]!).error?.code, JSONRPC_ERROR_CODES.rate_limited);
+	});
+
+	test('malformed params on a non-limited spec are still invalid_params', async () => {
+		const limiter = make_limiter(1);
+		const h = await build_harness({
+			handlers: { echo: (input) => input },
+			action_account_rate_limiter: limiter
+		});
+		await h.on_open();
+
+		const send = (id: number) =>
+			h.on_message({ jsonrpc: '2.0', method: 'echo', params: { value: 42 }, id });
+
+		await send(1);
+		await send(2);
+		await send(3);
+
+		assert.strictEqual(h.fake.sends.length, 3);
+		for (const sent of h.fake.sends) {
+			assert.strictEqual(parse_json(sent).error?.code, JSONRPC_ERROR_CODES.invalid_params);
+		}
+	});
+
 	test('action without rate_limit is unaffected', async () => {
 		const limiter = make_limiter(1);
 		const h = await build_harness({
-			handlers: { echo: (input) => input as { value: string } },
+			handlers: { echo: (input) => input },
 			action_account_rate_limiter: limiter
 		});
 		await h.on_open();
@@ -899,5 +2335,194 @@ describe('register_action_ws rate limit', () => {
 		assert.strictEqual(h.fake.sends.length, 2);
 		assert.strictEqual(parse_json(h.fake.sends[0]!).result?.value, 'x');
 		assert.strictEqual(parse_json(h.fake.sends[1]!).result?.value, 'x');
+	});
+});
+
+describe('register_action_ws inbound dispatch', () => {
+	// `hold` runs until its signal aborts (answering 'cancelled') or the test
+	// releases every held request (answering 'released'); `quick` answers at
+	// once. So "in flight" is a state the test controls, not a race.
+	const hold_spec: RequestResponseActionSpec = {
+		method: 'hold',
+		kind: 'request_response',
+		initiator: 'frontend',
+		auth: { account: 'required', actor: 'none' },
+		side_effects: false,
+		input: z.void(),
+		output: z.string(),
+		async: true,
+		description: 'held until cancelled or released'
+	};
+	const quick_spec: RequestResponseActionSpec = {
+		...hold_spec,
+		method: 'quick',
+		description: 'answers at once'
+	};
+
+	const build_inbound_harness = async (
+		opts: { action_account_rate_limiter?: RateLimiter; rate_limited?: boolean } = {}
+	) => {
+		let release_all!: () => void;
+		const released = new Promise<void>((resolve) => {
+			release_all = resolve;
+		});
+		const hold_handler = (_input: unknown, ctx: ActionContext): Promise<string> =>
+			new Promise<string>((resolve) => {
+				ctx.signal.addEventListener('abort', () => resolve('cancelled'), { once: true });
+				void released.then(() => resolve('released'));
+			});
+		const rate_limit = opts.rate_limited ? ({ rate_limit: 'account' } as const) : {};
+		const h = await build_harness({
+			handlers: {},
+			actions: [
+				{ spec: { ...hold_spec, ...rate_limit }, handler: hold_handler },
+				{ spec: { ...quick_spec, ...rate_limit }, handler: () => 'quick' }
+			],
+			action_account_rate_limiter: opts.action_account_rate_limiter
+		});
+		await h.on_open();
+		const request = (method: 'hold' | 'quick', id: string | number): Promise<void> =>
+			h.on_message({ jsonrpc: '2.0', id, method });
+		const cancel = (id: string | number): Promise<void> =>
+			h.on_message({ jsonrpc: '2.0', method: 'cancel', params: { request_id: id } });
+		const frames_for = (id: string | number): Array<any> =>
+			h.fake.sends.map(parse_json).filter((frame) => frame.id === id);
+		return { h, request, cancel, frames_for, release_all };
+	};
+
+	const assert_duplicate_refusal = (frame: any, id: string | number): void => {
+		assert.strictEqual(frame.id, id);
+		assert.deepStrictEqual(frame.error, {
+			code: JSONRPC_ERROR_CODES.invalid_request,
+			message: 'invalid request',
+			data: { reason: ERROR_DUPLICATE_REQUEST_ID }
+		});
+	};
+
+	test('a request reusing a live id is refused with that id and not dispatched', async () => {
+		const { request, cancel, frames_for } = await build_inbound_harness();
+
+		const first = request('hold', 7);
+		await request('quick', 7);
+		const refused = frames_for(7);
+		assert.strictEqual(refused.length, 1, 'the duplicate is answered once, by the refusal');
+		assert_duplicate_refusal(refused[0], 7);
+
+		// the string '7' is another id (SameValueZero), so it dispatches
+		await request('quick', '7');
+		assert.strictEqual(frames_for('7')[0]?.result, 'quick');
+
+		// the first request kept its cancel entry: a cancel for 7 reaches it
+		await cancel(7);
+		await first;
+		const answered = frames_for(7);
+		assert.strictEqual(answered.length, 2);
+		assert.strictEqual(answered[1].result, 'cancelled');
+
+		// answered, the id is free again
+		await request('quick', 7);
+		assert.strictEqual(frames_for(7)[2]?.result, 'quick');
+	});
+
+	test('a request answered with an error frees its id', async () => {
+		const { h, frames_for } = await build_inbound_harness();
+		// `hold` takes no input, so these params fail validation inside `perform_action`
+		await h.on_message({ jsonrpc: '2.0', id: 9, method: 'hold', params: { unexpected: true } });
+		const refused = frames_for(9);
+		assert.strictEqual(refused.length, 1);
+		assert.ok(refused[0].error, 'answered with an error');
+		assert.notStrictEqual(refused[0].error.data?.reason, ERROR_DUPLICATE_REQUEST_ID);
+
+		// answered, the id is free again — an error answer releases it like a result
+		await h.on_message({ jsonrpc: '2.0', id: 9, method: 'quick' });
+		assert.strictEqual(frames_for(9)[1]?.result, 'quick');
+	});
+
+	test('past the ceiling a request is shed with queue_overflow and the socket keeps serving', async () => {
+		const { h, request, cancel, frames_for, release_all } = await build_inbound_harness();
+		const held: Array<Promise<void>> = [];
+		for (let n = 0; n < MAX_INBOUND_DISPATCHES_PER_CONNECTION; n++) {
+			held.push(request('hold', n));
+		}
+
+		// a duplicate at the ceiling is refused as a duplicate — that check is first
+		await request('hold', 0);
+		assert_duplicate_refusal(frames_for(0)[0], 0);
+
+		await request('quick', 'over');
+		assert.deepStrictEqual(frames_for('over'), [
+			{
+				jsonrpc: '2.0',
+				id: 'over',
+				error: {
+					code: JSONRPC_ERROR_CODES.queue_overflow,
+					message: WS_INBOUND_DISPATCH_OVERFLOW_MESSAGE
+				}
+			}
+		]);
+		assert.strictEqual(
+			WS_INBOUND_DISPATCH_OVERFLOW_MESSAGE,
+			'too many concurrent requests on this connection',
+			'the Rust twin literal'
+		);
+		assert.strictEqual(h.fake.closes.length, 0, 'shedding never closes the socket');
+
+		// one completion frees one slot
+		await cancel(0);
+		await held[0];
+		assert.strictEqual(frames_for(0)[1]?.result, 'cancelled');
+		await request('quick', 'over');
+		assert.strictEqual(frames_for('over')[1]?.result, 'quick');
+
+		release_all();
+		await Promise.all(held);
+		for (let n = 1; n < MAX_INBOUND_DISPATCHES_PER_CONNECTION; n++) {
+			assert.strictEqual(frames_for(n)[0]?.result, 'released', `request ${n}`);
+		}
+	});
+
+	test('the ceiling admits exactly its value', async () => {
+		const { request, frames_for } = await build_inbound_harness();
+		for (let n = 0; n < MAX_INBOUND_DISPATCHES_PER_CONNECTION - 1; n++) {
+			void request('hold', n);
+		}
+		// the last slot dispatches
+		await request('quick', 'last');
+		assert.strictEqual(frames_for('last')[0]?.result, 'quick');
+		// filled, the next is shed
+		void request('hold', 'held');
+		await request('quick', 'shed');
+		assert.strictEqual(frames_for('shed')[0]?.error?.code, JSONRPC_ERROR_CODES.queue_overflow);
+	});
+
+	test('neither refusal charges the action rate limiter', async () => {
+		const limiter = new RateLimiter({
+			max_attempts: MAX_INBOUND_DISPATCHES_PER_CONNECTION + 1,
+			window_ms: 60_000,
+			cleanup_interval_ms: 0,
+			max_keys: null
+		});
+		const { request, cancel, frames_for, release_all } = await build_inbound_harness({
+			action_account_rate_limiter: limiter,
+			rate_limited: true
+		});
+		const held: Array<Promise<void>> = [];
+		for (let n = 0; n < MAX_INBOUND_DISPATCHES_PER_CONNECTION; n++) {
+			held.push(request('hold', n));
+		}
+		// refused, uncharged: a duplicate and an overflow
+		await request('hold', 0);
+		await request('quick', 'over');
+		assert_duplicate_refusal(frames_for(0)[0], 0);
+		assert.strictEqual(frames_for('over')[0]?.error?.code, JSONRPC_ERROR_CODES.queue_overflow);
+
+		await cancel(0);
+		await held[0];
+		// the budget's last attempt — rate_limited had either refusal been charged
+		await request('quick', 'last');
+		assert.strictEqual(frames_for('last')[0]?.result, 'quick');
+
+		release_all();
+		await Promise.all(held);
 	});
 });

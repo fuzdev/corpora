@@ -5,8 +5,9 @@
 	import downloadBlob from '../../_modules/downloadBlob.js';
 
 	/**
-	 * @typedef {import('../../_modules/constructReplLink.js').CodeFile} CodeFile
-	 * @typedef {import('../../_modules/constructReplLink.js').ExampleContent} ExampleContent
+	 * @typedef {import('../../_modules/getExampleContent.js').CodeFile} CodeFile
+	 * @typedef {import('../../_modules/getExampleContent.js').ExampleContent} ExampleContent
+	 * @typedef {import('../../_modules/getTemplateFiles.js').TemplateFile} TemplateFile
 	 */
 
 	/**
@@ -30,36 +31,40 @@
 		return imports;
 	}
 
-	// svelte-ignore state_referenced_locally
-	const imports = [data.main, ...data.components, ...data.componentComponents]
-		.reduce(
-			(/** @type {string[]} */ store, /** @type {CodeFile} */ val) =>
-				store.concat(getImports(val.contents)),
-			/** @type {string[]} */ ([])
+	// The npm packages the example imports, each listed once. Derived from
+	// `data` so it follows the example when the page is reused for another one
+	// on client-side navigation.
+	let imports = $derived([
+		...new Set(
+			[data.main, ...data.components, ...data.componentComponents].flatMap(
+				/** @param {CodeFile} file */ file => getImports(file.contents)
+			)
 		)
-		.reduce((/** @type {string[]} */ store, /** @type {string} */ val) => {
-			if (!store.includes(val)) {
-				store.push(val);
-				return store;
-			} else {
-				return store;
-			}
-		}, /** @type {string[]} */ ([]));
+	]);
 
 	async function download() {
 		downloading = true;
 
-		// console.log('downloading');
-
 		const cacheBust = new Date().getTime();
-		const files = await (await window.fetch(`/svelte-app.json?${cacheBust}`)).json();
+		/** @type {TemplateFile[]} */
+		const templateFiles = await (await window.fetch(`/svelte-app.json?${cacheBust}`)).json();
 		/** @type {Record<string, string>} */
 		const depsLookup = await (await window.fetch(`/deps.json?${cacheBust}`)).json();
+
+		// Start the zip from the template. Binary files such as the favicon arrive
+		// base64-encoded and go into the zip as bytes.
+		/** @type {{ path: string, data: string | number[] }[]} */
+		const files = templateFiles.map(file => ({
+			path: file.path,
+			data:
+				file.encoding === 'base64'
+					? Array.from(atob(file.data), char => char.charCodeAt(0))
+					: file.data
+		}));
+
 		if (imports.length > 0) {
-			const idx = files.findIndex(
-				/** @param {{ path: string }} file */ ({ path }) => path === 'package.json'
-			);
-			const pkg = JSON.parse(files[idx].data);
+			const idx = files.findIndex(({ path }) => path === 'package.json');
+			const pkg = JSON.parse(/** @type {string} */ (files[idx].data));
 			/** @type {Record<string, string>} */
 			const deps = {};
 			/** @type {Record<string, string>} */
@@ -81,59 +86,28 @@
 			files[idx].data = JSON.stringify(pkg, null, '  ');
 		}
 
-		files.push(
-			...data.components.map(
-				/** @param {CodeFile} component */ component => ({
-					path: `src/routes/${component.title.replace('./', '')}`,
-					data: component.contents
-				})
-			)
-		);
-		files.push(
-			...data.modules.map(
-				/** @param {CodeFile} mod */ mod => ({
-					path: `src/routes/${mod.title.replace('./', '')}`,
-					data: mod.contents
-				})
-			)
-		);
-		files.push(
-			...data.componentModules.map(
-				/** @param {CodeFile} mod */ mod => ({
-					path: `src/routes/${mod.title.replace('../', '')}`,
-					data: mod.contents
-				})
-			)
-		);
-		files.push(
-			...data.componentComponents.map(
-				/** @param {CodeFile} mod */ mod => ({
-					path: `src/routes/${mod.title}`,
-					data: mod.contents
-				})
-			)
-		);
-		files.push(
-			...data.csvs.map(
-				/** @param {CodeFile} mod */ mod => ({
-					path: `src/routes/${mod.title.replace('../', '')}`,
-					data: mod.contents
-				})
-			)
-		);
-		files.push(
-			...data.jsons.map(
-				/** @param {CodeFile} mod */ mod => ({
-					path: `src/routes/${mod.title.replace('../', '')}`,
-					data: mod.contents
-				})
-			)
-		);
+		// The example's files go under src/routes, at the paths its imports use
+		for (const group of [
+			data.components,
+			data.componentComponents,
+			data.modules,
+			data.componentModules,
+			data.csvs,
+			data.jsons
+		]) {
+			files.push(
+				...group.map(
+					/** @param {CodeFile} file */ file => ({
+						path: `src/routes/${file.title.replace(/^(\.\.?\/)+/, '')}`,
+						data: file.contents
+					})
+				)
+			);
+		}
 		files.push({
 			path: `src/routes/+page.svelte`,
 			data: data.main.contents
 		});
-		// console.log('here', files);
 		const filteredFiles = uniques(files.filter(Boolean), 'path', false);
 		downloadBlob(toAuto(filteredFiles), `layercake-${ssr ? 'ssr-' : ''}${slug}.zip`);
 		downloading = false;
@@ -190,25 +164,5 @@
 	.icon:disabled:before {
 		content: 'Please wait...';
 		transform: translate(75%, 0);
-	}
-
-	@keyframes zoom-in {
-		0% {
-			transform: scale(0);
-			opacity: 0;
-		}
-		100% {
-			transform: scale(1);
-			opacity: 1;
-		}
-	}
-
-	@keyframes fade-in {
-		0% {
-			opacity: 0;
-		}
-		100% {
-			opacity: 0.6;
-		}
 	}
 </style>

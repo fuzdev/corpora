@@ -1,0 +1,537 @@
+import { describe, expect, it } from 'vitest';
+import { createRawSnippet } from 'svelte';
+import { render } from 'vitest-browser-svelte';
+
+import TestHarness from '$lib/tests/TestHarness.svelte';
+import Spline from './Spline.svelte';
+
+/** Two series interleaved in one flat array, as long-format data arrives */
+const data = [
+  { group: 'a', date: new Date('2024-01-01'), value: 10, kind: 'first' },
+  { group: 'b', date: new Date('2024-01-01'), value: 50, kind: 'second' },
+  { group: 'a', date: new Date('2024-02-01'), value: 20, kind: 'first' },
+  { group: 'b', date: new Date('2024-02-01'), value: 60, kind: 'second' },
+  { group: 'a', date: new Date('2024-03-01'), value: 30, kind: 'first' },
+  { group: 'b', date: new Date('2024-03-01'), value: 70, kind: 'second' },
+];
+
+const chartProps = (extra: Record<string, any> = {}) => ({
+  data,
+  x: 'date',
+  y: 'value',
+  yDomain: [0, 100],
+  ...extra,
+});
+
+function paths() {
+  return Array.from(document.querySelectorAll('svg path'));
+}
+
+describe('Spline', () => {
+  describe('g (grouping)', () => {
+    it('draws one path per group from a single mark', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { g: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+    });
+
+    it('splits the data rather than drawing one line through every point', async () => {
+      // Without `g` the interleaved rows are a single zig-zag path
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: {},
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+      const single = paths()[0].getAttribute('d')!;
+      expect(single.split('L')).toHaveLength(data.length); // every point, one path
+    });
+
+    it('falls back to the chart`s `c` when it names a column', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ c: 'group' }),
+        componentProps: {},
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+    });
+
+    it('is not split by a `c` that computes a colour per row', async () => {
+      // A colour derived from the value encodes each point, it does not name a series — grouping
+      // on it would draw one path through the low points and another through the high ones
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({
+          c: (d: (typeof data)[number]) => (d.value < 40 ? 'low' : 'high'),
+          cDomain: ['low', 'high'],
+        }),
+        componentProps: {},
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+      expect(paths()[0].getAttribute('d')!.split('L')).toHaveLength(data.length);
+    });
+
+    it('falls back to the chart`s `g` accessor', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ g: 'group' }),
+        componentProps: {},
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+    });
+
+    it('takes its own `g` over the chart`s', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ g: 'group' }),
+        // `kind` is 1:1 with `group` here, so the count matches — what matters is that the
+        // override is read at all, which the `null` case below pins down
+        componentProps: { g: () => 'all' },
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+    });
+
+    it('is implied by a `stroke` naming a data property', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ c: 'group', cRange: ['red', 'blue'] }),
+        componentProps: { stroke: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+    });
+
+    it('is not implied by a CSS color', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { stroke: 'var(--color-danger)' },
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+    });
+
+    it('is not implied by a string that names nothing in the data', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { stroke: 'rebeccapurple' },
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+    });
+
+    it('an explicit `g` wins over the one `stroke` would imply', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ c: 'group', cRange: ['red', 'blue'] }),
+        // `kind` splits the same way as `group`, but `g: null`-style single grouping proves
+        // the explicit prop is what's read
+        componentProps: { g: () => 'all', stroke: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(1);
+    });
+
+    it('still splits by style function within each group', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: {
+          g: 'group',
+          // alternates every point, so each 3-point line becomes 2 segments
+          opacity: (d: any) => (d.value % 20 === 0 ? 1 : 0.5),
+        },
+      });
+
+      await expect.poll(() => paths().length).toBeGreaterThan(2);
+    });
+  });
+
+  describe('class', () => {
+    it('resolves per line when given a function', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: {
+          g: 'group',
+          class: (d: any) => (d.group === 'a' ? 'first-line' : 'second-line'),
+        },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+      const classes = paths().map((p) => p.getAttribute('class'));
+      expect(classes[0]).toContain('first-line');
+      expect(classes[1]).toContain('second-line');
+    });
+
+    it('applies a static string to every line', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { g: 'group', class: 'shared' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+      expect(paths().every((p) => p.getAttribute('class')?.includes('shared'))).toBe(true);
+    });
+
+    it('applies a static string without `g`', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { class: 'solo' },
+      });
+
+      await expect.poll(() => paths()[0]?.getAttribute('class')).toContain('solo');
+    });
+  });
+
+  describe('legend interaction for lines it split itself', () => {
+    // `stroke="group"` draws a line per group from one mark, and a series is declared per group —
+    // so the legend is already naming exactly those lines and should be able to single one out
+    const seriesProps = () =>
+      chartProps({
+        series: [
+          { key: 'a', color: 'rgb(255, 0, 0)' },
+          { key: 'b', color: 'rgb(0, 0, 255)' },
+        ],
+      });
+
+    function opacities() {
+      return paths().map((p) => p.getAttribute('opacity'));
+    }
+
+    it('fades the other lines when one is highlighted', async () => {
+      let ctx: any;
+      render(TestHarness, {
+        component: Spline,
+        chartProps: seriesProps(),
+        componentProps: { stroke: 'group' },
+        oncontext: (c: any) => (ctx = c),
+      } as any);
+
+      await expect.poll(() => paths().length).toBe(2);
+
+      ctx.series.setHighlight('a');
+      await expect.poll(opacities).toEqual(['1', '0.1']);
+
+      ctx.series.setHighlight(null);
+      await expect.poll(() => opacities().every((o) => o == null || o === '1')).toBe(true);
+    });
+
+    it('drops a line the legend has hidden', async () => {
+      let ctx: any;
+      render(TestHarness, {
+        component: Spline,
+        chartProps: seriesProps(),
+        componentProps: { stroke: 'group' },
+        oncontext: (c: any) => (ctx = c),
+      } as any);
+
+      await expect.poll(() => paths().length).toBe(2);
+
+      ctx.series.selectedKeys.toggle('a');
+      await expect.poll(() => paths().length).toBe(1);
+      await expect.poll(() => paths()[0]?.getAttribute('stroke')).toBe('rgb(255, 0, 0)');
+    });
+
+    it('leaves a `g` the legend does not name alone', async () => {
+      // Nothing on the legend corresponds to these groups, so they must not react to its keys
+      let ctx: any;
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ series: [{ key: 'unrelated', color: 'red' }] }),
+        componentProps: { g: 'group' },
+        oncontext: (c: any) => (ctx = c),
+      } as any);
+
+      await expect.poll(() => paths().length).toBe(2);
+
+      ctx.series.setHighlight('unrelated');
+      await expect.poll(() => paths().length).toBe(2);
+      expect(opacities().every((o) => o == null || o === '1')).toBe(true);
+    });
+  });
+
+  describe('stroke', () => {
+    it('resolves a data property through the chart`s color scale', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({
+          c: 'group',
+          cRange: ['rgb(255, 0, 0)', 'rgb(0, 0, 255)'],
+        }),
+        componentProps: { g: 'group', stroke: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+      const strokes = paths().map((p) => p.getAttribute('stroke'));
+      expect(strokes).toEqual(['rgb(255, 0, 0)', 'rgb(0, 0, 255)']);
+    });
+
+    it('falls back to the colors declared on `series`, with no `c` scale configured', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({
+          series: [
+            { key: 'a', color: 'rgb(255, 0, 0)' },
+            { key: 'b', color: 'rgb(0, 0, 255)' },
+          ],
+        }),
+        componentProps: { stroke: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+      expect(paths().map((p) => p.getAttribute('stroke'))).toEqual([
+        'rgb(255, 0, 0)',
+        'rgb(0, 0, 255)',
+      ]);
+    });
+
+    it('keeps the raw value when `series` colors do not cover it', async () => {
+      // The series-derived scale only knows its own keys — anything else behaves as it would
+      // with no scale at all, rather than wrapping around the palette
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ series: [{ key: 'nope', color: 'rgb(255, 0, 0)' }] }),
+        componentProps: { stroke: 'group' },
+      });
+
+      await expect.poll(() => paths().length).toBe(2);
+      expect(paths().map((p) => p.getAttribute('stroke'))).toEqual(['a', 'b']);
+    });
+
+    it('leaves a CSS color literal alone', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps({ c: 'group', cRange: ['red', 'blue'] }),
+        componentProps: { stroke: 'var(--color-danger)' },
+      });
+
+      await expect.poll(() => paths()[0]?.getAttribute('stroke')).toBe('var(--color-danger)');
+    });
+
+    it('leaves a named color alone when it is not a data property', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: chartProps(),
+        componentProps: { stroke: 'rebeccapurple' },
+      });
+
+      await expect.poll(() => paths()[0]?.getAttribute('stroke')).toBe('rebeccapurple');
+    });
+  });
+
+  describe('style-split runs', () => {
+    /** One line, dashed across the middle two points — the shape a "no data reported" bridge has */
+    const bridged = [
+      { date: new Date('2024-01-01'), value: 10, gap: false },
+      { date: new Date('2024-02-01'), value: 20, gap: false },
+      { date: new Date('2024-03-01'), value: 30, gap: true },
+      { date: new Date('2024-04-01'), value: 40, gap: true },
+      { date: new Date('2024-05-01'), value: 50, gap: false },
+      { date: new Date('2024-06-01'), value: 60, gap: false },
+    ];
+
+    const dashOn = (d: (typeof bridged)[number]) => (d.gap ? 'dashed' : 'solid');
+
+    it('takes each run`s style from the point it starts at, sharing the boundary point', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: { data: bridged, x: 'date', y: 'value', yDomain: [0, 100] },
+        componentProps: { class: dashOn },
+      });
+
+      await expect.poll(() => paths().length).toBe(3);
+      expect(paths().map((p) => p.classList.contains('dashed'))).toEqual([false, true, false]);
+      // The overlap: 3 + 3 + 2 points across the runs covers 6 rows twice-counting 2 boundaries
+      expect(paths().map((p) => p.getAttribute('d')!.split(/[ML]/).length - 1)).toEqual([3, 3, 2]);
+    });
+
+    it('keeps the `c` color on every run when only `class` splits the line', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: {
+          ...chartProps({ c: 'group', cRange: ['rgb(255, 0, 0)', 'rgb(0, 0, 255)'] }),
+        },
+        componentProps: { class: (d: any) => (d.value % 20 === 0 ? 'even' : 'odd') },
+      });
+
+      // Two lines (`c` names the groups), each split further by the class function
+      await expect.poll(() => paths().length).toBeGreaterThan(2);
+      // Every run is colored, and only by which line it belongs to — not by its style run
+      expect(
+        paths().every((p) =>
+          ['rgb(255, 0, 0)', 'rgb(0, 0, 255)'].includes(p.getAttribute('stroke')!)
+        )
+      ).toBe(true);
+      expect(paths().some((p) => p.classList.contains('even'))).toBe(true);
+      expect(paths().some((p) => p.classList.contains('odd'))).toBe(true);
+    });
+
+    it('keeps the series color on every run when only `class` splits the line', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: {
+          data: bridged,
+          x: 'date',
+          yDomain: [0, 100],
+          series: [{ key: 'value', color: 'rgb(0, 128, 0)' }],
+        },
+        componentProps: { seriesKey: 'value', class: dashOn },
+      });
+
+      await expect.poll(() => paths().length).toBe(3);
+      expect(paths().map((p) => p.getAttribute('stroke'))).toEqual([
+        'rgb(0, 128, 0)',
+        'rgb(0, 128, 0)',
+        'rgb(0, 128, 0)',
+      ]);
+    });
+
+    it('lets a `stroke` function color runs individually', async () => {
+      // The fallback must not overwrite what the style function actually asked for
+      render(TestHarness, {
+        component: Spline,
+        chartProps: {
+          data: bridged,
+          x: 'date',
+          yDomain: [0, 100],
+          series: [{ key: 'value', color: 'rgb(0, 128, 0)' }],
+        },
+        componentProps: {
+          seriesKey: 'value',
+          stroke: (d: (typeof bridged)[number]) => (d.gap ? 'rgb(255, 0, 0)' : 'rgb(0, 0, 255)'),
+        },
+      });
+
+      await expect.poll(() => paths().length).toBe(3);
+      expect(paths().map((p) => p.getAttribute('stroke'))).toEqual([
+        'rgb(0, 0, 255)',
+        'rgb(255, 0, 0)',
+        'rgb(0, 0, 255)',
+      ]);
+    });
+
+    describe('the ends of the line, not of each run', () => {
+      const dot = createRawSnippet(() => ({ render: () => '<circle r="4" />' }));
+
+      const ends = () => ({
+        start: document.querySelectorAll('.lc-path-g-start').length,
+        end: document.querySelectorAll('.lc-path-g-end').length,
+      });
+
+      it('renders start/end content once per line, not once per run', async () => {
+        render(TestHarness, {
+          component: Spline,
+          chartProps: { data: bridged, x: 'date', y: 'value', yDomain: [0, 100] },
+          componentProps: { class: dashOn, startContent: dot, endContent: dot },
+        });
+
+        await expect.poll(() => paths().length).toBe(3);
+        await expect.poll(ends).toEqual({ start: 1, end: 1 });
+      });
+
+      it('still renders them per line when `g` splits the mark', async () => {
+        render(TestHarness, {
+          component: Spline,
+          chartProps: chartProps(),
+          componentProps: { g: 'group', startContent: dot, endContent: dot },
+        });
+
+        await expect.poll(() => paths().length).toBe(2);
+        await expect.poll(ends).toEqual({ start: 2, end: 2 });
+      });
+
+      it('puts start/end markers on the line`s ends and mid markers on the seams', async () => {
+        render(TestHarness, {
+          component: Spline,
+          chartProps: { data: bridged, x: 'date', y: 'value', yDomain: [0, 100] },
+          componentProps: {
+            class: dashOn,
+            markerStart: 'circle',
+            markerMid: 'circle',
+            markerEnd: 'arrow',
+          },
+        });
+
+        await expect.poll(() => paths().length).toBe(3);
+        // The two seams are interior points of the line, so they take the mid marker — once each,
+        // from the run that starts there rather than the one that ends there
+        expect(paths().map((p) => p.hasAttribute('marker-end'))).toEqual([false, false, true]);
+        expect(paths().every((p) => p.hasAttribute('marker-start'))).toBe(true);
+        expect(paths().every((p) => p.hasAttribute('marker-mid'))).toBe(true);
+      });
+    });
+  });
+
+  describe('stacked series', () => {
+    /** Wide rows, so the series stack across columns */
+    const stackedData = [
+      { date: new Date('2024-01-01'), apples: 30, bananas: 20 },
+      { date: new Date('2024-02-01'), apples: 40, bananas: 10 },
+    ];
+
+    const stackedProps = {
+      data: stackedData,
+      x: 'date',
+      valueAxis: 'y',
+      yDomain: [0, 100],
+      height: 100,
+      width: 200,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      series: [{ key: 'apples' }, { key: 'bananas' }],
+      seriesLayout: 'stack',
+    };
+
+    /** The y pixel of the path's first point, as `M x,y` */
+    const firstY = () => {
+      const d = paths()[0]?.getAttribute('d') ?? '';
+      const m = d.match(/^M-?[\d.]+,(-?[\d.]+)/);
+      return m ? Math.round(Number(m[1])) : null;
+    };
+
+    it('should follow its series\u2019 stacked top', async () => {
+      // `bananas` is 20 on its own but sits on top of `apples` at 30 — a line drawn along the
+      // edge of a stacked area has to be at 50, not 20
+      render(TestHarness, {
+        component: Spline,
+        chartProps: stackedProps,
+        componentProps: { seriesKey: 'bananas' },
+      });
+
+      // yDomain [0, 100] over 100px, so a value of 50 lands at y=50
+      await expect.poll(firstY).toBe(50);
+    });
+
+    it('should draw its own values when given an explicit `y`', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: stackedProps,
+        componentProps: { seriesKey: 'bananas', y: 'bananas' },
+      });
+
+      await expect.poll(firstY).toBe(80); // 20 from the baseline
+    });
+
+    it('should draw raw values without a `seriesKey`', async () => {
+      render(TestHarness, {
+        component: Spline,
+        chartProps: { ...stackedProps, y: 'apples' },
+        componentProps: {},
+      });
+
+      await expect.poll(firstY).toBe(70); // 30 from the baseline
+    });
+  });
+});

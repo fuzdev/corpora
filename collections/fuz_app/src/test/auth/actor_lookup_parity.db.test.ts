@@ -4,7 +4,7 @@
  * Runs `describe_actor_lookup_cross_tests` against the in-process Hono app (no
  * process boundary), so the auth gate / populated round trip / input-bound
  * contract is verified under a plain `gro test` — the cross-process leg
- * (`actor_lookup.cross.test.ts`) additionally drives the TS spine binary +
+ * (`spine_suites.cross.test.ts`) additionally drives the TS spine binary +
  * Rust `testing_spine_stub` over real HTTP behind `FUZ_TEST_CROSS_BACKEND=1`.
  *
  * `actor_lookup` is opt-in (not in `create_standard_rpc_actions`), so the
@@ -14,16 +14,15 @@
  * @module
  */
 
-import { default_in_process_setup } from '$lib/testing/cross_backend/in_process_setup.ts';
-import { in_process_capabilities } from '$lib/testing/cross_backend/capabilities.ts';
-import { describe_actor_lookup_cross_tests } from '$lib/testing/cross_backend/actor_lookup.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
-import { create_actor_lookup_actions } from '$lib/auth/actor_lookup_actions.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { ROLE_ADMIN, ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+import { default_in_process_setup } from '#lib/testing/cross_backend/in_process_setup.ts';
+import { describe_actor_lookup_cross_tests } from '#lib/testing/cross_backend/actor_lookup.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
+import { create_actor_lookup_actions } from '#lib/auth/actor_lookup_actions.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { ROLE_ADMIN, ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
 
 const RPC_PATH = '/api/rpc';
 const session_options = create_session_config('test_session');
@@ -33,6 +32,8 @@ const setup_test = default_in_process_setup({
 	roles: [ROLE_KEEPER, ROLE_ADMIN],
 	create_route_specs: (ctx: AppServerContext): Array<RouteSpec> =>
 		create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: RPC_PATH,
 			actions: [...create_standard_rpc_actions(ctx.deps), ...create_actor_lookup_actions(ctx.deps)],
 			log: ctx.deps.log
@@ -41,6 +42,5 @@ const setup_test = default_in_process_setup({
 
 describe_actor_lookup_cross_tests({
 	setup_test,
-	capabilities: in_process_capabilities,
 	rpc_path: RPC_PATH
 });

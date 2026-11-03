@@ -7,15 +7,6 @@
  */
 
 /**
- * Maximum number of iterations for fixed-point iteration during publishing.
- * Used in both plan generation and actual publishing to resolve transitive dependency cascades.
- *
- * In practice, most repos converge in 2-3 iterations.
- * Deep dependency chains may require more iterations.
- */
-export const GITOPS_MAX_ITERATIONS_DEFAULT = 10;
-
-/**
  * Default path to the gitops configuration file.
  */
 export const GITOPS_CONFIG_PATH_DEFAULT = 'gitops.config.ts';
@@ -26,7 +17,8 @@ export const GITOPS_CONFIG_PATH_DEFAULT = 'gitops.config.ts';
 export const GITOPS_CONCURRENCY_DEFAULT = 5;
 
 /**
- * Default timeout in milliseconds for waiting on NPM package propagation (10 minutes).
- * NPM's CDN uses eventual consistency, so published packages may not be immediately available.
+ * Default timeout in milliseconds for `gitops_release --wait` to wait on registry
+ * propagation (10 minutes). npm's CDN is eventually consistent, so a published
+ * version can take minutes to show.
  */
 export const GITOPS_NPM_WAIT_TIMEOUT_DEFAULT = 600_000; // 10 minutes

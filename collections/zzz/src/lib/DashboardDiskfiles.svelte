@@ -1,16 +1,19 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import { swallow, is_editable } from '@fuzdev/fuz_util/dom.ts';
+	import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 	import { random_item } from '@fuzdev/fuz_util/random.ts';
 	import PendingAnimation from '@fuzdev/fuz_ui/PendingAnimation.svelte';
 	import { onMount } from 'svelte';
 
 	import { frontend_context } from './frontend.svelte.ts';
 	import DiskfileExplorer from './DiskfileExplorer.svelte';
-	import DiskfileEditorView from './DiskfileEditorView.svelte';
+	import DiskfileView from './DiskfileView.svelte';
 	import DiskfileTabListitem from './DiskfileTabListitem.svelte';
 	import { Reorderable } from './reorderable.svelte.ts';
 	import DiskfilePickerDialog from './DiskfilePickerDialog.svelte';
 	import ErrorMessage from './ErrorMessage.svelte';
+	import { prompt_create_diskfile } from './diskfile_helpers.ts';
 
 	const app = frontend_context.get();
 	const { diskfiles, capabilities } = app;
@@ -29,23 +32,16 @@
 		void capabilities.init_backend_check();
 	});
 
-	// TODO @many this is very hacky and duplicated, refactor into cell methods
-	// TODO @many improve UX to not use alert/prompt
-	const create_file = async () => {
-		if (!app.zzz_dir) {
-			alert('cannot create file: filesystem is not available'); // eslint-disable-line no-alert
-			return;
-		}
-
-		const filename = prompt('new file name:'); // eslint-disable-line no-alert
-		if (!filename) return;
-
-		try {
-			await diskfiles.create_file(filename);
-		} catch (error) {
-			console.error('failed to create file:', error);
-			alert(`failed to create file: ${error}`); // eslint-disable-line no-alert
-		}
+	/**
+	 * Closes a tab — or asks first, for a file with a draft, and the close
+	 * dialog handles focus — then focuses the newly selected tab's editor, since
+	 * the removed tab (and its close button) would otherwise drop focus to `body`.
+	 */
+	const close_tab = (tab_id: Uuid): void => {
+		editor.request_close_tab(tab_id);
+		if (editor.tabs.items.by_id.has(tab_id)) return; // asking first
+		const diskfile_id = editor.tabs.selected_diskfile_id;
+		if (diskfile_id) app.ui.pending_element_to_focus_key = diskfile_id;
 	};
 </script>
 
@@ -60,7 +56,7 @@
 			swallow(e);
 			const selected_tab = editor.tabs.selected_tab;
 			if (selected_tab) {
-				editor.close_tab(selected_tab.id);
+				close_tab(selected_tab.id);
 			}
 		}
 
@@ -106,7 +102,7 @@
 			<DiskfileExplorer />
 		</div>
 
-		<div class="flex:1 column overflow:auto height:100%">
+		<div class="flex:1 column overflow:hidden height:100%">
 			<!-- tabs -->
 			<menu
 				class="unstyled display:flex overflow-x:auto scrollbar-width:thin"
@@ -121,13 +117,7 @@
 							<DiskfileTabListitem
 								{tab}
 								onselect={(tab) => diskfiles.select(tab.diskfile_id)}
-								onclose={(tab) => {
-									// TODO does this logic belong in a `diskfiles` method that wraps editor.close_tab?
-									if (tab.diskfile_id === selected_diskfile?.id) {
-										diskfiles.select(null);
-									}
-									editor.close_tab(tab.id);
-								}}
+								onclose={(tab) => close_tab(tab.id)}
 								onopen={(tab) => editor.open_tab(tab.id)}
 							/>
 						</div>
@@ -135,54 +125,65 @@
 				{/each}
 			</menu>
 
-			<!-- editor content area -->
-			{#if selected_tab}
-				{#if selected_diskfile}
-					<DiskfileEditorView
-						diskfile={selected_diskfile}
-						onmodified={(diskfile_id) => editor.handle_file_modified(diskfile_id)}
-					/>
-				{:else}
-					<!-- TODO think this through - maybe the tabs should be more flexible than 1:1 with a diskfile? maybe `DiskfileEditorView` should have UI to create a file if there is none? -->
+			<!-- editor content area: the space under the tabs, so a view's `height:100%` fits it and
+			     the column never overflows - else `scrollIntoView` and focus scroll the tabs away -->
+			<div class="flex:1 min-height:0">
+				{#if selected_tab}
+					{#if selected_diskfile}
+						<DiskfileView
+							diskfile={selected_diskfile}
+							onmodified={(diskfile_id) => editor.handle_file_modified(diskfile_id)}
+						/>
+					{:else}
+						<!-- TODO think this through - maybe the tabs should be more flexible than 1:1 with a diskfile? maybe `DiskfileView` should have UI to create a file if there is none? -->
+						<div class="box height:100%">
+							<p>Something went wrong, this tab has no diskfile</p>
+						</div>
+					{/if}
+				{:else if diskfiles.on_disk.length > 0}
 					<div class="box height:100%">
-						<p>Something went wrong, this tab has no diskfile</p>
+						<p>
+							<button
+								type="button"
+								class="inline"
+								onclick={() => {
+									show_diskfile_picker = true;
+								}}
+							>
+								select
+							</button>
+							a file from the list or
+							<button
+								type="button"
+								class="inline palette_f"
+								onclick={() => {
+									const diskfile = random_item(app.diskfiles.on_disk);
+									diskfiles.select(diskfile.id);
+								}}
+							>
+								go fish
+							</button> to view and edit its content
+						</p>
+					</div>
+				{:else}
+					<div class="box height:100%">
+						<p>
+							no files yet,
+							{#if diskfiles.new_files_dir}
+								<button
+									type="button"
+									class="inline palette_d"
+									onclick={() => prompt_create_diskfile(diskfiles, 'file')}
+								>
+									create a new file
+								</button>?
+							{:else}
+								<a href={resolve('/workspaces')}>open a workspace</a> to create one
+							{/if}
+						</p>
 					</div>
 				{/if}
-			{:else if diskfiles.items.size > 0}
-				<div class="box height:100%">
-					<p>
-						<button
-							type="button"
-							class="inline"
-							onclick={() => {
-								show_diskfile_picker = true;
-							}}
-						>
-							select
-						</button>
-						a file from the list or
-						<button
-							type="button"
-							class="inline palette_f"
-							onclick={() => {
-								const diskfile = random_item(app.diskfiles.items.values);
-								diskfiles.select(diskfile.id);
-							}}
-						>
-							go fish
-						</button> to view and edit its content
-					</p>
-				</div>
-			{:else}
-				<div class="box height:100%">
-					<p>
-						no files yet,
-						<button type="button" class="inline palette_d" onclick={create_file}>
-							create a new file
-						</button>?
-					</p>
-				</div>
-			{/if}
+			</div>
 		</div>
 	{/if}
 </div>

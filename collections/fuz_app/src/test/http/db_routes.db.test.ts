@@ -1,44 +1,39 @@
 /**
  * Tests for backend_db_routes — allowlist-gated PostgreSQL table browser route specs.
  *
- * Uses pglite (in-memory) with auth tables for real schema/FK testing.
+ * Uses the default in-memory test database with auth tables for real schema/FK testing.
  *
  * @module
  */
 
 import { describe, assert, test, beforeAll, afterAll, beforeEach } from 'vitest';
-import { Hono } from 'hono';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import {
 	create_db_route_specs,
 	type ColumnInfo,
+	type DbRouteDeps,
 	type DbRouteOptions
-} from '$lib/http/db_routes.ts';
-import { create_recording_audit_emitter } from '$lib/testing/audit_drift_guard.ts';
-import { apply_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
-import { flush_post_commit_effects } from '$lib/http/pending_effects.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { REQUEST_CONTEXT_KEY, type RequestContext } from '$lib/auth/request_context.ts';
-import { audit_metadata_schemas } from '$lib/auth/audit_log_schema.ts';
-import { create_test_context } from '$lib/testing/entities.ts';
-import { ACCOUNT_ID_KEY, CREDENTIAL_TYPE_KEY, TEST_CONTEXT_PRESET_KEY } from '$lib/hono_context.ts';
-import type { Db } from '$lib/db/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_pglite_factory } from '$lib/testing/db.ts';
+} from '#lib/http/db_routes.ts';
+import { create_recording_audit_emitter } from '#lib/testing/audit_drift_guard.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+import { audit_metadata_schemas } from '#lib/auth/audit_log_schema.ts';
+import type { Db } from '#lib/db/db.ts';
+import { pg_error_code } from '#lib/db/pg_error.ts';
+import { run_migrations } from '#lib/db/migrate.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { create_pglite_db } from '#lib/db/db_pglite.ts';
+import { create_default_db_factory } from '#lib/testing/db.ts';
+import { create_db_routes_test_app, db_routes_keeper_ctx } from './db_routes_test_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 
-// Shared PGlite WASM instance via factory cache — avoids cold start overhead.
-const factory = create_pglite_factory(async (db) => {
-	await run_migrations(db, [auth_migration_ns]);
+// Shared WASM database instance via factory cache — avoids cold start overhead.
+const factory = create_default_db_factory(async (db) => {
+	await run_migrations(db, [AUTH_MIGRATION_NS]);
 });
 
 let db: Db;
-
-/** Create a request context with keeper role. */
-const keeper_ctx: RequestContext = create_test_context([{ role: 'keeper' }]);
 
 /** Recording audit emitter — `audit.calls` resets per test in `beforeEach`. */
 const audit = create_recording_audit_emitter();
@@ -70,32 +65,15 @@ const TEST_BROWSABLE: ReadonlyArray<string> = [
 /** Create db route specs with the suite defaults, overridable per test. */
 const create_specs = (overrides?: Partial<DbRouteOptions>): Array<RouteSpec> =>
 	create_db_route_specs(deps, {
-		db_type: 'pglite-memory',
+		db_type: 'pglet-memory',
 		db_name: 'test',
 		browsable_tables: TEST_BROWSABLE,
 		...overrides
 	});
 
 /** Create a test Hono app with keeper auth (daemon_token credential) and db route specs. */
-const create_test_app = (specs: Array<RouteSpec>) => {
-	const app = new Hono();
-	app.use('/*', async (c, next) => {
-		c.set(ACCOUNT_ID_KEY, keeper_ctx.account.id);
-		c.set(REQUEST_CONTEXT_KEY, keeper_ctx);
-		c.set(TEST_CONTEXT_PRESET_KEY, true);
-		c.set(CREDENTIAL_TYPE_KEY, 'daemon_token');
-		// the queues + post-commit flush the app server provides — the DELETE
-		// route defers its audit emission via `emit_after_commit`, so the
-		// recording emitter observes it only when the flush runs (i.e. only
-		// for a committed transaction)
-		c.set('pending_effects', []);
-		c.set('post_commit_effects', []);
-		await next();
-		await flush_post_commit_effects(c.var.post_commit_effects, log);
-	});
-	apply_route_specs(app, specs, fuz_auth_guard_resolver, log, db);
-	return app;
-};
+const create_test_app = (specs: Array<RouteSpec>, app_db: Db = db) =>
+	create_db_routes_test_app(specs, app_db, log);
 
 beforeAll(async () => {
 	db = await factory.create();
@@ -167,7 +145,7 @@ describe('route spec metadata', () => {
 		// drop or mistype here throws at registration and this test
 		// fails loudly inside fuz_app CI instead of surfacing as a
 		// confusing throw the first time a consumer
-		// (mageguild / zap) registers these routes.
+		// (fuz_forge) registers these routes.
 		const specs = create_specs();
 		assert.doesNotThrow(() => create_test_app(specs));
 	});
@@ -181,7 +159,7 @@ describe('GET /health handler', () => {
 		assert.strictEqual(res.status, 200);
 		const body = await res.json();
 		assert.strictEqual(body.connected, true);
-		assert.strictEqual(body.type, 'pglite-memory');
+		assert.strictEqual(body.type, 'pglet-memory');
 		assert.strictEqual(body.name, 'test');
 		assert.ok(typeof body.table_count === 'number');
 		// schema-wide by design (did-migrations-run diagnostic), not allowlist-filtered
@@ -282,20 +260,17 @@ describe('GET /tables/:name handler', () => {
 	});
 
 	test('bytea and bytea[] values are placeholdered, other columns pass through', async () => {
-		await db.query(`DROP DOMAIN IF EXISTS blob_dom CASCADE`);
-		await db.query(`CREATE DOMAIN blob_dom AS BYTEA`);
 		await db.query(`CREATE TABLE bytea_test (
 			id TEXT PRIMARY KEY,
 			data BYTEA,
 			datas BYTEA[],
-			data_dom BLOB_DOM,
 			note TEXT NOT NULL
 		)`);
 		await db.query(
-			`INSERT INTO bytea_test (id, data, datas, data_dom, note)
+			`INSERT INTO bytea_test (id, data, datas, note)
 			 VALUES
-			   ('a', decode('deadbeef', 'hex'), ARRAY[decode('dead', 'hex'), decode('beef', 'hex')], decode('cafebabe99', 'hex'), 'x'),
-			   ('b', NULL, NULL, NULL, 'y')`
+			   ('a', '\\xdeadbeef'::bytea, ARRAY['\\xdead'::bytea, '\\xbeef'::bytea], 'x'),
+			   ('b', NULL, NULL, 'y')`
 		);
 		const specs = create_specs();
 		const app = create_test_app(specs);
@@ -315,17 +290,39 @@ describe('GET /tables/:name handler', () => {
 		// bytea[] reports pg_column_size (storage size), not octet_length —
 		// the exact number is representation-dependent, the shape is the pin
 		assert.match(a.datas as string, /^<\d+ bytes>$/);
-		// a DOMAIN over bytea resolves to `udt_name: 'bytea'` in
-		// information_schema, so the placeholder holds — pinned so a
-		// consumer's domain-typed blob column can't silently reopen the
-		// bytea egress amplification
-		assert.strictEqual(a.data_dom, '<5 bytes>');
 		assert.strictEqual(a.note, 'x');
 		const b = by_id.get('b') as Record<string, unknown>;
 		assert.strictEqual(b.data, null);
 		assert.strictEqual(b.datas, null);
-		assert.strictEqual(b.data_dom, null);
 		assert.strictEqual(b.note, 'y');
+	});
+
+	test('a DOMAIN over bytea is placeholdered like bytea (PGlite)', async () => {
+		// a DOMAIN over bytea resolves to `udt_name: 'bytea'` in
+		// information_schema, so the placeholder holds — pinned so a
+		// consumer's domain-typed blob column can't silently reopen the
+		// bytea egress amplification. pglet has no domains (`CREATE DOMAIN` is
+		// refused), so this case builds its own PGlite — not the shared factory
+		// instance, which can be the suite's own `db` when the default driver is PGlite
+		const { PGlite } = await import('@electric-sql/pglite');
+		const { db: pglite_db, close } = create_pglite_db(new PGlite());
+		try {
+			await run_migrations(pglite_db, [AUTH_MIGRATION_NS]);
+			await pglite_db.query(`CREATE DOMAIN blob_dom AS BYTEA`);
+			await pglite_db.query(`CREATE TABLE bytea_test (id TEXT PRIMARY KEY, data_dom BLOB_DOM)`);
+			await pglite_db.query(
+				`INSERT INTO bytea_test (id, data_dom) VALUES ('a', '\\xcafebabe99'::bytea), ('b', NULL)`
+			);
+			const app = create_test_app(create_specs(), pglite_db);
+			const res = await app.request('/tables/bytea_test');
+			assert.strictEqual(res.status, 200);
+			const body = await res.json();
+			const by_id = new Map(body.rows.map((r: Record<string, unknown>) => [r.id, r] as const));
+			assert.strictEqual((by_id.get('a') as Record<string, unknown>).data_dom, '<5 bytes>');
+			assert.strictEqual((by_id.get('b') as Record<string, unknown>).data_dom, null);
+		} finally {
+			await close();
+		}
 	});
 
 	test('out-of-range and malformed paging params are 400s on both twins', async () => {
@@ -644,38 +641,59 @@ describe('DELETE /tables/:name/rows/:id handler', () => {
 		assert.strictEqual(parseInt(remaining[0]!.count, 10), 1, 'the floor row must survive');
 	});
 
-	test('FK constraint returns 409 when child rows prevent deletion', async () => {
-		// Auth tables use CASCADE, so create a custom table with RESTRICT FK
-		// to exercise the 409 handler path. PGlite (PG 17) raises 23503 here;
-		// PG 18+ raises 23001 restrict_violation for the same refusal — that
-		// arm is pinned against real PG by the Rust twin's
-		// `restricted_fk_delete_is_a_409_and_deletes_nothing`.
-		await db.query(`CREATE TABLE IF NOT EXISTS fk_test_parent (
-			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			name TEXT NOT NULL
-		)`);
-		await db.query(`CREATE TABLE IF NOT EXISTS fk_test_child (
-			id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			parent_id TEXT NOT NULL REFERENCES fk_test_parent(id) ON DELETE RESTRICT
-		)`);
-		const parent = await db.query<{ id: string }>(
-			`INSERT INTO fk_test_parent (name) VALUES ('parent') RETURNING id`
-		);
-		const parent_id = parent[0]!.id;
-		await db.query(`INSERT INTO fk_test_child (parent_id) VALUES ($1)`, [parent_id]);
+	// Two referencing-row refusals, one per SQLSTATE the handler maps to 409.
+	// `ON DELETE RESTRICT` raises 23001 `restrict_violation` on PostgreSQL 18,
+	// PGlite and pglet (an earlier PostgreSQL raises 23503); `NO ACTION` — what a
+	// constraint naming no action is — raises 23503 `foreign_key_violation` on
+	// every one of them. Auth tables use CASCADE, so each case builds its own
+	// child table. The Rust twin pins the same pair against real PG in
+	// `restricted_fk_delete_is_a_409_and_deletes_nothing` and
+	// `no_action_fk_delete_is_a_409_and_deletes_nothing`.
+	for (const { action, on_delete, sqlstate } of [
+		{ action: 'RESTRICT', on_delete: ' ON DELETE RESTRICT', sqlstate: '23001' },
+		{ action: 'NO ACTION', on_delete: '', sqlstate: '23503' }
+	]) {
+		test(`FK constraint (${action}) returns 409 when child rows prevent deletion`, async () => {
+			await db.query(`CREATE TABLE fk_test_parent (
+				id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+				name TEXT NOT NULL
+			)`);
+			await db.query(`CREATE TABLE fk_test_child (
+				id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+				parent_id TEXT NOT NULL REFERENCES fk_test_parent(id)${on_delete}
+			)`);
+			const parent = await db.query<{ id: string }>(
+				`INSERT INTO fk_test_parent (name) VALUES ('parent') RETURNING id`
+			);
+			const parent_id = parent[0]!.id;
+			await db.query(`INSERT INTO fk_test_child (parent_id) VALUES ($1)`, [parent_id]);
 
-		const specs = create_specs();
-		const app = create_test_app(specs);
-		const res = await app.request(`/tables/fk_test_parent/rows/${parent_id}`, {
-			method: 'DELETE'
+			// the engine raises the code this case is here for, so the case
+			// can't pass on the other arm
+			const raw = await db.query(`DELETE FROM fk_test_parent WHERE id = $1`, [parent_id]).then(
+				() => null,
+				(err: unknown) => err
+			);
+			assert.strictEqual(pg_error_code(raw), sqlstate, `a ${action} constraint raises ${sqlstate}`);
+
+			const specs = create_specs();
+			const app = create_test_app(specs);
+			const res = await app.request(`/tables/fk_test_parent/rows/${parent_id}`, {
+				method: 'DELETE'
+			});
+			assert.strictEqual(res.status, 409);
+			const body = await res.json();
+			assert.strictEqual(body.error, 'foreign_key_violation');
+			// Regression guard: PG detail/constraint must not leak to client
+			assert.strictEqual(body.detail, undefined, 'PG detail must not leak to client');
+			assert.strictEqual(body.constraint, undefined, 'PG constraint must not leak to client');
+			const remaining = await db.query<{ count: string }>(
+				`SELECT COUNT(*) as count FROM fk_test_parent WHERE id = $1`,
+				[parent_id]
+			);
+			assert.strictEqual(parseInt(remaining[0]!.count, 10), 1, 'the referenced parent survives');
 		});
-		assert.strictEqual(res.status, 409);
-		const body = await res.json();
-		assert.strictEqual(body.error, 'foreign_key_violation');
-		// Regression guard: PG detail/constraint must not leak to client (scrubbed 2026-03-19)
-		assert.strictEqual(body.detail, undefined, 'PG detail must not leak to client');
-		assert.strictEqual(body.constraint, undefined, 'PG constraint must not leak to client');
-	});
+	}
 
 	test('excluded table delete is refused and deletes nothing', async () => {
 		await db.query(
@@ -774,13 +792,42 @@ describe('DELETE audit emission', () => {
 		assert.strictEqual(call.event_type, 'db_admin_row_delete');
 		// Account-grain attribution — the browser's gate is account-grain, so
 		// the emission claims no actor.
-		assert.strictEqual(call.account_id, keeper_ctx.account.id);
+		assert.strictEqual(call.account_id, db_routes_keeper_ctx.account.id);
 		assert.isUndefined(call.actor_id);
 		assert.deepStrictEqual(call.metadata, { table: 'browse_test', pk_column: 'id', id });
 		// The recording emitter bypasses `query_audit_log`'s fail-open metadata
 		// validation, so bind the emitted shape to the builtin schema here — a
 		// schema key rename fails this parse instead of bumping a prod counter.
 		audit_metadata_schemas.db_admin_row_delete.parse(call.metadata);
+	});
+
+	test('the post-commit flush waits for the row write', async () => {
+		// a pool write that lands a macrotask later, as a real INSERT does —
+		// the flush waits for it only if the thunk returns the write's promise
+		const written: Array<Parameters<DbRouteDeps['audit']['emit_pool']>[0]> = [];
+		const slow_deps: DbRouteDeps = {
+			audit: {
+				emit_pool: async (input) => {
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					written.push(input);
+				}
+			}
+		};
+		const result = await db.query<{ id: string }>(
+			`INSERT INTO browse_test (label) VALUES ('awaited') RETURNING id`
+		);
+		const id = result[0]!.id;
+		const app = create_test_app(
+			create_db_route_specs(slow_deps, {
+				db_type: 'pglet-memory',
+				db_name: 'test',
+				browsable_tables: TEST_BROWSABLE
+			})
+		);
+		const res = await app.request(`/tables/browse_test/rows/${id}`, { method: 'DELETE' });
+		assert.strictEqual(res.status, 200);
+		assert.strictEqual(written.length, 1, 'the row was written before the response');
+		assert.strictEqual(written[0]!.event_type, 'db_admin_row_delete');
 	});
 
 	test('the audited id is the canonical PK rendering, not the URL spelling', async () => {

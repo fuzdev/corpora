@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { vite_plugin_pkg_json } from '$lib/vite_plugin_pkg_json.ts';
+import { vite_plugin_pkg_json } from '#lib/vite_plugin_pkg_json.ts';
 import { pkg_json_keys } from '@fuzdev/fuz_util/pkg_json.ts';
 
 // The plugin's hooks read `this` (a Rollup plugin context) for `addWatchFile`,

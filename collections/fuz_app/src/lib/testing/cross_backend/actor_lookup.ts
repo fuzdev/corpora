@@ -7,27 +7,26 @@ import '../assert_dev_env.ts';
  * (`{ids} → {actors: [{id, username, display_name?}]}`), not folded into the
  * standard bundle. It's live-mounted on the spine RPC path but kept off the
  * declared surface (`create_spine_surface_spec`) — like cells / ws / sse — so
- * the standard cross suite's generic round-trip never drives it; this
- * dedicated suite is its validator. Three cases over raw transport calls:
+ * the standard cross suite's generic round-trip never drives it.
  *
- * - **anonymous → 401** — the account-grain auth gate refuses an
- *   unauthenticated caller before the handler runs.
+ * Its single-request refusals are conformance-table rows on a table given the
+ * live mount (`live_rpc_endpoints`): the anonymous 401 a generated auth row,
+ * the empty-`ids` 400 a hand-written one. This suite holds what a row can't
+ * say, because it names the fixture's own actor:
+ *
  * - **keeper resolves own actor → 200** — the populated round trip: the
  *   returned row carries the keeper's `id` + `username`, and **no**
  *   `account_id` / `email` / timestamp / role field (the wire shape's
  *   deliberate info-leak posture). This is the assertion that exercises the
  *   Rust row→JSON mapping against the TS canonical shape.
- * - **empty `ids` → 400** — the `min(1)` input bound is enforced on both
- *   spines (TS Zod, Rust `parse_ids`).
+ * - **a soft-deleted account's actor doesn't resolve** — beside a live one,
+ *   after the keeper's `account_delete`.
  *
  * Runs both legs via the shared `{setup_test}` protocol: the in-process leg
  * (`auth/actor_lookup_parity.db.test.ts`, plain `gro test`) and the
- * cross-process leg (`cross_backend/actor_lookup.cross.test.ts`, the TS spine
+ * cross-process leg (`cross_backend/spine_suites.cross.test.ts`, the TS spine
  * binaries + Rust `testing_spine_stub` over real HTTP). `actor_lookup` is
  * mounted on every spine, so the suite is ungated.
- *
- * `$lib`-free by contract (relative specifiers only), like the sibling
- * cross-backend suites.
  *
  * @module
  */
@@ -40,8 +39,9 @@ import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
 
 /**
  * Options for the actor-lookup parity suite. The standard RPC-dispatched
- * cross-suite shape (`setup_test` / `capabilities` / `rpc_path`); aliases
- * the shared `RpcPathCrossSuiteOptions` rather than minting a duplicate.
+ * cross-suite shape (`setup_test` / `rpc_path`); aliases the shared
+ * `RpcPathCrossSuiteOptions` rather than minting a duplicate. No case here
+ * is capability-gated, so the flag bundle is not on the shape.
  */
 export type ActorLookupCrossTestOptions = RpcPathCrossSuiteOptions;
 
@@ -57,16 +57,6 @@ export const describe_actor_lookup_cross_tests = (options: ActorLookupCrossTestO
 	const rpc_path = options.rpc_path ?? SPINE_RPC_PATH;
 
 	describe('actor_lookup parity', () => {
-		test('anonymous → 401 (account-grain auth gate)', async () => {
-			const fixture = await setup_test();
-			const res = await fixture.fresh_transport()(rpc_path, {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: lookup_envelope([fixture.actor.id], 'anon-lookup')
-			});
-			assert.strictEqual(res.status, 401, 'unauthenticated actor_lookup must be refused');
-		});
-
 		test('keeper resolves own actor → 200 with id + username, no control fields', async () => {
 			const fixture = await setup_test();
 			const res = await fixture.transport(rpc_path, {
@@ -92,14 +82,34 @@ export const describe_actor_lookup_cross_tests = (options: ActorLookupCrossTestO
 			}
 		});
 
-		test('empty ids → 400 (min(1) input bound)', async () => {
+		test("a soft-deleted account's actor no longer resolves", async () => {
 			const fixture = await setup_test();
+			const gone = await fixture.create_account({ username: 'lookup_soft_deleted' });
+			const live = await fixture.create_account({ username: 'lookup_live' });
+			const deleted = await fixture.transport(rpc_path, {
+				method: 'POST',
+				headers: { ...fixture.create_session_headers(), 'content-type': 'application/json' },
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					method: 'account_delete',
+					params: { account_id: gone.account.id },
+					id: 'delete'
+				})
+			});
+			assert.strictEqual(deleted.status, 200, 'the admin deletes the account');
+			await deleted.text();
 			const res = await fixture.transport(rpc_path, {
 				method: 'POST',
 				headers: { ...fixture.create_session_headers(), 'content-type': 'application/json' },
-				body: lookup_envelope([], 'empty-lookup')
+				body: lookup_envelope([gone.actor.id, live.actor.id], 'tombstone-lookup')
 			});
-			assert.strictEqual(res.status, 400, 'empty ids must fail input validation');
+			assert.strictEqual(res.status, 200);
+			const body = (await res.json()) as { result?: { actors?: Array<{ id: string }> } };
+			assert.deepStrictEqual(
+				body.result?.actors?.map((a) => a.id),
+				[live.actor.id],
+				'the tombstoned actor drops out, the live one resolves'
+			);
 		});
 	});
 };

@@ -20,15 +20,22 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			The <ModuleLink module_path="vite.ts">Vite plugin</ModuleLink> is the recommended path for SvelteKit
-			and Vite projects. It runs analysis at build time and serves the result as
-			<Code lang="ts" inline content="'virtual:svelte-docinfo'" />; in dev mode it watches source
-			files and sends HMR updates as you edit.
+			The <ModuleLink module_path="vite.ts">Vite plugin</ModuleLink> is the recommended path for
+			SvelteKit and Vite projects. It runs analysis at build time and serves the result as
+			<Code lang="ts" inline content="'virtual:svelte-docinfo'" />. In dev it watches your source
+			files, plus the other files they import like <code>internal/</code> modules, and reloads the
+			page when an edit changes the result.
+		</p>
+		<p>
+			The plugin keeps a persistent <DeclarationLink name="createAnalysisSession" />, so dev
+			re-analysis reuses parsed ASTs and svelte2tsx output. To write the data to a file instead, use
+			the <TomeLink slug="cli">CLI</TomeLink>.
 		</p>
 	</section>
 
 	<TomeSection>
 		<TomeSectionHeader text="Setup" />
+		<p>Requires Vite 6 or later.</p>
 		<ol>
 			<li>
 				<p>Add the plugin to <code>vite.config.ts</code>:</p>
@@ -60,25 +67,31 @@ import data from 'virtual:svelte-docinfo';
 // data.modules and data.diagnostics are the same as the named exports`}
 				/>
 				<p>
-					Both exports match the programmatic <DeclarationLink name="AnalyzeResultJson" /> shape. See
-					<TomeLink slug="diagnostics" /> for what flows through <code>diagnostics</code>.
+					The data is <DeclarationLink name="AnalyzeResultJson" /> in its wire form
+					(<DeclarationLink name="AnalyzeResultJsonWire" />). <code>modules</code> and
+					<code>diagnostics</code> are always arrays, but entries in <code>modules</code> omit empty
+					arrays and <code>false</code> flags. Treat absent as empty, or restore the defaults per
+					module with <DeclarationLink name="parseModuleJson" /> from
+					<code>svelte-docinfo/types.js</code>, which is light enough for the browser (see
+					<TomeLink slug="output-format" hash="Compact-JSON">compact JSON</TomeLink>). See
+					<TomeLink slug="diagnostics" /> for <code>diagnostics</code>.
 				</p>
 			</li>
 		</ol>
 		<p>
-			If TypeScript reports <code>Cannot find module 'virtual:svelte-docinfo'</code>, ensure the
-			<code>/// &lt;reference&gt;</code> line is in your <code>app.d.ts</code>.
+			If TypeScript reports <code>Cannot find module 'virtual:svelte-docinfo'</code>, check the
+			<Code lang="ts" inline content={'/// <reference>'} /> line in <code>app.d.ts</code>.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="Options" />
 		<p>
-			All options are optional; the minimal call uses defaults (package.json exports discovery, glob
-			fallback):
+			All options are optional; the minimal call discovers files from <code>package.json</code>
+			exports, falling back to glob:
 		</p>
 		<Code lang="ts" content="svelteDocinfo()" />
-		<p>Every option, with its default:</p>
+		<p>Every option, with its default in the comment above it:</p>
 		<Code
 			lang="ts"
 			content={`import svelteDocinfo from 'svelte-docinfo/vite.js';
@@ -89,21 +102,19 @@ svelteDocinfo({
 
   // Glob patterns for file discovery. Forces glob mode under discovery: 'auto'.
   // Default: undefined (use exports discovery).
-  // Widens the source scope: each pattern's static base joins
-  // sourceOptions.sourcePaths (the watcher tracks it too); a pattern with
-  // no base scopes the whole project root and logs an info line.
+  // Each pattern's static base joins sourceOptions.sourcePaths; a pattern
+  // with no base makes the whole project root source and logs an info line.
   include: ['src/**/*.ts', 'src/**/*.svelte'],
 
-  // Exclude globs. An array fully replaces the default
-  // ['**/*.test.ts', '**/*.spec.ts', '**/internal/**']; the callback
-  // form extends the defaults without restating them. node_modules and
-  // dot-directories below a source path are always excluded,
-  // independent of this option.
+  // Exclude globs. An array replaces the default
+  // ['**/*.{test,spec}.{ts,mts,tsx,js,mjs,jsx}', '**/internal/**']; a callback extends
+  // it. Replaces sourceOptions.exclude when both are set. node_modules and
+  // dot-directories below a source path are never source.
   exclude: (defaults) => [...defaults, '**/*.gen.ts'],
 
   // Discovery strategy: 'auto' | 'exports' | 'glob'. Default: 'auto'.
   // 'auto'    → exports first, glob fallback
-  // 'exports' → strict; throws if package.json exports is missing
+  // 'exports' → strict; throws if package.json exports is missing or resolves to no files
   // 'glob'    → skip exports, use glob patterns
   discovery: 'auto',
 
@@ -113,72 +124,64 @@ svelteDocinfo({
   // Resolve module dependency graph. Default: true.
   resolveDependencies: true,
 
-  // Dispatch on duplicate declaration names across modules.
-  // 'throw' | 'warn' | (duplicates, log) => void.
-  // Default: undefined — the duplicate_declaration diagnostic still emits,
-  // but no extra dispatch fires. Set to 'throw' to fail fast on duplicates.
-  onDuplicates: undefined,
-
   // Partial overrides for default source options (SvelteKit src/lib layout).
   // Merged into createSourceOptions(projectRoot, sourceOptions).
   sourceOptions: {sourcePaths: ['src/lib']},
 
-  // HMR debounce in ms. Default: 100.
+  // dev re-analysis debounce in ms. Default: 100.
   hmrDebounceMs: 100,
+
+  // Opt-in check that names are unique across modules, for packages with a
+  // flat export namespace. Default: undefined (off).
+  // 'diagnostic' → emit duplicate_declaration diagnostics
+  // 'warn'       → also log them
+  // 'throw'      → also fail the build
+  onDuplicates: undefined,
+
+  // tsconfig path relative to projectRoot (searched upward from it), or false
+  // to analyze without one. Default: 'tsconfig.json'.
+  tsconfig: 'tsconfig.json',
+
+  // Compiler options merged over the tsconfig's. Default: none.
+  compilerOptions: undefined,
+
+  // The program's root files, in place of the tsconfig's: a list, or a
+  // function over the tsconfig's roots. Default: the tsconfig's roots.
+  // See the source files guide for the declarationFileRoots preset and its tradeoff.
+  rootFileNames: undefined,
 })`}
 		/>
 		<p>
-			The plugin runs the same pipeline as <DeclarationLink name="analyzeFromFiles" /> internally: discover
-			via <DeclarationLink name="discoverSourceFiles" />, resolve dependencies, then analyze.
-			<code>sourceOptions</code> is merged with defaults via
-			<DeclarationLink name="createSourceOptions" /> before discovery; <code>hmrDebounceMs</code>
-			only affects the dev-mode watcher.
+			The plugin runs the same pipeline as <DeclarationLink name="analyzeFromFiles" />: discover,
+			resolve dependencies, analyze. In dev, imports resolve through Vite's <code>resolveId</code>,
+			so Vite aliases apply; in builds, the TypeScript default resolver is used (it honors tsconfig
+			<code>paths</code>). <code>hmrDebounceMs</code> only affects the dev watcher.
 		</p>
 		<p>
-			Paths and patterns resolve against <code>projectRoot</code>: absolute
-			<code>sourcePaths</code> / <code>sourceRoot</code> entries and
-			<code>include</code> / <code>exclude</code> patterns inside the root are accepted (stored root-relative),
-			while anything resolving outside it throws at config time instead of silently emitting nothing.
+			<TomeLink slug="source-files" /> covers how <code>discovery</code>, <code>include</code>,
+			<code>exclude</code>, <code>sourceOptions</code>, and the tsconfig options decide what's
+			documented.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
-		<TomeSectionHeader text="CLI vs Vite plugin" />
+		<TomeSectionHeader text="Dev behavior" />
 		<p>
-			The CLI calls <DeclarationLink name="analyzeFromFiles" /> once, so use it for CI pipelines and one-off
-			generation. The plugin owns a persistent <DeclarationLink name="createAnalysisSession" />, so
-			HMR re-analyses reuse parsed TypeScript ASTs and svelte2tsx output across cycles. Use it when
-			the analysis feeds the SvelteKit/Vite bundle. See the <TomeLink slug="session" /> guide if you're
-			driving a session directly (custom bundler, LSP, etc.).
+			Options are validated when Vite resolves its config, so a bad one (like
+			<Code lang="ts" inline content="discovery: 'exports'" /> with <code>include</code>, or a path
+			outside the project root) fails at startup.
 		</p>
-	</TomeSection>
-
-	<TomeSection>
-		<TomeSectionHeader text="How it works" />
-		<p>The plugin hooks into four Vite lifecycle stages:</p>
-		<ol>
-			<li>
-				<strong>configResolved</strong>: throws synchronously when
-				<code>discovery: 'exports'</code> is combined with <code>include</code>, or when a source
-				path or include pattern escapes the project root, so bad configs fail at startup rather than
-				at first analysis
-			</li>
-			<li>
-				<strong>buildStart</strong>: creates a fresh
-				<DeclarationLink name="createAnalysisSession" /> session, discovers the source set, ingests file
-				contents via <code>setFiles</code>, and runs <code>query</code>; caches the serialized JSON
-				result
-			</li>
-			<li>
-				<strong>resolveId / load</strong>: serves the cached result as
-				<code>virtual:svelte-docinfo</code>, a JavaScript module exporting <code>modules</code>,
-				<code>diagnostics</code>, and a default <code>{`{modules, diagnostics}`}</code>
-			</li>
-			<li>
-				<strong>configureServer</strong>: watches source directories for changes, debounces
-				re-analysis, and sends HMR updates only when the output actually changes. The session diffs
-				incoming files by content equality, so unchanged files skip re-parsing entirely.
-			</li>
-		</ol>
+		<p>
+			In dev the plugin watches the source files and the files they import, debounces re-analysis by
+			<code>hmrDebounceMs</code>, and re-parses only what changed. Only the files discovery selects
+			emit modules, as in a build: an edit elsewhere refreshes the analysis without adding a module,
+			and a newly created file is checked against discovery again.
+		</p>
+		<p>
+			Any change to the output reloads the page, even one that only shifts a declaration's source
+			line, instead of letting Svelte HMR update components in place. Importers build state from the
+			data (like a layout building a library from <code>modules</code>), so re-running the module
+			alone would leave them stale.
+		</p>
 	</TomeSection>
 </TomeContent>

@@ -1,6 +1,7 @@
 import {
 	advance_probe,
 	is_digit,
+	is_hex_digit,
 	is_ident,
 	is_ident_start,
 	is_space,
@@ -12,12 +13,13 @@ import {
 	token_type,
 	trim_space_end,
 	words_map,
-	type Lexer,
+	WordIndex,
+	Lexer,
 	type SyntaxLang
 } from './lexer.ts';
 
 /**
- * Hand-written TypeScript/JavaScript lexer.
+ * TypeScript/JavaScript lexer.
  *
  * Disambiguation rests on three rules: previous-token tracking separates a
  * regex literal from division, template literals nest their `${…}`
@@ -27,6 +29,15 @@ import {
  * Nesting (template interpolations, generic argument lists, `: type`
  * annotations) runs on an explicit pooled frame stack, so arbitrarily deep
  * input tokenizes fully without touching the JS call stack.
+ *
+ * Type positions: a `:` is an annotation or an operator by where it is. The
+ * machine tracks the bracket level it is in (block, object literal, parens,
+ * array, class body) and each level's `?`s still waiting for a `:`, so
+ * `(x: T)`, `let x: T;` and `): T {` are annotations and `{a: b}`, `a ? b : c`,
+ * `case x:` and labels are not. The type then lexes in type mode and ends at
+ * the first token that can't continue it. A type alias's body and the tail of
+ * an `as` assertion lex the same way. It is a heuristic over tokens, not a
+ * parse: a name alone on its line before a `:` reads as a label.
  *
  * Resilience: unterminated strings extend to end of line; unterminated
  * templates, block comments, and interpolations extend to end of window.
@@ -73,7 +84,6 @@ const T_DECORATOR = token_type('decorator');
 const T_AT = token_type('at', 'operator');
 const T_DECORATOR_NAME = token_type('function', 'decorator_name');
 const T_TYPE_ANNOTATION = token_type('type_annotation');
-const T_COLON = token_type(':');
 const T_TYPE = token_type('type');
 
 // word classification kinds
@@ -109,63 +119,85 @@ const WORDS: Map<string, number> = words_map(
 	[K_NUMBER_WORD, 'NaN Infinity']
 );
 
-// keywords that put the lexer in a class-name context for the next identifier
-const CLASS_CTX_WORDS: Set<string> = new Set([
-	'class',
-	'extends',
-	'implements',
-	'instanceof',
-	'interface',
-	'new',
-	'type'
-]);
-// keywords after which the next identifier is a type assertion
-const AS_WORDS: Set<string> = new Set(['as', 'satisfies']);
-const IMPORT_WORDS: Set<string> = new Set(['import', 'export']);
-// value-like keywords — division follows, not a regex literal
-const VALUE_WORDS: Set<string> = new Set(['this', 'super', 'null', 'undefined']);
-
+// a word's value in `WORD_INDEX`: its kind in the low bits, `0` for a word that
+// is only a builtin, and context flags above
+const KIND_MASK = 15;
+const F_CLASS_CTX = 16; // puts the lexer in a class-name context for the next identifier
+const F_AS = 32; // the next identifier is a type assertion
+const F_IMPORT = 64;
+const F_VALUE = 128; // value-like keyword — division follows, not a regex literal
 // lowercase-only builtins are reachable — capitalized ones are claimed by
 // `capitalized_identifier` first in the classification order
-const BUILTIN_WORDS: Set<string> = new Set([
-	'Array',
-	'Function',
-	'Promise',
-	'any',
-	'boolean',
-	'console',
-	'never',
-	'number',
-	'string',
-	'symbol',
-	'unknown'
-]);
+const F_BUILTIN = 256;
+const F_BLOCK_INTRO = 512; // a `{` after it opens a block, not an object literal
+const F_CASE = 1024; // the next `:` ends a `case`/`default` clause
+const F_CLASS_BODY = 2048; // the next `{` opens a class or interface body
+const F_TYPE_OP = 4096; // continues a type: after it comes another part of the type
+// the flags the keyword path acts on, tested as one
+const F_CTX = F_CLASS_CTX | F_AS | F_IMPORT | F_BLOCK_INTRO | F_CASE | F_CLASS_BODY;
+
+for (const [flag, words] of [
+	[F_CLASS_CTX, 'class extends implements instanceof interface new type'],
+	[F_AS, 'as satisfies'],
+	[F_IMPORT, 'import export'],
+	[F_VALUE, 'this super null undefined'],
+	[
+		F_BUILTIN,
+		'Array Function Promise any bigint boolean console never number string symbol unknown'
+	],
+	[F_BLOCK_INTRO, 'else try finally do'],
+	[F_CASE, 'case default'],
+	[F_CLASS_BODY, 'class interface'],
+	[F_TYPE_OP, 'extends is keyof typeof infer readonly in as asserts new abstract']
+] as const) {
+	for (const word of words.split(' ')) WORDS.set(word, (WORDS.get(word) ?? 0) | flag);
+}
+
+const WORD_INDEX = new WordIndex(WORDS);
 
 // previous-significant-token categories, for regex-vs-division and contexts
 const P_NONE = 0; // start / after operator, `{`, `(`, `[`, `,`, `;` — regex allowed
 const P_VALUE = 1; // after a value — `/` is division
 const P_DOT = 2; // after `.` member access — next word is a property, not a keyword
 
-// bounded lookahead for heuristic scans (generics, annotations, arrow params)
+// a `prev_code` that is no char: after `=>` or a keyword like `else`, where a
+// `{` opens a block
+const PC_BLOCK_INTRO = 3;
+
+// what a bracket level of a value window is, in the low bits of its entry in
+// `TsMachine.levels`; the bits above count its `?`s still waiting for a `:`
+const L_BLOCK = 0;
+const L_OBJECT = 1;
+const L_PAREN = 2;
+const L_ARRAY = 3;
+const L_CLASS = 4;
+const L_MODULE = 5; // an `import {…}`/`export {…}` specifier list
+const L_KIND_MASK = 7;
+const L_TERNARY = 8;
+
+// `TsFrame.flags`
+const FF_CASE = 1; // a `case`/`default` whose `:` hasn't come
+const FF_CLASS_BODY = 2; // a `class`/`interface` whose body `{` hasn't come
+const FF_ALIAS = 4; // a `type` alias whose `=` hasn't come
+
+// bounded lookahead for heuristic scans (generics, arrow params)
 const MAX_SCAN = 600;
 
 /**
  * Monotonic next-occurrence caches for the heuristic-scan prechecks. Each
- * bounded scan can only succeed if its success char (`=` for type
- * annotations, `>` for generics, `)` for arrow params) occurs within its
- * `MAX_SCAN` window, so a cached native `indexOf` probe skips scans that
- * cannot succeed. The caches advance monotonically through the document, so
- * total probe work is O(n) — this is what keeps colon/angle/paren-dense
- * pathological inputs linear instead of paying `MAX_SCAN` per occurrence.
+ * bounded scan can only succeed if its success char (`>` for generics, `)` for
+ * arrow params) occurs within its `MAX_SCAN` window, so a cached native
+ * `indexOf` probe skips scans that cannot succeed. The caches advance
+ * monotonically through the document, so total probe work is O(n) — this is
+ * what keeps angle/paren-dense pathological inputs linear instead of paying
+ * `MAX_SCAN` per occurrence.
  */
 interface TsScanCache {
-	next_eq: number;
 	next_gt: number;
 	next_rparen: number;
 }
 
 const create_ts_scan_cache = (): TsScanCache => ({
-	next_eq: -1,
 	next_gt: -1,
 	next_rparen: -1
 });
@@ -192,54 +224,61 @@ const scan_ts_string = (text: string, from: number, end: number, quote: number):
 	return end;
 };
 
+// the digit loops allow `_` only between two wanted digits
+const scan_ts_decimal = (text: string, from: number, end: number): number => {
+	let j = from;
+	while (j < end) {
+		const c = text.charCodeAt(j);
+		if ((c >= 48 && c <= 57) || (c === 95 && is_digit(text.charCodeAt(j + 1)))) j++;
+		else break;
+	}
+	return j;
+};
+
+// `radix` is 16, 8, or 2
+const scan_ts_radix = (text: string, from: number, end: number, radix: number): number => {
+	let j = from;
+	while (j < end) {
+		const c = text.charCodeAt(j);
+		const wanted =
+			radix === 16 ? is_hex_digit(c) : radix === 2 ? c === 48 || c === 49 : c >= 48 && c <= 55;
+		if (wanted) j++;
+		else if (c === 95) {
+			const n = text.charCodeAt(j + 1);
+			const next =
+				radix === 16 ? is_hex_digit(n) : radix === 2 ? n === 48 || n === 49 : n >= 48 && n <= 55;
+			if (next) j++;
+			else break;
+		} else break;
+	}
+	return j;
+};
+
 /**
  * Scans a numeric literal from `i` (at a digit, or `.` before a digit),
  * returning the exclusive end. Handles hex/binary/octal, `_` separators,
  * exponents, and bigint `n` suffixes.
  *
- * The per-call closures are a measured exception to the top-level-functions
- * rule: V8 inlines them into specialized loops inside this function, and
- * hoisted top-level variants (both a param'd helper and a decimal-specialized
- * one) run ~1.2x slower on number-dense input.
+ * The digit loops are top-level functions rather than closures made per
+ * literal: closures allocate on every number, and measured slower on
+ * number-dense input.
  */
 const scan_ts_number = (text: string, i: number, end: number): number => {
-	const scan_digits = (from: number, is_wanted: (c: number) => boolean): number => {
-		let j = from;
-		while (j < end) {
-			const c = text.charCodeAt(j);
-			if (is_wanted(c) || (c === 95 && is_wanted(text.charCodeAt(j + 1)))) j++;
-			else break;
-		}
-		return j;
-	};
-	const is_hex = (c: number): boolean =>
-		(c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
-	const is_binary = (c: number): boolean => c === 48 || c === 49;
-	const is_octal = (c: number): boolean => c >= 48 && c <= 55;
-
 	if (text.charCodeAt(i) === 48) {
 		const c2 = text.charCodeAt(i + 1);
-		if (c2 === 120 || c2 === 88) {
-			let j = scan_digits(i + 2, is_hex);
+		const radix =
+			c2 === 120 || c2 === 88 ? 16 : c2 === 98 || c2 === 66 ? 2 : c2 === 111 || c2 === 79 ? 8 : 0;
+		if (radix !== 0) {
+			let j = scan_ts_radix(text, i + 2, end, radix);
 			if (text.charCodeAt(j) === 110) j++; // n
 			return j;
 		}
-		if (c2 === 98 || c2 === 66) {
-			let j = scan_digits(i + 2, is_binary);
-			if (text.charCodeAt(j) === 110) j++;
-			return j;
-		}
-		if (c2 === 111 || c2 === 79) {
-			let j = scan_digits(i + 2, is_octal);
-			if (text.charCodeAt(j) === 110) j++;
-			return j;
-		}
 	}
-	let j = scan_digits(i, is_digit);
+	let j = scan_ts_decimal(text, i, end);
 	let is_integer = true;
 	if (text.charCodeAt(j) === 46 && is_digit(text.charCodeAt(j + 1))) {
 		is_integer = false;
-		j = scan_digits(j + 1, is_digit);
+		j = scan_ts_decimal(text, j + 1, end);
 	}
 	const e = text.charCodeAt(j);
 	if (e === 101 || e === 69) {
@@ -247,7 +286,7 @@ const scan_ts_number = (text: string, i: number, end: number): number => {
 		const sign = text.charCodeAt(k);
 		if (sign === 43 || sign === 45) k++;
 		if (is_digit(text.charCodeAt(k))) {
-			j = scan_digits(k, is_digit);
+			j = scan_ts_decimal(text, k, end);
 			is_integer = false;
 		}
 	}
@@ -395,61 +434,41 @@ const is_function_variable = (
 };
 
 /**
- * Heuristic for `: type =` annotations: from the `:` at `i`, scans over a type
- * expression with balanced `<>`/`[]`/`{}`/`()`, succeeding at a top-level `=`
- * (not `==`/`=>`). Returns the exclusive end of the type text, or -1.
+ * Whether the `as` at `as_start` renames a module binding rather than asserting
+ * a type: it sits in an `import {…}`/`export {…}` specifier list, or follows the
+ * `*` of `import * as ns`/`export * as ns`, which no expression can.
  */
-const scan_type_annotation = (text: string, i: number, end: number, cache: TsScanCache): number => {
-	const limit = i + MAX_SCAN < end ? i + MAX_SCAN : end;
-	// success needs a top-level `=` within the window — skip the scan when
-	// there is no `=` at all
-	cache.next_eq = advance_probe(text, cache.next_eq, i + 1, '=');
-	if (cache.next_eq >= limit) return -1;
-	let angle = 0;
-	let square = 0;
-	let j = i + 1;
-	while (j < limit) {
-		const c = text.charCodeAt(j);
-		if (c === 61) {
-			// `=`
-			if (angle === 0 && square === 0) {
-				const c2 = text.charCodeAt(j + 1);
-				if (c2 === 61 || c2 === 62) return -1;
-				const c0 = text.charCodeAt(j - 1);
-				if (c0 === 33 || c0 === 60 || c0 === 62) return -1; // != <= >=
-				return j;
-			}
-			j++;
-		} else if (c === 60) {
-			angle++;
-			j++;
-		} else if (c === 62) {
-			if (angle === 0) return -1;
-			angle--;
-			j++;
-		} else if (c === 91) {
-			square++;
-			j++;
-		} else if (c === 93) {
-			if (square === 0) return -1;
-			square--;
-			j++;
-		} else if (
-			angle === 0 &&
-			square === 0 &&
-			(c === 59 || c === 44 || c === 123 || c === 125 || c === 40 || c === 41)
-		) {
-			// top-level statement/grouping chars end the candidate type text —
-			// object/function types are not annotation targets here, which keeps
-			// the scan from running away across statement boundaries
-			return -1;
-		} else if (c === 34 || c === 39) {
-			j = skip_quoted(text, j, end, c);
-		} else {
-			j++;
-		}
-	}
-	return -1;
+const is_module_rename = (text: string, as_start: number, level: number): boolean => {
+	if ((level & L_KIND_MASK) === L_MODULE) return true;
+	let before = as_start - 1;
+	while (before >= 0 && is_space(text.charCodeAt(before))) before--;
+	return text.charCodeAt(before) === 42;
+};
+
+/**
+ * Whether what is before the `:` at `colon` can take a type annotation: a name
+ * (optionally with `?` or `!`), or the end of a destructuring pattern. At
+ * statement level (`statement`) the name must also follow something on its
+ * own line, as in `let x: T`, which a label never does. Reads the text
+ * backwards so that the identifier path keeps no state for it.
+ */
+const is_annotated_name = (text: string, colon: number, statement: boolean): boolean => {
+	let j = colon - 1;
+	while (j >= 0 && is_space(text.charCodeAt(j))) j--;
+	if (j < 0) return false;
+	let c = text.charCodeAt(j);
+	// `x?: T`, `x!: T`
+	if (c === 63 || c === 33) c = text.charCodeAt(--j);
+	// `}: T`, `]: T`
+	if (c === 125 || c === 93) return true;
+	if (!is_ident(c)) return false;
+	if (!statement) return true;
+	while (j >= 0 && is_ident(text.charCodeAt(j))) j--;
+	// spaces and tabs only: the line must go on before the name
+	while (j >= 0 && (text.charCodeAt(j) === 32 || text.charCodeAt(j) === 9)) j--;
+	if (j < 0) return false;
+	const before = text.charCodeAt(j);
+	return is_ident(before) || before === 44;
 };
 
 /**
@@ -519,7 +538,8 @@ const R_ROOT = 0; // top-level window — nothing beneath it
 const R_INTERP = 1; // `${…}` body → close the interpolation, resume its template
 const R_CLASS_GENERIC = 2; // `Foo<…>` in a class-name chain → advance the window
 const R_GENERIC_CALL = 3; // `foo<…>(…)` args → close the generic, advance
-const R_TYPE_ANNO = 4; // `: type =` body → close the type, advance past it
+const R_TYPE_ANNO = 4; // `: type` body → close the type, advance to where it ended
+const R_TYPE_BARE = 6; // a type with no container (alias body, `as` tail) → advance
 const R_TEMPLATE = 5; // a template literal in a window → advance past it
 
 /**
@@ -559,11 +579,45 @@ interface TsFrame {
 	ret: number;
 	ret_a: number;
 	ret_b: number;
+	/**
+	 * Whether a type-mode window finds its own end: it stops before the first
+	 * token that can't continue the type (recorded in `ret_a`), with `depth`
+	 * counting its open `(`/`[`/`{`s, `angle` its `<`s outside them, `expect`
+	 * whether another part of the type must follow, and `cond` its `?`s waiting
+	 * for a `:`.
+	 */
+	self_type: boolean;
+	angle: number;
+	expect: boolean;
+	cond: number;
+	/**
+	 * A self-ending type: whether its last top-level `(…)` can be a parameter
+	 * list, so that a `=>` after it continues the type. One after `|` or `&`
+	 * can't — a function type there is itself parenthesized — so the `=>` is the
+	 * arrow of the function whose return type this is.
+	 */
+	params: boolean;
+	/** Value windows: `FF_*` contexts pending in this window. */
+	flags: number;
+	/** The window's first entry in `TsMachine.levels`. */
+	level_base: number;
 }
 
 interface TsMachine {
 	l: Lexer;
 	cache: TsScanCache;
+	/**
+	 * The bracket levels open in the value windows on the stack, innermost last:
+	 * each `L_*` kind plus its pending-ternary count. What a `:` means depends on
+	 * the level it is in.
+	 */
+	levels: Int32Array;
+	level_sp: number;
+	/**
+	 * A word that ends the root window where it stands outside every bracket,
+	 * `''` for none: see `SyntaxLang.lex_to_brace`.
+	 */
+	stop_word: string;
 	/** Frame pool doubling as the stack; frames above `sp` are dormant. */
 	stack: Array<TsFrame>;
 	sp: number;
@@ -584,7 +638,14 @@ const create_ts_frame = (): TsFrame => ({
 	depth: 0,
 	ret: R_ROOT,
 	ret_a: 0,
-	ret_b: 0
+	ret_b: 0,
+	self_type: false,
+	angle: 0,
+	expect: false,
+	cond: 0,
+	params: false,
+	flags: 0,
+	level_base: 0
 });
 
 /**
@@ -624,7 +685,40 @@ const mac_push_window = (
 	f.ret = ret;
 	f.ret_a = ret_a;
 	f.ret_b = ret_b;
+	f.self_type = false;
+	f.flags = 0;
+	// every window gets a level of its own, which its brackets stack on
+	const level = mac.level_sp + 1;
+	if (level === mac.levels.length) {
+		const next = new Int32Array(level * 2);
+		next.set(mac.levels);
+		mac.levels = next;
+	}
+	mac.levels[level] = L_BLOCK;
+	mac.level_sp = level;
+	f.level_base = level;
 	mac.sp = sp + 1;
+};
+
+/**
+ * Pushes a type-mode window from `from` that finds its own end, which the
+ * finalize reads from `ret_a`. `expect` is whether a type must start at `from`
+ * (after `:` or `=`) or may only continue (after an `as Foo`).
+ */
+const mac_push_type = (
+	mac: TsMachine,
+	from: number,
+	to: number,
+	ret: number,
+	ret_b: number,
+	expect: boolean
+): void => {
+	mac_push_window(mac, from, to, true, ret, to, ret_b, 0, 0);
+	const f = mac.stack[mac.sp - 1]!;
+	f.self_type = true;
+	f.angle = 0;
+	f.expect = expect;
+	f.cond = 0;
 };
 
 /**
@@ -733,13 +827,24 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 	const { text } = l;
 	const to = frame.to;
 	const type_mode = frame.type_mode;
+	const self_type = frame.self_type;
+	const level_base = frame.level_base;
 	const term = frame.term;
+	// only the root window stops at the machine's word
+	const stop_word = frame.ret === R_ROOT ? mac.stop_word : '';
+	const stop_len = stop_word.length;
 	let i = frame.i;
 	let prev = frame.prev;
 	let prev_code = frame.prev_code; // last significant punctuation char, for string-property detection
 	let class_ctx = frame.class_ctx;
 	let as_ctx = frame.as_ctx;
 	let import_ctx = frame.import_ctx;
+	// whether the current level may hold unmatched `?`s, so that `;` and `,`
+	// only reset the count when there can be one
+	let ternary_seen = true;
+	// the machine's level stack, kept in locals and written back before returning
+	let levels = mac.levels;
+	let level_sp = mac.level_sp;
 
 	while (i < to) {
 		const c = text.charCodeAt(i);
@@ -752,6 +857,28 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 		if (is_ident_start(c) || (c === 35 && i + 1 < to && is_ident_start(text.charCodeAt(i + 1)))) {
 			const start = i;
 			const ident_end = scan_ident(text, c === 35 ? i + 1 : i, to);
+			if (
+				stop_len !== 0 &&
+				ident_end - start === stop_len &&
+				level_sp === level_base &&
+				prev !== P_DOT &&
+				text.startsWith(stop_word, start)
+			) {
+				frame.ret_a = start;
+				mac.level_sp = level_sp;
+				return true;
+			}
+			if (self_type && frame.depth === 0 && frame.angle === 0) {
+				// a name where the type is complete starts something else, unless
+				// it is a word that continues a type (`extends`, `is`)
+				const type_op = (WORD_INDEX.find(text, start, ident_end) & F_TYPE_OP) !== 0;
+				if (!frame.expect && !type_op) {
+					frame.ret_a = start;
+					mac.level_sp = level_sp;
+					return true;
+				}
+				frame.expect = type_op;
+			}
 			const was_class_ctx = class_ctx;
 			const was_as_ctx = as_ctx;
 			const was_import_ctx = import_ctx;
@@ -760,11 +887,15 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 			prev = P_VALUE;
 			prev_code = 0;
 			i = ident_end;
+			// `import a, {…}`: a default binding before a specifier list
+			if (was_import_ctx && !was_dot && text.charCodeAt(skip_space(text, ident_end, to)) === 44) {
+				import_ctx = true;
+			}
 
-			const word = text.slice(start, ident_end);
-			const kind = c === 35 || was_dot ? undefined : WORDS.get(word);
+			const word = c === 35 ? 0 : WORD_INDEX.find(text, start, ident_end);
+			const kind = was_dot ? 0 : word & KIND_MASK;
 
-			if (was_class_ctx && kind === undefined && c !== 35) {
+			if (was_class_ctx && kind === 0 && c !== 35) {
 				// class-name chain: `Foo`, `a.b.Foo`, optionally with generics
 				l.leaf(T_CLASS_NAME, start, ident_end);
 				while (i + 1 < to && text.charCodeAt(i) === 46 && is_ident_start(text.charCodeAt(i + 1))) {
@@ -783,6 +914,7 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 						frame.class_ctx = class_ctx;
 						frame.as_ctx = as_ctx;
 						frame.import_ctx = import_ctx;
+						mac.level_sp = level_sp;
 						mac_push_window(
 							mac,
 							angle_start,
@@ -800,14 +932,29 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 				continue;
 			}
 
-			if (was_as_ctx && kind === undefined && c !== 35 && !BUILTIN_WORDS.has(word)) {
+			if (was_as_ctx && kind === 0 && c !== 35 && (word & F_BUILTIN) === 0) {
 				// `x as Foo` — but `as unknown`/`as string` keep their builtin type
 				l.leaf(T_TYPE_ASSERTION, start, ident_end);
+				if (!type_mode) {
+					// what follows may continue the type: `as Foo<T>`, `as A | B`
+					const tail = text.charCodeAt(skip_space(text, ident_end, to));
+					if (tail === 60 || tail === 91 || tail === 124 || tail === 38) {
+						frame.i = i;
+						frame.prev = prev;
+						frame.prev_code = prev_code;
+						frame.class_ctx = false;
+						frame.as_ctx = false;
+						frame.import_ctx = false;
+						mac.level_sp = level_sp;
+						mac_push_type(mac, ident_end, to, R_TYPE_BARE, 0, false);
+						return false;
+					}
+				}
 				continue;
 			}
 
 			// keyword classification (with contextual lookaheads)
-			if (kind !== undefined) {
+			if (kind !== 0) {
 				let keyword_id = 0;
 				switch (kind) {
 					case K_KEYWORD:
@@ -845,10 +992,12 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 						// import/export modifier, not a type-alias declaration
 						if (was_import_ctx && (n === 123 || n === 42)) {
 							l.leaf(T_IMPORT_TYPE_KEYWORD, start, ident_end);
+							import_ctx = true;
 							continue;
 						}
 						if (n === 123 || n === 42 || is_ident_start(n)) {
 							keyword_id = T_KEYWORD;
+							if (!type_mode && is_ident_start(n)) frame.flags |= FF_ALIAS;
 						}
 						break;
 					}
@@ -868,10 +1017,18 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 				}
 				if (keyword_id !== 0) {
 					l.leaf(keyword_id, start, ident_end);
-					if (CLASS_CTX_WORDS.has(word)) class_ctx = true;
-					if (AS_WORDS.has(word)) as_ctx = true;
-					if (IMPORT_WORDS.has(word)) import_ctx = true;
-					if (!VALUE_WORDS.has(word)) prev = P_NONE;
+					if ((word & F_CTX) !== 0) {
+						if ((word & F_CLASS_CTX) !== 0) class_ctx = true;
+						// `as` renames in a specifier list or after `* as`, never asserts
+						if ((word & F_AS) !== 0 && !is_module_rename(text, start, levels[level_sp]!)) {
+							as_ctx = true;
+						}
+						if ((word & F_IMPORT) !== 0) import_ctx = true;
+						if ((word & F_BLOCK_INTRO) !== 0) prev_code = PC_BLOCK_INTRO;
+						if ((word & F_CASE) !== 0) frame.flags |= FF_CASE;
+						if ((word & F_CLASS_BODY) !== 0) frame.flags |= FF_CLASS_BODY;
+					}
+					if ((word & F_VALUE) === 0) prev = P_NONE;
 					continue;
 				}
 			}
@@ -889,9 +1046,11 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 			}
 
 			// SCREAMING_CASE constants, then capitalized identifiers — both
-			// classified before the call lookahead
+			// classified before the call lookahead. A single uppercase letter is
+			// capitalized, not a constant: it is nearly always a type parameter
+			// (`x: T`, `Map<K, V>`), and most type positions lex in value mode
 			if (is_upper(c)) {
-				let all_caps = true;
+				let all_caps = ident_end - start > 1;
 				for (let k = start + 1; k < ident_end; k++) {
 					const cc = text.charCodeAt(k);
 					// `x` only after a digit (hex-ish constants like `A0x`)
@@ -928,6 +1087,7 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 					frame.class_ctx = class_ctx;
 					frame.as_ctx = as_ctx;
 					frame.import_ctx = import_ctx;
+					mac.level_sp = level_sp;
 					mac_push_window(
 						mac,
 						after_ident,
@@ -949,7 +1109,7 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 				continue;
 			}
 
-			if (kind === undefined && !was_dot && c !== 35 && BUILTIN_WORDS.has(word)) {
+			if (kind === 0 && !was_dot && (word & F_BUILTIN) !== 0) {
 				l.leaf(T_BUILTIN, start, ident_end);
 				continue;
 			}
@@ -975,6 +1135,11 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 				continue;
 			}
 			class_ctx = as_ctx = import_ctx = false;
+			if (self_type && frame.depth === 0 && frame.angle === 0) {
+				frame.ret_a = i;
+				mac.level_sp = level_sp;
+				return true;
+			}
 			if (prev !== P_VALUE && prev !== P_DOT) {
 				// regex literal position
 				const body_end = scan_regex_body(text, i, to);
@@ -1007,6 +1172,14 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 
 		// strings
 		if (c === 34 || c === 39) {
+			if (self_type && frame.depth === 0 && frame.angle === 0) {
+				if (!frame.expect) {
+					frame.ret_a = i;
+					mac.level_sp = level_sp;
+					return true;
+				}
+				frame.expect = false;
+			}
 			const str_end = scan_ts_string(text, i, to, c);
 			// `{"key": …}` / `, "key": …` — a string property key
 			let is_property = false;
@@ -1027,10 +1200,19 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 		// whose resume state is fully supplied by the R_TEMPLATE finalize (it
 		// advances past the whole literal), so nothing here needs writing back
 		if (c === 96) {
+			if (self_type && frame.depth === 0 && frame.angle === 0) {
+				if (!frame.expect) {
+					frame.ret_a = i;
+					mac.level_sp = level_sp;
+					return true;
+				}
+				frame.expect = false;
+			}
 			const r = scan_ts_template_body(text, i + 1, to);
 			if (r < 0) {
 				l.open(T_TEMPLATE_STRING, i);
 				l.leaf(T_TEMPLATE_PUNCTUATION, i, i + 1);
+				mac.level_sp = level_sp;
 				mac_push_template(mac, ~r, i + 1, to);
 				return false;
 			}
@@ -1056,6 +1238,14 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 
 		// numbers (also `.5` — the scan handles a leading `.` before digits)
 		if (is_digit(c) || (c === 46 && i + 1 < to && is_digit(text.charCodeAt(i + 1)))) {
+			if (self_type && frame.depth === 0 && frame.angle === 0) {
+				if (!frame.expect) {
+					frame.ret_a = i;
+					mac.level_sp = level_sp;
+					return true;
+				}
+				frame.expect = false;
+			}
 			let num_end = scan_ts_number(text, i, to);
 			// an embed window can end mid-number (e.g. mid-exponent); never emit past `to`
 			if (num_end > to) num_end = to;
@@ -1070,6 +1260,7 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 		// `.` — member access or spread
 		if (c === 46) {
 			class_ctx = as_ctx = import_ctx = false;
+			if (self_type) frame.expect = true;
 			if (i + 2 < to && text.charCodeAt(i + 1) === 46 && text.charCodeAt(i + 2) === 46) {
 				l.leaf(T_OPERATOR, i, i + 3);
 				i += 3;
@@ -1098,38 +1289,89 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 			continue;
 		}
 
-		// `:` — type annotation (with initializer) or plain operator
+		// `:` — type annotation, or a plain operator (ternary, property, case, label)
 		if (c === 58) {
 			class_ctx = as_ctx = import_ctx = false;
 			if (!type_mode) {
-				const type_end = scan_type_annotation(text, i, to, cache);
-				if (type_end !== -1) {
+				const level = levels[level_sp]!;
+				let annotation = false;
+				if ((frame.flags & FF_CASE) !== 0) {
+					frame.flags &= ~FF_CASE;
+				} else if (level >= L_TERNARY) {
+					levels[level_sp] = level - L_TERNARY;
+				} else {
+					const level_kind = level & L_KIND_MASK;
+					annotation =
+						prev_code === 41 ||
+						((level_kind === L_PAREN || level_kind === L_CLASS) &&
+							is_annotated_name(text, i, false)) ||
+						(level_kind === L_BLOCK && is_annotated_name(text, i, true));
+				}
+				if (annotation) {
 					const type_start = skip_space(text, i + 1, to);
-					const content_end = trim_space_end(text, type_start, type_end);
-					if (content_end > type_start) {
+					const t = text.charCodeAt(type_start);
+					// a type has to follow
+					if (
+						type_start < to &&
+						t !== 44 &&
+						t !== 59 &&
+						t !== 41 &&
+						t !== 93 &&
+						t !== 125 &&
+						t !== 61 &&
+						t !== 58
+					) {
 						l.open(T_TYPE_ANNOTATION, i);
-						l.leaf(T_COLON, i, i + 1);
+						l.leaf(T_OPERATOR, i, i + 1);
 						l.open(T_TYPE, type_start);
+						// a type that is one name and then its end (`x: T,`, `): void {`)
+						// needs no window: the name is the only token one would emit
+						if (is_ident_start(t)) {
+							const name_end = scan_ident(text, type_start, to);
+							const after = text.charCodeAt(skip_space(text, name_end, to));
+							const word = WORD_INDEX.find(text, type_start, name_end);
+							const word_kind = word & KIND_MASK;
+							if (
+								(after === 44 ||
+									after === 41 ||
+									after === 59 ||
+									after === 61 ||
+									after === 123 ||
+									after === 125 ||
+									after === 93) &&
+								(word_kind === 0 || word_kind === K_KEYWORD)
+							) {
+								if (word_kind !== 0) l.leaf(T_KEYWORD, type_start, name_end);
+								else if (is_upper(t)) l.leaf(T_TYPE_NAME, type_start, name_end);
+								else if ((word & F_BUILTIN) !== 0) l.leaf(T_BUILTIN, type_start, name_end);
+								l.close(name_end);
+								l.close(name_end);
+								i = name_end;
+								prev = P_VALUE;
+								prev_code = 0;
+								continue;
+							}
+						}
 						frame.i = i;
 						frame.prev = prev;
 						frame.prev_code = prev_code;
 						frame.class_ctx = false;
 						frame.as_ctx = false;
 						frame.import_ctx = false;
-						mac_push_window(
-							mac,
-							type_start,
-							content_end,
-							true,
-							R_TYPE_ANNO,
-							type_end,
-							content_end,
-							0,
-							0
-						);
+						mac.level_sp = level_sp;
+						mac_push_type(mac, type_start, to, R_TYPE_ANNO, type_start, true);
 						return false;
 					}
 				}
+			} else if (self_type && frame.depth === 0 && frame.angle === 0) {
+				// the `:` of a conditional type, or the end of the type
+				if (frame.cond === 0) {
+					frame.ret_a = i;
+					mac.level_sp = level_sp;
+					return true;
+				}
+				frame.cond--;
+				frame.expect = true;
 			}
 			l.leaf(T_OPERATOR, i, i + 1);
 			i++;
@@ -1154,14 +1396,92 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 			// braces inside strings/comments/regexes/child frames never reach here
 			if (c === term && --frame.depth === 0) {
 				frame.ret_a = i;
+				mac.level_sp = level_sp;
 				return true;
 			}
 			if (c === 123 && term !== 0) frame.depth++;
+			if (!type_mode) {
+				if (c === 123 || c === 40 || c === 91) {
+					// a bracket opens a level; a `{` is an object literal where a
+					// value is expected, else a block or a class body
+					let level_kind = c === 40 ? L_PAREN : L_ARRAY;
+					if (c === 123) {
+						if ((frame.flags & FF_CLASS_BODY) !== 0) {
+							level_kind = L_CLASS;
+						} else if (import_ctx) {
+							level_kind = L_MODULE;
+						} else if (
+							prev === P_NONE &&
+							prev_code !== 59 &&
+							prev_code !== 123 &&
+							prev_code !== 125 &&
+							prev_code !== PC_BLOCK_INTRO
+						) {
+							level_kind = L_OBJECT;
+						} else {
+							level_kind = L_BLOCK;
+						}
+						frame.flags = 0;
+					}
+					level_sp++;
+					if (level_sp === levels.length) {
+						const next = new Int32Array(level_sp * 2);
+						next.set(levels);
+						mac.levels = levels = next;
+					}
+					levels[level_sp] = level_kind;
+				} else if (c === 59 || c === 44) {
+					// a statement or list item ends: its unmatched `?`s don't carry
+					if (ternary_seen) {
+						levels[level_sp]! &= L_KIND_MASK;
+						ternary_seen = false;
+					}
+					if (c === 59) frame.flags = 0;
+				} else if (level_sp > level_base) {
+					level_sp--;
+					ternary_seen = true;
+				}
+			} else if (self_type) {
+				const top = frame.depth === 0;
+				if (c === 123 || c === 40 || c === 91) {
+					// a `{` or `(` where the type is complete is a body or a call
+					if (top && frame.angle === 0 && c !== 91 && !frame.expect) {
+						frame.ret_a = i;
+						mac.level_sp = level_sp;
+						return true;
+					}
+					if (top && c === 40) {
+						let before = i - 1;
+						while (before >= 0 && is_space(text.charCodeAt(before))) before--;
+						const b = text.charCodeAt(before);
+						// nor can one that starts with a `(`: that is a grouped type
+						frame.params =
+							b !== 124 && b !== 38 && text.charCodeAt(skip_space(text, i + 1, to)) !== 40;
+					}
+					frame.depth++;
+				} else if (c === 59 || c === 44) {
+					// `;` also ends a type left open at a `<`
+					if (top && (c === 59 || frame.angle === 0)) {
+						frame.ret_a = i;
+						mac.level_sp = level_sp;
+						return true;
+					}
+				} else {
+					if (top) {
+						frame.ret_a = i;
+						mac.level_sp = level_sp;
+						return true;
+					}
+					if (--frame.depth === 0 && frame.angle === 0) frame.expect = false;
+				}
+			}
 			l.leaf(T_PUNCTUATION, i, i + 1);
 			prev = c === 41 || c === 93 ? P_VALUE : P_NONE;
 			prev_code = c;
 			i++;
-			class_ctx = as_ctx = import_ctx = false;
+			// `import a, {…}`: the default binding's comma keeps the import context
+			import_ctx = c === 44 && import_ctx;
+			class_ctx = as_ctx = false;
 			continue;
 		}
 
@@ -1182,11 +1502,70 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 			c === 126
 		) {
 			const op_len = scan_operator(text, i, to);
+			let next_code = 0;
+			if (!type_mode) {
+				if (c === 63) {
+					// a ternary's `?` waits for its `:` — not `a?: T`, `(a?)`, `a?.b`, `a ?? b`
+					if (op_len === 1) {
+						const n = text.charCodeAt(i + 1);
+						if (n !== 58 && n !== 41 && n !== 44) {
+							levels[level_sp]! += L_TERNARY;
+							ternary_seen = true;
+						}
+					}
+				} else if (c === 61) {
+					if (op_len === 2 && text.charCodeAt(i + 1) === 62) {
+						next_code = PC_BLOCK_INTRO; // `=> {` is a body
+					} else if (op_len === 1 && (frame.flags & FF_ALIAS) !== 0) {
+						// `type A = …` — the alias's type
+						frame.flags &= ~FF_ALIAS;
+						l.leaf(T_OPERATOR, i, i + 1);
+						frame.i = i;
+						frame.prev = prev;
+						frame.prev_code = prev_code;
+						frame.class_ctx = false;
+						frame.as_ctx = false;
+						frame.import_ctx = false;
+						mac.level_sp = level_sp;
+						mac_push_type(mac, i + 1, to, R_TYPE_BARE, 0, true);
+						return false;
+					}
+				}
+			} else if (self_type && frame.depth === 0) {
+				if (c === 60 && op_len === 1) {
+					frame.angle++;
+				} else if (c === 62 && text.charCodeAt(i + op_len - 1) === 62) {
+					// `>`, `>>`, `>>>` close that many
+					if (frame.angle < op_len) {
+						frame.ret_a = i;
+						mac.level_sp = level_sp;
+						return true;
+					}
+					frame.angle -= op_len;
+					if (frame.angle === 0) frame.expect = false;
+				} else if (frame.angle === 0) {
+					const is_arrow = c === 61 && op_len === 2 && text.charCodeAt(i + 1) === 62;
+					if (
+						is_arrow ? prev_code === 41 && frame.params : op_len === 1 && (c === 124 || c === 38)
+					) {
+						// a function type's `=>`, a union, an intersection
+						frame.expect = true;
+					} else if (op_len === 1 && c === 63 && !frame.expect) {
+						frame.cond++; // a conditional type
+						frame.expect = true;
+					} else if (!(frame.expect && c === 45 && op_len === 1)) {
+						// anything but a negative literal's `-` is not part of a type
+						frame.ret_a = i;
+						mac.level_sp = level_sp;
+						return true;
+					}
+				}
+			}
 			l.leaf(T_OPERATOR, i, i + op_len);
 			// `?.` is member access — the next word is a property, not a keyword
 			prev = c === 63 && op_len === 2 && text.charCodeAt(i + 1) === 46 ? P_DOT : P_NONE;
 			i += op_len;
-			prev_code = 0;
+			prev_code = next_code;
 			class_ctx = as_ctx = import_ctx = false;
 			continue;
 		}
@@ -1197,6 +1576,7 @@ const run_ts_window = (mac: TsMachine, frame: TsFrame): boolean => {
 		prev_code = 0;
 		class_ctx = as_ctx = import_ctx = false;
 	}
+	mac.level_sp = level_sp;
 	return true;
 };
 
@@ -1247,6 +1627,7 @@ const run_ts = (mac: TsMachine): void => {
 		const done = frame.kind === F_WINDOW ? run_ts_window(mac, frame) : run_ts_template(mac, frame);
 		if (!done) continue; // a child frame was pushed — run it before resuming
 		mac.sp -= 1;
+		if (frame.kind === F_WINDOW) mac.level_sp = frame.level_base - 1;
 		const ret = frame.ret;
 		if (ret === R_ROOT) continue;
 		const parent = mac.stack[mac.sp - 1]!;
@@ -1276,11 +1657,23 @@ const run_ts = (mac: TsMachine): void => {
 				l.close(frame.ret_a); // close T_GENERIC_FUNCTION
 				parent.i = frame.ret_a;
 				break;
-			case R_TYPE_ANNO:
-				l.close(frame.ret_b); // close T_TYPE
-				l.close(frame.ret_b); // close T_TYPE_ANNOTATION
-				parent.i = frame.ret_a;
-				parent.prev = P_NONE;
+			case R_TYPE_ANNO: {
+				// the type's text, trimmed, but never to before its last token: a
+				// comment can itself end in whitespace
+				const type_end = frame.ret_a < frame.to ? frame.ret_a : frame.to;
+				const trimmed = trim_space_end(l.text, frame.ret_b, type_end);
+				const last_end = l.events[l.events_len - 1]!;
+				const content_end = last_end > trimmed ? last_end : trimmed;
+				l.close(content_end); // close T_TYPE
+				l.close(content_end); // close T_TYPE_ANNOTATION
+				parent.i = type_end;
+				parent.prev = P_VALUE;
+				parent.prev_code = 0;
+				break;
+			}
+			case R_TYPE_BARE:
+				parent.i = frame.ret_a < frame.to ? frame.ret_a : frame.to;
+				parent.prev = P_VALUE;
 				parent.prev_code = 0;
 				break;
 			case R_TEMPLATE:
@@ -1295,6 +1688,41 @@ const run_ts = (mac: TsMachine): void => {
 	}
 };
 
+// machines kept between calls, frames and all, so each embedded region (a Svelte
+// expression, a Markdown fence) doesn't build one; a stack, since embeds nest
+const ts_machines: Array<TsMachine> = [];
+
+/**
+ * Lexes `[from, l.end)` as the root window. A nonzero `term` makes it stop at
+ * the `term` char that closes none of its own openers, and a `stop_word`
+ * before that word outside every bracket; the return value is the index it
+ * stopped at. Otherwise, and when the window runs to its end, `-1`.
+ */
+const lex_ts_root = (l: Lexer, from: number, term: number, stop_word: string): number => {
+	const mac = ts_machines.pop() ?? {
+		l,
+		cache: create_ts_scan_cache(),
+		levels: new Int32Array(64),
+		level_sp: -1,
+		stop_word: '',
+		stack: [],
+		sp: 0
+	};
+	mac.l = l;
+	mac.sp = 0;
+	mac.level_sp = -1;
+	mac.stop_word = stop_word;
+	const { cache } = mac;
+	cache.next_gt = cache.next_rparen = -1;
+	mac_push_window(mac, from, l.end, false, R_ROOT, -1, 0, term, term === 0 ? 0 : 1);
+	run_ts(mac);
+	const close = mac.stack[0]!.ret_a;
+	// let go of the lexer and its text before pooling
+	mac.l = Lexer.shape_anchor;
+	ts_machines.push(mac);
+	return close;
+};
+
 const lex_ts = (l: Lexer): void => {
 	let i = l.pos;
 	// hashbang at the very start of the document
@@ -1303,10 +1731,15 @@ const lex_ts = (l: Lexer): void => {
 		l.leaf(T_HASHBANG, 0, line_end);
 		i = line_end;
 	}
-	const mac: TsMachine = { l, cache: create_ts_scan_cache(), stack: [], sp: 0 };
-	mac_push_window(mac, i, l.end, false, R_ROOT, 0, 0, 0, 0);
-	run_ts(mac);
+	lex_ts_root(l, i, 0, '');
 	l.pos = l.end;
+};
+
+// the root window in terminator mode, as a template's `${…}` body runs
+const lex_ts_to_brace = (l: Lexer, stop_word = ''): number => {
+	const close = lex_ts_root(l, l.pos, 125, stop_word);
+	l.pos = close === -1 ? l.end : close;
+	return close;
 };
 
 /**
@@ -1321,5 +1754,6 @@ const lex_ts = (l: Lexer): void => {
 export const lexer_ts: SyntaxLang = {
 	id: 'ts',
 	aliases: ['typescript', 'js', 'javascript'],
-	lex: lex_ts
+	lex: lex_ts,
+	lex_to_brace: lex_ts_to_brace
 };

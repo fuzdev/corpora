@@ -9,12 +9,13 @@ import {
 	skip_space,
 	token_type,
 	words_map,
+	WordIndex,
 	type Lexer,
 	type SyntaxLang
 } from './lexer.ts';
 
 /**
- * Hand-written Rust lexer.
+ * Rust lexer.
  *
  * A single flat scan loop — Rust has no re-entrant interiors at the token
  * level (no template interpolations), so the constructs that nest are handled
@@ -77,16 +78,19 @@ const WORDS: Map<string, number> = words_map(
 	[K_MACRO_RULES, 'macro_rules']
 );
 
-// keywords that put the lexer in a type-name context for the next identifier
-const CLASS_CTX_WORDS: Set<string> = new Set([
-	'struct',
-	'enum',
-	'trait',
-	'union',
-	'type',
-	'impl',
-	'dyn'
-]);
+// a word's value in `WORD_INDEX`: its kind in the low bits and flags above
+const KIND_MASK = 15;
+const F_FN = 16; // the next identifier names a function
+const F_CLASS_CTX = 32; // puts the lexer in a type-name context for the next identifier
+
+for (const [flag, words] of [
+	[F_FN, 'fn'],
+	[F_CLASS_CTX, 'struct enum trait type impl dyn']
+] as const) {
+	for (const word of words.split(' ')) WORDS.set(word, WORDS.get(word)! | flag);
+}
+
+const WORD_INDEX = new WordIndex(WORDS);
 
 /**
  * Scans a `"` string from the quote at `from`, returning the exclusive end.
@@ -190,51 +194,63 @@ const scan_rust_char = (text: string, from: number, end: number): number => {
 	return i < end && text.charCodeAt(i) === 39 ? i + 1 : -1;
 };
 
+// a run of `radix` digits (16, 10, 8, or 2); rust allows `_` freely between (and
+// after) digits: 1_000, 0x_ff
+const scan_rust_digits = (text: string, from: number, end: number, radix: number): number => {
+	let j = from;
+	while (j < end) {
+		const c = text.charCodeAt(j);
+		const wanted =
+			c === 95 ||
+			(radix === 10
+				? c >= 48 && c <= 57
+				: radix === 16
+					? is_hex_digit(c)
+					: radix === 2
+						? c === 48 || c === 49
+						: c >= 48 && c <= 55);
+		if (wanted) j++;
+		else break;
+	}
+	return j;
+};
+
 /**
  * Scans a numeric literal from the digit at `from`, returning the exclusive
  * end. Handles hex/octal/binary with `_` separators, decimal floats and
  * exponents, and literal suffixes (`1u8`, `2.5f32`) — any trailing ident run
  * glues onto the literal, matching rustc's lexing. A trailing `.` is never
  * consumed without a following digit, so `0..10` and `x.0` lex cleanly.
+ *
+ * The digit loop is a top-level function rather than closures made per
+ * literal: closures allocate on every number, and measured slower on
+ * number-dense input.
  */
 const scan_rust_number = (text: string, from: number, end: number): number => {
-	const scan_digits = (start: number, is_wanted: (c: number) => boolean): number => {
-		let j = start;
-		while (j < end) {
-			const c = text.charCodeAt(j);
-			// rust allows `_` freely between (and after) digits: 1_000, 0x_ff
-			if (is_wanted(c) || c === 95) j++;
-			else break;
-		}
-		return j;
-	};
-	const is_binary = (c: number): boolean => c === 48 || c === 49;
-	const is_octal = (c: number): boolean => c >= 48 && c <= 55;
-
 	let j;
 	if (text.charCodeAt(from) === 48) {
 		const c2 = text.charCodeAt(from + 1);
 		if (c2 === 120 || c2 === 88) {
-			j = scan_digits(from + 2, is_hex_digit);
+			j = scan_rust_digits(text, from + 2, end, 16);
 		} else if (c2 === 111 || c2 === 79) {
-			j = scan_digits(from + 2, is_octal);
+			j = scan_rust_digits(text, from + 2, end, 8);
 		} else if (c2 === 98 || c2 === 66) {
-			j = scan_digits(from + 2, is_binary);
+			j = scan_rust_digits(text, from + 2, end, 2);
 		} else {
-			j = scan_digits(from, is_digit);
+			j = scan_rust_digits(text, from, end, 10);
 		}
 	} else {
-		j = scan_digits(from, is_digit);
+		j = scan_rust_digits(text, from, end, 10);
 	}
 	if (text.charCodeAt(j) === 46 && is_digit(text.charCodeAt(j + 1))) {
-		j = scan_digits(j + 1, is_digit);
+		j = scan_rust_digits(text, j + 1, end, 10);
 	}
 	const e = text.charCodeAt(j);
 	if (e === 101 || e === 69) {
 		let k = j + 1;
 		const sign = text.charCodeAt(k);
 		if (sign === 43 || sign === 45) k++;
-		if (is_digit(text.charCodeAt(k))) j = scan_digits(k, is_digit);
+		if (is_digit(text.charCodeAt(k))) j = scan_rust_digits(text, k, end, 10);
 	}
 	// literal suffix
 	if (j < end && is_ident_start(text.charCodeAt(j))) j = scan_ident(text, j, end);
@@ -379,23 +395,23 @@ const lex_rust = (l: Lexer): void => {
 
 			const start = i;
 			const ident_end = scan_ident(text, i, end);
-			const word = text.slice(start, ident_end);
-			const kind = WORDS.get(word);
+			const word = WORD_INDEX.find(text, start, ident_end);
+			const kind = word & KIND_MASK;
 			const was_fn_ctx = fn_ctx;
 			const was_class_ctx = class_ctx;
 			fn_ctx = class_ctx = false;
 			i = ident_end;
 
-			if (kind !== undefined) {
+			if (kind !== 0) {
 				if (kind === K_KEYWORD) {
 					l.leaf(T_KEYWORD, start, ident_end);
 					// `fn name`/`struct Name` name the identifier that follows, but
 					// `fn(…)` is a pointer *type* and `impl<T>`/`struct;` have no name
 					// here — only enter the naming context when an identifier actually
 					// follows, or it leaks onto the next value
-					if (word === 'fn') {
+					if ((word & F_FN) !== 0) {
 						fn_ctx = is_ident_start(text.charCodeAt(skip_space(text, ident_end, end)));
-					} else if (CLASS_CTX_WORDS.has(word)) {
+					} else if ((word & F_CLASS_CTX) !== 0) {
 						class_ctx = is_ident_start(text.charCodeAt(skip_space(text, ident_end, end)));
 					}
 					continue;

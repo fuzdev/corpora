@@ -12,14 +12,16 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '../primitive_schemas.ts';
+import type { SchemaFieldMeta } from '../schema_meta.ts';
 
 import { ActingActor } from '../http/auth_shape.ts';
+import { CellRelationListLimit } from './cell_relation_list_limit.ts';
 import type { RequestResponseActionSpec } from '../actions/action_spec.ts';
 
 // -- Error reasons ----------------------------------------------------------
 
-/** Error reason — `cell_field_list` got neither `source_id` nor `target_id`. */
+/** Error reason — `cell_field_list` got neither or both of `source_id` and `target_id`. */
 export const ERROR_CELL_FIELD_LIST_REQUIRES_SOURCE_OR_TARGET =
 	'cell_field_list_requires_source_or_target' as const;
 
@@ -85,14 +87,16 @@ export type CellFieldDeleteOutput = z.infer<typeof CellFieldDeleteOutput>;
 
 /**
  * Input for `cell_field_list`. Pass `source_id` for forward fields or
- * `target_id` for reverse upfields — exactly one (the schema rejects
- * both / neither). Reverse listing has 2-layer authz (target view-check
+ * `target_id` for reverse upfields — exactly one; both or neither is
+ * `invalid_params` with `ERROR_CELL_FIELD_LIST_REQUIRES_SOURCE_OR_TARGET`,
+ * from the handler (the schema leaves both optional). Reverse listing has 2-layer authz (target view-check
  * gates the call; per-source view-check filters the rows).
  *
- * Forward listing supports cursor pagination via `name_after` (return
- * rows whose `name > name_after` lex). The reverse listing doesn't
- * paginate (the result set is small in practice — number of sources
- * pointing at a given target).
+ * Either direction returns a page of up to `limit` fields (default
+ * `CELL_RELATION_LIST_LIMIT_DEFAULT`) whose other end the caller can view —
+ * the view check runs before the limit. Forward listing pages on via
+ * `name_after` (return rows whose `name > name_after` lex); the reverse
+ * listing has no cursor, oldest field first.
  */
 export const CellFieldListInput = z
 	.strictObject({
@@ -106,15 +110,10 @@ export const CellFieldListInput = z
 			description:
 				'Cursor for forward pagination — return rows whose name > this lex. Forward only.'
 		}),
-		limit: z.number().int().positive().max(500).optional().meta({
-			description:
-				'Page size cap (max 500). Forward only. Omit for unbounded — explicit list calls escape the bundled `cell_get` cap.'
-		}),
+		limit: CellRelationListLimit,
 		acting: ActingActor
 	})
-	.refine((v) => Boolean(v.source_id) !== Boolean(v.target_id), {
-		message: ERROR_CELL_FIELD_LIST_REQUIRES_SOURCE_OR_TARGET
-	});
+	.meta({ empty_input_handler_guarded: true } satisfies SchemaFieldMeta);
 export type CellFieldListInput = z.infer<typeof CellFieldListInput>;
 
 export const CellFieldListOutput = z.strictObject({

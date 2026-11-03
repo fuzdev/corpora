@@ -1,42 +1,62 @@
 /**
- * PG-backed `FactStore` implementation.
+ * PG-backed `HeldFactStore` implementation.
  *
  * Wraps the raw queries in `db/fact_queries.ts` with the lifecycle the
- * `FactStore` interface promises:
+ * `HeldFactStore` interface promises:
  *
- * - sync hash on `put`, stream hash on `put_ref` (counting bytes against
- *   the caller-supplied `size`)
+ * - sync hash on `put`; `put_stream` hashes as it streams
  * - idempotent insert (`ON CONFLICT DO NOTHING` in the queries layer)
- * - JSON ref auto-extraction when `content_type` signals JSON and the
- *   caller didn't pass an explicit `refs` array
- * - verify-on-read for external content; embedded reads skip verify
+ * - refs are exactly the caller's `options.refs` — the bytes are never
+ *   scanned for hashes, whatever the `content_type`
+ * - verify-on-read for disk-backed content; embedded reads skip verify
  *   because PG storage IS the hash table
- * - mismatched external bytes return `null` + log warning (treat as
+ * - mismatched disk bytes return `null` + log warning (treat as
  *   unavailable; GC / repair is a separate concern)
  *
  * Embedded vs disk split: writes route by size. Bytes `<= embedded_threshold`
  * land in the PG `bytes` column; larger bytes go to the disk CAS at
  * `<facts_dir>/<shard>/<rest>` (`db/fact_disk_storage.ts`) and the row records a
  * `file:<shard>/<rest>` `external_url`. `put` takes fully-buffered bytes;
- * `put_stream` is the bounded-memory streaming twin (hash BLAKE3 + SHA-256 in
- * one pass, spill past the threshold, enforce `max_bytes` / `ENOSPC`). Both need
- * `disk_root` + `fs` (the `runtime/*Deps`) configured for the over-threshold
- * path; without them, an oversize `put` throws and the caller must `put_ref`
- * against an externally-managed URL (federation / stub-fetcher tests).
+ * `put_stream` is the bounded-memory streaming twin (hash BLAKE3 as it streams,
+ * spill past the threshold, enforce `max_bytes` / `ENOSPC`). `put` needs
+ * `disk_root` + `fs` (the `runtime/*Deps`) for the over-threshold path only:
+ * without them the store has nowhere to put bytes it cannot embed, and an
+ * oversize `put` throws. `put_stream` needs `fs` for a body of any size — with
+ * none it throws before reading the stream — and `disk_root` for the
+ * over-threshold spill: with none, a body that passes the threshold throws
+ * `FactPayloadTooLargeError`.
+ *
+ * Every `external_url` the store writes is a `file:<shard>/<rest>` URL into its
+ * own disk CAS, and that CAS is the only place `get` reads external bytes from
+ * — the store makes no network request. The column is free text
+ * (`query_put_fact` inserts what it is given), so `get` treats a row whose
+ * `external_url` has any other shape, and any external row on a store with no
+ * disk CAS configured, as unavailable: a warning and `null`. A `file:` URL
+ * naming another fact's file (`file_fact_url_addresses`) is refused the same
+ * way, logged as an error, before the file is read.
+ *
+ * ## Holders
+ *
+ * Every put names its holder (`HeldFactPutOptions.holder`): the actor whose
+ * request carried the bytes, or `null` for a system put (seeds, server-side
+ * imports). A named holder gets a `fact_holder` row on every put — a
+ * deduplicated put included, since bringing identical bytes is possession. The
+ * `fact` row, its refs, and the holder row commit in one transaction. Cell ref
+ * admission (`auth/cell_ref_admission.ts`) reads the holder rows. The holder is
+ * a spine concept, so `PgFactStore` implements `HeldFactStore` — the
+ * `@fuzdev/fuz_util` `FactStore` reads plus puts that take `HeldFactPutOptions` —
+ * rather than the backend-agnostic `FactStore`, whose puts name no actor.
  *
  * @module
  */
 
 import type { QueryDeps } from './query_deps.ts';
+import type { Db } from './db.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 import { to_error_message } from '@fuzdev/fuz_util/error.ts';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import {
-	fact_hash_bytes,
-	fact_hash_stream,
-	fact_hash_verify,
-	fact_hash_extract_refs
-} from '@fuzdev/fuz_util/fact_hash.ts';
+import { fact_hash_bytes, fact_hash_verify } from '@fuzdev/fuz_util/fact_hash.ts';
 import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
 import type {
 	FactMeta,
@@ -52,44 +72,63 @@ import {
 	query_get_fact_refs,
 	query_has_fact,
 	query_put_fact,
-	query_put_fact_refs
+	query_put_fact_refs,
+	type PutFactInput
 } from './fact_queries.ts';
+import { query_put_fact_holder } from './fact_holder_queries.ts';
+import { file_fact_url_addresses, parse_file_fact_url } from './file_fact_url.ts';
 import {
-	create_disk_fact_fetcher,
+	read_fact_bytes_from_disk,
 	stream_fact_to_disk,
 	write_fact_bytes_to_disk,
 	type FactDiskStorageDeps
 } from './fact_disk_storage.ts';
 
-/** Default embedded-vs-referenced cutoff (1 MiB). */
-export const FACT_EMBEDDED_THRESHOLD_DEFAULT = 1024 * 1024;
-
-/** Fetcher abstraction so tests can stub external URL retrieval. */
-export interface FactExternalFetcher {
-	fetch_stream: (url: string) => Promise<ReadableStream<Uint8Array>>;
-	fetch_bytes: (url: string) => Promise<Uint8Array>;
+/**
+ * Options for `HeldFactStore.put` / `put_stream`: the `@fuzdev/fuz_util`
+ * `FactPutOptions` plus the required `holder`.
+ *
+ * `holder` is the actor that brought these bytes, recorded in `fact_holder`
+ * whether or not the fact already existed. `null` is a system put (seeds,
+ * server-side imports) that records no holder — a cell write can newly
+ * reference such a fact only as a global admin or as an actor that puts the
+ * same bytes itself (refs a cell already carries stay admitted through update
+ * and clone). Required, so a put on behalf of a caller can't silently skip the
+ * possession record. Twin of the Rust `PutOptions::holder`.
+ */
+export interface HeldFactPutOptions extends FactPutOptions {
+	holder: Uuid | null;
 }
 
-/** Default fetcher backed by `globalThis.fetch`. */
-export const create_default_fetcher = (): FactExternalFetcher => ({
-	fetch_stream: async (url) => {
-		const response = await fetch(url);
-		if (!response.ok) {
-			throw new Error(`fact fetch failed: ${response.status} ${url}`);
-		}
-		if (!response.body) {
-			throw new Error(`fact fetch returned no body: ${url}`);
-		}
-		return response.body;
-	},
-	fetch_bytes: async (url) => {
-		const response = await fetch(url);
-		if (!response.ok) {
-			throw new Error(`fact fetch failed: ${response.status} ${url}`);
-		}
-		return new Uint8Array(await response.arrayBuffer());
-	}
-});
+/**
+ * A fact store whose puts record possession: the `@fuzdev/fuz_util`
+ * `FactStore` reads, plus `put` / `put_stream` taking `HeldFactPutOptions` with
+ * its required `holder`.
+ *
+ * The holder is required — a store typed by the generic `FactStore` cannot
+ * record possession, so cell ref admission (`auth/cell_ref_admission.ts`)
+ * could never admit a ref to a fact put through it. `AppDeps.fact_store` is
+ * typed by this interface; `PgFactStore` implements it.
+ */
+export interface HeldFactStore extends Omit<FactStore, 'put' | 'put_stream'> {
+	/**
+	 * Idempotent like `FactStore.put`; records `options.holder` (when non-null)
+	 * on a fresh insert and a dedup hit alike.
+	 */
+	put: (bytes: Uint8Array, options: HeldFactPutOptions) => Promise<FactHash>;
+	/**
+	 * Idempotent like `FactStore.put_stream`; records `options.holder` (when
+	 * non-null) on a fresh insert and a dedup hit alike.
+	 */
+	put_stream: (
+		stream: ReadableStream<Uint8Array>,
+		max_bytes: number,
+		options: HeldFactPutOptions
+	) => Promise<PutStreamOutcome>;
+}
+
+/** Default embedded-vs-referenced cutoff (1 MiB). */
+export const FACT_EMBEDDED_THRESHOLD_DEFAULT = 1024 * 1024;
 
 /**
  * Construction-time deps for `PgFactStore`.
@@ -103,31 +142,32 @@ export const create_default_fetcher = (): FactExternalFetcher => ({
  *
  * `disk_root` is the facts directory backing the `<shard>/<rest>` disk CAS;
  * `fs` supplies the filesystem capabilities (a `RuntimeDeps` satisfies it).
- * When both are set, oversize `put` + `put_stream` write to disk and the
- * default `fetcher` reads from it. When unset, oversize `put`/`put_stream`
- * spill throws and reads fall back to the `globalThis.fetch`-backed default
- * fetcher (or an injected stub). `log` is optional — the only call site is the
- * verify-mismatch warning path.
+ * When both are set, oversize `put` + `put_stream` write to disk and `get`
+ * reads disk-backed facts from it. When either is unset the store writes
+ * embedded rows only and `get` returns `null` for an external row: an oversize
+ * `put` throws; `put_stream` throws for a body of any size when `fs` is unset,
+ * and with `fs` but no `disk_root` throws `FactPayloadTooLargeError` for a body
+ * that passes the threshold. `log` is optional — its call sites are the
+ * warnings on the paths where `get` returns `null` for an external row.
  */
 export interface PgFactStoreDeps {
 	deps: QueryDeps;
 	embedded_threshold?: number;
 	disk_root?: string;
 	fs?: FactDiskStorageDeps;
-	fetcher?: FactExternalFetcher;
 	log?: Logger;
 }
 
 /**
- * PG-backed `FactStore`. Delegates to `db/fact_queries.ts` for I/O and adds
- * the lifecycle layer described in the module doc.
+ * PG-backed fact store. Delegates to `db/fact_queries.ts` for I/O and adds
+ * the lifecycle layer described in the module doc. Implements `HeldFactStore`:
+ * the `@fuzdev/fuz_util` `FactStore` reads, puts taking `HeldFactPutOptions`.
  */
-export class PgFactStore implements FactStore {
+export class PgFactStore implements HeldFactStore {
 	readonly #deps: QueryDeps;
 	readonly #embedded_threshold: number;
 	readonly #disk_root: string | undefined;
 	readonly #fs: FactDiskStorageDeps | undefined;
-	readonly #fetcher: FactExternalFetcher;
 	readonly #log: Logger | undefined;
 
 	constructor(options: PgFactStoreDeps) {
@@ -135,11 +175,6 @@ export class PgFactStore implements FactStore {
 		this.#embedded_threshold = options.embedded_threshold ?? FACT_EMBEDDED_THRESHOLD_DEFAULT;
 		this.#disk_root = options.disk_root;
 		this.#fs = options.fs;
-		this.#fetcher =
-			options.fetcher ??
-			(options.disk_root !== undefined && options.fs !== undefined
-				? create_disk_fact_fetcher(options.fs, options.disk_root)
-				: create_default_fetcher());
 		this.#log = options.log;
 	}
 
@@ -147,11 +182,15 @@ export class PgFactStore implements FactStore {
 	 * Store fully-buffered bytes, routing by size: `<= embedded_threshold` into
 	 * the PG `bytes` column; larger into the disk CAS (when `disk_root` + `fs`
 	 * are configured) at `<facts_dir>/<shard>/<rest>` with a `file:` URL. Oversize
-	 * without a disk root throws so the caller routes it through `put_ref`
-	 * explicitly. Idempotent — `ON CONFLICT DO NOTHING` + content-addressed disk
-	 * filenames make a re-write a no-op.
+	 * without a disk root throws: the store has nowhere to put bytes it cannot
+	 * embed. Idempotent — `ON CONFLICT DO NOTHING` + content-addressed disk
+	 * filenames make a re-write harmless (it renames verified bytes over the same
+	 * file). Refs are exactly `options.refs` (none when omitted). `options.holder`,
+	 * when set, is recorded as a holder on a fresh insert and a dedup hit alike.
+	 *
+	 * @mutates fact_holder - records `options.holder` (when non-null) in the transaction that writes the `fact` row
 	 */
-	async put(bytes: Uint8Array, options?: FactPutOptions): Promise<FactHash> {
+	async put(bytes: Uint8Array, options: HeldFactPutOptions): Promise<FactHash> {
 		const hash = fact_hash_bytes(bytes);
 		let row_bytes: Uint8Array | null;
 		let row_external_url: string | null;
@@ -160,7 +199,7 @@ export class PgFactStore implements FactStore {
 				throw new Error(
 					`fact bytes exceed embedded threshold (${bytes.length} > ${
 						this.#embedded_threshold
-					}); configure disk_root or use put_ref for external storage`
+					}) and no disk CAS is configured; set disk_root and fs to store them on disk`
 				);
 			}
 			row_bytes = null;
@@ -169,40 +208,41 @@ export class PgFactStore implements FactStore {
 			row_bytes = bytes;
 			row_external_url = null;
 		}
-		const inserted = await query_put_fact(this.#deps, {
-			hash,
-			bytes: row_bytes,
-			external_url: row_external_url,
-			content_type: options?.content_type ?? null,
-			size: bytes.length
-		});
-		if (inserted) {
-			await query_put_fact_refs(this.#deps, hash, resolve_refs(bytes, options));
-		}
+		await this.#insert_row(
+			{
+				hash,
+				bytes: row_bytes,
+				external_url: row_external_url,
+				content_type: options.content_type ?? null,
+				size: bytes.length
+			},
+			options.refs ?? [],
+			options.holder
+		);
 		return hash;
 	}
 
 	/**
-	 * Stream bytes into the store with bounded memory, returning the finalized
-	 * digests + size. Delegates the byte path to `stream_fact_to_disk` (hash
-	 * BLAKE3 + SHA-256 in one pass, buffer to the embedded threshold, spill to the
-	 * disk CAS), then inserts the `fact` row by placement — embedded bytes go to
-	 * the PG `bytes` column, disk-spilled bytes record the `file:` `external_url`.
-	 * The cap is enforced mid-stream (`PayloadTooLargeError`); a disk-full mid-
-	 * stream throws `StorageFullError`.
+	 * Stream bytes into the store with bounded memory, returning the fact hash +
+	 * size. Delegates the byte path to `stream_fact_to_disk` (hash BLAKE3 as it
+	 * streams, buffer to the embedded threshold, spill to the disk CAS), then
+	 * inserts the `fact` row by placement — embedded bytes go to the PG `bytes`
+	 * column, disk-spilled bytes record the `file:` `external_url`.
+	 * The cap is enforced mid-stream (`FactPayloadTooLargeError`); a disk-full mid-
+	 * stream throws `FactStorageFullError`.
 	 *
-	 * Refs: explicit `options.refs` are recorded; JSON auto-extraction is NOT
-	 * attempted (it would need a buffered re-read, defeating the bounded-memory
-	 * contract) — streamed uploads are opaque blobs.
+	 * Refs are exactly `options.refs` (none when omitted), as on `put`.
 	 *
 	 * Requires `fs` (and, for the over-threshold spill, `disk_root`) to be
 	 * configured. The streaming twin of `put`; mirrors the Rust
-	 * `FactStore::put_stream`.
+	 * `FactStore::put_stream`. Records `options.holder` the way `put` does.
+	 *
+	 * @mutates fact_holder - records `options.holder` (when non-null) in the transaction that writes the `fact` row
 	 */
 	async put_stream(
 		stream: ReadableStream<Uint8Array>,
 		max_bytes: number,
-		options?: FactPutOptions
+		options: HeldFactPutOptions
 	): Promise<PutStreamOutcome> {
 		if (this.#fs === undefined) {
 			throw new Error(
@@ -219,50 +259,47 @@ export class PgFactStore implements FactStore {
 		const row_bytes = streamed.placement.kind === 'embedded' ? streamed.placement.bytes : null;
 		const row_external_url =
 			streamed.placement.kind === 'disk' ? streamed.placement.external_url : null;
-		const inserted = await query_put_fact(this.#deps, {
-			hash: streamed.hash,
-			bytes: row_bytes,
-			external_url: row_external_url,
-			content_type: options?.content_type ?? null,
-			size: streamed.size
-		});
-		if (inserted && options?.refs && options.refs.length > 0) {
-			await query_put_fact_refs(this.#deps, streamed.hash, options.refs);
-		}
-		return { hash: streamed.hash, sha256: streamed.sha256, size: streamed.size };
+		await this.#insert_row(
+			{
+				hash: streamed.hash,
+				bytes: row_bytes,
+				external_url: row_external_url,
+				content_type: options.content_type ?? null,
+				size: streamed.size
+			},
+			options.refs ?? [],
+			options.holder
+		);
+		return { hash: streamed.hash, size: streamed.size };
 	}
 
 	/**
-	 * Stream-hash external content and record `(hash, external_url, size)`.
-	 * Throws when the streamed byte count disagrees with the caller's
-	 * declared `size` — a size mismatch usually means the upload was
-	 * truncated or the URL points at the wrong content.
+	 * Insert the `fact` row, then — in the same transaction — its refs (fresh
+	 * insert only) and the holder row (every put, a dedup hit included). Shared
+	 * by `put` and `put_stream`; twin of the Rust `PgFactStore::insert_row`.
 	 */
-	async put_ref(url: string, size: number, options?: FactPutOptions): Promise<FactHash> {
-		const stream = await this.#fetcher.fetch_stream(url);
-		const { hash, byte_count } = await hash_counted_stream(stream);
-		if (byte_count !== size) {
-			throw new Error(
-				`fact size mismatch for ${url}: caller declared ${size}, streamed ${byte_count}`
-			);
-		}
-		const inserted = await query_put_fact(this.#deps, {
-			hash,
-			bytes: null,
-			external_url: url,
-			content_type: options?.content_type ?? null,
-			size
+	async #insert_row(row: PutFactInput, refs: Array<FactHash>, holder: Uuid | null): Promise<void> {
+		await this.#deps.db.transaction(async (db: Db) => {
+			const inserted = await query_put_fact({ db }, row);
+			if (inserted && refs.length > 0) {
+				await query_put_fact_refs({ db }, row.hash, refs);
+			}
+			if (holder !== null) {
+				await query_put_fact_holder({ db }, holder, row.hash);
+			}
 		});
-		if (inserted && options?.refs && options.refs.length > 0) {
-			await query_put_fact_refs(this.#deps, hash, options.refs);
-		}
-		return hash;
 	}
 
 	/**
-	 * Retrieve bytes. Embedded reads return PG bytes directly; external
-	 * reads fetch + verify and return `null` (with a warning log) when
-	 * the bytes don't match the stored hash.
+	 * Retrieve bytes. Embedded reads return PG bytes directly. An external
+	 * read comes from the disk CAS and nowhere else: the bytes at the row's
+	 * `file:<shard>/<rest>` URL are read and verified against the hash.
+	 *
+	 * Returns `null`, with a warning log, for an external row the store cannot
+	 * serve — an `external_url` that is not a `file:<shard>/<rest>` URL, no disk
+	 * CAS configured (`disk_root` + `fs`), a failed disk read, or bytes that
+	 * don't match the hash — and, with an error log, for a URL that names
+	 * another fact's file. Never makes a network request.
 	 */
 	async get(hash: FactHash): Promise<Uint8Array | null> {
 		const row = await query_get_fact(this.#deps, hash);
@@ -273,12 +310,33 @@ export class PgFactStore implements FactStore {
 		if (row.external_url === null) {
 			return null;
 		}
+		// the URL is not echoed — the column is free text, so its shape and
+		// length are whatever the row's writer chose
+		const parsed = parse_file_fact_url(row.external_url);
+		if (!parsed) {
+			this.#log?.warn(
+				`PgFactStore.get external_url for ${hash} is not a file:<shard>/<rest> URL; treating as not-found`
+			);
+			return null;
+		}
+		if (!file_fact_url_addresses(parsed, hash)) {
+			this.#log?.error(
+				`PgFactStore.get external_url for ${hash} addresses another fact's file; treating as not-found`
+			);
+			return null;
+		}
+		if (this.#disk_root === undefined || this.#fs === undefined) {
+			this.#log?.warn(
+				`PgFactStore.get ${hash} is disk-backed and no disk CAS is configured (disk_root + fs); treating as not-found`
+			);
+			return null;
+		}
 		let bytes: Uint8Array;
 		try {
-			bytes = await this.#fetcher.fetch_bytes(row.external_url);
+			bytes = await read_fact_bytes_from_disk(this.#fs, this.#disk_root, row.external_url);
 		} catch (err) {
 			this.#log?.warn(
-				`PgFactStore.get fetch failed for ${hash} at ${row.external_url}:`,
+				`PgFactStore.get disk read failed for ${hash} at ${row.external_url}:`,
 				to_error_message(err)
 			);
 			return null;
@@ -321,11 +379,11 @@ export class PgFactStore implements FactStore {
 	 * NOT verify the fact is unreferenced — that policy lives one layer
 	 * up (the orphan-fact admin surface in the consumer; a future GC walker).
 	 *
-	 * External-URL unlink is the caller's responsibility — the store
-	 * doesn't know how to resolve `file:` / `s3:` / etc. URLs to a
-	 * deletable handle. Caller iterates the returned `external_url`
-	 * (when non-null) and dispatches to the appropriate cleanup
-	 * routine. Mirrors the read-side `FactExternalFetcher` split.
+	 * The disk file of a disk-backed fact is NOT unlinked — that is the
+	 * caller's responsibility, using the returned `external_url` (when
+	 * non-null): a `file:<shard>/<rest>` URL names
+	 * `<disk_root>/<shard>/<rest>`. The value is the row's free text — parse
+	 * it with `parse_file_fact_url` before joining a path.
 	 *
 	 * @returns `{size, external_url}` for the deleted row, or `null` if
 	 *   no row matched the hash.
@@ -336,48 +394,16 @@ export class PgFactStore implements FactStore {
 }
 
 /**
- * Resolve refs for a `put` call: explicit `refs` win; otherwise auto-extract
- * from JSON content; otherwise no refs.
- */
-const resolve_refs = (bytes: Uint8Array, options: FactPutOptions | undefined): Array<FactHash> => {
-	if (options?.refs !== undefined) return options.refs;
-	if (options?.content_type !== 'application/json') return [];
-	let value: unknown;
-	try {
-		value = JSON.parse(new TextDecoder().decode(bytes));
-	} catch {
-		// Malformed JSON — caller mislabeled content_type. Fall back to no refs;
-		// the alternative (throwing) would surprise callers who set
-		// content_type advisorially.
-		return [];
-	}
-	return fact_hash_extract_refs(value as never);
-};
-
-/** Hash a stream while counting bytes. Lets `put_ref` verify size in one pass. */
-const hash_counted_stream = async (
-	stream: ReadableStream<Uint8Array>
-): Promise<{ hash: FactHash; byte_count: number }> => {
-	let byte_count = 0;
-	const counting = new TransformStream<Uint8Array, Uint8Array>({
-		transform(chunk, controller) {
-			byte_count += chunk.length;
-			controller.enqueue(chunk);
-		}
-	});
-	const piped = stream.pipeThrough(counting);
-	const hash = await fact_hash_stream(piped);
-	return { hash, byte_count };
-};
-
-/**
  * Coerce whatever the driver returns for BYTEA into a `Uint8Array`.
  *
  * `pg` returns `Buffer` (a `Uint8Array` subclass), `pglite` already returns
  * `Uint8Array`. Wrapping `Buffer` in a fresh `Uint8Array` keeps the
  * downstream type honest without a copy.
+ *
+ * @param value - a BYTEA column value as the driver returned it
+ * @returns a plain `Uint8Array` over the same bytes
  */
-const to_uint8 = (value: Uint8Array): Uint8Array =>
+export const to_uint8 = (value: Uint8Array): Uint8Array =>
 	value instanceof Uint8Array && value.constructor === Uint8Array
 		? value
 		: new Uint8Array(value.buffer, value.byteOffset, value.byteLength);

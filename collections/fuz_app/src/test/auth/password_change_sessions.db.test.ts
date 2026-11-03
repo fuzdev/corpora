@@ -10,16 +10,17 @@
 
 import { describe, test, assert, beforeAll, afterAll } from 'vitest';
 
-import { create_test_app, type TestApp } from '$lib/testing/app_server.ts';
-import { DEFAULT_TEST_PASSWORD } from '$lib/testing/test_credentials.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
-import { account_verify_action_spec } from '$lib/auth/account_action_specs.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { prefix_route_specs } from '$lib/http/route_spec.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { query_session_list_for_account } from '$lib/auth/session_queries.ts';
+import { create_test_app, type TestApp } from '#lib/testing/app_server.ts';
+import { TEST_ORIGIN } from '#lib/testing/test_origin.ts';
+import { DEFAULT_TEST_PASSWORD } from '#lib/testing/test_credentials.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
+import { account_verify_action_spec } from '#lib/auth/account_action_specs.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { prefix_route_specs } from '#lib/http/route_spec.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { query_session_list_for_account } from '#lib/auth/session_queries.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
@@ -41,10 +42,13 @@ describe('password change multi-session invalidation', () => {
 					})
 				),
 				...create_rpc_endpoint({
+					action_ip_rate_limiter: null,
+					action_account_rate_limiter: null,
 					path: RPC_PATH,
 					actions: create_account_actions({
 						log: ctx.deps.log,
-						audit: ctx.deps.audit
+						audit: ctx.deps.audit,
+						connection_closer: ctx.deps.connection_closer
 					}),
 					log: ctx.deps.log
 				})
@@ -60,7 +64,7 @@ describe('password change multi-session invalidation', () => {
 		const login_headers = {
 			'Content-Type': 'application/json',
 			host: 'localhost',
-			origin: 'http://localhost:5173'
+			origin: TEST_ORIGIN
 		};
 
 		// Log in 3 times to create 3 sessions (capturing each Set-Cookie)

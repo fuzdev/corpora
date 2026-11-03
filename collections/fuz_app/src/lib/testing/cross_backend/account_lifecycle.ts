@@ -3,7 +3,9 @@ import '../assert_dev_env.ts';
 /**
  * Cross-backend parity suite for the account-lifecycle admin verbs:
  * `account_delete` (soft), `account_undelete` (reactivation), and
- * `account_purge` (keeper hard-delete), plus the keeper guard.
+ * `account_purge` (keeper hard-delete), plus the keeper guard and the
+ * session-only self-delete (an API token can't end its own account; an admin
+ * token still deletes another).
  *
  * Like the cell suites, these verbs can't ride the generic
  * `describe_rpc_round_trip_tests`: they're stateful and destructive (a
@@ -12,9 +14,6 @@ import '../assert_dev_env.ts';
  * so this dedicated suite is their cross-impl validator. Every success
  * `result` is parsed against the verb's declared Zod **output** schema, so
  * a TS↔Rust envelope drift fails the assertion.
- *
- * `$lib`-free by contract (relative specifiers only) so it can be imported
- * from the spawnable cross-process test files.
  *
  * @module
  */
@@ -26,24 +25,28 @@ import {
 	AccountUndeleteOutput,
 	AccountPurgeOutput,
 	AdminAccountListOutput,
-	AuditLogListOutput,
 	ERROR_CANNOT_DELETE_KEEPER
 } from '../../auth/admin_action_specs.ts';
 import {
 	ERROR_ACCOUNT_NOT_FOUND,
-	ERROR_AUTHENTICATION_REQUIRED
+	ERROR_AUTHENTICATION_REQUIRED,
+	ERROR_CREDENTIAL_TYPE_REQUIRED
 } from '../../http/error_schemas.ts';
+import { JSONRPC_ERROR_CODES } from '../../http/jsonrpc_errors.ts';
+import { assert_audit_metadata_fields, list_audit_events } from './audit_cross_helpers.ts';
 import { test_if } from './capabilities.ts';
-import { cross_rpc_call, error_reason, expect_output } from './cell_cross_helpers.ts';
-import type { RpcPathCrossSuiteOptions } from './setup.ts';
+import { cross_rpc_call, error_reason, expect_output } from './cross_rpc.ts';
+import { assert_iso8601_seconds } from './wire_shapes.ts';
+import type { RpcPathCapabilityGatedCrossSuiteOptions } from './setup.ts';
 import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
 
 /**
  * Options for the account-lifecycle parity suite. The standard
- * RPC-dispatched cross-suite shape (`setup_test` / `capabilities` /
- * `rpc_path`); aliases `RpcPathCrossSuiteOptions` rather than duplicating.
+ * capability-gating RPC-dispatched cross-suite shape (`setup_test` /
+ * `capabilities` / `rpc_path`); aliases
+ * `RpcPathCapabilityGatedCrossSuiteOptions` rather than duplicating.
  */
-export type AccountLifecycleCrossTestOptions = RpcPathCrossSuiteOptions;
+export type AccountLifecycleCrossTestOptions = RpcPathCapabilityGatedCrossSuiteOptions;
 
 export const describe_account_lifecycle_cross_tests = (
 	options: AccountLifecycleCrossTestOptions
@@ -85,6 +88,22 @@ export const describe_account_lifecycle_cross_tests = (
 					AccountUndeleteOutput
 				);
 				assert.strictEqual(undeleted.undeleted, true);
+
+				// each verb audits the victim's identity snapshot, attributed to
+				// the admin (`list_audit_events` parses the metadata)
+				for (const event_type of ['account_delete', 'account_undelete'] as const) {
+					const events = await list_audit_events(fixture, { event_type }, rpc_path);
+					const row = events.find(
+						(e) => e.outcome === 'success' && e.target_account_id === victim.account.id
+					);
+					assert.ok(row, `${event_type} writes a success row targeting the victim`);
+					assert.strictEqual(row.account_id, fixture.account.id, event_type);
+					assert.strictEqual(
+						(row.metadata as { username?: unknown } | null)?.username,
+						victim.account.username,
+						`${event_type} snapshots the username`
+					);
+				}
 			}
 		);
 
@@ -104,6 +123,18 @@ export const describe_account_lifecycle_cross_tests = (
 				AccountPurgeOutput
 			);
 			assert.strictEqual(purged.purged, true);
+
+			// the purge row outlives the account it names, carrying its identity
+			const events = await list_audit_events(fixture, { event_type: 'account_purge' }, rpc_path);
+			const row = events.find(
+				(e) => e.outcome === 'success' && e.target_account_id === victim.account.id
+			);
+			assert.ok(row, 'account_purge writes a success row targeting the victim');
+			assert.strictEqual(
+				(row.metadata as { username?: unknown } | null)?.username,
+				victim.account.username,
+				'account_purge snapshots the username'
+			);
 		});
 
 		test_if(
@@ -133,6 +164,87 @@ export const describe_account_lifecycle_cross_tests = (
 				);
 				assert.strictEqual(purge.ok, false, 'purge of keeper account must be refused');
 				assert.strictEqual(error_reason(purge), ERROR_CANNOT_DELETE_KEEPER);
+			}
+		);
+
+		test_if(
+			capabilities.account_lifecycle,
+			'self-delete is session-only; an admin bearer still deletes another account',
+			async () => {
+				const fixture = await setup_test();
+				const member = await fixture.create_account({ username: 'lifecycle_self_bearer' });
+
+				// The member's own bearer may not end its account (handler-enforced,
+				// the dispatcher's credential-type refusal).
+				const refused = await cross_rpc_call(
+					fixture.fresh_transport({ origin: null }),
+					rpc_path,
+					'account_delete',
+					{},
+					member.create_bearer_headers()
+				);
+				assert.strictEqual(refused.ok, false, 'a bearer self-delete must be refused');
+				assert.strictEqual(refused.error?.code, JSONRPC_ERROR_CODES.forbidden);
+				assert.strictEqual(error_reason(refused), ERROR_CREDENTIAL_TYPE_REQUIRED);
+				assert.deepStrictEqual(
+					(refused.error?.data as { required_credential_types?: unknown } | undefined)
+						?.required_credential_types,
+					['session']
+				);
+
+				// An explicit own id is self in either case (`Uuid` admits both) — the
+				// keeper's too, whose refusal is the credential one, not the keeper guard.
+				for (const [label, account_id, headers] of [
+					['member', member.account.id, member.create_bearer_headers()],
+					['keeper', fixture.account.id, fixture.create_bearer_headers()]
+				] as const) {
+					const upper = await cross_rpc_call(
+						fixture.fresh_transport({ origin: null }),
+						rpc_path,
+						'account_delete',
+						{ account_id: account_id.toUpperCase() },
+						headers
+					);
+					assert.strictEqual(upper.ok, false, `${label}: an uppercased own id is self`);
+					assert.deepStrictEqual(upper.error, refused.error, label);
+				}
+
+				// Nothing was tombstoned: the member's session still verifies.
+				const still = await cross_rpc_call(
+					fixture.fresh_transport(),
+					rpc_path,
+					'account_verify',
+					undefined,
+					member.create_session_headers()
+				);
+				assert.ok(still.ok, 'the refused self-delete leaves the account live');
+
+				// The keeper's bearer (admin-capable) deletes another account.
+				const deleted = expect_output(
+					await cross_rpc_call(
+						fixture.fresh_transport({ origin: null }),
+						rpc_path,
+						'account_delete',
+						{ account_id: member.account.id },
+						fixture.create_bearer_headers()
+					),
+					AccountDeleteOutput
+				);
+				assert.strictEqual(deleted.deleted, true);
+
+				// A self-delete over a session goes through.
+				const self = await fixture.create_account({ username: 'lifecycle_self_session' });
+				const self_deleted = expect_output(
+					await cross_rpc_call(
+						fixture.fresh_transport(),
+						rpc_path,
+						'account_delete',
+						{},
+						self.create_session_headers()
+					),
+					AccountDeleteOutput
+				);
+				assert.strictEqual(self_deleted.deleted, true);
 			}
 		);
 
@@ -220,33 +332,11 @@ export const describe_account_lifecycle_cross_tests = (
 				);
 				assert.strictEqual(error_reason(del), ERROR_CANNOT_DELETE_KEEPER);
 
-				// Deterministic barrier before reading: await in-flight
-				// fire-and-forget audit writes (the real await on the Rust spine;
-				// satisfied-by-construction on the TS spine via await_pending_effects).
-				const td = fixture.fresh_transport({ origin: null });
-				const drained = await cross_rpc_call(
-					td,
-					rpc_path,
-					'_testing_drain_effects',
-					undefined,
-					fixture.create_daemon_token_headers()
-				);
-				assert.ok(drained.ok, `_testing_drain_effects failed: ${JSON.stringify(drained.error)}`);
-
-				// The failure row is now authoritative on both spines. `_testing_reset`
-				// wiped audit_log at setup, so the refused delete is the only
-				// account_delete event.
-				const listed = expect_output(
-					await cross_rpc_call(
-						t,
-						rpc_path,
-						'audit_log_list',
-						{ event_type: 'account_delete' },
-						fixture.create_session_headers()
-					),
-					AuditLogListOutput
-				);
-				const failure = listed.events.find(
+				// Read behind the drain barrier, so the failure row is authoritative
+				// on both spines. `_testing_reset` wiped audit_log at setup, so the
+				// refused delete is the only account_delete event.
+				const events = await list_audit_events(fixture, { event_type: 'account_delete' }, rpc_path);
+				const failure = events.find(
 					(e) =>
 						e.outcome === 'failure' &&
 						(e.metadata as { reason?: unknown } | null)?.reason === ERROR_CANNOT_DELETE_KEEPER
@@ -255,6 +345,9 @@ export const describe_account_lifecycle_cross_tests = (
 					failure,
 					'keeper-removal guard must emit an account_delete outcome=failure audit row with reason cannot_delete_keeper'
 				);
+				// Byte-shape gate on the audit row's timestamp — `z.string()` in
+				// `AuditLogEventWithUsernamesJson` accepts a millisecond stamp too.
+				assert_iso8601_seconds(failure.created_at, 'audit_log_list.created_at');
 			}
 		);
 
@@ -304,6 +397,18 @@ export const describe_account_lifecycle_cross_tests = (
 				);
 				assert.strictEqual(again.ok, false, 'double-undelete must not silently succeed');
 				assert.strictEqual(error_reason(again), ERROR_ACCOUNT_NOT_FOUND);
+
+				// the refused undelete is audited as a failure naming the probed id
+				const events = await list_audit_events(
+					fixture,
+					{ event_type: 'account_undelete', outcome: 'failure' },
+					rpc_path
+				);
+				assert.strictEqual(events.length, 1, 'one account_undelete failure row');
+				assert_audit_metadata_fields(fixture, events[0]!.metadata, {
+					reason: ERROR_ACCOUNT_NOT_FOUND,
+					attempted_account_id: victim.account.id
+				});
 			}
 		);
 
@@ -363,6 +468,9 @@ export const describe_account_lifecycle_cross_tests = (
 					row.account.deleted_at !== null,
 					'tombstoned row carries a non-null deleted_at on both spines'
 				);
+				assert_iso8601_seconds(row.account.created_at, 'admin_account_list.created_at');
+				assert_iso8601_seconds(row.account.updated_at, 'admin_account_list.updated_at');
+				assert_iso8601_seconds(row.account.deleted_at, 'admin_account_list.deleted_at');
 			}
 		);
 	});

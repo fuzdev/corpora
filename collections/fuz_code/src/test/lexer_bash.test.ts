@@ -1,8 +1,8 @@
 import { describe, test, assert } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { syntax_events_to_tokens, validate_syntax_events } from '$lib/lexer.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { syntax_events_to_tokens, validate_syntax_events } from '#lib/lexer.ts';
 
 const tokens_of = (text: string): Array<[string, string]> =>
 	syntax_events_to_tokens(syntax_styler_global.lex(text, 'bash')).map((t) => [
@@ -276,6 +276,32 @@ describe('lexer_bash heredocs', () => {
 			tokens.some((t) => t.type === 'heredoc_delimiter' && text.slice(t.start, t.end) === 'EOF')
 		);
 		assert.ok(tokens.some((t) => t.type === 'variable'));
+	});
+});
+
+describe('lexer_bash escapes', () => {
+	test('a backslash outside quotes makes the next char literal', () => {
+		const text =
+			"case $x in\n  *\\`* | *\\'* | *\\\"* | *' '* ) exit 1 ;;\nesac\n# a `comment`\necho \\$HOME";
+		assert.deepEqual(
+			tokens_of(text).filter(([type]) => type !== 'operator'),
+			[
+				['keyword', 'case'],
+				['variable', '$x'],
+				['keyword', 'in'],
+				['string', "' '"],
+				['punctuation', ')'],
+				['builtin', 'exit'],
+				['number', '1'],
+				['keyword', 'esac'],
+				['comment', '# a `comment`'],
+				['builtin', 'echo']
+			]
+		);
+	});
+
+	test('a backslash before a newline continues the line', () => {
+		assert.deepEqual(picked('echo a \\\n  b', ['builtin']), [['builtin', 'echo']]);
 	});
 });
 

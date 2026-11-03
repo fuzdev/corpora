@@ -1,11 +1,11 @@
 <script lang="ts" module>
-  export type {
-    GroupProps,
-    GroupPropsWithoutHTML,
-  } from './Group.shared.svelte.js';
+  export type { GroupProps, GroupPropsWithoutHTML } from './Group.shared.svelte.js';
 </script>
 
-<script lang="ts" generics="T extends import('$lib/utils/types.js').Transition = import('$lib/utils/types.js').Transition">
+<script
+  lang="ts"
+  generics="T extends import('$lib/utils/types.js').Transition = import('$lib/utils/types.js').Transition"
+>
   import type { TouchEventHandler } from 'svelte/elements';
   import { GroupState, type GroupProps } from './Group.shared.svelte.js';
 
@@ -21,10 +21,13 @@
     y,
     initialX,
     initialY,
+    z,
     data,
     key,
     center,
     motion,
+    seriesKey,
+    opacity,
     ...rest
   }: GroupProps<T> = $props();
 
@@ -40,10 +43,13 @@
         y,
         initialX,
         initialY,
+        z,
         data,
         key,
         center,
         motion,
+        seriesKey,
+        opacity,
         ...rest,
       }) as GroupProps
   );
@@ -65,11 +71,13 @@
   };
 </script>
 
-{#if c.dataMode}
+{#if c.hidden}
+  <!-- `seriesKey` names a series the legend has hidden -->
+{:else if c.dataMode}
   {#each c.resolvedItems as item (item.key)}
     <div
       style:transform="translate({item.x}px, {item.y}px)"
-      style:opacity={rest.opacity}
+      style:opacity={c.opacity}
       {...rest}
       class={['lc-group-div', className]}
       ontouchmove={handleTouchMove}
@@ -81,7 +89,7 @@
   <div
     bind:this={ref}
     style:transform={c.transform}
-    style:opacity={rest.opacity}
+    style:opacity={c.opacity}
     in:transitionIn={transitionInParams}
     {...rest}
     class={['lc-group-div', className]}

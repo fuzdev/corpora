@@ -19,6 +19,8 @@
  * @see `typescript-extract-type-json.ts` for `resolveTypeInfo`, `referenceSymbolName`, `tupleElements`, `restElementForms`
  * @see `tsdoc.ts` for `parseComment`, `applyToDeclaration`
  * @see `source.ts` for `SourceFileInfo`, `getComponentName`
+ * @see `svelte-legacy.ts` for `scanLegacyExports`, `resolveLegacyPropsAnchor`
+ * @see `svelte-scripts.ts` for `findScriptTags`, `isModuleScript`
  *
  * @module
  */
@@ -43,6 +45,10 @@ import {
 	parseComment,
 	applyToDeclaration,
 	hasDocContent,
+	hasModuleTag,
+	parseCommentText,
+	parseModuleComment,
+	toModuleDocFields,
 	type TsdocParsedComment
 } from './tsdoc.ts';
 import {
@@ -51,7 +57,14 @@ import {
 	getTypeSignature,
 	createExtractContext,
 	optionalWidened,
-	type ExtractContext
+	extractSignatureParameters,
+	applyReturnType,
+	isExternalSignature,
+	isStrayComponentTypedef,
+	selectDeclarationNode,
+	type ExtractContext,
+	type FileExists,
+	type IsEmittedFile
 } from './typescript-extract-shared.ts';
 import {
 	referenceSymbolName,
@@ -59,25 +72,39 @@ import {
 	restElementForms,
 	tupleElementName,
 	tupleElements,
+	writtenTypeAnnotation,
 	type AliasRegistry
 } from './typescript-extract-type-json.ts';
 import {
 	extractModuleComment,
 	analyzeExports,
-	warnModuleCommentNodocs
+	warnModuleCommentTags
 } from './typescript-exports.ts';
 import {
 	type SourceFileInfo,
 	getComponentName,
 	isSvelte2tsxGeneratedExport,
-	SVELTE_COMPONENT_ALIAS_SUFFIX,
 	SVELTE_VIRTUAL_SUFFIX
 } from './source.ts';
 import { type ModuleSourceOptions, extractDependencies } from './source-config.ts';
 import { compareStrings } from './postprocess.ts';
 import { type Diagnostic } from './diagnostics.ts';
-import { to_error_message } from './error.ts';
+import { toErrorMessage } from './error.ts';
 import { toPosixPath } from './paths.ts';
+import { resolveLegacyPropsAnchor, scanLegacyExports } from './svelte-legacy.ts';
+import {
+	analyzeComponentCss,
+	documentCssProperties,
+	findCsspropTagLine,
+	type ComponentCss
+} from './svelte-css.ts';
+import {
+	findHtmlComments,
+	findScriptTags,
+	isModuleScript,
+	type HtmlComment,
+	type SvelteScriptTag
+} from './svelte-scripts.ts';
 
 /** Resolved source map type (avoids repeating the verbose `InstanceType<...>` inline). */
 type SourceMap = InstanceType<typeof TraceMap>;
@@ -104,6 +131,25 @@ export interface SvelteVirtualFile {
 	 * derived from it at output.
 	 */
 	scriptKind: ts.ScriptKind;
+	/**
+	 * The component's script tags as located in the original source: the
+	 * top-level `<script>` tags, in source order (`findScriptTags`).
+	 * `transformSvelteSource` locates them once, and `analyzeSvelteModule`
+	 * reads the instance and module scripts from here on every analysis.
+	 *
+	 * Optional so a virtual built by hand needs none: `analyzeSvelteModule`
+	 * then locates them in the source it's given.
+	 */
+	scriptTags?: ReadonlyArray<SvelteScriptTag>;
+	/**
+	 * The component's styling API as `analyzeComponentCss` reads it from the
+	 * original source, read once at transform like `scriptTags`, plus the
+	 * problem `analyzeSvelteModule` reports when the style wasn't read.
+	 *
+	 * Optional so a virtual built by hand needs none: `analyzeSvelteModule`
+	 * then reads it from the source it's given.
+	 */
+	css?: ComponentCss;
 }
 
 /**
@@ -126,8 +172,9 @@ export interface TransformResult {
  *
  * Produces a `SvelteVirtualFile` containing the transformed TypeScript content
  * and source map. The virtual file can be included in a TypeScript program
- * (via `createAnalysisProgram({ virtualFiles })`) so that the checker can
- * resolve imported types, `<script module>` exports, and re-exports.
+ * (via `createAnalysisProgram({ virtualFiles })`, or the language service's
+ * `setFile` in sessions) so that the checker can resolve imported types,
+ * `<script module>` exports, and re-exports.
  *
  * Errors at ingest are returned via `diagnostics` rather than thrown:
  * - svelte2tsx throws → `transform_failed`, `virtual: undefined`
@@ -150,12 +197,16 @@ export const transformSvelteSource = (sourceFile: SourceFileInfo): TransformResu
 	// already posixified at ingest.
 	const posixId = toPosixPath(sourceFile.id);
 	const diagnostics: Array<Diagnostic> = [];
-	// mirror the Svelte compiler's lang detection: the first script tag with a
-	// valued `lang` attribute decides the file and only `ts` counts (svelte2tsx's
-	// fallback also takes `typescript`; Svelte core doesn't). Reading parsed
-	// attributes keeps `lang="ts"` in markup from flipping a JS component to TS
-	// and discarding its JSDoc prop types
-	const firstLang = findScriptTags(sourceFile.content)
+	// The first of the component's script tags with a valued `lang` attribute
+	// decides the file, and only `ts` counts (svelte2tsx's fallback also takes
+	// `typescript`; Svelte core doesn't). Reading the located tags' parsed
+	// attributes keeps `lang="ts"` in markup, or on a `<script>` nested in the
+	// template, from flipping a JS component to TS and discarding its JSDoc
+	// prop types. Svelte's own parser is looser here: it enables TypeScript
+	// syntax for the whole file from the first `<script … lang>` it finds
+	// anywhere, nested or not.
+	const scriptTags = findScriptTags(sourceFile.content).tags;
+	const firstLang = scriptTags
 		.map((tag) => tag.attributes.get('lang'))
 		.find((lang) => typeof lang === 'string');
 	const isTsFile = firstLang === 'ts';
@@ -171,7 +222,7 @@ export const transformSvelteSource = (sourceFile: SourceFileInfo): TransformResu
 		diagnostics.push({
 			kind: 'transform_failed',
 			file: posixId,
-			message: `svelte2tsx failed to transform Svelte source: ${to_error_message(err)}`,
+			message: `svelte2tsx failed to transform Svelte source: ${toErrorMessage(err)}`,
 			severity: 'error'
 		});
 		return { virtual: undefined, diagnostics };
@@ -186,7 +237,7 @@ export const transformSvelteSource = (sourceFile: SourceFileInfo): TransformResu
 		diagnostics.push({
 			kind: 'source_map_failed',
 			file: posixId,
-			message: `Failed to parse svelte2tsx source map: ${to_error_message(err)}. Line/column positions for this file will reference virtual TypeScript output instead of the original Svelte source.`,
+			message: `Failed to parse svelte2tsx source map: ${toErrorMessage(err)}. Line/column positions for this file will reference virtual TypeScript output instead of the original Svelte source.`,
 			severity: 'warning'
 		});
 	}
@@ -196,7 +247,9 @@ export const transformSvelteSource = (sourceFile: SourceFileInfo): TransformResu
 			virtualPath,
 			content: tsResult.code,
 			sourceMap,
-			scriptKind: isTsFile ? ts.ScriptKind.TS : ts.ScriptKind.JS
+			scriptKind: isTsFile ? ts.ScriptKind.TS : ts.ScriptKind.JS,
+			scriptTags,
+			css: analyzeComponentCss(sourceFile.content)
 		},
 		diagnostics
 	};
@@ -218,9 +271,7 @@ const SVELTE2TSX_IDENTIFIERS = {
 	/** Identifier for `$props()` rune. */
 	PROPS_RUNE: '$props',
 	/** Identifier for `$bindable()` rune. */
-	BINDABLE_RUNE: '$bindable',
-	/** Suffix on the synthesized component const/type alias (shared constant — `isSvelte2tsxInternal` in `source.ts` filters on it too). */
-	COMPONENT_ALIAS_SUFFIX: SVELTE_COMPONENT_ALIAS_SUFFIX
+	BINDABLE_RUNE: '$bindable'
 } as const;
 
 /**
@@ -255,10 +306,14 @@ const assertSvelteVersion = (): void => {
 interface ComponentNodes {
 	/** `function $$render()`, whose body is the instance `<script>`. */
 	renderFunction?: ts.FunctionDeclaration;
+	/**
+	 * The object `$$render` returns (`{props: …, slots: …, bindings: …, …}`):
+	 * where svelte2tsx's legacy-or-runes reading, a legacy component's default
+	 * slot, and its props are read.
+	 */
+	renderReturn?: ts.ObjectLiteralExpression;
 	/** `class __sveltets_Render`, emitted for generic components. */
 	renderClass?: ts.ClassDeclaration;
-	/** `const <Name>__SvelteComponent_`, which carries the HTML `@component` JSDoc. */
-	componentAlias?: ts.VariableStatement;
 }
 
 /** Locate the svelte2tsx landmarks in a transformed source. */
@@ -268,23 +323,95 @@ const findComponentNodes = (virtualSource: ts.SourceFile): ComponentNodes => {
 		if (ts.isFunctionDeclaration(statement)) {
 			if (statement.name?.text === SVELTE2TSX_IDENTIFIERS.RENDER_FUNCTION) {
 				nodes.renderFunction = statement;
+				const returned = statement.body?.statements.findLast(ts.isReturnStatement)?.expression;
+				if (returned && ts.isObjectLiteralExpression(returned)) nodes.renderReturn = returned;
 			}
 		} else if (ts.isClassDeclaration(statement)) {
 			if (statement.name?.text === SVELTE2TSX_IDENTIFIERS.RENDER_CLASS) {
 				nodes.renderClass = statement;
 			}
-		} else if (
-			ts.isVariableStatement(statement) &&
-			statement.declarationList.declarations.some(
-				(declaration) =>
-					ts.isIdentifier(declaration.name) &&
-					declaration.name.text.endsWith(SVELTE2TSX_IDENTIFIERS.COMPONENT_ALIAS_SUFFIX)
-			)
-		) {
-			nodes.componentAlias = statement;
 		}
 	}
 	return nodes;
+};
+
+/** The value of `name: …` in the object `$$render` returns, when it's a plain property assignment. */
+const renderReturnValue = (nodes: ComponentNodes, name: string): ts.Expression | undefined => {
+	for (const property of nodes.renderReturn?.properties ?? []) {
+		if (
+			ts.isPropertyAssignment(property) &&
+			ts.isIdentifier(property.name) &&
+			property.name.text === name
+		) {
+			return property.initializer;
+		}
+	}
+	return undefined;
+};
+
+/**
+ * How svelte2tsx read a component:
+ *
+ * - `'legacy'` — runes-less: its exported bindings are props, its default slot
+ *   renders children
+ * - `'runes'` — its props come from `$props()` alone, and an exported binding
+ *   is an instance export
+ * - `'unrecognized'` — the virtual doesn't say, so nothing is assumed
+ */
+type RenderMode = 'legacy' | 'runes' | 'unrecognized';
+
+/**
+ * Classify how svelte2tsx read the component, legacy or runes.
+ *
+ * This is svelte2tsx's classification, not the compiler's: analysis never
+ * sees the compiler's `runes` option, and svelte2tsx decides from the source
+ * alone (a rune in the script or template, or `<svelte:options runes />`). It
+ * records the decision in the `bindings` value `$$render` returns: a string
+ * literal (`bindings: ""`) for a legacy component, a `__sveltets_$$bindings`
+ * call (`bindings: __sveltets_$$bindings('a')`) for a runes one.
+ * Template-only components and rune-free scripts read as legacy.
+ *
+ * The one mode signal, read once per component: the legacy props path and
+ * the default-slot rule both take it. The runes arm matches the callee by name, not any call, so a
+ * svelte2tsx that starts writing something else there is `'unrecognized'`
+ * and gets reported, instead of passing for runes and silently dropping a
+ * legacy component's props. A missing value is `'unrecognized'` too.
+ */
+const classifyRenderMode = (nodes: ComponentNodes): RenderMode => {
+	const bindings = renderReturnValue(nodes, 'bindings');
+	if (!bindings) return 'unrecognized';
+	if (ts.isStringLiteral(bindings)) return 'legacy';
+	if (
+		ts.isCallExpression(bindings) &&
+		ts.isIdentifier(bindings.expression) &&
+		bindings.expression.text === SVELTE2TSX_IDENTIFIERS.BINDINGS_FUNCTION
+	) {
+		return 'runes';
+	}
+	return 'unrecognized';
+};
+
+/**
+ * Whether a legacy component has a default slot, read off the type of the
+ * `slots` value `$$render` returns. That covers a template `<slot />` and a
+ * declared `$$Slots`, with props or without, with a script or template-only.
+ * A named slot alone doesn't count.
+ *
+ * The caller asks only for a component svelte2tsx read as legacy
+ * (`classifyRenderMode`): a runes component declares what it accepts through
+ * its `children` prop, and a `<slot />` there is ignored. An unrecognized
+ * mode isn't read either.
+ *
+ * @returns `false` too when the virtual has no recognized `slots` value or the checker throws
+ */
+const hasDefaultSlot = (nodes: ComponentNodes, checker: ts.TypeChecker): boolean => {
+	const slots = renderReturnValue(nodes, 'slots');
+	if (!slots) return false;
+	try {
+		return checker.getTypeAtLocation(slots).getProperty('default') !== undefined;
+	} catch (_) {
+		return false;
+	}
 };
 
 /**
@@ -361,6 +488,14 @@ const mapVirtualPositionWithFallback = (
 	return { line: line + 1, column: character + 1 };
 };
 
+/** Whether a node is a JSDoc `@typedef`/`@callback` tag in the given virtual. */
+const isVirtualTypedefTag = (
+	node: ts.Node,
+	virtualSource: ts.SourceFile
+): node is ts.JSDocTypedefTag | ts.JSDocCallbackTag =>
+	(ts.isJSDocTypedefTag(node) || ts.isJSDocCallbackTag(node)) &&
+	node.getSourceFile() === virtualSource;
+
 /**
  * Extract the original source line for the component's `<script>` tag.
  *
@@ -379,106 +514,40 @@ const extractComponentSourceLine = (
 };
 
 /**
- * Extract the content of the main `<script>` tag from Svelte source —
- * commented-out scripts skipped, module scripts (`<script module>`,
- * `<script context="module">`) excluded.
+ * Extract the content of the component's instance `<script>` from Svelte
+ * source: the top-level one that isn't a module script (`<script module>`,
+ * `<script context="module">`). A commented-out script doesn't count, and
+ * neither does one nested in the template (`<svelte:head>`, an element, a
+ * block), which is an ordinary element.
  *
- * @returns the script tag content, or undefined if no matching script tag is found
+ * Locates the tags itself on every call (`findScriptTags`), parsing the
+ * template when the scan can't prove them top-level.
+ *
+ * @returns the script tag content, or undefined if the source has no instance script
  */
 export const extractScriptContent = (svelteSource: string): string | undefined =>
-	findScriptTags(svelteSource).find((tag) => !isModuleScript(tag.attributes))?.content;
+	findScriptTags(svelteSource).tags.find((tag) => !isModuleScript(tag.attributes))?.content;
 
 /**
- * Extract the content of the module `<script>` tag from Svelte source.
+ * Extract the content of the component's module `<script>` from Svelte source.
  *
- * Counterpart of `extractScriptContent`: matches only module scripts, so the
- * two partition a source's script tags consistently.
+ * Counterpart of `extractScriptContent`: matches only the module script, under
+ * the same top-level rule and at the same per-call cost, so the two partition
+ * a source's script tags consistently.
  *
  * @returns the module script tag content, or undefined if no module script is found
  */
 export const extractModuleScriptContent = (svelteSource: string): string | undefined =>
-	findScriptTags(svelteSource).find((tag) => isModuleScript(tag.attributes))?.content;
-
-/** A located script tag: parsed attributes, content, and where the content starts in the source. */
-interface ScriptTag {
-	/** Opening-tag attributes; bare attributes (`module`) map to `true`. */
-	attributes: Map<string, string | true>;
-	content: string;
-	/** Offset of `content` within the source, for mapping script positions to original lines. */
-	start: number;
-}
-
-/**
- * Scan Svelte source for script tags, in source order.
- *
- * Ports Svelte's preprocessor regex (`svelte/src/compiler/preprocess`):
- * quote-aware attributes (`>` inside a value doesn't end the tag),
- * commented-out scripts skipped, contentless self-closing tags dropped.
- * Adaptations: the `d` flag for content offsets, no `i` flag (`<Script>` is
- * a component), `\s*` before the closing `>` per the parser's
- * `/<\/script\s*>/`. Shared costless limits: whitespace around an attribute
- * `=` makes the tag unmatchable (Svelte rejects that spelling — svelte2tsx
- * throws first), and `</script>` in a string literal ends the content early.
- */
-const findScriptTags = (svelteSource: string): Array<ScriptTag> => {
-	const scriptRegex =
-		/<!--[^]*?-->|<script((?:\s+[^=>'"/\s]+=(?:"[^"]*"|'[^']*'|[^>\s]+)|\s+[^=>'"/\s]+)*\s*)(?:\/>|>([^]*?)<\/script\s*>)/dg;
-	const tags: Array<ScriptTag> = [];
-	let match;
-	while ((match = scriptRegex.exec(svelteSource)) !== null) {
-		// the comment alternative and the self-closing branch capture no content
-		if (match[2] === undefined) continue;
-		tags.push({
-			attributes: parseAttributes(match[1]!),
-			content: match[2],
-			start: match.indices![2]![0]
-		});
-	}
-	return tags;
-};
-
-/**
- * Parse an opening-tag attribute string into a name → value map — bare
- * attributes map to `true`. The token grammar mirrors `findScriptTags`'s
- * attribute branch, so anything that regex matched parses cleanly here.
- */
-const parseAttributes = (attrs: string): Map<string, string | true> => {
-	const attributes: Map<string, string | true> = new Map();
-	const attributeRegex = /([^=>'"/\s]+)(?:=(?:"([^"]*)"|'([^']*)'|([^>\s]+)))?/g;
-	let match;
-	while ((match = attributeRegex.exec(attrs)) !== null) {
-		attributes.set(match[1]!, match[2] ?? match[3] ?? match[4] ?? true);
-	}
-	return attributes;
-};
-
-/** Collect the raw content of each HTML comment (`<!-- ... -->`) in source order. */
-const findHtmlComments = (svelteSource: string): Array<string> => {
-	const commentRegex = /<!--([^]*?)-->/g;
-	const contents: Array<string> = [];
-	let match;
-	while ((match = commentRegex.exec(svelteSource)) !== null) {
-		contents.push(match[1]!);
-	}
-	return contents;
-};
-
-/**
- * A script tag is a module script when it carries a `module` attribute
- * (Svelte 5) or `context="module"` (Svelte 4) — Svelte's `read_script` test,
- * minus its error paths. `module` inside an attribute *value* doesn't count.
- */
-const isModuleScript = (attributes: Map<string, string | true>): boolean =>
-	attributes.has('module') || attributes.get('context') === 'module';
+	findScriptTags(svelteSource).tags.find((tag) => isModuleScript(tag.attributes))?.content;
 
 /**
  * Parse script-tag content as standalone TypeScript for syntactic scans.
  *
  * TS is a syntactic superset of both script langs, so the parse serves JS
  * scripts too. Parents are set so consumers can call `getStart()` freely.
- * Shared by `extractSvelteModuleComment` and the legacy-prop scan —
- * `analyzeSvelteModule` parses the instance script once and hands the result
- * to both.
+ * Shared by `extractSvelteModuleComment` and the legacy-export scan
+ * (`scanLegacyExports`) — `analyzeSvelteModule` parses the instance script once
+ * and hands the result to both.
  */
 const parseScriptContent = (scriptContent: string): ts.SourceFile =>
 	ts.createSourceFile('script.ts', scriptContent, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -492,105 +561,55 @@ const lineOfOffset = (text: string, offset: number): number => {
 	return line;
 };
 
-/** A legacy prop found by `detectLegacyProps`. */
-interface LegacyProp {
-	/** Exported prop name (the rename in `export {a as b}` form). */
-	name: string;
-	/** Offset within the script content — the caller owns line mapping. */
-	pos: number;
-}
-
 /**
- * Detect legacy `export let` props in an instance script.
- *
- * Runes-less components declare props by exporting mutable bindings —
- * `export let a` / `export var a` directly, or `let a; export {a as b}` for
- * renames (the reserved-word workaround). Presence of either form is a
- * reliable legacy signal without classifying the component's mode: `export
- * let` is a compile error in runes mode, so no valid component mixes it with
- * `$props()`. `export const` / `export function` are accessors, not props,
- * and type-only exports aren't runtime bindings — both stay out. The scan
- * reads the *original* instance script (via `parseScriptContent`) because
- * svelte2tsx rewrites the `export` modifier away inside `$$render`; a purely
- * syntactic walk over top-level statements is all it needs.
- *
- * @param scriptSource - parsed instance `<script>` content from the original source
- * @returns detected props in source order; empty when the component isn't legacy
+ * Clean an HTML comment's content: normalize CRLF, strip the indentation its
+ * lines share, and trim. Only the common indentation goes, so an indented
+ * code block in an `@example` keeps its shape. The first line, which sits on
+ * the `<!--` opener, is trimmed alone and doesn't count toward the common
+ * indentation; blank lines don't count either. Lines indented with tabs and
+ * lines indented with spaces share no common prefix, so mixed indentation
+ * keeps its relative indentation.
  */
-const detectLegacyProps = (scriptSource: ts.SourceFile): Array<LegacyProp> => {
-	// top-level non-const bindings, for the export-clause rename form
-	const mutableBindings: Set<string> = new Set();
-	const found: Array<LegacyProp> = [];
-
-	for (const statement of scriptSource.statements) {
-		if (!ts.isVariableStatement(statement)) continue;
-		// const/using/await-using bindings aren't reassignable — accessors, not props
-		if (statement.declarationList.flags & (ts.NodeFlags.Const | ts.NodeFlags.Using)) continue;
-		const exported =
-			statement.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
-		for (const declaration of statement.declarationList.declarations) {
-			// legacy props are simple identifiers; skip destructuring defensively
-			if (!ts.isIdentifier(declaration.name)) continue;
-			// a directly-exported binding can still be renamed by a clause —
-			// `export let a; export {a as b}` declares props `a` and `b`
-			mutableBindings.add(declaration.name.text);
-			if (exported) {
-				found.push({ name: declaration.name.text, pos: declaration.name.getStart(scriptSource) });
-			}
-		}
-	}
-
-	// separate pass — an export clause may precede the binding it re-exports
-	for (const statement of scriptSource.statements) {
-		if (
-			!ts.isExportDeclaration(statement) ||
-			statement.isTypeOnly ||
-			statement.moduleSpecifier !== undefined ||
-			statement.exportClause === undefined ||
-			!ts.isNamedExports(statement.exportClause)
-		) {
+const dedentHtmlComment = (rawContent: string): string => {
+	const [first = '', ...rest] = rawContent.replace(/\r\n?/g, '\n').split('\n');
+	let indent: string | undefined;
+	for (const line of rest) {
+		if (!line.trim()) continue;
+		const lineIndent = /^[ \t]*/.exec(line)![0];
+		if (indent === undefined) {
+			indent = lineIndent;
 			continue;
 		}
-		for (const spec of statement.exportClause.elements) {
-			if (spec.isTypeOnly) continue;
-			if (!mutableBindings.has((spec.propertyName ?? spec.name).text)) continue;
-			found.push({ name: spec.name.text, pos: spec.getStart(scriptSource) });
-		}
+		let i = 0;
+		while (i < indent.length && i < lineIndent.length && indent[i] === lineIndent[i]) i++;
+		indent = indent.slice(0, i);
 	}
-
-	return found.sort((a, b) => a.pos - b.pos);
+	const dedented = rest.map((line) =>
+		(indent && line.startsWith(indent) ? line.slice(indent.length) : line).trimEnd()
+	);
+	return [first.trim(), ...dedented].join('\n').trim();
 };
 
 /**
- * Extract `@module` comment from HTML comments in Svelte source.
+ * Extract and parse the `@module` comment from HTML comments in Svelte source.
  *
  * Scans all `<!-- ... -->` comments for one containing `@module` at the
  * start of a line. This allows `@component` and `@module` to coexist as
  * separate HTML comments. Works for template-only components.
  *
+ * The lines' common indentation is stripped (`dedentHtmlComment`), then the
+ * text parses through `parseModuleComment`, the parser a script's module
+ * comment uses, so tags read the same in either form (a `*\/` in the HTML
+ * text survives intact).
+ *
  * @param svelteSource - the full Svelte source code
- * @returns the cleaned module comment text, or undefined if no `@module` HTML comment found
+ * @returns the parsed module comment, or undefined if no `@module` HTML
+ *   comment is found or it holds nothing but `@module`
  */
-export const extractHtmlModuleComment = (svelteSource: string): string | undefined => {
-	for (const rawContent of findHtmlComments(svelteSource)) {
-		// Clean: normalize CRLF, strip leading/trailing whitespace per line, trim
-		const cleaned = rawContent
-			.replace(/\r\n/g, '\n')
-			.split('\n')
-			.map((line) => line.trim())
-			.join('\n')
-			.trim();
-
-		if (!cleaned) continue;
-
-		// Check for `@module` as a proper tag (at start of line, not mentioned in prose)
-		if (!/(?:^|\n)@module\b/.test(cleaned)) continue;
-
-		// Strip the `@module` tag line and return
-		const lines = cleaned.split('\n');
-		const filtered = lines.filter((line) => !/^\s*@module\b/.test(line));
-		const result = filtered.join('\n').trim();
-		return result || undefined;
+export const extractHtmlModuleComment = (svelteSource: string): TsdocParsedComment | undefined => {
+	for (const { content } of findHtmlComments(svelteSource)) {
+		const cleaned = dedentHtmlComment(content);
+		if (cleaned && hasModuleTag(cleaned)) return parseModuleComment(cleaned);
 	}
 	return undefined;
 };
@@ -604,19 +623,51 @@ export const extractHtmlModuleComment = (svelteSource: string): string | undefin
  * `extractScriptContent`/`extractModuleScriptContent`).
  *
  * @param scriptContent - the content of a `<script>` or `<script module>` tag
- * @returns the cleaned module comment text, or undefined if none found
+ * @returns the parsed module comment, or undefined if none is found
  */
-export const extractSvelteModuleComment = (scriptContent: string): string | undefined =>
+export const extractSvelteModuleComment = (scriptContent: string): TsdocParsedComment | undefined =>
 	extractModuleComment(parseScriptContent(scriptContent));
 
+/** A line that starts with the `@component` tag, as opposed to a mention in prose. */
+const COMPONENT_TAG_LINE = /^(\s*)@component\b[ \t]*/;
+
 /**
- * Check if the original Svelte source contains an HTML `@component` comment.
+ * The HTML component comment: the first HTML comment with a line starting
+ * `@component`, the rule `@module` follows. A backticked or mid-prose mention
+ * doesn't count.
  *
- * Only checks HTML comments (`<!-- @component ... -->`), not JSDoc in `<script>`.
- * Used for duplicate `docComment` detection.
+ * svelte2tsx, and so editor hover, picks differently: the *last* HTML comment
+ * containing `@component` anywhere (`svelte2tsxComponentComment`), which
+ * `analyzeSvelteModule` warns about as `component_comment_mismatch` when the
+ * two disagree.
  */
-const hasHtmlComponentComment = (svelteSource: string): boolean =>
-	findHtmlComments(svelteSource).some((content) => /(?:^|\n)\s*@component\b/.test(content));
+const findHtmlComponentComment = (comments: ReadonlyArray<HtmlComment>): HtmlComment | undefined =>
+	comments.find(({ content }) =>
+		dedentHtmlComment(content)
+			.split('\n')
+			.some((line) => COMPONENT_TAG_LINE.test(line))
+	);
+
+/** The comment svelte2tsx documents the component with: the last one containing `@component`. */
+const svelte2tsxComponentComment = (
+	comments: ReadonlyArray<HtmlComment>
+): HtmlComment | undefined => comments.findLast(({ content }) => content.includes('@component'));
+
+/**
+ * Parse an HTML component comment with `parseCommentText`, after removing the
+ * `@component` tag from each line it starts. Text after the tag on its line
+ * stays prose (`<!-- @component A button. -->`), and the lines' common
+ * indentation is stripped (`dedentHtmlComment`), as for an HTML module comment.
+ */
+const parseHtmlComponentComment = (comment: HtmlComment): TsdocParsedComment | undefined => {
+	const text = dedentHtmlComment(comment.content)
+		.split('\n')
+		.map((line) => line.replace(COMPONENT_TAG_LINE, '$1'))
+		.join('\n')
+		.trim();
+	const parsed = parseCommentText(text);
+	return parsed && hasDocContent(parsed) ? parsed : undefined;
+};
 
 /** A component `docComment` plus the authoring form it came from. */
 interface ComponentTsdoc {
@@ -626,31 +677,33 @@ interface ComponentTsdoc {
 }
 
 /**
- * Extract component-level TSDoc comment from svelte2tsx transformed output.
+ * Extract the component-level TSDoc comment.
  *
  * Two authoring forms reach here, searched in precedence order:
  *
- * 1. in-script JSDoc — the instance `<script>` becomes the body of the
- *    `$$render()` function, so the comment rides the props destructuring (or an
- *    earlier statement in that body)
- * 2. the HTML `@component` comment — re-emitted as JSDoc on the synthesized
- *    `<Name>__SvelteComponent_` const at the end of the virtual source
+ * 1. in-script JSDoc, read from the svelte2tsx output — the instance
+ *    `<script>` becomes the body of the `$$render()` function, so the comment
+ *    rides the props destructuring (or an earlier statement in that body)
+ * 2. the HTML `@component` comment, read from the original source
+ *    (`findHtmlComponentComment`), not from the JSDoc svelte2tsx re-emits for
+ *    it, since svelte2tsx picks the comment by a looser rule
  *
- * Scoping the search to those two regions is what keeps `<script module>` out:
- * its declarations hoist above `$$render`, and a whole-file walk would take the
- * first one's JSDoc — which documents that export, not the component.
+ * Scoping the in-script search to `$$render` is what keeps `<script module>`
+ * out: its declarations hoist above `$$render`, and a whole-file walk would
+ * take the first one's JSDoc — which documents that export, not the component.
  */
 const extractComponentTsdoc = (
 	nodes: ComponentNodes,
-	sourceFile: ts.SourceFile
+	sourceFile: ts.SourceFile,
+	htmlComponentComment: HtmlComment | undefined
 ): ComponentTsdoc | undefined => {
 	const renderBody = nodes.renderFunction?.body;
 	if (renderBody) {
 		const tsdoc = findInstanceTsdoc(renderBody, sourceFile);
 		if (tsdoc) return { tsdoc, source: 'script' };
 	}
-	if (nodes.componentAlias) {
-		const tsdoc = findComponentTsdoc(nodes.componentAlias, sourceFile);
+	if (htmlComponentComment) {
+		const tsdoc = parseHtmlComponentComment(htmlComponentComment);
 		if (tsdoc) return { tsdoc, source: 'html' };
 	}
 	return undefined;
@@ -667,6 +720,9 @@ const extractComponentTsdoc = (
  * documented statement in a propless runes component or a legacy `export let`
  * component is some local's doc, not the component's). The HTML `@component`
  * comment is the authoring path for anchorless components.
+ *
+ * A JSDoc above the instance script's first import is missed: svelte2tsx
+ * hoists imports out of `$$render`, taking their leading comments with them.
  */
 const findInstanceTsdoc = (
 	renderBody: ts.Block,
@@ -705,6 +761,18 @@ const isPropsDeclaration = (statement: ts.Statement): boolean =>
  * annotation (or the one svelte2tsx synthesizes for untyped `$props()`)
  * parses to an empty result and would otherwise claim the doc slot, masking
  * the HTML `@component` fallback.
+ *
+ * Two JS-component caveats: a description block written above a separate
+ * `/** @type {...} *\/` block never attaches (TypeScript binds only the last
+ * block — write docs in the HTML comment, or inside the `@type` block), and
+ * svelte2tsx consumes descriptions merged into an inline `@type {{...}}`
+ * literal when it rewrites it into a synthesized typedef (the HTML fallback
+ * still applies).
+ *
+ * Typedef blocks aren't skipped here: an instance-script typedef is local to
+ * `$$render` and never emitted, and this doc slot is the package's convention
+ * rather than a declaration's hover, so the block's prose stays the
+ * component's.
  */
 const findComponentTsdoc = (
 	root: ts.Node,
@@ -719,7 +787,7 @@ const findComponentTsdoc = (
 		if (ts.isPropertySignature(node)) return;
 
 		if (ts.isVariableStatement(node) || ts.isVariableDeclaration(node)) {
-			const tsdoc = parseComment(node, sourceFile);
+			const tsdoc = parseComment(node, sourceFile, false);
 			if (tsdoc && hasDocContent(tsdoc)) {
 				foundTsdoc = tsdoc;
 				return;
@@ -757,7 +825,7 @@ const findComponentTsdoc = (
  * assembling modules themselves through `analyzeModule` /
  * `analyzeSvelteModule`.
  *
- * @mutates diagnostics — rewrites `line`/`column` on virtual-file entries
+ * @mutates diagnostics - rewrites `line`/`column` on virtual-file entries
  */
 export const remapVirtualDiagnosticPositions = (
 	diagnostics: Array<Diagnostic>,
@@ -793,8 +861,9 @@ const assemblePropInfo = (
 	typeInfo: TypeJson | undefined,
 	optional: boolean,
 	propDecl: ts.Node | undefined,
-	metadata: PropsMetadata,
-	parameters?: Array<ParameterJsonInput>
+	anchor: PropsAnchor,
+	parameters?: Array<ParameterJsonInput>,
+	callbackReturn?: { returnType?: string; returnTypeInfo?: TypeJson }
 ): ComponentPropJsonInput => {
 	const tsdoc = propDecl ? parseComment(propDecl) : undefined;
 
@@ -804,19 +873,27 @@ const assemblePropInfo = (
 		optional,
 		description: tsdoc?.text || undefined,
 		// Default value: AST first (source of truth), then @default tag (fallback)
-		defaultValue: metadata.propsDefaults.get(propName) ?? tsdoc?.defaultValue,
-		bindable: metadata.bindableProps.has(propName),
+		defaultValue: anchor.defaults.get(propName) ?? tsdoc?.defaultValue,
+		bindable: anchor.bindable === 'all' || anchor.bindable.has(propName),
 		examples: tsdoc?.examples,
 		deprecatedMessage: tsdoc?.deprecatedMessage,
 		seeAlso: tsdoc?.seeAlso,
 		throws: tsdoc?.throws,
-		since: tsdoc?.since
+		since: tsdoc?.since,
+		internalMessage: tsdoc?.internalMessage
 	};
+	// mirrors `applyToDeclaration`: an empty record is absence
+	if (tsdoc?.mutates && Object.keys(tsdoc.mutates).length > 0) result.mutates = tsdoc.mutates;
 	if (typeInfo) result.typeInfo = typeInfo;
-	// Only set parameters when there are actual params to expose.
-	// Bare Snippet/Snippet<[]> doesn't set this — consumers use the type string for detection.
+	// Only set parameters when there are actual params to expose. Bare
+	// Snippet/Snippet<[]> doesn't set this (consumers use the type string for
+	// detection), nor does a zero-parameter callback (`returnType` marks it).
 	if (parameters && parameters.length > 0) {
 		result.parameters = parameters;
+	}
+	if (callbackReturn?.returnType !== undefined) {
+		result.returnType = callbackReturn.returnType;
+		if (callbackReturn.returnTypeInfo) result.returnTypeInfo = callbackReturn.returnTypeInfo;
 	}
 	return result;
 };
@@ -827,17 +904,39 @@ const assemblePropInfo = (
 interface PropsMetadata {
 	/** Props marked with `$bindable()`. */
 	bindableProps: Set<string>;
-	/** Default values from destructuring pattern. */
+	/** Default values from the destructuring pattern, keyed by prop name. */
 	propsDefaults: Map<string, string>;
+	/**
+	 * Prop names the `$props()` destructuring pattern binds, in pattern order:
+	 * every element but the `...rest` one, keyed by the prop name (`class` for
+	 * `class: className`), a nested pattern by its top-level name. Empty when
+	 * `$props()` isn't destructured.
+	 */
+	destructuredProps: Array<string>;
 	/** The `let {...} = $props()` declaration (first match), when present. */
 	propsDeclaration: ts.VariableDeclaration | undefined;
 }
 
 /**
+ * The prop name an object binding element reads — the property name when the
+ * element renames (`class: className`, `'aria-label': label`) or nests
+ * (`a: {b}`), else the bound identifier. `undefined` for the rest element and
+ * for computed names, which name no statically known prop.
+ */
+const bindingElementPropName = (element: ts.BindingElement): string | undefined => {
+	if (element.dotDotDotToken) return undefined;
+	const nameNode = element.propertyName ?? element.name;
+	if (ts.isIdentifier(nameNode) || ts.isStringLiteral(nameNode) || ts.isNumericLiteral(nameNode)) {
+		return nameNode.text;
+	}
+	return undefined;
+};
+
+/**
  * Extract all props-related metadata in a single AST traversal: bindables from
- * the `__sveltets_$$bindings(...)` call, defaults from the `$props()` binding
- * pattern, and the `$props()` declaration itself (the anchor
- * `extractPropsViaChecker` resolves the props type from).
+ * the `__sveltets_$$bindings(...)` call, the destructured names and defaults
+ * from the `$props()` binding pattern, and the `$props()` declaration itself
+ * (the anchor `extractPropsViaChecker` resolves the props type from).
  *
  * @param virtualSource - the svelte2tsx transformed TypeScript source
  * @returns combined metadata from single traversal
@@ -845,6 +944,7 @@ interface PropsMetadata {
 const extractPropsMetadata = (virtualSource: ts.SourceFile): PropsMetadata => {
 	const bindableProps: Set<string> = new Set();
 	const propsDefaults: Map<string, string> = new Map();
+	const destructuredProps: Array<string> = [];
 	let propsDeclaration: ts.VariableDeclaration | undefined;
 
 	function visit(node: ts.Node) {
@@ -861,47 +961,44 @@ const extractPropsMetadata = (virtualSource: ts.SourceFile): PropsMetadata => {
 			}
 		}
 
-		// Extract the declaration + defaults from $props() call
-		if (ts.isVariableDeclaration(node)) {
-			if (isPropsCall(node.initializer)) {
-				propsDeclaration ??= node;
+		// Extract the declaration, its destructured names, and defaults from the
+		// first $props() call (Svelte allows only one)
+		if (ts.isVariableDeclaration(node) && !propsDeclaration && isPropsCall(node.initializer)) {
+			propsDeclaration = node;
 
-				// Extract defaults from binding pattern
-				if (ts.isObjectBindingPattern(node.name)) {
-					for (const element of node.name.elements) {
-						if (ts.isBindingElement(element) && element.initializer) {
-							const propName = ts.isIdentifier(element.name) ? element.name.text : undefined;
-							if (!propName) continue;
+			if (ts.isObjectBindingPattern(node.name)) {
+				for (const element of node.name.elements) {
+					// keyed by the prop name, not the local binding, so a renamed
+					// prop's default lands on the prop (`class: c = 'a'` → `class`)
+					const propName = bindingElementPropName(element);
+					if (!propName) continue;
+					destructuredProps.push(propName);
+					if (!element.initializer) continue;
 
-							// Skip $bindable() with no args (no default), but extract argument if present
-							if (ts.isCallExpression(element.initializer)) {
-								const expr = element.initializer.expression;
-								if (ts.isIdentifier(expr) && expr.text === SVELTE2TSX_IDENTIFIERS.BINDABLE_RUNE) {
-									// Only extract if has argument: $bindable('value') → 'value'
-									if (element.initializer.arguments.length > 0) {
-										const arg = element.initializer.arguments[0]!;
-										// Skip $bindable(undefined) - same semantic as $bindable()
-										if (!(ts.isIdentifier(arg) && arg.text === 'undefined')) {
-											propsDefaults.set(propName, arg.getText());
-										}
-									}
-									// Skip $bindable() with no args
-									continue;
+					// Skip $bindable() with no args (no default), but extract argument if present
+					if (ts.isCallExpression(element.initializer)) {
+						const expr = element.initializer.expression;
+						if (ts.isIdentifier(expr) && expr.text === SVELTE2TSX_IDENTIFIERS.BINDABLE_RUNE) {
+							// Only extract if has argument: $bindable('value') → 'value'
+							if (element.initializer.arguments.length > 0) {
+								const arg = element.initializer.arguments[0]!;
+								// Skip $bindable(undefined) - same semantic as $bindable()
+								if (!(ts.isIdentifier(arg) && arg.text === 'undefined')) {
+									propsDefaults.set(propName, arg.getText());
 								}
 							}
-
-							// Skip explicit undefined (same semantic as no default)
-							if (
-								ts.isIdentifier(element.initializer) &&
-								element.initializer.text === 'undefined'
-							) {
-								continue;
-							}
-
-							// Regular default value
-							propsDefaults.set(propName, element.initializer.getText());
+							// Skip $bindable() with no args
+							continue;
 						}
 					}
+
+					// Skip explicit undefined (same semantic as no default)
+					if (ts.isIdentifier(element.initializer) && element.initializer.text === 'undefined') {
+						continue;
+					}
+
+					// Regular default value
+					propsDefaults.set(propName, element.initializer.getText());
 				}
 			}
 		}
@@ -910,7 +1007,7 @@ const extractPropsMetadata = (virtualSource: ts.SourceFile): PropsMetadata => {
 	}
 
 	visit(virtualSource);
-	return { bindableProps, propsDefaults, propsDeclaration };
+	return { bindableProps, propsDefaults, destructuredProps, propsDeclaration };
 };
 
 // Snippet Detection
@@ -993,6 +1090,26 @@ export const extractSnippetParameters = (
 };
 
 /**
+ * The signature that makes a prop a callback: the first call signature of its
+ * type that this project declared, or `undefined` when there is none.
+ *
+ * External-origin signatures never count — the rule callable members follow
+ * (`populatePropertyMember`). It keeps the non-callbacks among external
+ * callables out (`Component`, an intersection of `Snippet`s, a class
+ * constructor's call form), and in an intersection of an own signature with an
+ * external one it selects the own. A union reports no signature: TypeScript
+ * synthesizes one whose parameters intersect the members', which describes
+ * none of them.
+ *
+ * Callers pass the type with `null`/`undefined` stripped, as for
+ * `isSnippetType`.
+ */
+const localCallSignature = (type: ts.Type, ctx: ExtractContext): ts.Signature | undefined =>
+	type.isUnion()
+		? undefined
+		: type.getCallSignatures().find((sig) => !isExternalSignature(sig, ctx.isExternalFile));
+
+/**
  * Check if a return type string matches svelte2tsx's snippet return type pattern.
  *
  * svelte2tsx transforms exported snippets into arrow functions with
@@ -1008,6 +1125,32 @@ export const isSnippetReturnType = (returnType: string): boolean => {
 		returnType.includes('{@render ...} must be called with a Snippet') &&
 		returnType.includes('unique symbol')
 	);
+};
+
+/**
+ * Turn the function declaration svelte2tsx makes of an exported snippet back
+ * into a `kind: 'snippet'`, in place; any other declaration is left alone.
+ *
+ * svelte2tsx transforms `{#snippet}` + export into an arrow function whose
+ * return type is `ReturnType<import('svelte').Snippet>` (`isSnippetReturnType`),
+ * so the checker-backed extraction sees a function with svelte2tsx's types.
+ * Runs wherever such a declaration can surface: a component's own module
+ * exports, and an alias another module synthesizes when it re-exports the
+ * snippet from a component that emits no module of its own.
+ *
+ * @mutates declaration - sets `kind` and `typeSignature`, drops the return and overload fields
+ */
+export const reclassifySnippetDeclaration = (declaration: DeclarationJsonBuild): void => {
+	if (declaration.kind !== 'function' || !declaration.returnType) return;
+	if (!isSnippetReturnType(declaration.returnType)) return;
+	declaration.kind = 'snippet';
+	// a clean Snippet type string instead of the svelte2tsx noise
+	declaration.typeSignature = synthesizeSnippetTypeSignature(declaration.parameters ?? []);
+	// snippets don't have meaningful return types or overloads
+	delete declaration.returnType;
+	delete declaration.returnTypeInfo;
+	delete declaration.returnDescription;
+	delete declaration.overloads;
 };
 
 /**
@@ -1069,7 +1212,7 @@ const detectChildrenSnippet = (
 		ctx.diagnostics.push({
 			kind: 'svelte_prop_failed',
 			file: diagnosticFile,
-			message: `Failed to resolve type for "children" in ${componentName} while detecting acceptsChildren: ${to_error_message(err)}`,
+			message: `Failed to resolve type for "children" in ${componentName} while detecting acceptsChildren: ${toErrorMessage(err)}`,
 			severity: 'warning',
 			componentName,
 			propName: 'children'
@@ -1079,60 +1222,95 @@ const detectChildrenSnippet = (
 };
 
 /**
- * Extract props from svelte2tsx output using the TypeScript checker.
+ * Where a component's props are read from: the resolved props type plus what
+ * the component's own script says about each prop. `extractPropsViaChecker`
+ * projects props from it the same way whichever syntax declared them.
  *
- * Anchors on `metadata.propsDeclaration` (located by `extractPropsMetadata`'s
- * traversal) and uses `checker.getTypeAtLocation()` to resolve the props type,
- * including imported types that are not locally defined.
+ * Runes components build one from the `$props()` declaration
+ * (`resolveRunesPropsAnchor`); legacy `export let` components from the
+ * instance script's exports and the `$$render` return
+ * (`resolveExportLetPropsAnchor`). The optional fields are the legacy
+ * differences, absent on the runes path.
  */
-const extractPropsViaChecker = (
-	virtualSource: ts.SourceFile,
+interface PropsAnchor {
+	/** The props type. */
+	type: ts.Type;
+	/**
+	 * The node the type was read from, in the component's own virtual. Property
+	 * types resolve at it, its file is the component's own for picking a prop's
+	 * representative declaration, and when it's a type node the `externalTypes`
+	 * walk reads it.
+	 */
+	node: ts.Node;
+	/**
+	 * Prop names the script itself binds, in source order: the `$props()`
+	 * destructuring's, or the `export let` names. An external-origin property
+	 * is documented only when named here.
+	 */
+	scriptNames: ReadonlyArray<string>;
+	/** Default values as written in the script, keyed by prop name. */
+	defaults: ReadonlyMap<string, string>;
+	/** The bindable prop names, or `'all'`. */
+	bindable: ReadonlySet<string> | 'all';
+	/**
+	 * Order every `scriptNames` prop first, in that order, ahead of props only
+	 * the type declares. Unset, props the project declares come first in
+	 * declaration order and `scriptNames` orders just the admitted external
+	 * ones.
+	 */
+	scriptNamesFirst?: boolean;
+	/**
+	 * Which of the type's properties are props. Unset, all are. A legacy
+	 * component's type also lists its accessors, which aren't passed in.
+	 */
+	isProp?: (name: string) => boolean;
+	/**
+	 * Optional prop names, replacing the type's own optionality. Set when the
+	 * type can't carry it: a legacy JS component's props object, whose every
+	 * property reads as required.
+	 */
+	optionalNames?: ReadonlySet<string>;
+}
+
+/**
+ * Resolve the props anchor of a runes component: the type of its `$props()`
+ * declaration, with the destructuring's names and defaults and the
+ * `$bindable()` props.
+ *
+ * Emits `svelte_prop_failed` when the declaration names a type the checker
+ * throws on.
+ *
+ * @returns the anchor, or `undefined` when the declaration carries no type or it doesn't resolve
+ */
+const resolveRunesPropsAnchor = (
+	metadata: PropsMetadata,
+	propsDeclaration: ts.VariableDeclaration,
 	ctx: ExtractContext,
 	componentName: string,
-	diagnosticFile: string,
-	sourceMap: SourceMap | null,
-	metadata: PropsMetadata
-): {
-	props: Array<ComponentPropJsonInput>;
-	externalTypes?: Array<string>;
-	acceptsChildren: boolean;
-} => {
-	const { checker, diagnostics } = ctx;
-	// Resolve the $props() declaration's type via the checker. Type and node
-	// are both-or-neither — the node is what `filterDocumentedProperties` and
-	// snippet extraction walk, so a resolved type without one is useless
-	let resolvedProps: { type: ts.Type; node: ts.Node } | undefined;
-	let propsTypeName: string | undefined;
-
-	if (metadata.propsDeclaration) {
-		// JS components carry the props type as JSDoc instead of a TypeNode —
-		// the author's `@type {Props}`, or the `@type {$$ComponentProps}`
-		// typedef svelte2tsx synthesizes for untyped destructuring. The JSDoc
-		// type participates in checking because JS-lang virtuals parse with
-		// `ScriptKind.JS` (see `SvelteVirtualFile.scriptKind`). TS virtuals
-		// never reach the fallback — svelte2tsx synthesizes a real annotation
-		// (`$$ComponentProps`) even for untyped `$props()` — so a stray JSDoc
-		// `@type` on a TS component is ignored, not honored.
-		const typeNode = metadata.propsDeclaration.type ?? ts.getJSDocType(metadata.propsDeclaration);
-		if (typeNode) {
-			// Read the name from the AST before the checker call so a throw
-			// below still knows what it failed to resolve
-			if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
-				propsTypeName = typeNode.typeName.text;
-			}
-			try {
-				resolvedProps = { type: checker.getTypeAtLocation(typeNode), node: typeNode };
-			} catch (_) {
-				// Fall through — resolvedProps stays undefined
-			}
-		}
-	}
-
-	if (!resolvedProps) {
-		// If $props() was used with a type name but the checker threw resolving
-		// it, emit a diagnostic
-		if (propsTypeName) {
-			diagnostics.push({
+	diagnosticFile: string
+): PropsAnchor | undefined => {
+	// JS components carry the props type as JSDoc instead of a TypeNode —
+	// the author's `@type {Props}`, or the `@type {$$ComponentProps}`
+	// typedef svelte2tsx synthesizes for untyped destructuring. The JSDoc
+	// type participates in checking because JS-lang virtuals parse with
+	// `ScriptKind.JS` (see `SvelteVirtualFile.scriptKind`). TS virtuals
+	// never reach the fallback — svelte2tsx synthesizes a real annotation
+	// (`$$ComponentProps`) even for untyped `$props()` — so a stray JSDoc
+	// `@type` on a TS component is ignored, not honored.
+	const typeNode = propsDeclaration.type ?? ts.getJSDocType(propsDeclaration);
+	if (!typeNode) return undefined;
+	// Type and node are both-or-neither — the node is what
+	// `filterDocumentedProperties` and snippet extraction walk, so a resolved
+	// type without one is useless
+	let type: ts.Type;
+	try {
+		type = ctx.checker.getTypeAtLocation(typeNode);
+	} catch (_) {
+		// the name is read from the AST, so a throw still knows what it failed
+		// to resolve; an unnamed type fails silently
+		if (ts.isTypeReferenceNode(typeNode) && ts.isIdentifier(typeNode.typeName)) {
+			const propsTypeName = typeNode.typeName.text;
+			ctx.diagnostics.push({
 				kind: 'svelte_prop_failed',
 				file: diagnosticFile,
 				message: `Component "${componentName}" uses $props() with type "${propsTypeName}" but the checker could not resolve it. This may indicate an incompatible svelte2tsx version.`,
@@ -1141,16 +1319,125 @@ const extractPropsViaChecker = (
 				propName: propsTypeName
 			});
 		}
-		return { props: [], acceptsChildren: false };
+		return undefined;
 	}
-	const { type: propsType, node: propsTypeNode } = resolvedProps;
+	return {
+		type,
+		node: typeNode,
+		scriptNames: metadata.destructuredProps,
+		defaults: metadata.propsDefaults,
+		bindable: metadata.bindableProps
+	};
+};
+
+/**
+ * Resolve the props anchor of a component with no `$props()` declaration: the
+ * `export let` props of one svelte2tsx read as legacy.
+ *
+ * Joins the two legacy readings: the scan of the original instance script
+ * (`scanLegacyExports`: names, order, defaults, accessors), which svelte2tsx
+ * can't supply since it rewrites the `export` modifier away, and the checker
+ * anchor in the `$$render` return (`resolveLegacyPropsAnchor`: the type).
+ *
+ * A component read as runes isn't scanned: it has no props without
+ * `$props()`, and its exported bindings are instance exports.
+ *
+ * Emits a `svelte_prop_failed` per scanned export when there's nothing to
+ * type them from, refusing rather than guessing: the mode is unrecognized
+ * (the exports look like props, but nothing says the component is legacy), or
+ * the props value is. The latter includes the empty value svelte2tsx writes
+ * when it found no exports where the scan did. The known case is a script
+ * closed with whitespace before the `>` (`</script >`): Svelte's parser and
+ * `findScriptTags` take it, svelte2tsx's own tag matcher doesn't, so its
+ * virtual doesn't have the instance script as written, and the message names
+ * that cause beside a version mismatch.
+ *
+ * @param instanceScript - the instance script's tag and parsed content, when the component has one
+ * @param svelteSource - the original Svelte source, for diagnostic lines
+ * @returns the anchor, or `undefined` when the script exports no props or they were refused
+ */
+const resolveExportLetPropsAnchor = (
+	renderMode: RenderMode,
+	nodes: ComponentNodes,
+	instanceScript: { tag: SvelteScriptTag; source: ts.SourceFile } | undefined,
+	svelteSource: string,
+	ctx: ExtractContext,
+	componentName: string,
+	diagnosticFile: string
+): PropsAnchor | undefined => {
+	if (!instanceScript || renderMode === 'runes') return undefined;
+	const { props, accessors } = scanLegacyExports(instanceScript.source);
+	if (props.length === 0) return undefined;
+
+	const legacyAnchor =
+		renderMode === 'legacy'
+			? resolveLegacyPropsAnchor(renderReturnValue(nodes, 'props'), ctx.checker)
+			: undefined;
+	if (!legacyAnchor) {
+		for (const prop of props) {
+			ctx.diagnostics.push({
+				kind: 'svelte_prop_failed',
+				file: diagnosticFile,
+				line: lineOfOffset(svelteSource, instanceScript.tag.start + prop.pos),
+				message: `Failed to extract prop "${prop.name}" in ${componentName}: the svelte2tsx output has no recognized props type for its legacy export let syntax. svelte2tsx may not have read the instance script (a closing tag with whitespace before the ">", as in "</script >", on either script makes it skip or misread it), or its version may be incompatible.`,
+				severity: 'warning',
+				componentName,
+				propName: prop.name
+			});
+		}
+		return undefined;
+	}
+
+	const scriptNames = props.map((p) => p.name);
+	const scriptNameSet = new Set(scriptNames);
+	return {
+		type: legacyAnchor.type,
+		node: legacyAnchor.node,
+		scriptNames,
+		defaults: new Map(
+			props.flatMap((p) => (p.defaultValue === undefined ? [] : [[p.name, p.defaultValue]]))
+		),
+		// any `export let` can be bound
+		bindable: 'all',
+		scriptNamesFirst: true,
+		isProp:
+			legacyAnchor.kind === 'authored'
+				? (name) => !accessors.has(name)
+				: (name) => scriptNameSet.has(name),
+		optionalNames:
+			legacyAnchor.kind === 'untyped'
+				? new Set(props.filter((p) => p.hasInitializer).map((p) => p.name))
+				: undefined
+	};
+};
+
+/**
+ * Extract props from svelte2tsx output using the TypeScript checker.
+ *
+ * Reads the props type off `anchor`, which the checker resolved, so imported
+ * types that aren't locally defined are included.
+ */
+const extractPropsViaChecker = (
+	virtualSource: ts.SourceFile,
+	ctx: ExtractContext,
+	componentName: string,
+	diagnosticFile: string,
+	sourceMap: SourceMap | null,
+	anchor: PropsAnchor
+): {
+	props: Array<ComponentPropJsonInput>;
+	externalTypes?: Array<string>;
+	acceptsChildren: boolean;
+} => {
+	const { checker, diagnostics } = ctx;
+	const { type: propsType, node: propsTypeNode } = anchor;
 
 	// Detect `acceptsChildren` via type inference: `children` must resolve to a
-	// `Snippet<...>` type. Checking the symbol name alone (the previous approach)
-	// misreports a non-Snippet `children` (e.g. `children: string`) as accepting
-	// children. The lookup runs on the unfiltered props type so inherited
-	// `children` from `SvelteHTMLElements`/`DOMAttributes` (declared as `Snippet`)
-	// is honored even when its declaration lives in node_modules.
+	// `Snippet<...>` type. Checking the symbol name alone would misreport a
+	// non-Snippet `children` (e.g. `children: string`) as accepting children.
+	// The lookup runs on the unfiltered props type so inherited `children` from
+	// `SvelteHTMLElements`/`DOMAttributes` (declared as `Snippet`) is honored
+	// even when its declaration lives in node_modules.
 	const acceptsChildren = detectChildrenSnippet(
 		propsType,
 		propsTypeNode,
@@ -1162,12 +1449,33 @@ const extractPropsViaChecker = (
 	// Drop properties contributed by external types (node_modules / svelte's
 	// element-attribute bags like `SvelteHTMLElements['li']`); those external
 	// types are summarized in `externalTypes` rather than enumerated as props.
-	const { properties, externalTypes } = filterDocumentedProperties(
+	// No `hasExtractableProperties` gate here, unlike the type-alias path, so
+	// union prop types (`HTMLButtonAttributes | HTMLAnchorAttributes`) still get
+	// `externalTypes`.
+	//
+	// The exception is a prop the `$props()` destructuring names: binding it
+	// shows the component handles it (`type = 'text'` over
+	// `HTMLInputAttributes`), so it's documented like a local prop, with the
+	// external declaration's type and JSDoc and the destructuring's default.
+	// The rest element names nothing, and a name the props type lacks (a type
+	// error in the component) or matches only through an index signature has
+	// no property to admit, so neither invents a prop.
+	//
+	// A legacy component's `export let` names are admitted by the same rule,
+	// and `isProp` drops what its props type lists beyond the props.
+	const filtered = filterDocumentedProperties(
 		propsType,
 		propsTypeNode,
 		checker,
-		ctx.isExternalFile
+		ctx.isExternalFile,
+		new Set(anchor.scriptNames)
 	);
+	const { externalTypes } = filtered;
+	const { isProp } = anchor;
+	const properties = isProp
+		? filtered.properties.filter((p) => isProp(p.name))
+		: filtered.properties;
+	const admitted = isProp ? filtered.admitted.filter((p) => isProp(p.name)) : filtered.admitted;
 
 	// One pick rule for "which declaration represents this prop": the symbol's
 	// declaration in the component's own file when one exists, else the usual
@@ -1208,32 +1516,61 @@ const extractPropsViaChecker = (
 		if (declB) return 1;
 		return compareStrings(a.name, b.name);
 	});
+	// Admitted external props follow, in destructuring order. Their declaration
+	// position is in a package's `.d.ts`, which says nothing about the
+	// component, and sorting by it would group them by how the package path
+	// compares to the component's; the pattern is the only position the
+	// component itself gives them.
+	const scriptOrder = new Map(anchor.scriptNames.map((name, i) => [name, i]));
+	const admittedInOrder = admitted.sort(
+		(a, b) => scriptOrder.get(a.name)! - scriptOrder.get(b.name)!
+	);
+	let orderedProperties = [...sortedProperties, ...admittedInOrder];
+	// Legacy components order by the script instead: every `export let` prop in
+	// export order, whichever side declared its type, then the props only a
+	// `$$Props` type declares, in the order above. The exports are the
+	// component's own statement of its props; `$$Props` is a type beside them.
+	if (anchor.scriptNamesFirst) {
+		const inScript = orderedProperties
+			.filter((p) => scriptOrder.has(p.name))
+			.sort((a, b) => scriptOrder.get(a.name)! - scriptOrder.get(b.name)!);
+		orderedProperties = [...inScript, ...orderedProperties.filter((p) => !scriptOrder.has(p.name))];
+	}
 
 	const props: Array<ComponentPropJsonInput> = [];
 
-	for (const prop of sortedProperties) {
+	for (const prop of orderedProperties) {
 		const propDecl = representativeDeclaration(prop);
 
 		// Check optionality via symbol flags (computed before type resolution
 		// since the type-string path strips the widened `undefined` for optional props)
-		const optional = (prop.flags & ts.SymbolFlags.Optional) !== 0;
+		const optional = anchor.optionalNames
+			? anchor.optionalNames.has(prop.name)
+			: (prop.flags & ts.SymbolFlags.Optional) !== 0;
 
 		// Get type string via checker
 		let typeString = 'any';
 		let typeInfo: TypeJson | undefined;
-		let snippetParams: Array<ParameterJsonInput> | undefined;
+		let callableParams: Array<ParameterJsonInput> | undefined;
+		let callbackReturn: { returnType?: string; returnTypeInfo?: TypeJson } | undefined;
 		try {
 			const propType = checker.getTypeOfSymbolAtLocation(prop, propsTypeNode);
 			// For optional properties, the checker includes `undefined` in the union.
 			// Strip it to match the declared type (e.g., `number` not `number | undefined`).
 			// Under `exactOptionalPropertyTypes` the checker doesn't widen, so the
 			// strip is gated off and a written `| undefined` survives.
+			// (A legacy JS prop made optional by its initializer strips the same
+			// way, so `optional` carries the `undefined` whichever syntax said it.)
 			const widened = optionalWidened(ctx, optional);
 			typeString = getTypeSignature(propType, checker, widened);
 			// the written annotation (in the svelte2tsx virtual or an imported
-			// props type) feeds name recovery; only symbols are resolved from it,
-			// so source-position remapping is not implicated
-			const annotation = propDecl && ts.isPropertySignature(propDecl) ? propDecl.type : undefined;
+			// props type, or a JS typedef's `@property` tag) feeds name recovery
+			// and union order; only symbols are resolved from it, so
+			// source-position remapping is not implicated
+			const annotation =
+				propDecl && (ts.isPropertySignature(propDecl) || ts.isJSDocPropertyTag(propDecl))
+					? writtenTypeAnnotation(propDecl)
+					: undefined;
 			typeInfo = resolveTypeInfo(propType, checker, ctx.aliasRegistry, widened, {
 				writtenNode: annotation
 			});
@@ -1247,12 +1584,23 @@ const extractPropsViaChecker = (
 			if (isSnippetType(strippedPropType, checker)) {
 				// the same annotation feeds both trees, so a recovered name in the
 				// prop's tuple typeArg and in `parameters[i].typeInfo` can't disagree
-				snippetParams = extractSnippetParameters(
+				callableParams = extractSnippetParameters(
 					strippedPropType,
 					checker,
 					ctx.aliasRegistry,
 					annotation
 				);
+			} else {
+				const signature = localCallSignature(strippedPropType, ctx);
+				if (signature) {
+					// both or neither: parameters without a `returnType` would read
+					// as a snippet's
+					const parameters = extractSignatureParameters(signature, ctx, undefined);
+					const returned: { returnType?: string; returnTypeInfo?: TypeJson } = {};
+					applyReturnType(returned, signature, ctx);
+					callableParams = parameters;
+					callbackReturn = returned;
+				}
 			}
 		} catch (err) {
 			// Map position if possible. A prop declared outside the virtual (an
@@ -1273,7 +1621,7 @@ const extractPropsViaChecker = (
 				file: diagnosticFile,
 				line: finalLine,
 				column: finalColumn,
-				message: `Failed to resolve type for prop "${prop.name}" in ${componentName}, falling back to 'any': ${to_error_message(err)}`,
+				message: `Failed to resolve type for prop "${prop.name}" in ${componentName}, falling back to 'any': ${toErrorMessage(err)}`,
 				severity: 'warning',
 				componentName,
 				propName: prop.name
@@ -1281,7 +1629,16 @@ const extractPropsViaChecker = (
 		}
 
 		props.push(
-			assemblePropInfo(prop.name, typeString, typeInfo, optional, propDecl, metadata, snippetParams)
+			assemblePropInfo(
+				prop.name,
+				typeString,
+				typeInfo,
+				optional,
+				propDecl,
+				anchor,
+				callableParams,
+				callbackReturn
+			)
 		);
 	}
 
@@ -1292,10 +1649,30 @@ const extractPropsViaChecker = (
  * Analyze a Svelte module using checker-backed analysis.
  *
  * Requires the svelte2tsx virtual output to be included in the TypeScript program
- * (via `createAnalysisProgram({ virtualFiles })`). Provides full type resolution for:
+ * (via `createAnalysisProgram({ virtualFiles })`, or the language service's
+ * `setFile` in sessions). Provides full type resolution for:
  * - Imported prop types (`let {x}: ImportedProps = $props()`)
  * - `<script module>` exports (constants, types, re-exports)
  * - Star exports and re-exports from Svelte files
+ *
+ * Mirrors the numbered steps in the body:
+ *
+ * 1. `analyzeExports` on the virtual collects `<script module>` exports,
+ *    re-exports, and star exports
+ * 2. svelte2tsx internals are filtered (`isSvelte2tsxGeneratedExport`) and
+ *    exported snippets reclassified to `kind: 'snippet'` (`isSnippetReturnType`);
+ *    2b remaps module-level `sourceLine`s to the original `.svelte` source
+ * 3. the component declaration is synthesized: props via `extractPropsViaChecker`
+ *    from the component's `PropsAnchor` (`resolveRunesPropsAnchor` for a
+ *    `$props()` declaration, else `resolveExportLetPropsAnchor` for a legacy
+ *    component's exports), `acceptsChildren` from a `Snippet`-typed `children`
+ *    prop, template use (`__sveltets_2_ensureSnippet`) or, failing those, a
+ *    legacy component's default slot (`hasDefaultSlot`), the styling API read
+ *    at transform (`SvelteVirtualFile.css`), plus generics, doc comment, and
+ *    source line from the landmarks `findComponentNodes` locates
+ * 4. the module comment is read from the original source
+ * 5. declarations combine, component first
+ * 6. dependencies are extracted
  *
  * @param sourceFile - the original Svelte source file
  * @param modulePath - module path relative to source root; feeds
@@ -1307,6 +1684,8 @@ const extractPropsViaChecker = (
  * @param program - TypeScript program containing the virtual file
  * @param virtualFile - pre-transformed virtual file data
  * @param aliasRegistry - the analyzed set's alias registry (see `buildAliasRegistry`), or `undefined` when no pre-pass ran
+ * @param isEmittedFile - whether a file emits a module this pass (see `IsEmittedFile`); defaults to `isSource`
+ * @param fileExists - whether a path exists, owned content included (see `SvelteFileStatus`); defaults to the disk
  * @returns module analysis with declarations, re-exports, and star exports;
  *   `undefined` if the virtual file is not found in the program
  */
@@ -1318,7 +1697,9 @@ export const analyzeSvelteModule = (
 	diagnostics: Array<Diagnostic>,
 	program: ts.Program,
 	virtualFile: SvelteVirtualFile,
-	aliasRegistry?: AliasRegistry
+	aliasRegistry?: AliasRegistry,
+	isEmittedFile?: IsEmittedFile,
+	fileExists?: FileExists
 ): ModuleAnalysis | undefined => {
 	// Every diagnostic below carries the absolute `.svelte` id, never
 	// `modulePath` — see the `Diagnostic.file` schema doc for why the absolute
@@ -1344,10 +1725,18 @@ export const analyzeSvelteModule = (
 
 	// One pass-scoped extraction context, shared by the export walk (step 1)
 	// and the component synthesis (steps 3+)
-	const ctx = createExtractContext(program, checker, options, diagnostics, aliasRegistry);
+	const ctx = createExtractContext(
+		program,
+		checker,
+		options,
+		diagnostics,
+		aliasRegistry,
+		isEmittedFile,
+		fileExists
+	);
 
 	// 1. Use analyzeExports for full checker-backed analysis (same as .ts files).
-	// Its `moduleComment` is undefined for virtuals — the `<script module>`
+	// Its `moduleDoc` is undefined for virtuals — the `<script module>`
 	// comment is extracted from the original source in step 4, because svelte2tsx
 	// hoists instance-script imports (with their leading JSDoc) to the virtual's
 	// top level, where an instance `@module` comment would masquerade as a
@@ -1359,9 +1748,28 @@ export const analyzeSvelteModule = (
 		externalReExports,
 		externalStarExports
 	} = analyzeExports(virtualTsSource, ctx, options);
+	// stray typedefs from the HTML `@component` comment document nothing, so
+	// their `alias_lost` warnings drop with them
+	const virtualModuleSymbol = checker.getSymbolAtLocation(virtualTsSource);
+	const virtualExports = virtualModuleSymbol ? checker.getExportsOfModule(virtualModuleSymbol) : [];
+	const strayTypedefNames = new Set(
+		virtualExports.filter(isStrayComponentTypedef).map((symbol) => symbol.name)
+	);
+	if (strayTypedefNames.size) {
+		for (let i = diagnostics.length - 1; i >= 0; i--) {
+			const diagnostic = diagnostics[i]!;
+			if (
+				diagnostic.kind === 'alias_lost' &&
+				diagnostic.file === virtualTsSource.fileName &&
+				strayTypedefNames.has(diagnostic.aliasName)
+			) {
+				diagnostics.splice(i, 1);
+			}
+		}
+	}
 
 	// 2. Filter internal svelte2tsx symbols and the default export (generated component class),
-	//    and reclassify exported snippets from 'function' to 'snippet'
+	//    the stray typedefs, and reclassify exported snippets from 'function' to 'snippet'
 	const moduleDeclarations: Array<DeclarationAnalysis> = [];
 	for (const d of rawDeclarations) {
 		// The svelte2tsx-emitted component default export (`export default Foo__SvelteComponent_`)
@@ -1369,22 +1777,9 @@ export const analyzeSvelteModule = (
 		// synthesized fresh below — drop it with the rest of the generated names.
 		const name = d.declaration.name;
 		if (name === undefined || isSvelte2tsxGeneratedExport(name)) continue;
+		if (strayTypedefNames.has(name)) continue;
 
-		// Reclassify exported snippets: svelte2tsx transforms {#snippet} + export
-		// into arrow functions with ReturnType<import('svelte').Snippet> return type.
-		if (d.declaration.kind === 'function' && d.declaration.returnType) {
-			if (isSnippetReturnType(d.declaration.returnType)) {
-				d.declaration.kind = 'snippet';
-				// Synthesize a clean Snippet type string instead of the svelte2tsx noise
-				const params = d.declaration.parameters ?? [];
-				d.declaration.typeSignature = synthesizeSnippetTypeSignature(params);
-				// Snippets don't have meaningful return types or overloads
-				delete d.declaration.returnType;
-				delete d.declaration.returnTypeInfo;
-				delete d.declaration.returnDescription;
-				delete d.declaration.overloads;
-			}
-		}
+		reclassifySnippetDeclaration(d.declaration);
 
 		moduleDeclarations.push(d);
 	}
@@ -1436,7 +1831,24 @@ export const analyzeSvelteModule = (
 					}
 				} else if (stmt.exportClause && ts.isNamespaceExport(stmt.exportClause)) {
 					addExportNode(stmt.exportClause.name.text, stmt.exportClause);
+				} else if (!stmt.exportClause) {
+					// `export * from`: no binding to name, but the declarations and
+					// edges materialized from a star over a module that emits
+					// nothing carry the statement's line
+					const line =
+						virtualTsSource.getLineAndCharacterOfPosition(stmt.getStart(virtualTsSource)).line + 1;
+					if (!exportNodesByLine.has(line)) exportNodesByLine.set(line, stmt);
 				}
+			}
+		}
+		// a JS `<script module>`'s `@typedef`/`@callback` declares no statement:
+		// its node is the tag, which also wins over a same-named const
+		// (`selectDeclarationNode` documents the merged pair as the typedef)
+		for (const symbol of virtualExports) {
+			if (strayTypedefNames.has(symbol.name)) continue;
+			const node = selectDeclarationNode(symbol);
+			if (node && isVirtualTypedefTag(node, virtualTsSource)) {
+				nodesByName.set(symbol.name, node);
 			}
 		}
 
@@ -1447,7 +1859,11 @@ export const analyzeSvelteModule = (
 			const fromExportStatement =
 				d.declaration.aliasOf !== undefined || d.declaration.kind === 'namespace';
 			const node = fromExportStatement
-				? exportNodesByName.get(d.declaration.name)
+				? (exportNodesByName.get(d.declaration.name) ??
+					// star-materialized: no specifier names it, its line is the star's
+					(d.declaration.sourceLine !== undefined
+						? exportNodesByLine.get(d.declaration.sourceLine)
+						: undefined))
 				: nodesByName.get(d.declaration.name);
 			if (node) d.declaration.sourceLine = originalLineOf(node);
 		}
@@ -1472,28 +1888,61 @@ export const analyzeSvelteModule = (
 		componentDecl.lang = 'js';
 	}
 
-	// scan the original source once — the legacy-prop scan reads the instance
-	// script, step 4's module-comment extraction reads both
-	const scriptTags = findScriptTags(sourceFile.content);
+	// the component's script tags in the original source, located at transform
+	// time — the legacy-prop scan reads the instance script, step 4's
+	// module-comment extraction reads both
+	const scriptTags = virtualFile.scriptTags ?? findScriptTags(sourceFile.content).tags;
 	const instanceScript = scriptTags.find((tag) => !isModuleScript(tag.attributes));
 	const instanceScriptSource = instanceScript
 		? parseScriptContent(instanceScript.content)
 		: undefined;
 
-	// Extract props via checker (resolves imported types)
+	// Locate the svelte2tsx landmarks once — the legacy props anchor, the
+	// default slot, generics, doc comment, and source line all read from them
+	const componentNodes = findComponentNodes(virtualTsSource);
+
+	// svelte2tsx's legacy-or-runes reading, taken once for the props anchor and
+	// the default-slot rule
+	const renderMode = classifyRenderMode(componentNodes);
+
+	// Resolve where the props are read from: the `$props()` declaration, or
+	// without one a legacy component's `export let` exports
 	const propsMetadata = extractPropsMetadata(virtualTsSource);
+	const propsAnchor = propsMetadata.propsDeclaration
+		? resolveRunesPropsAnchor(
+				propsMetadata,
+				propsMetadata.propsDeclaration,
+				ctx,
+				componentName,
+				diagnosticFile
+			)
+		: resolveExportLetPropsAnchor(
+				renderMode,
+				componentNodes,
+				instanceScript && instanceScriptSource
+					? { tag: instanceScript, source: instanceScriptSource }
+					: undefined,
+				sourceFile.content,
+				ctx,
+				componentName,
+				diagnosticFile
+			);
+
+	// Extract props via checker (resolves imported types)
 	const {
 		props,
 		externalTypes,
 		acceptsChildren: propsAcceptsChildren
-	} = extractPropsViaChecker(
-		virtualTsSource,
-		ctx,
-		componentName,
-		diagnosticFile,
-		virtualFile.sourceMap,
-		propsMetadata
-	);
+	}: ReturnType<typeof extractPropsViaChecker> = propsAnchor
+		? extractPropsViaChecker(
+				virtualTsSource,
+				ctx,
+				componentName,
+				diagnosticFile,
+				virtualFile.sourceMap,
+				propsAnchor
+			)
+		: { props: [], acceptsChildren: false };
 	if (props.length > 0) {
 		componentDecl.props = props;
 	}
@@ -1502,42 +1951,18 @@ export const analyzeSvelteModule = (
 		componentDecl.externalTypes = externalTypes;
 	}
 
-	// Legacy (runes-less) components declare props with `export let`, which
-	// has no `$props()` anchor — nothing was extracted above. Detect the
-	// syntax in the original instance script so the empty `props` carries a
-	// diagnostic instead of silence.
-	if (!propsMetadata.propsDeclaration && instanceScript && instanceScriptSource) {
-		const legacyProps = detectLegacyProps(instanceScriptSource);
-		if (legacyProps.length > 0) {
-			const propNames = legacyProps.map((p) => p.name);
-			diagnostics.push({
-				kind: 'legacy_props',
-				file: diagnosticFile,
-				// the first legacy export's line in the original source
-				line: lineOfOffset(sourceFile.content, instanceScript.start + legacyProps[0]!.pos),
-				message: `Component "${componentName}" declares props with legacy export let syntax (${propNames.join(', ')}). Legacy props are not extracted — migrate to $props().`,
-				severity: 'warning',
-				componentName,
-				propNames
-			});
-		}
-	}
-
-	// Determine acceptsChildren via two paths:
+	// Determine acceptsChildren via three paths, cheapest first:
 	// Path A: children found in props type (from extractPropsViaChecker, before external-property filtering)
 	// Path B: implicit children usage in template (for components without $props() children declaration)
-	let acceptsChildren = propsAcceptsChildren;
-	if (!acceptsChildren) {
+	// Path C: a legacy component's default slot (a runes component's `<slot />` is ignored)
+	const acceptsChildren =
+		propsAcceptsChildren ||
 		// Path B: scan virtual source for __sveltets_2_ensureSnippet(children pattern
-		acceptsChildren = virtualFile.content.includes('__sveltets_2_ensureSnippet(children');
-	}
+		virtualFile.content.includes('__sveltets_2_ensureSnippet(children') ||
+		(renderMode === 'legacy' && hasDefaultSlot(componentNodes, checker));
 	if (acceptsChildren) {
 		componentDecl.acceptsChildren = true;
 	}
-
-	// Locate the svelte2tsx landmarks once — generics, doc comment, and source
-	// line all read from them
-	const componentNodes = findComponentNodes(virtualTsSource);
 
 	// Extract generic params
 	const genericParams = extractGenericParams(componentNodes);
@@ -1545,8 +1970,15 @@ export const analyzeSvelteModule = (
 		componentDecl.genericParams = genericParams;
 	}
 
-	// Extract component-level TSDoc from virtual source
-	const componentTsdoc = extractComponentTsdoc(componentNodes, virtualTsSource);
+	// Extract component-level TSDoc: in-script JSDoc from the virtual source,
+	// else the HTML `@component` comment from the original
+	const htmlComments = findHtmlComments(sourceFile.content);
+	const htmlComponentComment = findHtmlComponentComment(htmlComments);
+	const componentTsdoc = extractComponentTsdoc(
+		componentNodes,
+		virtualTsSource,
+		htmlComponentComment
+	);
 	applyToDeclaration(componentDecl, componentTsdoc?.tsdoc);
 
 	// Extract source line via source map (maps $$render back to <script> tag)
@@ -1556,24 +1988,129 @@ export const analyzeSvelteModule = (
 		virtualFile.sourceMap
 	);
 
-	// Warn if both HTML @component and script JSDoc provide docComment
+	// The styling API, read at transform, with the doc comment's `@cssprop`
+	// tags merged in; its problem and unread tags report here, each query, like
+	// the other per-component warnings
+	const css = virtualFile.css ?? analyzeComponentCss(sourceFile.content);
+	const csspropTags = componentTsdoc?.tsdoc.cssProperties ?? [];
+	// the winning doc comment's range in the original source, where its tags sit
+	const [docStart, docEnd] =
+		componentTsdoc?.source === 'script'
+			? instanceScript
+				? [instanceScript.start, instanceScript.start + instanceScript.content.length]
+				: [0, 0]
+			: htmlComponentComment
+				? [
+						htmlComponentComment.start,
+						// `<!--`, the content, `-->`
+						htmlComponentComment.start + htmlComponentComment.content.length + 7
+					]
+				: [0, 0];
+	const tagLineOf = (name: string | undefined, occurrence = 0): number =>
+		findCsspropTagLine(sourceFile.content, docStart, docEnd, name, occurrence) ??
+		componentDecl.sourceLine ??
+		1;
+	const documentedCss = documentCssProperties(css, csspropTags, tagLineOf);
+	if (documentedCss.properties.length) {
+		componentDecl.cssCustomProperties = documentedCss.properties;
+	}
+	if (css.problem) {
+		diagnostics.push({ ...css.problem, file: diagnosticFile, severity: 'warning' });
+	}
+	for (const { name, sourceLine } of documentedCss.unread) {
+		diagnostics.push({
+			kind: 'unknown_cssprop',
+			file: diagnosticFile,
+			line: sourceLine,
+			message: `@cssprop "${name}" on "${componentName}" names a custom property the component never reads (typo, or one it leaves to its children?)`,
+			severity: 'warning',
+			propertyName: name,
+			componentName
+		});
+	}
+	for (const property of documentedCss.mismatched) {
+		diagnostics.push({
+			kind: 'cssprop_default_mismatch',
+			file: diagnosticFile,
+			line: property.sourceLine,
+			message: `@cssprop "${property.name}" on "${componentName}" documents the default "${property.default}" but the style falls back to "${property.fallback}"`,
+			severity: 'warning',
+			propertyName: property.name,
+			componentName,
+			default: property.default!,
+			fallback: property.fallback!
+		});
+	}
+	// the tags that document nothing, each at its own line: the nth malformed
+	// tag, or the nth repeat of a name (its first tag is occurrence 0)
+	let malformedSeen = 0;
+	const repeatsSeen: Map<string, number> = new Map();
+	for (const problem of componentTsdoc?.tsdoc.cssPropertyProblems ?? []) {
+		if (problem.kind === 'malformed') {
+			diagnostics.push({
+				kind: 'malformed_tag',
+				file: diagnosticFile,
+				line: tagLineOf(undefined, malformedSeen++),
+				message: `${problem.text ? `@cssprop "${problem.text}"` : 'An empty @cssprop'} on "${componentName}" names no custom property (the form is \`@cssprop {<syntax>} [--name=default] - description\`), so it's dropped`,
+				severity: 'warning',
+				tagName: 'cssprop',
+				declarationName: componentName
+			});
+		} else {
+			const occurrence = (repeatsSeen.get(problem.name!) ?? 0) + 1;
+			repeatsSeen.set(problem.name!, occurrence);
+			diagnostics.push({
+				kind: 'duplicate_tag',
+				file: diagnosticFile,
+				line: tagLineOf(problem.name, occurrence),
+				message: `@cssprop "${problem.name}" on "${componentName}" repeats an earlier tag, which wins; this one is dropped`,
+				severity: 'warning',
+				tagName: 'cssprop',
+				declarationName: componentName,
+				key: problem.name!
+			});
+		}
+	}
+
+	// Warn when svelte2tsx (and so editor hover) would document the component
+	// with a different HTML comment than the one read here; moot when in-script
+	// JSDoc supplies the doc
+	const svelte2tsxComment = svelte2tsxComponentComment(htmlComments);
+	if (componentTsdoc?.source !== 'script' && svelte2tsxComment !== htmlComponentComment) {
+		const svelte2tsxLine = lineOfOffset(sourceFile.content, svelte2tsxComment!.start);
+		diagnostics.push({
+			kind: 'component_comment_mismatch',
+			file: diagnosticFile,
+			line: svelte2tsxLine,
+			message: htmlComponentComment
+				? `svelte2tsx and editor hover document the component with the HTML comment at line ${svelte2tsxLine}, the last one containing @component; using the one at line ${lineOfOffset(sourceFile.content, htmlComponentComment.start)}, the first with @component at a line start.`
+				: `The HTML comment at line ${svelte2tsxLine} mentions @component, so svelte2tsx and editor hover use it as the component's docs; no line starts with @component, so the component has none here.`,
+			severity: 'warning'
+		});
+	}
+
+	// Warn when both the in-script JSDoc and the HTML @component comment carry
+	// documentation (prose or a tag): the JSDoc wins whole, so the HTML
+	// comment's prose and tags are lost, even to a JSDoc of tags alone
 	if (
-		componentDecl.docComment &&
 		componentTsdoc?.source === 'script' &&
-		hasHtmlComponentComment(sourceFile.content)
+		htmlComponentComment &&
+		parseHtmlComponentComment(htmlComponentComment)
 	) {
 		diagnostics.push({
 			kind: 'duplicate_comment',
 			commentType: 'doc_comment',
 			file: diagnosticFile,
 			message:
-				'Both HTML @component comment and JSDoc in <script> provide component documentation. Using JSDoc.',
+				"Both the JSDoc in <script> and the HTML @component comment document the component. Using the JSDoc; the HTML comment's prose and tags are ignored.",
 			severity: 'warning'
 		});
 	}
 
-	// 4. Extract module comment from original Svelte source (not virtual)
-	// Priority: instance <script> @module > <script module> @module > HTML <!-- @module -->
+	// 4. Extract module comment from original Svelte source (not virtual).
+	// Priority: instance <script> @module > <script module> @module > HTML
+	// <!-- @module -->, but a comment that projects to no module field (only
+	// declaration-only tags, like `@nodocs`) yields to one that does
 	const instanceModuleComment = instanceScriptSource
 		? extractModuleComment(instanceScriptSource)
 		: undefined;
@@ -1582,30 +2119,38 @@ export const analyzeSvelteModule = (
 		? extractSvelteModuleComment(moduleScript.content)
 		: undefined;
 	const htmlModuleComment = extractHtmlModuleComment(sourceFile.content);
-	const moduleComment = instanceModuleComment ?? scriptModuleComment ?? htmlModuleComment;
-
-	// @nodocs has no module-level meaning — warn per misplaced comment
-	warnModuleCommentNodocs(instanceModuleComment, diagnosticFile, diagnostics);
-	warnModuleCommentNodocs(scriptModuleComment, diagnosticFile, diagnostics);
-	warnModuleCommentNodocs(htmlModuleComment, diagnosticFile, diagnostics);
-
-	// Warn if multiple @module sources exist
 	const moduleCommentSources = [
-		instanceModuleComment,
-		scriptModuleComment,
-		htmlModuleComment
-	].filter(Boolean);
+		{ doc: instanceModuleComment, label: 'JSDoc in <script>' },
+		{ doc: scriptModuleComment, label: 'JSDoc in <script module>' },
+		{ doc: htmlModuleComment, label: 'HTML comment' }
+	].filter((source): source is { doc: TsdocParsedComment; label: string } => !!source.doc);
+	const moduleCommentWinner =
+		moduleCommentSources.find(({ doc }) => Object.keys(toModuleDocFields(doc)).length > 0) ??
+		moduleCommentSources[0];
+	const moduleDoc = moduleCommentWinner?.doc;
+
+	// declaration-only tags (`@param`, `@nodocs`, …) do nothing in a module
+	// comment — warn per comment, the losers' included
+	warnModuleCommentTags(instanceModuleComment, diagnosticFile, diagnostics);
+	warnModuleCommentTags(scriptModuleComment, diagnosticFile, diagnostics);
+	warnModuleCommentTags(htmlModuleComment, diagnosticFile, diagnostics);
+
+	// Warn if multiple @module sources exist. A source counts when it parsed to
+	// anything (prose or a tag, even a tag-only comment); a bare `@module` doesn't
 	if (moduleCommentSources.length > 1) {
 		diagnostics.push({
 			kind: 'duplicate_comment',
 			commentType: 'module_comment',
 			file: diagnosticFile,
-			message: `Multiple @module comments found (${[instanceModuleComment && 'JSDoc in <script>', scriptModuleComment && 'JSDoc in <script module>', htmlModuleComment && 'HTML comment'].filter(Boolean).join(', ')}). Using first found.`,
+			message: `Multiple @module comments found (${moduleCommentSources.map(({ label }) => label).join(', ')}). Using ${moduleCommentWinner!.label}.`,
 			severity: 'warning'
 		});
 	}
 
-	// 5. Combine: component declaration first (primary export), then <script module> exports
+	// 5. Combine: component declaration first (primary export), then <script module> exports;
+	// `@nodocs` is read from whichever doc source won (in-script JSDoc over the
+	// HTML `@component` comment), so an HTML `@nodocs` is ignored when in-script
+	// JSDoc supplies the doc
 	const allDeclarations: Array<DeclarationAnalysis> = [
 		{ declaration: componentDecl, nodocs: componentTsdoc?.tsdoc.nodocs === true },
 		...moduleDeclarations
@@ -1616,7 +2161,7 @@ export const analyzeSvelteModule = (
 
 	return {
 		path: modulePath,
-		moduleComment,
+		moduleDoc,
 		declarations: allDeclarations,
 		dependencies,
 		dependents,

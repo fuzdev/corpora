@@ -1,8 +1,8 @@
-import { args_serialize } from '@fuzdev/fuz_util/args.ts';
 import { print_spawn_result } from '@fuzdev/fuz_util/process.ts';
-import { z } from 'zod';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 
-import { to_forwarded_args } from './args.ts';
+import { has_forwarded_flag, to_forwarded_argv } from './args.ts';
 import { configure_colored_output_with_path_replacement } from './child_process_logging.ts';
 import { find_cli, spawn_cli, spawn_cli_process } from './cli.ts';
 import { SVELTE_CHECK_CLI } from './constants.ts';
@@ -11,22 +11,22 @@ import { sveltekit_sync_if_available } from './sveltekit_helpers.ts';
 import { TaskError, type Task } from './task.ts';
 
 /** @nodocs */
-export const Args = z.strictObject({
-	svelte_check_cli: z
-		.string()
-		.meta({ description: 'the svelte-check CLI to use' })
-		.default(SVELTE_CHECK_CLI),
-	typescript_cli: z
-		.string()
-		.meta({ description: 'the TypeScript CLI to use as a fallback to svelte-check' })
-		.default('tsc'),
-	path_replacement: z
-		.string()
-		.meta({ description: 'replacement string for current working directory in output' })
-		.default('.'),
-	cwd: z.string().meta({ description: 'current working directory' }).default(paths.root)
+export const Args = s.object({
+	svelte_check_cli: s.with_default(
+		meta(s.string, { description: 'the svelte-check CLI to use' }),
+		SVELTE_CHECK_CLI
+	),
+	typescript_cli: s.with_default(
+		meta(s.string, { description: 'the TypeScript CLI to use as a fallback to svelte-check' }),
+		'tsc'
+	),
+	path_replacement: s.with_default(
+		meta(s.string, { description: 'replacement string for current working directory in output' }),
+		'.'
+	),
+	cwd: s.with_default(meta(s.string, { description: 'current working directory' }), paths.root)
 });
-export type Args = z.infer<typeof Args>;
+export type Args = s.Infer<typeof Args>;
 
 /** @nodocs */
 export const task: Task<Args> = {
@@ -40,8 +40,8 @@ export const task: Task<Args> = {
 		// Prefer svelte-check if available.
 		const found_svelte_check_cli = await find_cli(svelte_check_cli);
 		if (found_svelte_check_cli) {
-			const serialized = args_serialize(to_forwarded_args(svelte_check_cli));
-			const spawned = await spawn_cli_process(found_svelte_check_cli, serialized, undefined, {
+			const forwarded_argv = to_forwarded_argv(svelte_check_cli);
+			const spawned = await spawn_cli_process(found_svelte_check_cli, forwarded_argv, undefined, {
 				stdio: ['inherit', 'pipe', 'pipe'],
 				env: { ...process.env, FORCE_COLOR: '1' } // Needed for colors (maybe make an option)
 			});
@@ -64,12 +64,15 @@ export const task: Task<Args> = {
 		// Fall back to tsc.
 		const found_typescript_cli = await find_cli(typescript_cli);
 		if (found_typescript_cli) {
-			const forwarded = to_forwarded_args(typescript_cli);
-			if (!forwarded.noEmit) forwarded.noEmit = true;
-			const serialized = args_serialize(forwarded);
-			const svelte_check_result = await spawn_cli(found_typescript_cli, serialized, log);
-			if (!svelte_check_result?.ok) {
-				throw new TaskError(`Failed to typecheck. ${print_spawn_result(svelte_check_result!)}`);
+			const forwarded_argv = to_forwarded_argv(typescript_cli);
+			// tsc's flags are case-insensitive, so a forwarded `--noemit` overrides too,
+			// and `--noEmit` goes last because `--build` must be tsc's first arg
+			const tsc_argv = has_forwarded_flag(forwarded_argv, 'noEmit', true)
+				? forwarded_argv
+				: [...forwarded_argv, '--noEmit'];
+			const tsc_result = await spawn_cli(found_typescript_cli, tsc_argv, log);
+			if (!tsc_result?.ok) {
+				throw new TaskError(`Failed to typecheck. ${print_spawn_result(tsc_result!)}`);
 			}
 			return;
 		}

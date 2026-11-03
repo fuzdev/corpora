@@ -26,13 +26,13 @@ export interface BenchmarkedImplementation {
 export interface StabilityCheck {
 	is_stable: boolean;
 	lag: number;
-	memory_pressure?: number;
+	memory_pressure: number;
 	jitter: number;
 }
 
 /**
  * One iteration's two timings, both measured from the same start (props set):
- * `work_ms` ends when the highlight work is committed and laid out; `paint_ms`
+ * `work_ms` ends when the styling work is committed and laid out; `paint_ms`
  * ends once the browser has settled pixels (adds ~1-2 animation frames).
  */
 export interface IterationTiming {
@@ -46,7 +46,6 @@ export interface MeasurementData {
 	/** Per-iteration paint-settled time — work plus the frames until pixels update (ms). */
 	paint_ms: Array<number>;
 	stability_checks: Array<StabilityCheck>;
-	timestamps: Array<number>;
 }
 
 /**
@@ -54,7 +53,7 @@ export interface MeasurementData {
  * Uses milliseconds for display (mean_ms, median_ms, etc.) while storing nanoseconds internally.
  */
 export interface BrowserBenchmarkStats {
-	/** Work-time stats — stylize + DOM commit, the highlighter's compute cost (in nanoseconds). */
+	/** Work-time stats — stylize + DOM commit, the styler's compute cost (in nanoseconds). */
 	core: FuzBenchmarkStats;
 	/** Paint-settled stats — work plus the frames until pixels update (in nanoseconds). */
 	paint: FuzBenchmarkStats;
@@ -74,8 +73,8 @@ export interface BenchmarkResult {
 }
 
 export interface SummaryStats {
-	avg_mean: number;
-	avg_ops: number;
+	geomean_ms: number;
+	geomean_ops: number;
 	avg_cv: number;
 	languages: number;
 	relative_speed?: number;

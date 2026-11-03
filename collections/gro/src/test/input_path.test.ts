@@ -9,14 +9,14 @@ import {
 	get_possible_paths,
 	type ResolvedInputPath,
 	type ResolvedInputFile
-} from '$lib/input_path.ts';
-import { GRO_DIST_DIR, paths } from '$lib/paths.ts';
+} from '#lib/input_path.ts';
+import { paths } from '#lib/paths.ts';
 
 test('to_input_path', () => {
 	expect(to_input_path(resolve('foo.ts'))).toBe(resolve('foo.ts'));
 	expect(to_input_path('./foo.ts')).toBe(resolve('foo.ts'));
 	expect(to_input_path('foo.ts')).toBe('foo.ts');
-	expect(to_input_path('gro/foo')).toBe(GRO_DIST_DIR + 'foo');
+	expect(to_input_path('gro/foo')).toBe('gro/foo'); // no special prefix
 	// trailing slashes are preserved:
 	expect(to_input_path(resolve('foo/bar/'))).toBe(resolve('foo/bar/'));
 	expect(to_input_path('./foo/bar/')).toBe(resolve('foo/bar/'));
@@ -209,20 +209,6 @@ test('resolve_input_files', async () => {
 	];
 	expect(result).toEqual({
 		resolved_input_files,
-		resolved_input_files_by_root_dir: new Map([
-			[
-				process.cwd(),
-				[
-					{ id: 'fake/test1.ext.ts', input_path: a.input_path, resolved_input_path: a },
-					{ id: 'fake/test2.ext.ts', input_path: b.input_path, resolved_input_path: b },
-					{ id: 'fake/test3/a.ts', input_path: c.input_path, resolved_input_path: c },
-					{ id: 'fake/test3/b.ts', input_path: c.input_path, resolved_input_path: c },
-					{ id: 'fake/test3/c.ts', input_path: d.input_path, resolved_input_path: d },
-					{ id: 'fake2/test.ext.ts', input_path: f.input_path, resolved_input_path: f },
-					{ id: 'fake3/test.ext.ts', input_path: h.input_path, resolved_input_path: h }
-				]
-			]
-		]),
 		input_directories_with_no_files: [e.input_path]
 	});
 });

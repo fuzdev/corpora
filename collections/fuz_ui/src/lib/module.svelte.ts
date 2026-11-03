@@ -72,8 +72,46 @@ export class Module {
 		return './' + this.path;
 	}
 
+	/**
+	 * Prose of the `@module` comment, tag lines removed. Absent for a tag-only
+	 * comment, whose tags still populate the doc fields below.
+	 */
 	get module_comment(): string | undefined {
 		return this.module_json.moduleComment;
+	}
+
+	get deprecated_message(): string | undefined {
+		return this.module_json.deprecatedMessage;
+	}
+
+	/**
+	 * Internal-API marker from the module comment's `@internal` tag. Presence
+	 * means the tag was written; an empty string is a bare tag.
+	 */
+	get internal_message(): string | undefined {
+		return this.module_json.internalMessage;
+	}
+
+	get since(): string | undefined {
+		return this.module_json.since;
+	}
+
+	get examples(): NonNullable<ModuleJsonInput['examples']> {
+		return this.module_json.examples ?? EMPTY_ARRAY;
+	}
+
+	get see_also(): NonNullable<ModuleJsonInput['seeAlso']> {
+		return this.module_json.seeAlso ?? EMPTY_ARRAY;
+	}
+
+	// presence, not truthiness — a bare `@deprecated` (no message text) arrives as `''`
+	get is_deprecated(): boolean {
+		return this.deprecated_message !== undefined;
+	}
+
+	// presence, not truthiness — a bare `@internal` (no message text) arrives as `''`
+	get is_internal(): boolean {
+		return this.internal_message !== undefined;
 	}
 
 	#declarations: Array<Declaration> | undefined;
@@ -121,8 +159,20 @@ export class Module {
 		return this.declarations.length > 0;
 	}
 
-	get has_module_comment(): boolean {
-		return !!this.module_comment;
+	/**
+	 * Whether the module comment documents anything — prose or any doc field.
+	 * A tag-only comment (just `@see`, say) has no `module_comment` but still
+	 * counts.
+	 */
+	get has_module_doc(): boolean {
+		return (
+			!!this.module_comment ||
+			this.is_deprecated ||
+			this.is_internal ||
+			!!this.since ||
+			this.examples.length > 0 ||
+			this.see_also.length > 0
+		);
 	}
 
 	/**

@@ -4,7 +4,7 @@
 import { test, assert, describe, beforeEach, afterEach, vi } from 'vitest';
 import { flushSync } from 'svelte';
 
-import { intersect } from '$lib/intersect.svelte.ts';
+import { intersect } from '#lib/intersect.svelte.ts';
 
 // Mock IntersectionObserver
 let observer_callback: IntersectionObserverCallback | null = null;
@@ -15,6 +15,7 @@ let disconnected = false;
 class MockIntersectionObserver implements IntersectionObserver {
 	readonly root: Element | Document | null = null;
 	readonly rootMargin: string = '';
+	readonly scrollMargin: string = '';
 	readonly thresholds: ReadonlyArray<number> = [];
 
 	constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {

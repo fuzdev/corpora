@@ -8,7 +8,7 @@
  * `pending_effects` queue is the opposite: its pool writes (attempt audits)
  * run outside the transaction and intentionally survive rollback.
  *
- * This pins both halves through a real PGlite transaction across both dispatch
+ * This pins both halves through a real database transaction across both dispatch
  * sites: the action dispatcher (`actions/perform_action.ts`, the RPC/WS path —
  * where every production `emit_after_commit` caller lives) and the REST route
  * wrapper (`http/route_spec.ts`). It also proves the underlying row rolled back.
@@ -24,29 +24,29 @@
 import { test, assert } from 'vitest';
 import { z } from 'zod';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
 import {
-	create_pglite_factory,
+	create_default_db_factory,
 	create_describe_db,
 	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { emit_after_commit } from '$lib/http/pending_effects.ts';
-import { get_route_input, type RouteSpec } from '$lib/http/route_spec.ts';
-import { rpc_action } from '$lib/actions/action_rpc.ts';
-import type { RequestResponseActionSpec } from '$lib/actions/action_spec.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { Db } from '$lib/db/db.ts';
+} from '#lib/testing/db.ts';
+import { run_migrations } from '#lib/db/migrate.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { emit_after_commit } from '#lib/http/pending_effects.ts';
+import { get_route_input, type RouteSpec } from '#lib/http/route_spec.ts';
+import { rpc_action } from '#lib/actions/action_types.ts';
+import type { RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { Db } from '#lib/db/db.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
 const REST_PATH = '/test/rollback_probe';
 
-const factory = create_pglite_factory(async (db) => {
-	await run_migrations(db, [auth_migration_ns]);
+const factory = create_default_db_factory(async (db) => {
+	await run_migrations(db, [AUTH_MIGRATION_NS]);
 	await db.query('CREATE TABLE IF NOT EXISTS rollback_probe (token text primary key)');
 });
 const describe_db = create_describe_db(factory, auth_integration_truncate_tables);

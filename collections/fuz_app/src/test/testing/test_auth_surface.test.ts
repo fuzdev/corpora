@@ -16,38 +16,39 @@ import {
 	stub_mw,
 	create_throwing_stub,
 	create_noop_stub
-} from '$lib/testing/stubs.ts';
-import {
-	create_test_request_context,
-	create_test_app_from_specs,
-	resolve_test_path
-} from '$lib/testing/auth_apps.ts';
+} from '#lib/testing/stubs.ts';
+import { create_test_request_context, create_test_app_from_specs } from '#lib/testing/auth_apps.ts';
 import {
 	resolve_fixture_path,
 	assert_surface_matches_snapshot,
 	assert_surface_deterministic,
 	assert_only_expected_public_routes,
 	assert_full_middleware_stack
-} from '$lib/testing/assertions.ts';
+} from '#lib/testing/assertions.ts';
 import {
 	describe_adversarial_auth,
 	resolve_standard_error_schema_tightness
-} from '$lib/testing/attack_surface.ts';
-import { describe_adversarial_404 } from '$lib/testing/adversarial_404.ts';
-import { resolve_valid_path, generate_valid_body } from '$lib/testing/schema_generators.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
-import type { MiddlewareSpec } from '$lib/http/middleware_spec.ts';
+} from '#lib/testing/attack_surface.ts';
+import { describe_adversarial_404 } from '#lib/testing/adversarial_404.ts';
+import { describe_adversarial_input } from '#lib/testing/adversarial_input.ts';
+import { resolve_valid_path, generate_valid_body } from '#lib/testing/schema_generators.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+import type { MiddlewareSpec } from '#lib/http/middleware_spec.ts';
 import {
 	generate_app_surface,
 	create_app_surface_spec,
 	type AppSurface
-} from '$lib/http/surface.ts';
+} from '#lib/http/surface.ts';
 import {
 	audit_error_schema_tightness,
 	assert_error_schema_tightness,
 	fuz_app_stock_route_tightness_allowlist
-} from '$lib/testing/surface_invariants.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
+} from '#lib/testing/surface_invariants.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
+import { FactHashSchema } from '#lib/primitive_schemas.ts';
+
+/** The content type every non-`raw_body` POST route requires. */
+const JSON_HEADERS = { 'content-type': 'application/json' };
 
 describe('stubs', () => {
 	test('stub throws on property access', () => {
@@ -127,23 +128,6 @@ describe('create_test_request_context', () => {
 	});
 });
 
-describe('resolve_test_path', () => {
-	test('replaces single param', () => {
-		assert.strictEqual(resolve_test_path('/api/users/:id'), '/api/users/test_id');
-	});
-
-	test('replaces multiple params', () => {
-		assert.strictEqual(
-			resolve_test_path('/api/users/:user_id/posts/:post_id'),
-			'/api/users/test_user_id/posts/test_post_id'
-		);
-	});
-
-	test('returns path unchanged when no params', () => {
-		assert.strictEqual(resolve_test_path('/api/health'), '/api/health');
-	});
-});
-
 describe('resolve_fixture_path', () => {
 	test('resolves relative to the provided import.meta.url', () => {
 		const result = resolve_fixture_path('test.json', import.meta.url);
@@ -206,7 +190,7 @@ describe('create_test_app_from_specs', () => {
 	test('role app passes role guard', async () => {
 		const ctx = create_test_request_context('admin');
 		const app = create_test_app_from_specs(test_specs, ctx);
-		const res = await app.request('/admin', { method: 'POST' });
+		const res = await app.request('/admin', { method: 'POST', headers: JSON_HEADERS });
 		assert.strictEqual(res.status, 200);
 	});
 });
@@ -397,6 +381,43 @@ const adversarial_specs: Array<RouteSpec> = [
 		query: z.strictObject({ acting: ActingActor }),
 		input: z.null(),
 		output: z.null()
+	},
+	{
+		// The audit SSE stream's shape: a role gate *and* a session-channel
+		// gate. Both blocks must reach it — the role cases through the session
+		// credential the role apps carry, and the credential case on a channel
+		// the gate refuses. Bucketing it as "credential-gated, therefore skip
+		// the role cases" is how the coverage went quiet when the real route
+		// gained its gate.
+		method: 'GET',
+		path: '/session-only-role',
+		auth: {
+			account: 'required',
+			actor: 'required',
+			roles: ['admin'],
+			credential_types: ['session']
+		},
+		handler: (c) => c.json({ streamed: true }),
+		description: 'Session-channel-gated admin route',
+		query: z.strictObject({ acting: ActingActor }),
+		input: z.null(),
+		output: z.null()
+	},
+	{
+		// Regression guard for the params-schema-aware path synthesizer. The
+		// hash param carries a pattern (`^blake3:[0-9a-f]{64}$`), so a
+		// `test_hash` segment would 400 at params validation *before* the
+		// authority gates — the generated case would assert a 401 and see a
+		// 400. `resolve_valid_path` synthesizes a value the schema accepts,
+		// so the case reaches the gate it is about.
+		method: 'GET',
+		path: '/patterned-params/:hash',
+		auth: { account: 'required', actor: 'none' },
+		params: z.strictObject({ hash: FactHashSchema }),
+		handler: (c) => c.json({ ok: true }),
+		description: 'Protected route with a format-constrained path param',
+		input: z.null(),
+		output: z.null()
 	}
 ];
 
@@ -407,6 +428,31 @@ describe_adversarial_auth({
 		create_app_surface_spec({
 			middleware_specs: adversarial_middleware,
 			route_specs: adversarial_specs
+		}),
+	roles: ['admin', 'keeper']
+});
+
+// Regression guard for typed probes: a `raw_body` POST refuses an untyped
+// request with 415 before params or query validation, so the params and query
+// fuzz cases must send the route's content type to reach the 400 they assert.
+describe_adversarial_input({
+	build: () =>
+		create_app_surface_spec({
+			middleware_specs: adversarial_middleware,
+			route_specs: [
+				{
+					method: 'POST',
+					path: '/raw-upload/:id',
+					auth: { account: 'required', actor: 'none' },
+					params: z.strictObject({ id: z.uuid() }),
+					query: z.strictObject({ size: z.string().regex(/^\d+$/) }),
+					handler: (c) => c.json({ ok: true }),
+					description: 'Raw-byte upload with a uuid param and a numeric query',
+					input: z.null(),
+					output: z.null(),
+					raw_body: true
+				}
+			]
 		}),
 	roles: ['admin', 'keeper']
 });
@@ -422,8 +468,14 @@ describe('resolve_valid_path', () => {
 		);
 	});
 
-	test('replaces non-uuid params with test_ prefix', () => {
+	test('synthesizes a schema-satisfying value for a non-uuid param', () => {
 		const params = z.strictObject({ name: z.string() });
+		const resolved = resolve_valid_path('/things/:name', params);
+		assert.ok(params.safeParse({ name: resolved.slice('/things/'.length) }).success);
+	});
+
+	test('falls back to the test_ prefix for a param the schema does not name', () => {
+		const params = z.strictObject({ other: z.string() });
 		assert.strictEqual(resolve_valid_path('/things/:name', params), '/things/test_name');
 	});
 
@@ -595,7 +647,7 @@ describe('generate_valid_body', () => {
 		// through the input schema without error — previously it returned the
 		// default `'xxxxxxxxxx'` which fails the regex.
 		const { account_session_revoke_action_spec } =
-			await import('$lib/auth/account_action_specs.ts');
+			await import('#lib/auth/account_action_specs.ts');
 		const body = generate_valid_body(account_session_revoke_action_spec.input);
 		assert.ok(body);
 		const parsed = account_session_revoke_action_spec.input.safeParse(body);

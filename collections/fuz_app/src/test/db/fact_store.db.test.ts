@@ -6,14 +6,16 @@
  * - embedded round-trip preserves bytes exactly across pg + pglite
  * - `fact_hash_verify(hash, await get(hash))` is true on a stored fact
  * - declared refs on `put` are queryable via `get_refs`
- * - JSON content auto-extracts refs when no explicit `refs` is passed;
- *   binary content does NOT auto-extract
+ * - refs are only what a put declares: JSON content naming hashes, `put` or
+ *   `put_stream`, records none unless they are passed as `refs`
  * - `has` / `get` / `get_meta` return false / null on absent hashes
- * - `put_ref` round-trips through an injected stub fetcher
- * - `put_ref` size-mismatch rejects
- * - `put` rejects bytes over the embedded threshold
- * - external `get` with mismatched bytes returns `null` (treated as missing)
- * - `delete` drops the row, is idempotent, and reports `external_url`
+ * - `put` rejects bytes over the embedded threshold when no disk root is
+ *   configured
+ * - `delete` drops the row and is idempotent
+ *
+ * Disk-backed (external) facts — the disk read, verify-on-read, the external
+ * rows `get` refuses, and `delete` reporting `external_url` — are covered in
+ * `fact_store.stream.db.test.ts`.
  *
  * @module
  */
@@ -23,7 +25,7 @@ import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import { fact_hash_bytes, fact_hash_verify } from '@fuzdev/fuz_util/fact_hash.ts';
 import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
 
-import { PgFactStore, type FactExternalFetcher } from '$lib/db/fact_store.ts';
+import { PgFactStore } from '#lib/db/fact_store.ts';
 import { describe_db } from '../fact_db_fixture.ts';
 
 const FAKE_BLAKE =
@@ -31,32 +33,10 @@ const FAKE_BLAKE =
 
 const encode = (s: string): Uint8Array => new TextEncoder().encode(s);
 
-const stub_fetcher = (responses: ReadonlyMap<string, Uint8Array>): FactExternalFetcher => ({
-	fetch_bytes: async (url) => {
-		const bytes = responses.get(url);
-		if (!bytes) throw new Error(`stub fetcher: no response for ${url}`);
-		return bytes;
-	},
-	fetch_stream: async (url) => {
-		const bytes = responses.get(url);
-		if (!bytes) throw new Error(`stub fetcher: no response for ${url}`);
-		return new ReadableStream({
-			start(controller) {
-				controller.enqueue(bytes);
-				controller.close();
-			}
-		});
-	}
-});
-
 describe_db('pg_fact_store', (get_db) => {
-	const make_store = (overrides?: {
-		fetcher?: FactExternalFetcher;
-		embedded_threshold?: number;
-	}): PgFactStore =>
+	const make_store = (overrides?: { embedded_threshold?: number }): PgFactStore =>
 		new PgFactStore({
 			deps: { db: get_db() },
-			...(overrides?.fetcher ? { fetcher: overrides.fetcher } : {}),
 			...(overrides?.embedded_threshold !== undefined
 				? { embedded_threshold: overrides.embedded_threshold }
 				: {})
@@ -66,8 +46,8 @@ describe_db('pg_fact_store', (get_db) => {
 		const store = make_store();
 		const bytes = encode('hello fact layer');
 
-		const hash_a = await store.put(bytes);
-		const hash_b = await store.put(bytes);
+		const hash_a = await store.put(bytes, { holder: null });
+		const hash_b = await store.put(bytes, { holder: null });
 		assert.equal(hash_a, hash_b);
 		assert.equal(hash_a, fact_hash_bytes(bytes));
 
@@ -82,7 +62,7 @@ describe_db('pg_fact_store', (get_db) => {
 		const store = make_store();
 		const bytes = encode('round trip me');
 
-		const hash = await store.put(bytes);
+		const hash = await store.put(bytes, { holder: null });
 		const back = await store.get(hash);
 		assert(back !== null);
 		assert.deepEqual(back, bytes);
@@ -91,10 +71,11 @@ describe_db('pg_fact_store', (get_db) => {
 
 	test('declared refs on put are queryable via get_refs', async () => {
 		const store = make_store();
-		const cover = await store.put(encode('cover image bytes'));
-		const detail = await store.put(encode('detail image bytes'));
+		const cover = await store.put(encode('cover image bytes'), { holder: null });
+		const detail = await store.put(encode('detail image bytes'), { holder: null });
 
 		const manifest = await store.put(encode('opaque binary manifest'), {
+			holder: null,
 			content_type: 'application/octet-stream',
 			refs: [cover, detail]
 		});
@@ -103,32 +84,33 @@ describe_db('pg_fact_store', (get_db) => {
 		assert.deepEqual(new Set(refs), new Set([cover, detail]));
 	});
 
-	test('JSON content auto-extracts refs when no explicit refs passed', async () => {
+	test('JSON content naming hashes records no refs unless they are declared', async () => {
 		const store = make_store();
-		// Real hashes — auto-extraction must produce hashes that pass is_fact_hash
-		const cover = await store.put(encode('cover'));
-		const item = await store.put(encode('item'));
+		const cover = await store.put(encode('cover'), { holder: null });
+		const item = await store.put(encode('item'), { holder: null });
 
-		const manifest_json = JSON.stringify({
-			kind: 'collection',
-			cover,
-			items: [item],
-			label: 'Auto-extract test',
-			fake_hex_not_a_ref: 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262'
-		});
-		const manifest_hash = await store.put(encode(manifest_json), {
+		const manifest_json = JSON.stringify({ kind: 'collection', cover, items: [item] });
+		const undeclared = await store.put(encode(manifest_json), {
+			holder: null,
 			content_type: 'application/json'
 		});
+		assert.deepEqual(await store.get_refs(undeclared), []);
 
-		const refs = await store.get_refs(manifest_hash);
-		assert.deepEqual(new Set(refs), new Set([cover, item]));
+		// declared refs are recorded as given, whatever else the JSON names
+		const declared_json = JSON.stringify({ kind: 'collection', cover, items: [item], v: 2 });
+		const declared = await store.put(encode(declared_json), {
+			holder: null,
+			content_type: 'application/json',
+			refs: [cover]
+		});
+		assert.deepEqual(await store.get_refs(declared), [cover]);
 	});
 
 	test('binary content with no explicit refs records no refs', async () => {
 		const store = make_store();
-		// JSON-shaped string but content_type is octet-stream → should NOT auto-extract
 		const json_text = JSON.stringify({ cover: FAKE_BLAKE });
 		const hash = await store.put(encode(json_text), {
+			holder: null,
 			content_type: 'application/octet-stream'
 		});
 		const refs = await store.get_refs(hash);
@@ -145,7 +127,7 @@ describe_db('pg_fact_store', (get_db) => {
 	test('get_meta returns content_type, size, created_at, external=false', async () => {
 		const store = make_store();
 		const bytes = encode('meta probe');
-		const hash = await store.put(bytes, { content_type: 'text/plain' });
+		const hash = await store.put(bytes, { holder: null, content_type: 'text/plain' });
 
 		const meta = await store.get_meta(hash);
 		assert(meta !== null);
@@ -155,70 +137,22 @@ describe_db('pg_fact_store', (get_db) => {
 		assert.equal(meta.external, false);
 	});
 
-	test('put rejects bytes over the embedded threshold', async () => {
+	test('put rejects bytes over the embedded threshold when no disk root is configured', async () => {
 		const store = make_store({ embedded_threshold: 16 });
 		const bytes = encode('this string is definitely longer than sixteen bytes');
-		await assert_rejects(() => store.put(bytes), /embedded threshold/);
-	});
-
-	test('put_ref round-trips through stub fetcher', async () => {
-		const url = 'https://example.test/large.png';
-		const bytes = encode('pretend-this-is-a-large-image');
-		const fetcher = stub_fetcher(new Map([[url, bytes]]));
-		const store = make_store({ fetcher });
-
-		const hash = await store.put_ref(url, bytes.length, {
-			content_type: 'image/png',
-			refs: []
-		});
-		assert.equal(hash, fact_hash_bytes(bytes));
-
-		const meta = await store.get_meta(hash);
-		assert(meta !== null);
-		assert.equal(meta.external, true);
-		assert.equal(meta.content_type, 'image/png');
-		assert.equal(meta.size, bytes.length);
-
-		const back = await store.get(hash);
-		assert(back !== null);
-		assert.deepEqual(back, bytes);
-	});
-
-	test('put_ref rejects when streamed size disagrees with declared size', async () => {
-		const url = 'https://example.test/short.bin';
-		const bytes = encode('actual content');
-		const fetcher = stub_fetcher(new Map([[url, bytes]]));
-		const store = make_store({ fetcher });
-
+		// The message names the configuration that would accept the bytes.
 		await assert_rejects(
-			() => store.put_ref(url, bytes.length + 5, { content_type: 'application/octet-stream' }),
-			/size mismatch/
+			() => store.put(bytes, { holder: null }),
+			/embedded threshold.*disk_root and fs/
 		);
-	});
-
-	test('external get returns null when fetched bytes fail verify', async () => {
-		const url = 'https://example.test/swapped.bin';
-		const original = encode('original content');
-		const tampered = encode('tampered content');
-
-		// First store with the original content so put_ref succeeds + records the
-		// genuine hash; then swap the fetcher's URL→bytes mapping for the get
-		// path so retrieval sees mismatched bytes.
-		const fetcher_responses = new Map([[url, original]]);
-		const fetcher = stub_fetcher(fetcher_responses);
-		const store = make_store({ fetcher });
-
-		const hash = await store.put_ref(url, original.length);
-		fetcher_responses.set(url, tampered);
-
-		const back = await store.get(hash);
-		assert.equal(back, null);
+		// Nothing was stored.
+		assert.equal(await store.has(fact_hash_bytes(bytes)), false);
 	});
 
 	test('delete drops the row and returns size + external_url', async () => {
 		const store = make_store();
 		const bytes = encode('about to be deleted');
-		const hash = await store.put(bytes);
+		const hash = await store.put(bytes, { holder: null });
 
 		const result = await store.delete(hash);
 		assert(result !== null);
@@ -234,18 +168,5 @@ describe_db('pg_fact_store', (get_db) => {
 		const store = make_store();
 		const result = await store.delete(FAKE_BLAKE);
 		assert.equal(result, null);
-	});
-
-	test('delete reports external_url for `put_ref`-stored facts', async () => {
-		const url = 'https://example.test/external.bin';
-		const bytes = encode('external content');
-		const fetcher = stub_fetcher(new Map([[url, bytes]]));
-		const store = make_store({ fetcher });
-
-		const hash = await store.put_ref(url, bytes.length);
-		const result = await store.delete(hash);
-		assert(result !== null);
-		assert.equal(result.size, bytes.length);
-		assert.equal(result.external_url, url);
 	});
 });

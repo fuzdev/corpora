@@ -1,45 +1,27 @@
 <script>
-	import { LayerCake, Svg } from 'layercake';
+	import { LayerCake, Svg, groupLonger, flatten } from 'layercake';
 	import { scaleOrdinal } from 'd3-scale';
 	import { timeParse } from 'd3-time-format';
 
 	import MultiLine from '../../_components/MultiLine.svelte';
 
-	// This example loads csv data as json and converts numeric columns to numbers using @rollup/plugin-dsv. See vite.config.js for details
+	// The CSV rows are parsed, and their numbers typed, by @rollup/plugin-dsv. See vite.config.js
 	import data from '../../_data/fruit.csv';
 
-	/* --------------------------------------------
-	 * Set what is our x key to separate it from the other series
-	 */
+	// Name the x field so it can be told apart from the series fields
 	const xKey = 'month';
 	const yKey = 'value';
-	const zKey = 'fruit';
+	const cKey = 'fruit';
 
 	const seriesNames = Object.keys(data[0]).filter(d => d !== xKey);
 	const seriesColors = ['#ffe4b8', '#ffb3c0', '#ff7ac7', '#ff00cc'];
 
+	// Turn the date strings into Date objects, on copies so the imported rows stay as they are
 	const parseDate = timeParse('%Y-%m-%d');
+	const rows = data.map(d => ({ ...d, [xKey]: parseDate(d[xKey]) }));
 
-	const dataLong = seriesNames.map(key => {
-		return {
-			[zKey]: key,
-			values: data.map(d => {
-				// Put this in a conditional so that we don't recast the data on second render
-				d[xKey] = typeof d[xKey] === 'string' ? parseDate(d[xKey]) : d[xKey];
-				return {
-					[yKey]: +d[key],
-					[xKey]: d[xKey]
-				};
-			})
-		};
-	});
-
-	// Make a flat array of the `values` of our nested series
-	// we can pluck the `value` field from each item in the array to measure extents
-	const flatten = data =>
-		data.reduce((memo, group) => {
-			return memo.concat(group.values);
-		}, []);
+	// Reshape the wide rows into one group per series, each with its own list of points
+	const dataLong = groupLonger(rows, seriesNames, { groupTo: cKey, valueTo: yKey });
 </script>
 
 <div class="chart-container">
@@ -47,12 +29,12 @@
 		padding={{ top: 10 }}
 		x={xKey}
 		y={yKey}
-		z={zKey}
+		c={cKey}
 		yDomain={[0, null]}
-		zScale={scaleOrdinal()}
-		zDomain={seriesNames}
-		zRange={seriesColors}
-		flatData={flatten(dataLong)}
+		cScale={scaleOrdinal()}
+		cDomain={seriesNames}
+		cRange={seriesColors}
+		flatData={flatten(dataLong, 'values')}
 		data={dataLong}
 	>
 		<Svg>
@@ -62,12 +44,7 @@
 </div>
 
 <style>
-	/*
-		The wrapper div needs to have an explicit width and height in CSS.
-		It can also be a flexbox child or CSS grid element.
-		The point being it needs dimensions since the <LayerCake> element will
-		expand to fill it.
-	*/
+	/* Give the wrapper a width and height. LayerCake fills it. */
 	.chart-container {
 		width: 100%;
 		height: 250px;

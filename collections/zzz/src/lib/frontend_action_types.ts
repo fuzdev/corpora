@@ -111,6 +111,20 @@ export interface FrontendActionHandlers {
 			action_event: TypedActionEvent<'diskfile_update', 'receive_error', 'handling'>
 		) => void | Promise<void>;
 	};
+	diskfile_create?: {
+		send_request?: (
+			action_event: TypedActionEvent<'diskfile_create', 'send_request', 'handling'>
+		) => void | Promise<void>;
+		receive_response?: (
+			action_event: TypedActionEvent<'diskfile_create', 'receive_response', 'handling'>
+		) => void | Promise<void>;
+		send_error?: (
+			action_event: TypedActionEvent<'diskfile_create', 'send_error', 'handling'>
+		) => void | Promise<void>;
+		receive_error?: (
+			action_event: TypedActionEvent<'diskfile_create', 'receive_error', 'handling'>
+		) => void | Promise<void>;
+	};
 	diskfile_delete?: {
 		send_request?: (
 			action_event: TypedActionEvent<'diskfile_delete', 'send_request', 'handling'>
@@ -137,6 +151,58 @@ export interface FrontendActionHandlers {
 		) => void | Promise<void>;
 		receive_error?: (
 			action_event: TypedActionEvent<'directory_create', 'receive_error', 'handling'>
+		) => void | Promise<void>;
+	};
+	media_finalize?: {
+		send_request?: (
+			action_event: TypedActionEvent<'media_finalize', 'send_request', 'handling'>
+		) => void | Promise<void>;
+		receive_response?: (
+			action_event: TypedActionEvent<'media_finalize', 'receive_response', 'handling'>
+		) => void | Promise<void>;
+		send_error?: (
+			action_event: TypedActionEvent<'media_finalize', 'send_error', 'handling'>
+		) => void | Promise<void>;
+		receive_error?: (
+			action_event: TypedActionEvent<'media_finalize', 'receive_error', 'handling'>
+		) => void | Promise<void>;
+	};
+	transcription_create?: {
+		send_request?: (
+			action_event: TypedActionEvent<'transcription_create', 'send_request', 'handling'>
+		) => void | Promise<void>;
+		receive_response?: (
+			action_event: TypedActionEvent<'transcription_create', 'receive_response', 'handling'>
+		) => void | Promise<void>;
+		send_error?: (
+			action_event: TypedActionEvent<'transcription_create', 'send_error', 'handling'>
+		) => void | Promise<void>;
+		receive_error?: (
+			action_event: TypedActionEvent<'transcription_create', 'receive_error', 'handling'>
+		) => void | Promise<void>;
+	};
+	transcription_progress?: {
+		receive?: (
+			action_event: TypedActionEvent<'transcription_progress', 'receive', 'handling'>
+		) => void | Promise<void>;
+	};
+	job_cancel?: {
+		send_request?: (
+			action_event: TypedActionEvent<'job_cancel', 'send_request', 'handling'>
+		) => void | Promise<void>;
+		receive_response?: (
+			action_event: TypedActionEvent<'job_cancel', 'receive_response', 'handling'>
+		) => void | Promise<void>;
+		send_error?: (
+			action_event: TypedActionEvent<'job_cancel', 'send_error', 'handling'>
+		) => void | Promise<void>;
+		receive_error?: (
+			action_event: TypedActionEvent<'job_cancel', 'receive_error', 'handling'>
+		) => void | Promise<void>;
+	};
+	job_changed?: {
+		receive?: (
+			action_event: TypedActionEvent<'job_changed', 'receive', 'handling'>
 		) => void | Promise<void>;
 	};
 	completion_create?: {
@@ -208,6 +274,20 @@ export interface FrontendActionHandlers {
 	terminal_data?: {
 		receive?: (
 			action_event: TypedActionEvent<'terminal_data', 'receive', 'handling'>
+		) => void | Promise<void>;
+	};
+	terminal_ack?: {
+		send_request?: (
+			action_event: TypedActionEvent<'terminal_ack', 'send_request', 'handling'>
+		) => void | Promise<void>;
+		receive_response?: (
+			action_event: TypedActionEvent<'terminal_ack', 'receive_response', 'handling'>
+		) => void | Promise<void>;
+		send_error?: (
+			action_event: TypedActionEvent<'terminal_ack', 'send_error', 'handling'>
+		) => void | Promise<void>;
+		receive_error?: (
+			action_event: TypedActionEvent<'terminal_ack', 'receive_error', 'handling'>
 		) => void | Promise<void>;
 	};
 	terminal_resize?: {

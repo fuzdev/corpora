@@ -3,7 +3,6 @@ import type { SVGAttributes } from 'svelte/elements';
 
 import { extent } from 'd3-array';
 import { pointRadial } from 'd3-shape';
-import { timeDay, timeHour, timeMillisecond, timeMinute, timeSecond, timeYear } from 'd3-time';
 
 import { type FormatType, type FormatConfig, unique, PeriodType } from '@layerstack/utils';
 import { cls } from '@layerstack/tailwind';
@@ -12,17 +11,26 @@ import type { Transition, TransitionParams, Without } from '$lib/utils/types.js'
 import type { GroupProps } from '../Group/Group.shared.svelte.js';
 import type { TextProps } from '../Text/Text.shared.svelte.js';
 import type Rule from '../Rule/Rule.svelte';
-import { isScaleBand } from '$lib/utils/scales.svelte.js';
+import { isScaleBand, isScaleUtc } from '$lib/utils/scales.svelte.js';
+import { occlude } from '$lib/utils/occlusion.js';
+import { getTextRect } from '$lib/utils/string.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { getFacetPanel } from '$lib/contexts/facet.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import { type MotionProp } from '$lib/utils/motion.svelte.js';
-import { autoTickVals, autoTickFormat, type TicksConfig } from '$lib/utils/ticks.js';
+import {
+  autoTickVals,
+  autoTickFormat,
+  filterTicksByFormat,
+  type TicksConfig,
+} from '$lib/utils/ticks.js';
 
 export type AxisPropsWithoutHTML<In extends Transition = Transition> = {
   /**
-   * Location of axis
+   * Location of axis.  `'back'` runs along `z` up the back corner of an `isometric` chart's floor.
    */
-  placement: 'top' | 'bottom' | 'left' | 'right' | 'angle' | 'radius';
+  placement: 'top' | 'bottom' | 'left' | 'right' | 'angle' | 'radius' | 'back';
 
   /**
    * The label for the axis.
@@ -75,6 +83,23 @@ export type AxisPropsWithoutHTML<In extends Transition = Transition> = {
   tickSpacing?: number | null;
 
   /**
+   * Drop ticks whose labels would overlap one already kept, measuring each label at the size
+   * it actually renders.
+   *
+   * `tickSpacing` only picks a tick *count* — it cannot know how wide a formatted label turns
+   * out to be, so a long format (`'Wednesday'`, `'$1,234,567'`) still collides at any count
+   * that fits the axis.  This measures instead.
+   *
+   * - `priority`: which ticks win when labels compete. `'end'` (default) keeps the last tick and
+   *   walks backwards (the newest value on a time axis); `'start'` keeps the first; `'start-end'`
+   *   anchors both ends of the axis and thins what is between them.
+   * - `padding`: minimum gap, in pixels, required between two kept labels.
+   *
+   * @default false
+   */
+  tickOcclusion?: boolean | { padding?: number; priority?: 'start' | 'end' | 'start-end' };
+
+  /**
    * Whether to render tick labels on multiple lines for additional context
    *
    * @default false
@@ -122,9 +147,21 @@ export type AxisPropsWithoutHTML<In extends Transition = Transition> = {
   transitionInParams?: TransitionParams<In>;
 
   /**
+   * Draw in every panel of a faceted chart, rather than only on the grid's outer edge.
+   * @default false
+   */
+  facetAll?: boolean;
+
+  /**
    * Override scale for the axis
    */
   scale?: any;
+
+  /**
+   * Domain for the axis, on a copy of `scale` (or the chart's scale for this placement) that keeps
+   * its range and type.  Useful for a secondary axis, e.g. `domain={[0, 100]}` on the right.
+   */
+  domain?: any[];
 
   /**
    * Stroke color for axis rule, grid lines, and tick marks.
@@ -173,7 +210,78 @@ export type AxisTickItem = {
  */
 export class AxisState {
   #getProps: () => AxisProps = () => ({}) as AxisProps;
+
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: AxisProps = $derived(this.#getProps());
+
   ctx: ChartState = getChartContext();
+  #facetPanel = getFacetPanel();
+  #layerIsometric = getLayerIsometric();
+
+  /**
+   * Anchors for a `viewport` label hanging off this axis' edge of an `isometric` floor (see
+   * `viewportAnchors`), or `undefined` to keep the flat ones.
+   */
+  #viewportAnchors(viewport: boolean | undefined) {
+    const m = this.#layerIsometric();
+    if (!viewport || !m) return undefined;
+    const outward = {
+      top: { x: 0, y: -1 },
+      bottom: { x: 0, y: 1 },
+      left: { x: -1, y: 0 },
+      right: { x: 1, y: 0 },
+    }[this.#props.placement as string];
+    return outward ? this.ctx.isometric!.viewportAnchors(m, outward) : undefined;
+  }
+  /**
+   * For `placement="back"`: the floor corner the axis stands on, the lift, and screen offsets on
+   * the floor.  `null` without an isometric floor and a `z`.
+   */
+  back = $derived.by(() => {
+    const m = this.#layerIsometric();
+    const lift = this.ctx.isometricLift;
+    if (!m || !lift || this.ctx.props.z == null) return null;
+    const iso = this.ctx.isometric!;
+    const corner = iso.floorCorner({ width: this.ctx.width, height: this.ctx.height }, m, 'left');
+    const left = iso.screenToFloor(m, { x: -1, y: 0 });
+    const up = iso.screenToFloor(m, { x: 0, y: -1 });
+    if (!left || !up) return null;
+    const raise = (height: number) => ({
+      x: corner.x + lift.x * height,
+      y: corner.y + lift.y * height,
+    });
+    return { corner, raise, left, up, top: raise(this.ctx.zDepth) };
+  });
+
+  /**
+   * Whether to draw at all.  In a faceted chart an axis belongs on the grid's outer edge — a
+   * left/radius axis on the leftmost column, a bottom/angle axis on the last row — so interior
+   * panels don't redraw the same ticks.  `facetAll` opts back into one per panel.
+   */
+  visible = $derived.by(() => {
+    // Height only stands up off an isometric floor
+    if (this.#props.placement === 'back' && !this.back) return false;
+    const facet = this.#facetPanel?.();
+    if (!facet || this.#props.facetAll) return true;
+
+    switch (this.#props.placement) {
+      case 'left':
+      case 'radius':
+        return facet.left;
+      case 'right':
+        return facet.right;
+      case 'top':
+        return facet.top;
+      case 'bottom':
+      case 'angle':
+        return facet.bottom;
+    }
+    return true;
+  });
 
   constructor(getProps: () => AxisProps) {
     this.#getProps = getProps;
@@ -183,7 +291,8 @@ export class AxisState {
   // --- Derived from placement ---
 
   orientation = $derived.by(() => {
-    const placement = this.#getProps().placement;
+    const placement = this.#props.placement;
+    if (placement === 'back') return 'back';
     return placement === 'angle'
       ? 'angle'
       : placement === 'radius'
@@ -194,32 +303,43 @@ export class AxisState {
   });
 
   scale = $derived.by(() => {
-    const scaleProp = this.#getProps().scale;
-    return scaleProp ?? (['horizontal', 'angle'].includes(this.orientation) ? this.ctx.xScale : this.ctx.yScale);
+    const scale =
+      this.#props.scale ??
+      (this.orientation === 'back'
+        ? this.ctx.zScale
+        : ['horizontal', 'angle'].includes(this.orientation)
+          ? this.ctx.xScale
+          : this.ctx.yScale);
+    const domain = this.#props.domain;
+    return domain && scale ? scale.copy().domain(domain) : scale;
   });
 
   interval = $derived(
-    ['horizontal', 'angle'].includes(this.orientation) ? this.ctx.xInterval : this.ctx.yInterval
+    this.orientation === 'back'
+      ? null
+      : ['horizontal', 'angle'].includes(this.orientation)
+        ? this.ctx.xInterval
+        : this.ctx.yInterval
   );
 
   defaultTickSpacing = $derived.by(() => {
-    const placement = this.#getProps().placement;
+    const placement = this.#props.placement;
     return ['top', 'bottom', 'angle'].includes(placement)
       ? 80
-      : ['left', 'right', 'radius'].includes(placement)
+      : ['left', 'right', 'radius', 'back'].includes(placement)
         ? 50
         : undefined;
   });
 
   tickSpacing = $derived.by(() => {
-    const tickSpacingProp = this.#getProps().tickSpacing;
+    const tickSpacingProp = this.#props.tickSpacing;
     if (tickSpacingProp !== undefined) return tickSpacingProp;
     if (isScaleBand(this.scale) && this.interval == null) return null;
     return this.defaultTickSpacing;
   });
 
   resolvedFormat = $derived.by(() => {
-    const format = this.#getProps().format;
+    const format = this.#props.format;
     if (format !== undefined) return format;
 
     if (this.ctx.series.stackLayout === 'stackExpand') {
@@ -241,7 +361,14 @@ export class AxisState {
     if (this.orientation === 'vertical') return this.ctx.height;
     if (this.orientation === 'horizontal') return this.ctx.width;
     if (this.orientation === 'radius') return this.ctx.height / 2;
-    if (this.orientation === 'angle') return this.ctx.width;
+    if (this.orientation === 'back') return this.ctx.zDepth;
+    if (this.orientation === 'angle') {
+      // The arc the labels run around, so the ticks don't change with the chart's width
+      const [a0, a1] = this.xRangeMinMax;
+      const outerRadius = Math.max(...this.yRangeMinMax.map(Math.abs));
+      const arc = Math.abs(a1 - a0) * outerRadius;
+      return Number.isFinite(arc) && arc > 0 ? arc : null;
+    }
     return null;
   });
 
@@ -257,53 +384,37 @@ export class AxisState {
   });
 
   tickCount = $derived.by(() => {
-    const ticks = this.#getProps().ticks;
+    const ticks = this.#props.ticks;
     if (typeof ticks === 'number') return ticks;
-    if (this.tickSpacing && this.effectiveSize) return Math.round(this.effectiveSize / this.tickSpacing);
+    if (this.tickSpacing && this.effectiveSize)
+      return Math.round(this.effectiveSize / this.tickSpacing);
     return undefined;
   });
 
   formatCount = $derived.by(() => {
-    const ticks = this.#getProps().ticks;
+    const ticks = this.#props.ticks;
     if (typeof ticks === 'number') return ticks;
-    if (this.defaultTickSpacing && this.effectiveSize) return Math.round(this.effectiveSize / this.defaultTickSpacing);
+    if (this.defaultTickSpacing && this.effectiveSize)
+      return Math.round(this.effectiveSize / this.defaultTickSpacing);
     return undefined;
   });
 
   tickVals = $derived.by(() => {
-    const ticks = this.#getProps().ticks;
+    const ticks = this.#props.ticks;
     let tickVals = autoTickVals(this.scale, ticks, this.tickCount);
 
     if (this.interval != null) {
-      // Remove last tick when interval is provided (such as for bar charts with center aligned (offset) ticks)
-      tickVals.pop();
+      // Ticks are centered in their interval (such as for bar charts), so one on the domain's end
+      // would label a bar past the last.  A coarser tick inside the domain — a month on a daily
+      // interval — still labels a bar, so keep it.
+      const last = tickVals[tickVals.length - 1];
+      const domainEnd = this.scale.domain()[1];
+      if (last != null && +last >= +domainEnd) tickVals.pop();
     }
 
-    // Use format to filter ticks (helpful to keep ticks above a threshold for wide charts or short durations)
-    const formatType =
-      typeof this.resolvedFormat === 'object' ? this.resolvedFormat?.type : this.resolvedFormat;
-
-    if (formatType === 'integer') {
-      tickVals = tickVals.filter(Number.isInteger);
-    } else if (formatType === 'year' || formatType === PeriodType.CalendarYear) {
-      tickVals = tickVals.filter((val) => +timeYear.floor(val) === +val);
-    } else if (
-      formatType === 'month' ||
-      formatType === PeriodType.Month ||
-      formatType === PeriodType.MonthYear
-    ) {
-      tickVals = tickVals.filter((val) => val.getDate() < 7); // first week of the month
-    } else if (formatType === 'day' || formatType === PeriodType.Day) {
-      tickVals = tickVals.filter((val) => +timeDay.floor(val) === +val);
-    } else if (formatType === 'hour' || formatType === PeriodType.Hour) {
-      tickVals = tickVals.filter((val) => +timeHour.floor(val) === +val);
-    } else if (formatType === 'minute' || formatType === PeriodType.Minute) {
-      tickVals = tickVals.filter((val) => +timeMinute.floor(val) === +val);
-    } else if (formatType === 'second' || formatType === PeriodType.Second) {
-      tickVals = tickVals.filter((val) => +timeSecond.floor(val) === +val);
-    } else if (formatType === 'millisecond' || formatType === PeriodType.Millisecond) {
-      tickVals = tickVals.filter((val) => +timeMillisecond.floor(val) === +val);
-    }
+    // Filter to the boundary implied by the format, matching the scale's own (local vs UTC)
+    // day/hour/... boundaries — see `filterTicksByFormat`.
+    tickVals = filterTicksByFormat(tickVals, this.resolvedFormat, { utc: isScaleUtc(this.scale) });
 
     return unique(tickVals);
   });
@@ -311,16 +422,16 @@ export class AxisState {
   tickFormat = $derived.by(() =>
     autoTickFormat({
       scale: this.scale,
-      ticks: this.#getProps().ticks,
+      ticks: this.#props.ticks,
       count: this.formatCount,
       formatType: this.resolvedFormat,
-      multiline: this.#getProps().tickMultiline ?? false,
-      placement: this.#getProps().placement,
+      multiline: this.#props.tickMultiline ?? false,
+      placement: this.#props.placement,
     })
   );
 
   getCoords(tick: any): { x: number; y: number } {
-    const placement = this.#getProps().placement;
+    const placement = this.#props.placement;
     const scale = this.scale;
     switch (placement) {
       case 'top':
@@ -360,25 +471,33 @@ export class AxisState {
           x: this.xRangeMinMax[0],
           y: scale(tick) + (isScaleBand(scale) ? scale.bandwidth() / 2 : 0),
         };
+
+      case 'back':
+        return this.back ? this.back.raise(scale(tick)) : { x: 0, y: 0 };
     }
     return { x: 0, y: 0 };
   }
 
   getDefaultTickLabelProps(tick: any): Partial<TextProps> {
-    const { placement, tickLength = 4 } = this.#getProps();
+    const { placement, tickLength = 4 } = this.#props;
+    // Cap-height anchoring (`verticalAnchor` start/end, see Text `startDy`) places the label
+    // edge exactly `tickLength` from the axis, leaving no gap to the tick. Add a little padding
+    // above/below so the label clears the tick — matching the `left`/`right` visual, whose
+    // horizontal `textAnchor` already sits a comfortable distance out.
+    const labelPadding = 2;
     switch (placement) {
       case 'top':
         return {
           textAnchor: 'middle',
           verticalAnchor: 'end',
-          dy: -tickLength,
+          dy: -(tickLength + labelPadding),
         };
 
       case 'bottom':
         return {
           textAnchor: 'middle',
           verticalAnchor: 'start',
-          dy: tickLength,
+          dy: tickLength + labelPadding,
         };
 
       case 'left':
@@ -418,12 +537,24 @@ export class AxisState {
           verticalAnchor: 'middle',
           dx: 2,
         };
+
+      case 'back': {
+        // Left of the edge on screen, however the floor is turned
+        const gap = tickLength + labelPadding;
+        return {
+          textAnchor: 'end',
+          verticalAnchor: 'middle',
+          dx: (this.back?.left.x ?? 0) * gap,
+          dy: (this.back?.left.y ?? 0) * gap,
+          viewport: true,
+        };
+      }
     }
     return {};
   }
 
   resolvedLabelX = $derived.by(() => {
-    const { placement, labelPlacement = 'middle' } = this.#getProps();
+    const { placement, labelPlacement = 'middle' } = this.#props;
     if (placement === 'left' || (this.orientation === 'horizontal' && labelPlacement === 'start')) {
       return -this.ctx.padding.left;
     } else if (
@@ -436,7 +567,7 @@ export class AxisState {
   });
 
   resolvedLabelY = $derived.by(() => {
-    const { placement, labelPlacement = 'middle' } = this.#getProps();
+    const { placement, labelPlacement = 'middle' } = this.#props;
     if (placement === 'top' || (this.orientation === 'vertical' && labelPlacement === 'start')) {
       return -this.ctx.padding.top;
     } else if (this.orientation === 'vertical' && labelPlacement === 'middle') {
@@ -448,7 +579,7 @@ export class AxisState {
   });
 
   resolvedLabelTextAnchor = $derived.by(() => {
-    const { placement, labelPlacement = 'middle' } = this.#getProps();
+    const { placement, labelPlacement = 'middle' } = this.#props;
     if (labelPlacement === 'middle') return 'middle';
     if (placement === 'right' || (this.orientation === 'horizontal' && labelPlacement === 'end'))
       return 'end';
@@ -456,7 +587,7 @@ export class AxisState {
   });
 
   resolvedLabelVerticalAnchor = $derived.by(() => {
-    const { placement, labelPlacement = 'middle' } = this.#getProps();
+    const { placement, labelPlacement = 'middle' } = this.#props;
     if (
       placement === 'top' ||
       (this.orientation === 'vertical' && labelPlacement === 'start') ||
@@ -475,14 +606,37 @@ export class AxisState {
       stroke,
       fill,
       classes = {},
-    } = this.#getProps();
+    } = this.#props;
+    const anchors = this.#viewportAnchors(labelProps?.viewport);
+
+    // Atop the edge, facing the viewer
+    if (this.back && this.#props.placement === 'back') {
+      const gap = 8;
+      return {
+        value: typeof label === 'function' ? '' : label,
+        x: this.back.top.x + this.back.up.x * gap,
+        y: this.back.top.y + this.back.up.y * gap,
+        textAnchor: 'middle',
+        verticalAnchor: 'end',
+        viewport: true,
+        capHeight: '7px',
+        lineHeight: '11px',
+        fill,
+        stroke,
+        ...labelProps,
+        class: cls('lc-axis-label', classes.label, labelProps?.class),
+      } as TextProps;
+    }
+
     return {
       value: typeof label === 'function' ? '' : label,
       x: this.resolvedLabelX,
       y: this.resolvedLabelY,
       textAnchor: this.resolvedLabelTextAnchor,
       verticalAnchor: this.resolvedLabelVerticalAnchor,
-      rotate: this.orientation === 'vertical' && labelPlacement === 'middle' ? -90 : 0,
+      // Facing the viewer, a title reads left to right like the tick labels
+      rotate: !anchors && this.orientation === 'vertical' && labelPlacement === 'middle' ? -90 : 0,
+      ...anchors,
       capHeight: '7px',
       lineHeight: '11px',
       fill,
@@ -492,26 +646,80 @@ export class AxisState {
     } as TextProps;
   });
 
+  /**
+   * Box each tick label occupies once rendered, for `tickOcclusion`.
+   *
+   * Measured with the same metrics `<Text>` draws with, anchored the way
+   * `getDefaultTickLabelProps()` anchors it.  Rotation matters: an angled label is what makes
+   * long categories fit in the first place, and measuring it flat would keep dropping ticks that
+   * now have room.
+   */
+  #tickLabelRect(labelProps: TextProps) {
+    const value = labelProps.value;
+    const lines = (Array.isArray(value) ? value : [value]).filter(Boolean).map(String);
+
+    return getTextRect(lines, Number(labelProps.x) || 0, Number(labelProps.y) || 0, {
+      textAnchor: labelProps.textAnchor as 'start' | 'middle' | 'end',
+      verticalAnchor: labelProps.verticalAnchor as 'start' | 'middle' | 'end',
+      fontSize: Number.parseFloat(String(labelProps.fontSize ?? 10)) || 10,
+      dx: Number(labelProps.dx) || 0,
+      dy: Number(labelProps.dy) || 0,
+      rotate: Number(labelProps.rotate) || 0,
+    });
+  }
+
+  /**
+   * Ticks whose labels fit, in axis order.
+   *
+   * `occlude()` returns what it kept in *priority* order, so the result is put back into tick
+   * order before rendering — otherwise the `{#each}` key order would jump around on resize.
+   */
+  #occludeTickItems(items: AxisTickItem[]): AxisTickItem[] {
+    const config = this.#props.tickOcclusion;
+    if (!config || items.length <= 1) return items;
+
+    const { padding = 4, priority = 'end' } = config === true ? {} : config;
+
+    const order = new Map(items.map((item, index) => [item, index]));
+    const last = items.length - 1;
+
+    /**
+     * `occlude()` places the highest priority first, so ranking by index makes the last tick win
+     * (`'end'`) and negating it makes the first win (`'start'`).
+     *
+     * `'start-end'` lifts both ends above every interior tick — `items.length` clears the whole
+     * index range — and thins what is left between them from the end inwards.
+     */
+    function rank(item: AxisTickItem) {
+      const index = order.get(item)!;
+      if (priority === 'start') return -index;
+      if (priority === 'start-end' && (index === 0 || index === last)) return items.length;
+      return index;
+    }
+
+    const kept = occlude(items, (item) => this.#tickLabelRect(item.tickLabelProps), {
+      priority: rank,
+      padding,
+    });
+
+    return kept.sort((a, b) => order.get(a)! - order.get(b)!);
+  }
+
   tickItems = $derived.by<AxisTickItem[]>(() => {
-    const {
-      motion,
-      stroke,
-      fill,
-      tickLabelProps,
-      classes = {},
-    } = this.#getProps();
-    return this.tickVals.map((tick, index) => {
+    const { motion, stroke, fill, tickLabelProps, classes = {} } = this.#props;
+    const items = this.tickVals.map((tick, index) => {
       const tickCoords = this.getCoords(tick);
       const [radialTickCoordsX, radialTickCoordsY] = pointRadial(tickCoords.x, tickCoords.y);
       const [radialTickMarkCoordsX, radialTickMarkCoordsY] = pointRadial(
         tickCoords.x,
-        tickCoords.y + (this.#getProps().tickLength ?? 4)
+        tickCoords.y + (this.#props.tickLength ?? 4)
       );
       const labelProps: TextProps = {
         x: this.orientation === 'angle' ? radialTickCoordsX : tickCoords.x,
         y: this.orientation === 'angle' ? radialTickCoordsY : tickCoords.y,
         value: this.tickFormat(tick, index),
         ...this.getDefaultTickLabelProps(tick),
+        ...this.#viewportAnchors(tickLabelProps?.viewport),
         motion,
         capHeight: '7px',
         lineHeight: '11px',
@@ -533,5 +741,7 @@ export class AxisState {
         tickLabelProps: labelProps,
       };
     });
+
+    return this.#occludeTickItems(items);
   });
 }

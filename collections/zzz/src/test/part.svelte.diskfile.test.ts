@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
 import { test, describe, beforeEach, assert } from 'vitest';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Frontend } from '$lib/frontend.svelte.ts';
-import { DiskfilePath, SerializableDisknode } from '$lib/diskfile_types.ts';
-import type { Diskfile } from '$lib/diskfile.svelte.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
+import { DiskfilePath, SerializableDisknode } from '#lib/diskfile_types.ts';
+import type { Diskfile } from '#lib/diskfile.svelte.ts';
+
+import { format_prompt_content } from '#lib/prompt_helpers.ts';
+import { DISKFILE_CONTENT_NOT_LOADED_PLACEHOLDER } from '#lib/diskfile_helpers.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -163,48 +165,44 @@ describe('DiskfilePart content access', () => {
 		assert.deepEqual(part.diskfile, test_diskfiles.get(path));
 	});
 
-	test('content setter updates diskfile content', () => {
+	test('content is read-only and never writes to disk', () => {
 		const path = TEST_PATHS.EDITABLE;
-		const initial_content = TEST_CONTENT.EDITABLE.INITIAL;
-		const updated_content = TEST_CONTENT.EDITABLE.UPDATED;
-
 		const part = app.cell_registry.instantiate('DiskfilePart', {
 			type: 'diskfile',
 			path
 		});
+		const update_calls: Array<string> = [];
+		app.diskfiles.update = (_path, content) => {
+			update_calls.push(content);
+			return Promise.resolve({ ok: true, value: null });
+		};
 
-		// Verify initial state
-		assert.strictEqual(part.content, initial_content);
+		// a getter-only accessor throws on assignment in strict mode
+		assert.throws(() => {
+			(part as { content: unknown }).content = TEST_CONTENT.EDITABLE.UPDATED;
+		}, TypeError);
 
-		// Update content
-		part.content = updated_content;
-
-		// Verify diskfile was updated - get it fresh from zzz
-		const diskfile = app.diskfiles.get_by_path(path);
-		assert.strictEqual(diskfile?.content, updated_content);
-		assert.strictEqual(part.content, updated_content);
+		assert.deepEqual(update_calls, []);
+		assert.strictEqual(part.content, TEST_CONTENT.EDITABLE.INITIAL);
+		assert.strictEqual(app.diskfiles.get_by_path(path)?.content, TEST_CONTENT.EDITABLE.INITIAL);
 	});
 
-	test('assigning part content updates diskfile content', () => {
-		const path = TEST_PATHS.EDITABLE;
-		const initial_content = TEST_CONTENT.EDITABLE.INITIAL;
-		const updated_content = TEST_CONTENT.EDITABLE.UPDATED;
-
+	test('content is null, never the editor text, when the file content was not loaded', () => {
+		const path = TEST_PATHS.BASIC;
+		const diskfile = test_diskfiles.get(path)!;
 		const part = app.cell_registry.instantiate('DiskfilePart', {
 			type: 'diskfile',
 			path
 		});
+		assert.strictEqual(part.content, TEST_CONTENT.BASIC);
+		// the file's editor shows '' for an unloaded file
+		const editor_state = app.diskfiles.get_editor_state(diskfile);
+		diskfile.content = null;
+		assert.strictEqual(editor_state.current_content, '');
 
-		// Verify initial state
-		assert.strictEqual(part.content, initial_content);
-
-		// Update content using assignment
-		part.content = updated_content;
-
-		// Verify diskfile was updated - get it fresh from zzz
-		const diskfile = app.diskfiles.get_by_path(path);
-		assert.strictEqual(diskfile?.content, updated_content);
-		assert.strictEqual(part.content, updated_content);
+		assert.isNull(part.content);
+		// marked in the formatted prompt, not silently dropped
+		assert.include(format_prompt_content([part]), DISKFILE_CONTENT_NOT_LOADED_PLACEHOLDER);
 	});
 
 	test('content is undefined when diskfile not found', () => {
@@ -217,36 +215,6 @@ describe('DiskfilePart content access', () => {
 
 		assert.ok(part.diskfile === undefined);
 		assert.ok(part.content === undefined);
-	});
-
-	test('setting content to null logs error in development', () => {
-		const path = TEST_PATHS.BASIC;
-		const part = app.cell_registry.instantiate('DiskfilePart', {
-			type: 'diskfile',
-			path
-		});
-
-		// Save original console.error
-		const original_console_error = console.error;
-		let error_called = false;
-
-		// Mock console.error
-		console.error = () => {
-			error_called = true;
-		};
-
-		// Try setting to null
-		part.content = null as any;
-
-		// Restore console.error
-		console.error = original_console_error;
-
-		// Verify error was logged
-		assert.ok(error_called);
-
-		// Verify diskfile content was not changed
-		const diskfile = test_diskfiles.get(path);
-		assert.strictEqual(diskfile?.content, TEST_CONTENT.BASIC);
 	});
 });
 

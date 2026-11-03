@@ -5,7 +5,8 @@
  *
  * - `display:flex` → `.display\:flex { display: flex; }`
  * - `hover:opacity:80%` → `.hover\:opacity\:80\%:hover { opacity: 80%; }`
- * - `md:dark:hover:before:opacity:80%` → nested CSS with media query, ancestor, state, pseudo-element
+ * - `md:dark:hover:before:opacity:80%` → media query, color scheme, state, and pseudo-element
+ *   applied by the generator (see `generate_classes_css`)
  *
  * @see {@link https://github.com/fuzdev/fuz_css} for documentation
  * @module
@@ -13,8 +14,17 @@
 
 import { levenshtein_distance } from '@fuzdev/fuz_util/string.ts';
 
+import {
+	css_custom_property_name_is_contained,
+	css_value_is_contained
+} from './css_containment.ts';
 import { type InterpreterDiagnostic } from './diagnostics.ts';
-import { get_modifier, get_all_modifier_names, type ModifierDefinition } from './modifiers.ts';
+import {
+	get_modifier,
+	get_all_modifier_names,
+	to_modifier_argument_hint,
+	type ModifierDefinition
+} from './modifiers.ts';
 
 //
 // Types
@@ -77,16 +87,6 @@ export type ModifierExtractionResult =
 	| { ok: true; modifiers: ExtractedModifiers; remaining: Array<string> }
 	| { ok: false; error: InterpreterDiagnostic };
 
-/**
- * Result of interpreting a CSS-literal class.
- *
- * Uses `| null` for warnings to avoid allocating empty arrays.
- * Callers should use a guard pattern: `if (result.warnings) { ... }`
- */
-export type InterpretCssLiteralResult =
-	| { ok: true; output: CssLiteralOutput; warnings: Array<InterpreterDiagnostic> | null }
-	| { ok: false; error: InterpreterDiagnostic };
-
 //
 // CSS Property Validation
 //
@@ -101,24 +101,29 @@ export const load_css_properties = async (): Promise<Set<string>> => {
 	return new Set(Object.keys(indexed.properties));
 };
 
+// the shape of a property name when no property set is given to check it
+// against - a plain identifier, so it can't end its declaration or rule
+const PROPERTY_NAME_MATCHER = /^-?[a-z][\w-]*$/iu;
+
 /**
- * Checks if a property name is a valid CSS property.
- * Custom properties (--*) always return true.
+ * Checks if a property name is a valid CSS property. The name renders
+ * verbatim, so a custom property (`--*`) is valid when its name is a plain
+ * identifier (`css_custom_property_name_is_contained`), and with no property
+ * set to check against, any other name must be a plain identifier too.
  *
  * @param property - the CSS property name to validate
  * @param properties - Set of valid CSS properties from `load_css_properties()`
- *                     Pass `null` to skip validation.
+ *                     Pass `null` to skip validation against the set.
  * @returns true if valid CSS property or custom property
  */
 export const is_valid_css_property = (
 	property: string,
 	properties: Set<string> | null
 ): boolean => {
-	// Custom properties are always valid
-	if (property.startsWith('--')) return true;
+	if (property.startsWith('--')) return css_custom_property_name_is_contained(property.slice(2));
 
-	// If no properties provided, skip validation
-	if (!properties) return true;
+	// with no properties provided, only check the name's shape
+	if (!properties) return PROPERTY_NAME_MATCHER.test(property);
 
 	return properties.has(property);
 };
@@ -175,6 +180,10 @@ export const format_css_value = (value: string): string => {
 	result = result.replace(/\s*!important$/, ' !important');
 	return result;
 };
+
+// the `!important` suffix `format_css_value` normalizes, split off before
+// the containment check (which rejects a `!` outside strings)
+const IMPORTANT_SUFFIX_MATCHER = / !important$/;
 
 /**
  * Pattern to detect calc expressions possibly missing spaces around + or -.
@@ -445,6 +454,18 @@ export const extract_and_validate_modifiers = (
 /**
  * Parses a CSS-literal class name into its components.
  *
+ * The value renders verbatim, so one that could end its declaration or rule
+ * (an unclosed quote or bracket, a stray `)`, a top-level `;`) is an error:
+ * it must pass `css_value_is_contained` once a trailing `!important` is
+ * split off. That check is stricter than the CSS grammar - it also rejects
+ * braces, comments, and escapes outside strings (`--x:{}`, `content:\201C`),
+ * any `!` but that trailing one (`display:flex!`,
+ * `color:red!important!important`), and an unquoted `url(` holding what
+ * needs quotes - so quote such values or set them in a stylesheet. The
+ * property name renders verbatim too, so it must pass
+ * `is_valid_css_property`, which holds a custom property's name to a plain
+ * identifier.
+ *
  * @param class_name - the class name to parse
  * @param css_properties - Set of valid CSS properties from `load_css_properties()`
  *                         Pass `null` to skip property validation.
@@ -487,14 +508,15 @@ export const parse_css_literal = (
 	// If any remain, they're unknown modifiers (since we already separated property:value)
 	if (modifier_result.remaining.length > 0) {
 		const unknown = modifier_result.remaining[0]!;
-		const suggestion = suggest_modifier(unknown);
+		const hint = to_modifier_argument_hint(unknown);
+		const suggestion = hint ? null : suggest_modifier(unknown);
 		return {
 			ok: false,
 			error: {
 				level: 'error',
 				message: `Unknown modifier "${unknown}"`,
 				identifier: class_name,
-				suggestion: suggestion ? `Did you mean "${suggestion}"?` : null
+				suggestion: hint ?? (suggestion ? `Did you mean "${suggestion}"?` : null)
 			}
 		};
 	}
@@ -503,20 +525,38 @@ export const parse_css_literal = (
 
 	// Validate property
 	if (!is_valid_css_property(property, css_properties)) {
-		const suggestion = suggest_css_property(property, css_properties);
+		// a modifier with an invalid argument lands here when only one segment
+		// follows it (`min-width(800):p_md`)
+		const hint = to_modifier_argument_hint(property);
+		const suggestion = hint ? null : suggest_css_property(property, css_properties);
 		return {
 			ok: false,
 			error: {
 				level: 'error',
 				message: `Unknown CSS property "${property}"`,
 				identifier: class_name,
-				suggestion: suggestion ? `Did you mean "${suggestion}"?` : null
+				suggestion: hint ?? (suggestion ? `Did you mean "${suggestion}"?` : null)
 			}
 		};
 	}
 
 	// Format value
 	const formatted_value = format_css_value(value);
+
+	// the value renders verbatim into the stylesheet, so one that could end its
+	// declaration or rule would swallow the rules after it
+	if (!css_value_is_contained(formatted_value.replace(IMPORTANT_SUFFIX_MATCHER, ''))) {
+		return {
+			ok: false,
+			error: {
+				level: 'error',
+				message: `Uncontained CSS value "${formatted_value}": it could end its declaration or rule`,
+				identifier: class_name,
+				suggestion:
+					'Balance its quotes and brackets, and keep braces, comments, and escapes inside strings'
+			}
+		};
+	}
 
 	// Check for calc warnings
 	const calc_warning = check_calc_expression(formatted_value);
@@ -549,80 +589,10 @@ export const parse_css_literal = (
 //
 
 /**
- * Generates the CSS selector for a parsed CSS-literal class.
- * Includes state pseudo-classes and pseudo-element in the selector.
- */
-export const generate_selector = (escaped_class_name: string, parsed: ParsedCssLiteral): string => {
-	let selector = `.${escaped_class_name}`;
-
-	// Add state pseudo-classes
-	for (const state of parsed.states) {
-		selector += state.css;
-	}
-
-	// Add pseudo-element (must come last)
-	if (parsed.pseudo_element) {
-		selector += parsed.pseudo_element.css;
-	}
-
-	return selector;
-};
-
-/**
  * Generates the CSS declaration for a parsed CSS-literal class.
  */
 export const generate_declaration = (parsed: ParsedCssLiteral): string => {
 	return `${parsed.property}: ${parsed.value};`;
-};
-
-/**
- * Information needed to generate CSS output for a CSS-literal class.
- */
-export interface CssLiteralOutput {
-	/** CSS declaration (property: value;) */
-	declaration: string;
-	/** Full CSS selector including pseudo-classes/elements */
-	selector: string;
-	/** Media query wrapper if any */
-	media_wrapper: string | null;
-	/** Ancestor wrapper if any */
-	ancestor_wrapper: string | null;
-}
-
-/**
- * Interprets a CSS-literal class and returns CSS generation info.
- *
- * Callers should first check `is_possible_css_literal()` to filter non-CSS-literal classes.
- *
- * @param class_name - the class name to interpret
- * @param escaped_class_name - the CSS-escaped version of the class name
- * @param css_properties - Set of valid CSS properties from `load_css_properties()`
- *                         Pass `null` to skip property validation.
- * @returns result with output and warnings on success, or error on failure
- */
-export const interpret_css_literal = (
-	class_name: string,
-	escaped_class_name: string,
-	css_properties: Set<string> | null
-): InterpretCssLiteralResult => {
-	const result = parse_css_literal(class_name, css_properties);
-
-	if (!result.ok) {
-		return { ok: false, error: result.error };
-	}
-
-	const { parsed, diagnostics } = result;
-
-	return {
-		ok: true,
-		output: {
-			declaration: generate_declaration(parsed),
-			selector: generate_selector(escaped_class_name, parsed),
-			media_wrapper: parsed.media?.css ?? null,
-			ancestor_wrapper: parsed.ancestor?.css ?? null
-		},
-		warnings: diagnostics
-	};
 };
 
 //
@@ -718,43 +688,3 @@ const contextualize_error = (
 	...error,
 	identifier: context_class_name
 });
-
-/**
- * Generates simple CSS for a CSS-literal class (without grouping).
- * Used by the interpreter for basic output.
- *
- * @param output - the CSS-literal output info
- * @returns CSS string for this class
- */
-export const generate_css_literal_simple = (output: CssLiteralOutput): string => {
-	let css = '';
-	let indent = '';
-
-	// Open media wrapper if present
-	if (output.media_wrapper) {
-		css += `${output.media_wrapper} {\n`;
-		indent = '\t';
-	}
-
-	// Open ancestor wrapper if present
-	if (output.ancestor_wrapper) {
-		css += `${indent}${output.ancestor_wrapper} {\n`;
-		indent += '\t';
-	}
-
-	// Write the rule
-	css += `${indent}${output.selector} { ${output.declaration} }\n`;
-
-	// Close ancestor wrapper
-	if (output.ancestor_wrapper) {
-		indent = indent.slice(0, -1);
-		css += `${indent}}\n`;
-	}
-
-	// Close media wrapper
-	if (output.media_wrapper) {
-		css += '}\n';
-	}
-
-	return css;
-};

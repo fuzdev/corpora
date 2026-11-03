@@ -1,6 +1,22 @@
 <script lang="ts">
-	import { format_speedup } from './benchmark_data.ts';
-	import type { BenchmarksCliReport, CliScenario, CliFormatterResult } from './benchmarks_cli.ts';
+	import { plural } from '@fuzdev/fuz_util/string.ts';
+
+	import { to_baseline_key } from './benchmark_baseline.ts';
+	import {
+		format_cli_corpus,
+		format_count,
+		format_mib,
+		format_ms,
+		format_speedup
+	} from './benchmark_display.ts';
+	import {
+		cli_default_anchor_label,
+		cli_ratio_between,
+		type BenchmarksCliReport,
+		type CliScenario,
+		type CliFormatterResult,
+		type CliMetric
+	} from './benchmarks_cli.ts';
 
 	const {
 		report
@@ -8,118 +24,152 @@
 		report: BenchmarksCliReport;
 	} = $props();
 
-	// listed as the harness reported them, so a formatter added or dropped upstream
-	// shows up here instead of silently rendering `undefined` for a fixed key
-	const versions = $derived(
-		Object.entries(report.versions)
-			.map(([name, version]) => `${name} ${version}`)
-			.join(', ')
-	);
+	// the row the pointer is over re-baselines its own table, as the format, parse,
+	// and size groups do (`to_baseline_key`); only one row is ever hovered, so one
+	// slot serves every table
+	let hovered: { scenario_key: string; label: string } | undefined = $state(undefined);
+	const to_hovered = (event: PointerEvent, scenario_key: string): typeof hovered => {
+		const label = to_baseline_key(event);
+		return label === undefined ? undefined : { scenario_key, label };
+	};
 
-	const format_time = (ms: number): string =>
-		ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
-
-	// tsv is the reference row; every ratio is `other / tsv` (>1 = tsv is that many
-	// times faster / lighter). Returns null for the tsv row itself.
+	// Every ratio is `anchor / row` (>1 = the row is that many times faster or lighter
+	// than the anchor; `format_speedup` prints a worse row negated, as the charts do),
+	// through the same `cli_ratio_between` the page's prose quotes. The anchor is
+	// the hovered row, else the scenario's default (`cli_default_anchor_label`: the
+	// dispatcher row facing other tools, native tsv in the tsv-only table).
+	// `undefined` on the anchor row itself and wherever a side wasn't measured. A
+	// scenario with no tsv row has nothing to anchor on and renders no table.
 	interface Row {
 		result: CliFormatterResult;
-		is_tsv: boolean;
-		wall_ratio: number | null;
-		cpu_ratio: number | null;
-		memory_ratio: number | null;
+		is_anchor: boolean;
+		wall_ratio: number | undefined;
+		cpu_ratio: number | undefined;
+		memory_ratio: number | undefined;
 	}
-	const to_rows = (scenario: CliScenario): Array<Row> => {
-		const tsv = scenario.results.find((r) => r.label === 'tsv');
-		if (!tsv) return [];
+	const to_anchor_label = (scenario: CliScenario): string | undefined =>
+		hovered?.scenario_key === scenario.key ? hovered.label : cli_default_anchor_label(scenario);
+	const to_rows = (scenario: CliScenario, anchor_label: string | undefined): Array<Row> => {
+		if (anchor_label === undefined) return [];
 		return scenario.results.map((result) => {
-			const is_tsv = result === tsv;
+			const is_anchor = result.label === anchor_label;
+			const ratio = (metric: CliMetric) =>
+				is_anchor
+					? undefined
+					: cli_ratio_between(scenario.results, anchor_label, result.label, metric);
 			return {
 				result,
-				is_tsv,
-				wall_ratio: is_tsv ? null : result.wall_ms / tsv.wall_ms,
-				cpu_ratio: is_tsv ? null : result.cpu_ms / tsv.cpu_ms,
-				memory_ratio:
-					is_tsv || result.memory_mb == null || tsv.memory_mb == null
-						? null
-						: result.memory_mb / tsv.memory_mb
+				is_anchor,
+				wall_ratio: ratio('wall_ms'),
+				cpu_ratio: ratio('cpu_ms'),
+				memory_ratio: ratio('memory_mb')
 			};
 		});
 	};
+	// the anchor's own cells read as the unit they are; an unmeasured side stays a dash
+	const format_cell = (row: Row, ratio: number | undefined, measured: boolean): string =>
+		ratio != null ? format_speedup(ratio) : row.is_anchor && measured ? format_speedup(1) : '—';
 </script>
 
 {#each report.scenarios as scenario (scenario.key)}
-	<div class="scenario">
+	{@const anchor_label = to_anchor_label(scenario)}
+	{@const rows = to_rows(scenario, anchor_label)}
+	<div class="mb_xl5">
 		<h3>{scenario.heading}: {scenario.target}</h3>
 		<p>{scenario.description}</p>
-		<div class="table-scroll">
-			<table>
-				<thead>
-					<tr>
-						<th class="formatter">formatter</th>
-						<th>time</th>
-						<th>vs tsv</th>
-						<th>vs tsv (CPU work)</th>
-						<th>peak RSS</th>
-						<th>vs tsv</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each to_rows(scenario) as row (row.result.label)}
-						<tr class:tsv={row.is_tsv}>
-							<td class="formatter">{row.result.label}</td>
-							<td>{format_time(row.result.wall_ms)}</td>
-							<td class="speedup">
-								{row.wall_ratio == null ? '—' : format_speedup(row.wall_ratio)}
-							</td>
-							<td class="speedup">{row.cpu_ratio == null ? '—' : format_speedup(row.cpu_ratio)}</td>
-							<td>
-								{row.result.memory_mb == null ? '—' : `${Math.round(row.result.memory_mb)} MB`}
-							</td>
-							<td class="speedup">
-								{row.memory_ratio == null ? '—' : format_speedup(row.memory_ratio)}
-							</td>
+		{#if rows.length > 0}
+			<div class="benchmarks-table-scroll">
+				<table class="benchmarks-table">
+					<thead>
+						<tr>
+							<th scope="col" class="formatter">formatter</th>
+							<th scope="col">time</th>
+							<th scope="col">time ratio</th>
+							<th scope="col">CPU ratio</th>
+							<th scope="col">peak RSS</th>
+							<th scope="col">RSS ratio</th>
 						</tr>
-					{/each}
-				</tbody>
-			</table>
-		</div>
+					</thead>
+					<!-- hover re-baselines this table's ratios only, and `pointerleave` restores the
+						default anchor; no focus path, as `BenchmarksBaselineGroup` -->
+					<tbody
+						onpointerover={(event) => (hovered = to_hovered(event, scenario.key))}
+						onpointerleave={() => (hovered = undefined)}
+					>
+						{#each rows as row (row.result.label)}
+							<tr class:anchor={row.is_anchor} data-baseline-key={row.result.label}>
+								<th scope="row" class="formatter">{row.result.label}</th>
+								<td>{format_ms(row.result.wall_ms)}</td>
+								<td class="speedup">
+									{format_cell(row, row.wall_ratio, true)}
+								</td>
+								<td class="speedup">
+									{format_cell(row, row.cpu_ratio, true)}
+								</td>
+								<td>{format_mib(row.result.memory_mb)}</td>
+								<td class="speedup">
+									{format_cell(row, row.memory_ratio, row.result.memory_mb != null)}
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+		<!-- one note per table: the corpus revision and size, and the run counts; the section's
+			notes say how memory is measured -->
+		<p>
+			<small>
+				Corpus:
+				{format_cli_corpus(scenario.corpus)}{scenario.files
+					? `, ${format_count(scenario.files)} file${plural(scenario.files)}`
+					: ''}.
+				{#if rows.length > 0 && scenario.benchmark_runs > 0}
+					Each time is the mean of {scenario.benchmark_runs} runs after {scenario.warmup_runs}
+					warmups.
+				{/if}
+			</small>
+		</p>
+		{#if scenario.unshimmed}
+			<p><small>{scenario.unshimmed}</small></p>
+		{/if}
+		{#if scenario.aborted}
+			<p>{scenario.aborted}</p>
+		{/if}
 	</div>
 {/each}
 
-<p class="versions">
-	Measured on {report.machine} — {versions}. Wall-clock ratios scale with core count; "vs tsv (CPU
-	work)" is the parallelism-neutral view.
-</p>
-
 <style>
-	.scenario {
-		margin-bottom: var(--space_xl2);
-	}
-	/* wide table scrolls in its own container so the page body never scrolls sideways */
-	.table-scroll {
-		overflow-x: auto;
-	}
+	/* fixed columns, so re-baselining on hover changes the ratios' text and nothing
+	   else; the floor keeps a narrow screen scrolling rather than squeezing */
 	table {
-		width: 100%;
+		table-layout: fixed;
+		min-width: 64rem;
 	}
 	th,
 	td {
-		padding: var(--space_xs) var(--space_sm);
 		text-align: right;
+		font-variant-numeric: tabular-nums;
 		white-space: nowrap;
 	}
 	.formatter {
+		width: 30%;
 		text-align: left;
 	}
 	.speedup {
 		font-weight: 600;
 	}
-	tr.tsv {
-		font-weight: 700;
-		background-color: var(--fg_10);
+	/* the row every ratio in the table is currently taken against — the default, or
+	   whichever row is hovered — marked as the bar groups mark theirs; a row's
+	   background means nothing else here, so the base `tr:hover` tint is matched to it */
+	tr.anchor,
+	tbody tr:hover {
+		background-color: var(--ink_05);
 	}
-	.versions {
-		font-size: var(--font_size_sm);
-		opacity: 0.7;
+	tr.anchor .formatter {
+		box-shadow: inset var(--border_width_3) 0 0 var(--ink_50);
+	}
+	tr.anchor .speedup {
+		color: var(--text_40);
 	}
 </style>

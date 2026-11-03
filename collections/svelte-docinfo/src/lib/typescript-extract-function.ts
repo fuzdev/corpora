@@ -9,20 +9,23 @@
  * @see `typescript-extract-shared.ts` for shared helpers (signatures,
  *   overloads, generics, reactivity)
  *
+ * @internal
+ *
  * @module
  */
 
 import ts from 'typescript';
 
 import type { DeclarationJsonBuild } from './declaration-build.ts';
-import { to_error_message } from './error.ts';
-import type { TsdocParsedComment } from './tsdoc.ts';
-import { resolveTypeInfo } from './typescript-extract-type-json.ts';
+import { toErrorMessage } from './error.ts';
+import { functionInitializer, type TsdocParsedComment } from './tsdoc.ts';
+import { resolveTypeInfo, writtenTypeAnnotation } from './typescript-extract-type-json.ts';
 import {
 	detectReactivity,
 	getNodeLocation,
 	parseGenericParam,
 	populateCallableMember,
+	signatureTypeParameters,
 	type ExtractContext
 } from './typescript-extract-shared.ts';
 
@@ -59,27 +62,33 @@ export const extractFunctionInfo = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to analyze signature for "${symbol.name}": ${to_error_message(err)}`,
+			message: `Failed to analyze signature for "${symbol.name}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			functionName: symbol.name
 		});
 	}
 
-	// Extract generic type parameters
-	let typeParameters: ts.NodeArray<ts.TypeParameterDeclaration> | undefined;
+	// Extract generic type parameters, the checker's reading
+	// (`signatureTypeParameters`), so a JS function's `@template` tags count
+	// like `<T>`. A JS function with `@overload` tags is documented by its
+	// overloads, so its generics are its first overload's, as a TypeScript
+	// function's are, and the implementation's `@template` tags are hidden
+	let typeParameters: ReadonlyArray<ts.TypeParameterDeclaration> | undefined;
 	if (ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
-		typeParameters = node.typeParameters;
+		typeParameters = signatureTypeParameters(node);
 	} else if (ts.isVariableDeclaration(node)) {
-		if (node.type && ts.isFunctionTypeNode(node.type)) {
-			// `export const fn: <T>(x: T) => T = (x) => x` — generics on the type annotation.
-			// Annotation wins over initializer when both carry generics: it's the public type.
-			typeParameters = node.type.typeParameters;
-		} else if (
-			node.initializer &&
-			(ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
-		) {
-			// `export const foo = <T>(x: T) => x` — generics live on the initializer, not the variable.
-			typeParameters = node.initializer.typeParameters;
+		const annotation = writtenTypeAnnotation(node);
+		if (annotation && ts.isFunctionTypeNode(annotation)) {
+			// `export const fn: <T>(x: T) => T = (x) => x` (or a JS `@type` writing
+			// it) — generics on the type annotation. Annotation wins over
+			// initializer when both carry generics: it's the public type.
+			typeParameters = annotation.typeParameters;
+		} else {
+			// `export const foo = <T>(x: T) => x` — generics live on the initializer,
+			// not the variable. In JS the statement's `@template` tags are the
+			// initializer's
+			const initializer = functionInitializer(node);
+			if (initializer) typeParameters = signatureTypeParameters(initializer);
 		}
 	}
 	if (typeParameters?.length) {
@@ -108,7 +117,7 @@ export const extractVariableInfo = (
 	try {
 		const type = checker.getTypeOfSymbolAtLocation(symbol, node);
 		declaration.typeSignature = checker.typeToString(type);
-		const annotation = ts.isVariableDeclaration(node) ? node.type : undefined;
+		const annotation = ts.isVariableDeclaration(node) ? writtenTypeAnnotation(node) : undefined;
 		const typeInfo = resolveTypeInfo(type, checker, ctx.aliasRegistry, false, {
 			writtenNode: annotation
 		});
@@ -121,7 +130,7 @@ export const extractVariableInfo = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to extract type for variable "${symbol.name}": ${to_error_message(err)}`,
+			message: `Failed to extract type for variable "${symbol.name}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			symbolName: symbol.name
 		});

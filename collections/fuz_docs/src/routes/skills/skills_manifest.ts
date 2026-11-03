@@ -15,19 +15,9 @@ export const skills: Array<SkillMeta> = [
 			"Development conventions and coding patterns for the @fuzdev ecosystem — naming, file organization, testing, styling, documentation, and tooling for TypeScript, Svelte 5, and Rust projects. Use when writing or reviewing code in any @fuzdev project. Triggers include running gro commands (gro check, gro test, gro gen), styling with fuz_css, writing or splitting tests, generating code with .gen.ts files, naming functions or variables (snake_case conventions), organizing files in src/lib/ or src/test/, writing TSDoc comments, creating Svelte 5 components with runes, or formatting code. Also use for the Result type, fixture-based testing, CSS utility classes, TODO_ docs, breaking changes policy, async concurrency patterns, Gro task system, type utilities (Flavored, Branded), dependency injection patterns (*Deps/*Options/*Context interfaces, AppDeps, RuntimeDeps, mock factories), or setting up documentation (tomes, svelte-docinfo, API routes, docs layout). Also covers the ecosystem's Rust workspaces — cargo and clippy lints, thiserror error handling, the dependency-injection escalation ladder, enum-dispatch and make-impossible-states idioms, spine-consumer servers (zzz_server, fuz_forge_server), daemon lifecycle, and CLI and xtask patterns. Triggers include running cargo or clippy, editing Cargo.toml, naming or organizing Rust crates, or working on the fuz and fuzd daemon, the zap convergence engine, or the spine crates.",
 		references: [
 			{
-				slug: 'async-patterns',
-				title: 'Async Patterns',
-				description: 'Concurrency primitives — semaphore, deferred, concurrent map/each'
-			},
-			{
 				slug: 'code-generation',
 				title: 'Code Generation',
-				description: 'Gro gen system — .gen.* files, dependencies, output formats'
-			},
-			{
-				slug: 'common-utilities',
-				title: 'Common Utilities',
-				description: 'Result type, Logger, Timings, DAG execution'
+				description: 'Gro gen system — .gen.* files, inputs, output formats'
 			},
 			{
 				slug: 'css-patterns',
@@ -51,9 +41,10 @@ export const skills: Array<SkillMeta> = [
 				description: 'Docs pipeline — Tome system, layout architecture, project setup'
 			},
 			{
-				slug: 'file-organization',
-				title: 'File Organization',
-				description: 'src/ tree, domain subdirectories, full-path imports, test mirroring'
+				slug: 'fuz-util',
+				title: 'fuz_util',
+				description:
+					'fuz_util — Result, error helpers, Logger, Timings, concurrency, DAG, type utilities'
 			},
 			{
 				slug: 'mdz',
@@ -114,16 +105,12 @@ export const skills: Array<SkillMeta> = [
 			{
 				slug: 'twin-impl',
 				title: 'Twin Implementations (TS ↔ Rust)',
-				description: 'TS ↔ Rust twin implementations — convergence, naming parity, wire crates'
-			},
-			{
-				slug: 'type-utilities',
-				title: 'Type Utilities',
-				description: 'Nominal typing (Flavored/Branded), strict utility types'
+				description:
+					'TS ↔ Rust twin implementations — convergence, naming parity, wire crates, digests'
 			},
 			{
 				slug: 'wasm-patterns',
-				title: 'WASM Patterns for the Fuz Ecosystem',
+				title: 'WASM Patterns',
 				description: 'WASM/N-API build targets — wasm-bindgen, component model, JS interop'
 			},
 			{
@@ -137,7 +124,7 @@ export const skills: Array<SkillMeta> = [
 		name: 'grimoire',
 		title: 'Grimoire',
 		description:
-			'Navigate and maintain a grimoire — a markdown meta-repo that coordinates work across multiple sibling repositories. Covers the three primitives: skills (agent knowledge files), lore (per-repo planning projections), and quests (cross-repo goals). Use when orienting work across repos, reading project planning context, checking TODOs before working on a project, updating planning docs after completing work, creating or updating lore entries, drafting new quests, deciding whether to create a quest vs a lore TODO, pruning stale decisions from lore entries, or understanding grimoire conventions and structure.',
+			'Navigate and maintain a grimoire — a markdown meta-repo that coordinates work across sibling repos through lore (per-repo planning context), quests (cross-repo goals), and arcs (long-running implementation efforts). Use when orienting across repos, reading or updating planning docs, creating lore entries or quests, choosing between a lore TODO, a quest, and an arc, pruning stale lore, running a tending pass, adding self-observation checks, or applying grimoire conventions.',
 		references: []
 	}
 ];

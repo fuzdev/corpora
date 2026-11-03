@@ -1,11 +1,12 @@
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { fs_exists } from '@fuzdev/fuz_util/fs.ts';
 import { identity } from '@fuzdev/fuz_util/function.ts';
-import type { PathFilter, PathId } from '@fuzdev/fuz_util/path.ts';
+import type { PathFilter } from '@fuzdev/fuz_util/path.ts';
 import { json_stringify_deterministic } from '@fuzdev/fuz_util/json.ts';
 import { hash_blake3 } from '@fuzdev/fuz_util/hash_blake3.ts';
 
-import { GRO_DIST_DIR, IS_THIS_GRO, paths } from './paths.ts';
+import { paths } from './paths.ts';
 import {
 	GRO_CONFIG_FILENAME,
 	JS_CLI_DEFAULT,
@@ -18,7 +19,7 @@ import {
 import create_default_config from './gro.config.default.ts';
 import type { PluginsCreateConfig } from './plugin.ts';
 import type { PackageJsonMapper } from './package_json.ts';
-import type { FilerOptions } from './filer.ts';
+import type { WatchOptions } from './module_graph.ts';
 
 /**
  * BLAKE3 hash of empty string, used for configs without `build_cache_config`.
@@ -44,13 +45,11 @@ export interface GroConfig extends RawGroConfig {
 	 */
 	map_package_json: PackageJsonMapper | null;
 	/**
-	 * The root directories to search for tasks given implicit relative input paths.
-	 * Defaults to `./src/lib`, then the cwd, then the Gro package dist.
-	 */
-	task_root_dirs: Array<PathId>;
-	/**
-	 * When searching the filesystem for tasks and genfiles,
+	 * When searching the filesystem for tasks, genfiles, and files to format,
 	 * directories and files are included if they pass all of these filters.
+	 * Each filter gets the path relative to the project root, like `src/lib/foo.ts`,
+	 * whichever directory a search starts in, so the directories above the root
+	 * never exclude anything; a path outside the root gets its absolute id.
 	 */
 	search_filters: Array<PathFilter>;
 	/**
@@ -62,17 +61,17 @@ export interface GroConfig extends RawGroConfig {
 	 */
 	pm_cli: string;
 	/**
-	 * SHA-256 hash of the user's `build_cache_config` from `gro.config.ts`.
-	 * This is computed during config normalization and the raw value is immediately deleted.
+	 * BLAKE3 hash of the user's `build_cache_config` from `gro.config.ts`, as deterministic JSON.
+	 * This is computed during config normalization, which then drops the raw value from the config.
 	 * If no `build_cache_config` was provided, this is the hash of an empty string.
 	 * @see `RawGroConfig.build_cache_config`
 	 */
 	build_cache_config_hash: string;
 	/**
-	 * Options passed to the `Filer` for file watching and import resolution.
-	 * @see `FilerOptions`
+	 * What the task context's `graph` and `watcher` watch.
+	 * Defaults to `src/` with no filter.
 	 */
-	filer_options: Partial<FilerOptions> | null;
+	watch: WatchOptions;
 }
 
 /**
@@ -83,7 +82,6 @@ export interface GroConfig extends RawGroConfig {
 export interface RawGroConfig {
 	plugins?: PluginsCreateConfig;
 	map_package_json?: PackageJsonMapper | null;
-	task_root_dirs?: Array<string>;
 	search_filters?: PathFilter | Array<PathFilter> | null;
 	js_cli?: string;
 	pm_cli?: string;
@@ -99,16 +97,17 @@ export interface RawGroConfig {
 	 *
 	 * Can be a static object or an async function that returns an object.
 	 *
-	 * IMPORTANT: It's safe to include secrets here because they are hashed and `delete`d
-	 * during config normalization. The raw value is never logged or persisted.
+	 * Gro stores only an unkeyed hash of the value in `.gro/build.json` and never logs the raw value.
+	 * The hash hides only high-entropy values: when every value in the object is short or
+	 * guessable, such as flags and known URLs, hashing candidates recovers them.
+	 * The process still holds the raw values it read, as in `process.env`.
 	 */
 	build_cache_config?:
 		Record<string, unknown> | (() => Record<string, unknown> | Promise<Record<string, unknown>>);
 	/**
-	 * Options passed to the `Filer` for file watching and import resolution.
-	 * @see `FilerOptions`
+	 * What the task context's `graph` and `watcher` watch, each field defaulting separately.
 	 */
-	filer_options?: Partial<FilerOptions> | null;
+	watch?: Partial<WatchOptions>;
 }
 
 export type CreateGroConfig = (base_config: GroConfig) => RawGroConfig | Promise<RawGroConfig>;
@@ -116,32 +115,26 @@ export type CreateGroConfig = (base_config: GroConfig) => RawGroConfig | Promise
 export const create_empty_gro_config = (): GroConfig => ({
 	plugins: () => [],
 	map_package_json: identity,
-	task_root_dirs: [
-		// TODO maybe disable if no SvelteKit `lib` directory? or other detection to improve defaults
-		paths.lib,
-		IS_THIS_GRO ? null : paths.root,
-		IS_THIS_GRO ? null : GRO_DIST_DIR
-	].filter((v) => v !== null),
 	search_filters: [(id) => !SEARCH_EXCLUDER_DEFAULT.test(id)],
 	js_cli: JS_CLI_DEFAULT,
 	pm_cli: PM_CLI_DEFAULT,
 	build_cache_config_hash: EMPTY_BUILD_CACHE_CONFIG_HASH,
-	filer_options: null
+	watch: { dir: paths.source, filter: null }
 });
 
 /**
  * The regexp used by default to exclude directories and files
- * when searching the filesystem for tasks and genfiles.
+ * when searching the filesystem for tasks and genfiles,
+ * tested against paths relative to the project root.
  * Customize via `search_filters` in the `GroConfig`.
  * See the test cases for the exact behavior.
  */
 export const SEARCH_EXCLUDER_DEFAULT = new RegExp(
 	`(${
 		'(^|/)\\.[^/]+' + // exclude all `.`-prefixed directories
-		// TODO probably change to `pkg.name` instead of this catch-all (also `gro` below)
-		`|(^|/)${NODE_MODULES_DIRNAME}(?!/(@[^/]+/)?gro/${SVELTEKIT_DIST_DIRNAME})` + // exclude `node_modules` unless it's to the Gro directory
+		`|(^|/)${NODE_MODULES_DIRNAME}` +
 		`|(^|/)${SVELTEKIT_BUILD_DIRNAME}` + // exclude the SvelteKit build directory
-		`|(^|/)(?<!(^|/)gro/)${SVELTEKIT_DIST_DIRNAME}` + // exclude the SvelteKit dist directory unless it's in the Gro directory
+		`|(^|/)${SVELTEKIT_DIST_DIRNAME}` + // exclude the SvelteKit dist directory
 		`|(^|/)${SERVER_DIST_PATH}` // exclude the Gro server plugin dist directory
 	})($|/)`,
 	'u'
@@ -150,7 +143,7 @@ export const SEARCH_EXCLUDER_DEFAULT = new RegExp(
 /**
  * Transforms a `RawGroConfig` to the more strict `GroConfig`.
  * This allows users to provide a more relaxed config.
- * Hashes the `build_cache_config` and deletes the raw value for security.
+ * Hashes the `build_cache_config` and drops the raw value from the config.
  */
 export const cook_gro_config = async (raw_config: RawGroConfig): Promise<GroConfig> => {
 	const empty_config = create_empty_gro_config();
@@ -160,16 +153,14 @@ export const cook_gro_config = async (raw_config: RawGroConfig): Promise<GroConf
 	const {
 		plugins = empty_config.plugins,
 		map_package_json = empty_config.map_package_json,
-		task_root_dirs = empty_config.task_root_dirs,
 		search_filters = empty_config.search_filters,
 		js_cli = empty_config.js_cli,
 		pm_cli = empty_config.pm_cli,
 		build_cache_config,
-		filer_options = empty_config.filer_options
+		watch
 	} = raw_config;
 
-	// Hash build_cache_config and delete the raw value
-	// IMPORTANT: Raw value may contain secrets - hash it and delete immediately
+	// hash build_cache_config and drop the raw value, so it isn't passed around with the config
 	let build_cache_config_hash: string;
 	if (!build_cache_config) {
 		build_cache_config_hash = EMPTY_BUILD_CACHE_CONFIG_HASH;
@@ -182,13 +173,12 @@ export const cook_gro_config = async (raw_config: RawGroConfig): Promise<GroConf
 		build_cache_config_hash = hash_blake3(json_stringify_deterministic(resolved));
 	}
 
-	// Delete the raw value to ensure it doesn't persist in memory
+	// `delete` drops the reference, it doesn't scrub memory
 	delete (raw_config as any).build_cache_config;
 
 	return {
 		plugins,
 		map_package_json,
-		task_root_dirs: task_root_dirs.map((p) => resolve(p)),
 		search_filters: Array.isArray(search_filters)
 			? search_filters
 			: search_filters
@@ -197,7 +187,10 @@ export const cook_gro_config = async (raw_config: RawGroConfig): Promise<GroConf
 		js_cli,
 		pm_cli,
 		build_cache_config_hash,
-		filer_options: filer_options ?? null
+		watch: {
+			dir: resolve(watch?.dir ?? empty_config.watch.dir),
+			filter: watch?.filter ?? empty_config.watch.filter
+		}
 	};
 };
 
@@ -217,7 +210,7 @@ export const load_gro_config = async (dir = paths.root): Promise<GroConfig> => {
 	}
 
 	// Import the user's `gro.config.ts`.
-	const config_module = await import(config_path);
+	const config_module = await import(pathToFileURL(config_path).href);
 
 	validate_gro_config_module(config_module, config_path);
 

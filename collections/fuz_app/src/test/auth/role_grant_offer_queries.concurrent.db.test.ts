@@ -2,9 +2,9 @@
  * Concurrent-race tests for the offer surface.
  *
  * True `SELECT FOR UPDATE` / row-lock serialization requires two concurrent
- * transactions against a real `pg` pool — PGlite runs transactions serially,
- * so the cross-tx interleavings that matter here are only reachable with
- * real connection-level concurrency. Runs against `pg_factory` only;
+ * transactions against a real `pg` pool — the in-memory drivers (pglet,
+ * PGlite) run transactions serially, so the cross-tx interleavings that matter
+ * here are only reachable with real connection-level concurrency. Runs against `pg_factory` only;
  * skipped when `TEST_DATABASE_URL` is unset.
  *
  * @module
@@ -12,10 +12,10 @@
 
 import { assert, test } from 'vitest';
 
-import { query_accept_offer } from '$lib/auth/role_grant_offer_queries.ts';
-import { query_create_role_grant, query_revoke_role_grant } from '$lib/auth/role_grant_queries.ts';
-import type { Db } from '$lib/db/db.ts';
-import { create_describe_db, auth_integration_truncate_tables } from '$lib/testing/db.ts';
+import { query_accept_offer } from '#lib/auth/role_grant_offer_queries.ts';
+import { query_create_role_grant, query_revoke_role_grant } from '#lib/auth/role_grant_queries.ts';
+import type { Db } from '#lib/db/db.ts';
+import { create_describe_db, auth_integration_truncate_tables } from '#lib/testing/db.ts';
 
 import { pg_factory } from '../db_fixture.ts';
 import { make_account, create_pending_offer } from './role_grant_offer_queries.fixtures.ts';

@@ -21,12 +21,15 @@
 import { Logger, type Logger as LoggerType } from '@fuzdev/fuz_util/log.ts';
 
 import { create_jsonrpc_notification, to_jsonrpc_params } from '../http/jsonrpc_helpers.ts';
-import type { ActionDispatcher } from './action_dispatcher.ts';
 import type { ActionSpecUnion } from './action_spec.ts';
-import {
-	is_filterable_broadcast_transport,
-	type ConnectionIdentity
-} from './transports_ws_backend.ts';
+import type { ConnectionRegistry, ConnectionIdentity } from './connection_registry.ts';
+
+/**
+ * What a broadcast is sent through — the fan-out half of
+ * `ConnectionRegistry`. A structural `Pick`, so a test or another
+ * registry can stand in.
+ */
+export type BroadcastTarget = Pick<ConnectionRegistry, 'broadcast' | 'broadcast_filtered'>;
 
 /**
  * Per-connection delivery predicate for subscription ACLs.
@@ -38,15 +41,19 @@ import {
  * `method` is the action method name.
  */
 export type ShouldDeliverFn = (
-	connection: ConnectionIdentity,
+	connection: Readonly<ConnectionIdentity>,
 	method: string,
 	input: unknown
 ) => boolean;
 
 /** Options for `create_broadcast_api`. */
 export interface CreateBroadcastApiOptions {
-	/** The peer holding the transport registry used for sends. */
-	peer: ActionDispatcher;
+	/**
+	 * The connection registry broadcasts go out on — typically the WS endpoint's
+	 * `ConnectionRegistry` (`AppServer.ws_endpoints[path]`, or the one a
+	 * `WsEndpointSpec.registry` supplies).
+	 */
+	registry: BroadcastTarget;
 	/**
 	 * Notification specs to expose as broadcast methods. Typically the
 	 * `remote_notification` specs whose initiator is `backend` (or `both`).
@@ -58,23 +65,12 @@ export interface CreateBroadcastApiOptions {
 	log?: LoggerType | null;
 	/**
 	 * Optional per-connection ACL predicate. When set, the broadcast fans out
-	 * via the transport's `broadcast_filtered` (feature-detected) — each
-	 * connection's identity is checked before the message is sent. When
-	 * unset, the transport broadcasts unfiltered via `transport.send`.
-	 *
-	 * Requires a transport that implements `FilterableBroadcastTransport`
-	 * (today: only `BackendWebsocketTransport`). If set and the active
-	 * transport is not filterable, the send is skipped and an error logged.
+	 * via the registry's `broadcast_filtered` — each connection's identity is
+	 * checked before the message is sent. When unset, the registry broadcasts
+	 * unfiltered via `registry.broadcast`.
 	 */
 	should_deliver?: ShouldDeliverFn;
 }
-
-/**
- * Loose base shape for a broadcast API. Consumers typically declare a
- * stricter per-method interface (e.g. `BackendActionsApi`) and pin it via
- * the type parameter on `create_broadcast_api`.
- */
-export type BroadcastApi = Record<string, (input: never) => Promise<void>>;
 
 /**
  * Builds a typed broadcast API from a set of action specs.
@@ -82,11 +78,11 @@ export type BroadcastApi = Record<string, (input: never) => Promise<void>>;
  * For each spec, adds a method keyed by `spec.method` that:
  * - Validates `input` against the spec's Zod schema (logs and returns on failure)
  * - Creates a JSON-RPC notification from the validated input
- * - Broadcasts via the peer (filtered by `should_deliver` when supplied)
+ * - Broadcasts on the registry (filtered by `should_deliver` when supplied)
  *
- * Silently returns when no transport is ready (e.g. before any clients
- * connect). Errors during send are logged but never thrown — broadcasts are
- * fire-and-forget from the handler's perspective.
+ * A broadcast with no connections reaches nobody and is not an error. Errors
+ * during send are logged but never thrown — broadcasts are fire-and-forget from
+ * the handler's perspective.
  *
  * ## Typed consumer surface
  *
@@ -99,7 +95,7 @@ export type BroadcastApi = Record<string, (input: never) => Promise<void>>;
  * }
  *
  * const api = create_broadcast_api<BackendActionsApi>({
- *   peer: backend.peer,
+ *   registry: app_server.ws_endpoints['/api/ws']!,
  *   specs: [filer_change_action_spec, workspace_changed_action_spec],
  * });
  * ```
@@ -111,55 +107,39 @@ export type BroadcastApi = Record<string, (input: never) => Promise<void>>;
 export const create_broadcast_api = <TApi extends object>(
 	options: CreateBroadcastApiOptions
 ): TApi => {
-	const { peer, specs, should_deliver } = options;
+	const { registry, specs, should_deliver } = options;
 	const log = options.log === undefined ? new Logger('[broadcast]') : options.log;
 
 	const api: Record<string, (input: unknown) => Promise<void>> = {};
 
 	for (const spec of specs) {
 		const { method } = spec;
-		api[method] = async (input: unknown): Promise<void> => {
+		const send = (input: unknown): void => {
 			const parsed = spec.input.safeParse(input);
 			if (!parsed.success) {
 				log?.error(`[${method}] input validation failed:`, parsed.error.issues);
 				return;
 			}
 
-			// Resolve the broadcast target deterministically — no fallback.
-			// Broadcast is 1→N over a specific primary transport; falling through
-			// to "any ready transport" would send to an unexpected audience.
-			// Silent skip when no ready transport (e.g. before any clients connect).
-			const transport_name = peer.default_send_options.transport_name;
-			const transport = transport_name
-				? peer.transports.get_transport_by_name(transport_name)
-				: peer.transports.get_current_transport();
-			if (!transport?.is_ready()) return;
-
 			const notification = create_jsonrpc_notification(method, to_jsonrpc_params(parsed.data));
 
 			try {
 				if (should_deliver) {
-					if (!is_filterable_broadcast_transport(transport)) {
-						log?.error(
-							`[${method}] should_deliver set but transport ${
-								transport.transport_name
-							} does not support per-connection filtering`
-						);
-						return;
-					}
-					transport.broadcast_filtered(notification, (identity) =>
+					registry.broadcast_filtered(notification, (identity) =>
 						should_deliver(identity, method, parsed.data)
 					);
-					return;
-				}
-
-				const result = await transport.send(notification);
-				if (result !== null) {
-					log?.error(`[${method}] failed to send notification:`, result.error);
+				} else {
+					registry.broadcast(notification);
 				}
 			} catch (error) {
 				log?.error(`[${method}] unexpected error:`, error);
 			}
+		};
+		// the broadcast is synchronous; the method stays `Promise<void>`, the
+		// shape `BackendActionsApi` declares
+		api[method] = (input: unknown): Promise<void> => {
+			send(input);
+			return Promise.resolve();
 		};
 	}
 

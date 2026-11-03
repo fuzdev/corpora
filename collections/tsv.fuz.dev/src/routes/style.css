@@ -1,9 +1,4 @@
-/* global stylesheet imported by `src/routes/+layout.svelte */
+/* global stylesheet imported by `src/routes/+layout.svelte` */
 
-/*
-
-:root {
-  --some_stylish_property: 100%;
-}
-
-*/
+/* Nothing global yet — the benchmarks page's shared classes live beside it in
+   `docs/benchmarks/benchmarks.css`, so they ship with that route. */

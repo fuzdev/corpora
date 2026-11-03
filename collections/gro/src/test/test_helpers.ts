@@ -1,5 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import ts from 'typescript';
 import { vi } from 'vitest';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
@@ -7,10 +6,11 @@ import type { Timings } from '@fuzdev/fuz_util/timings.ts';
 import { json_stringify_deterministic } from '@fuzdev/fuz_util/json.ts';
 import { hash_blake3 } from '@fuzdev/fuz_util/hash_blake3.ts';
 
-import type { GroConfig } from '$lib/gro_config.ts';
-import type { Filer } from '$lib/filer.ts';
-import type { ParsedSvelteConfig } from '$lib/svelte_config.ts';
-import type { TaskContext } from '$lib/task.ts';
+import type { GroConfig } from '#lib/gro_config.ts';
+import { paths } from '#lib/paths.ts';
+import type { ModuleGraph, Watcher } from '#lib/module_graph.ts';
+import type { ParsedSvelteConfig } from '#lib/svelte_config.ts';
+import type { TaskContext } from '#lib/task.ts';
 
 /**
  * Creates a mock logger for testing.
@@ -52,13 +52,13 @@ export const create_mock_config = async (
 	return {
 		plugins: () => [],
 		map_package_json: null,
-		task_root_dirs: [],
 		search_filters: [],
 		js_cli: 'node',
 		pm_cli: 'npm',
+		watch: { dir: paths.source, filter: null },
 		build_cache_config_hash,
 		...(rest as Partial<GroConfig>)
-	} as GroConfig;
+	};
 };
 
 /**
@@ -106,56 +106,10 @@ export const mock_dir_entry = (name: string): any => ({
 
 export const TEST_TIMEOUT_MD = 20_000;
 
-export const SOME_PUBLIC_ENV_VAR_NAME = 'PUBLIC_SOME_PUBLIC_ENV_VAR';
-export const SOME_PUBLIC_ENV_VAR_VALUE = 'SOME_PUBLIC_ENV_VAR';
-const name_equals = SOME_PUBLIC_ENV_VAR_NAME + '=';
-const line = name_equals + SOME_PUBLIC_ENV_VAR_VALUE;
-
-let inited = false;
-
 /**
- * Hacky global helper to init the test env.
- *
- * @returns boolean indicating if the env file was created or not
+ * Gro's source loader, which tests spawn rather than a built `dist/` that may be stale or absent.
  */
-export const init_test_env = async (
-	dir = process.cwd(),
-	env_filename = '.env'
-): Promise<boolean> => {
-	if (inited) return false;
-	inited = true;
-
-	const env_file = join(dir, env_filename);
-
-	let contents: string;
-	try {
-		contents = await readFile(env_file, 'utf8');
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-			await writeFile(env_file, line + '\n', 'utf8');
-			return true;
-		}
-		throw error;
-	}
-
-	const lines = contents.split('\n');
-	if (lines.includes(line)) {
-		return false; // already exists
-	}
-
-	let new_contents: string;
-	const found_index = lines.findIndex((l) => l.startsWith(name_equals));
-	if (found_index === -1) {
-		// if the line does not exist, add it
-		new_contents = contents + (contents.endsWith('\n') ? '' : '\n') + line + '\n';
-	} else {
-		// if the line exists but with a different value, replace it
-		new_contents = contents.replace(new RegExp(`${SOME_PUBLIC_ENV_VAR_NAME}=.*`), line);
-	}
-	await writeFile(env_file, new_contents, 'utf8');
-
-	return true;
-};
+export const LOADER_SOURCE_PATH = resolve('src/lib/loader.ts');
 
 /**
  * Creates a TypeScript environment for testing.
@@ -279,20 +233,29 @@ export const create_mock_timings = (): Timings =>
 	}) as unknown as Timings;
 
 /**
- * Creates a mock Filer object for testing.
+ * Creates a mock `ModuleGraph` whose queries throw, for tests that never use it.
  */
-export const create_mock_filer = (): Filer =>
-	({
-		find: vi.fn(),
-		create_changeset: vi.fn()
-	}) as unknown as Filer;
+export const create_mock_module_graph = (): ModuleGraph => ({
+	modules: () => Promise.reject(Error('mock ModuleGraph: modules not implemented')),
+	dependents: () => Promise.reject(Error('mock ModuleGraph: dependents not implemented')),
+	watch: () => Promise.reject(Error('mock ModuleGraph: watch not implemented')),
+	close: vi.fn(() => Promise.resolve())
+});
+
+/**
+ * Creates a mock `Watcher` whose `watch` throws, for tests that never use it.
+ */
+export const create_mock_watcher = (): Watcher => ({
+	watch: () => Promise.reject(Error('mock Watcher: watch not implemented')),
+	close: vi.fn(() => Promise.resolve())
+});
 
 /**
  * Creates a mock ParsedSvelteConfig for testing.
  */
 export const create_mock_svelte_config = (): ParsedSvelteConfig =>
 	({
-		lib_path: 'src/lib',
+		src_path: 'src',
 		routes_path: 'src/routes'
 	}) as ParsedSvelteConfig;
 
@@ -314,7 +277,6 @@ export const create_mock_task_context = <TArgs extends object = any>(
 	config: {
 		plugins: () => [],
 		map_package_json: null,
-		task_root_dirs: [],
 		search_filters: [],
 		js_cli: 'node',
 		pm_cli: 'npm',
@@ -322,7 +284,8 @@ export const create_mock_task_context = <TArgs extends object = any>(
 		...config_overrides
 	} as GroConfig,
 	svelte_config: Promise.resolve(create_mock_svelte_config()),
-	filer: create_mock_filer(),
+	graph: create_mock_module_graph(),
+	watcher: create_mock_watcher(),
 	log: create_mock_logger(),
 	timings: create_mock_timings(),
 	invoke_task: vi.fn()

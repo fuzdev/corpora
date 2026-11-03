@@ -18,7 +18,7 @@ import {
 	setup_contextmenu_attachment,
 	type SharedTestOptions
 } from './contextmenu_test_helpers.ts';
-import { CONTEXTMENU_DEFAULT_LONGPRESS_DURATION } from '$lib/contextmenu_helpers.ts';
+import { CONTEXTMENU_DEFAULT_LONGPRESS_DURATION } from '#lib/contextmenu_helpers.ts';
 
 export const create_shared_link_entry_tests = (
 	Component: any,

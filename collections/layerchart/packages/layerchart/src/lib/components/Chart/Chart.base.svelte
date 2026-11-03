@@ -25,10 +25,13 @@
   lang="ts"
   generics="TData = any, XScale extends AnyScale = AnyScale, YScale extends AnyScale = AnyScale"
 >
+  import { untrack } from 'svelte';
   import { setGeoContext } from '$lib/contexts/geo.js';
   import { getSettings } from '$lib/contexts/settings.js';
   import { setChartContext } from '$lib/contexts/chart.js';
+  import { getChartGroup } from '$lib/contexts/group.js';
   import { ChartState } from '$lib/states/chart.svelte.js';
+  import { connectToChartGroup } from '$lib/states/group.svelte.js';
   import type { ChartPropsWithoutHTML } from './Chart.shared.svelte.js';
   import { isScaleBand } from '$lib/utils/scales.svelte.js';
   import { getObjectOrNull } from '$lib/utils/common.js';
@@ -61,6 +64,8 @@
     ondragend,
     ondragstart,
     brush,
+    group,
+    groupOptions,
     motion,
     debug = false,
     clip = false,
@@ -69,20 +74,16 @@
     ...restProps
   } = $derived(props);
 
-  let brushXDomain = $state<BrushDomainType>();
-  let brushYDomain = $state<BrushDomainType>();
-
   // Pass the `$props()` proxy directly — `props.X` reads stay reactive and
   // don't pay the cost of an `{...props}` spread (recursive `ownKeys` across
   // nested rest/spread proxies). Brush selections are supplied as getters so
   // the chart's domain calculation can layer them on top of `props.xDomain`
   // / `props.yDomain` at the read sites.
+  const settings = getSettings();
+
   const chartState = new ChartState<TData, XScale, YScale>(
     props as ChartPropsWithoutHTML<TData, XScale, YScale>,
-    {
-      brushXDomain: () => brushXDomain,
-      brushYDomain: () => brushYDomain,
-    }
+    settings
   );
 
   let ref = $state<HTMLElement>();
@@ -97,7 +98,15 @@
   setChartContext(chartState);
   setGeoContext(chartState.geoState);
 
-  const settings = getSettings();
+  // Join a chart group — an explicit `group` prop, else one provided by an ancestor `<ChartGroup>`
+  const inheritedGroup = getChartGroup();
+  const resolvedGroup = $derived(group ?? inheritedGroup);
+  const groupSync = connectToChartGroup(
+    chartState,
+    () => resolvedGroup,
+    () => groupOptions
+  );
+
   $effect(() => {
     settings.debug = debug;
   });
@@ -135,19 +144,65 @@
     }
   });
 
+  /**
+   * Where a `projection` transform starts: the projection as its props place it — fitted, and with
+   * any `scale` / `translate` — so the chart doesn't jump once `TransformContext` loads
+   */
   const initialTransform = $derived.by(() => {
-    if (
-      transform?.mode !== 'projection' ||
-      !(resolvedApply.translate || resolvedApply.scale) ||
-      !geo?.fitGeojson ||
-      !geo?.projection
-    ) {
+    if (transform?.mode !== 'projection' || !(resolvedApply.translate || resolvedApply.scale)) {
       return undefined;
     }
-    const fitted = geo.projection().fitSize([chartState.width, chartState.height], geo.fitGeojson);
-    const t = fitted.translate();
-    return { translate: { x: t[0], y: t[1] }, scale: fitted.scale() };
+    const projection = chartState.geoState.untransformedProjection;
+    if (!projection) return undefined;
+    const t = projection.translate();
+    return { translate: { x: t[0], y: t[1] }, scale: projection.scale() };
   });
+
+  /**
+   * The zoom a chart opens at, read once `TransformContext` is here to take it.
+   *
+   * Deliberately untracked: `_initialTransform` follows the chart's width, and `TransformContext`
+   * resets whenever its initial values change — so tracking it would snap a panned chart back to
+   * where it started on the next resize.  Reading it at this point picks up the laid-out width.
+   */
+  const initialZoom = $derived.by(() => {
+    if (!TransformContext) return undefined;
+    return untrack(() => chartState._initialTransform);
+  });
+
+  /** The isometric view the transform turns from (the `isometric` angles, eased), or `null` */
+  const isometricView = $derived.by(() => {
+    if (!chartState.isometricTransform) return null;
+    const { rotate, tilt } = chartState.isometricAngles;
+    return { x: rotate, y: tilt };
+  });
+
+  /**
+   * `x` is the turn and `y` the tilt, in degrees.  Dragging right spins the floor with the pointer
+   * across its front edge; dragging up tips it towards edge on.
+   */
+  function processIsometricRotate(x: number, y: number, deltaX: number, deltaY: number) {
+    return { x: x - deltaX / 2, y: Math.min(89, Math.max(0, y - deltaY * 0.3)) };
+  }
+
+  /**
+   * Where the transform starts — a fitted projection, or the domain a chart opens zoomed to.  The
+   * two are exclusive: one is `mode: 'projection'`, the other `mode: 'domain'`.
+   */
+  const resolvedInitialTransform = $derived(
+    transform?.mode === 'projection'
+      ? {
+          // A globe the transform turns starts at its `rotate`, rather than snapping from it to
+          // `[0, 0]` once `TransformContext` loads — translate is its yaw and pitch
+          translate: resolvedApply.translate
+            ? initialTransform?.translate
+            : resolvedApply.rotation && geo?.rotate
+              ? { x: geo.rotate.yaw, y: geo.rotate.pitch }
+              : undefined,
+          scale: resolvedApply.scale ? initialTransform?.scale : undefined,
+        }
+      : { translate: initialZoom?.translate, scale: initialZoom?.scale }
+  );
 
   const processTranslate = $derived.by(() => {
     if (resolvedApply.rotation && chartState.geoState?.projection) {
@@ -391,25 +446,42 @@
     if (!brush) return { disabled: true };
     const userProps = typeof brush === 'object' ? brush : {};
 
+    const userOnChange = userProps.onChange;
     const userOnBrushEnd = userProps.onBrushEnd;
     const zoomOnBrush = 'zoomOnBrush' in userProps ? userProps.zoomOnBrush : false;
-    const needsEnhancement = transform?.mode === 'domain' || zoomOnBrush;
-    if (!needsEnhancement) return userProps;
+    // Brush-to-zoom consumes the selection (it becomes the domain) and resets it afterwards.
+    // Sharing must not opt a plain brush into that — it would wipe the selection on release.
+    const zoomsOnBrush = transform?.mode === 'domain' || zoomOnBrush;
+    const sharesBrush = resolvedGroup?.brushOptions != null;
+    if (!zoomsOnBrush && !sharesBrush) return userProps;
 
     return {
       ...userProps,
+      // Publish live so followers track the drag, not just its result
+      onChange: (e: { brush: BrushState }) => {
+        groupSync.publishBrush(e.brush);
+        userOnChange?.(e);
+      },
       onBrushEnd: (e: { brush: BrushState }) => {
+        if (!zoomsOnBrush) {
+          // Nothing to publish — the gesture reports every change through `onChange`, clearing
+          // on a click included
+          userOnBrushEnd?.(e);
+          return;
+        }
+
         if (e.brush.active) {
           if (transform?.mode === 'domain') {
             chartState.zoomToBrush(e.brush, userProps.axis ?? 'x');
           } else if (zoomOnBrush) {
             const axis = userProps.axis ?? 'x';
             if (axis === 'x' || axis === 'both') {
-              brushXDomain = expandBandBrushDomain(e.brush.x, chartState._baseXDomain);
+              chartState.brushXDomain = expandBandBrushDomain(e.brush.x, chartState._baseXDomain);
             }
             if (axis === 'y' || axis === 'both') {
-              brushYDomain = expandBandBrushDomain(e.brush.y, chartState._baseYDomain);
+              chartState.brushYDomain = expandBandBrushDomain(e.brush.y, chartState._baseYDomain);
             }
+            groupSync.publishDomain(chartState.brushXDomain, chartState.brushYDomain);
           }
           userOnBrushEnd?.(e);
           e.brush.reset();
@@ -417,11 +489,15 @@
           if (transform?.mode === 'domain') {
             chartState.transform.reset();
           } else if (zoomOnBrush) {
-            brushXDomain = undefined;
-            brushYDomain = undefined;
+            chartState.brushXDomain = undefined;
+            chartState.brushYDomain = undefined;
+            groupSync.publishDomain(undefined, undefined);
           }
           userOnBrushEnd?.(e);
         }
+
+        // the selection was just reset above, so this publishes the cleared state
+        groupSync.publishBrush(e.brush);
       },
     };
   });
@@ -446,6 +522,27 @@
       import('../BrushContext.svelte').then((m) => (BrushContext = m.default));
     }
   });
+
+  /**
+   * Explicit dimensions are already the real ones, and the server has nothing to measure — only an
+   * auto-sized chart in the browser has to wait.
+   */
+  const needsMeasure = $derived(typeof window !== 'undefined' && (width == null || height == null));
+
+  /**
+   * Measure the container before the subtree is built, rather than letting marks construct against
+   * the placeholder and correcting them afterwards.
+   *
+   * `bind:clientWidth` below keeps the size current, but it reports through a `ResizeObserver` that
+   * lands after this flush — too late for marks that capture the scales as they are constructed.
+   * Reading the element here costs one layout per chart and gets them the real numbers first time.
+   */
+  $effect(() => {
+    if (!needsMeasure || !ref) return;
+    chartState._containerWidth = ref.clientWidth;
+    chartState._containerHeight = ref.clientHeight;
+    chartState.isMeasured = true;
+  });
 </script>
 
 {#if ssr === true || typeof window !== 'undefined'}
@@ -465,7 +562,7 @@
     class={['lc-root-container', className]}
     {...restProps}
   >
-    {#key chartState.isMounted}
+    {#if !needsMeasure || chartState.isMeasured}
       {#if transform && TransformContext}
         <!-- Lazy-load TransformContext only when transform is enabled -->
         {@const {
@@ -480,8 +577,10 @@
         <TransformContext
           bind:state={chartState.transformState}
           mode={transform.mode ?? 'none'}
-          initialTranslate={resolvedApply.translate ? initialTransform?.translate : undefined}
-          initialScale={resolvedApply.scale ? initialTransform?.scale : undefined}
+          initialTranslate={resolvedInitialTransform.translate}
+          initialScale={resolvedInitialTransform.scale}
+          initialRotation={isometricView}
+          processRotate={processIsometricRotate}
           {processTranslate}
           {...transformProps}
           scaleExtent={resolvedScaleExtent}
@@ -499,7 +598,7 @@
       {:else}
         {@render inner()}
       {/if}
-    {/key}
+    {/if}
   </div>
 {/if}
 

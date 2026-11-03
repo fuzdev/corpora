@@ -1,8 +1,8 @@
 import { test, assert, describe } from 'vitest';
-import type { KitConfig } from '@sveltejs/kit';
+import type { Config } from '@sveltejs/kit/vite';
 import type { Defined } from '@fuzdev/fuz_util/types.ts';
 
-import { create_csp_directives, type CspDirectives } from '$lib/csp.ts';
+import { create_csp_directives, type CspDirectives } from '#lib/csp.ts';
 import { src } from './csp_test_helpers.ts';
 
 // SvelteKit-specific tests only — real-world scenarios (Stripe, analytics, Google Fonts,
@@ -10,7 +10,7 @@ import { src } from './csp_test_helpers.ts';
 
 describe('SvelteKit type compatibility', () => {
 	test('CspDirectives is assignable to SvelteKit CSP directives type', () => {
-		type KitCspDirectives = Defined<KitConfig['csp']>['directives'];
+		type KitCspDirectives = Defined<Config['csp']>['directives'];
 
 		const csp: CspDirectives = create_csp_directives();
 		const kit_csp: KitCspDirectives = csp;
@@ -30,7 +30,7 @@ describe('SvelteKit type compatibility', () => {
 	});
 
 	test('empty CSP is valid for SvelteKit', () => {
-		type KitCspDirectives = Defined<KitConfig['csp']>['directives'];
+		type KitCspDirectives = Defined<Config['csp']>['directives'];
 
 		const empty_csp: CspDirectives = {};
 		const kit_csp: KitCspDirectives = empty_csp;

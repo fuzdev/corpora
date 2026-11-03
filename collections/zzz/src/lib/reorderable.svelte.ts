@@ -2,7 +2,7 @@
 
 import type { Attachment } from 'svelte/attachments';
 import { on } from 'svelte/events';
-import type { Flavored } from '@fuzdev/fuz_util/types.ts';
+import type { Flavored } from '@fuzdev/fuz_schema/schema.ts';
 import { EMPTY_OBJECT } from '@fuzdev/fuz_util/object.ts';
 
 import {
@@ -249,7 +249,7 @@ export class Reorderable implements ReorderableStyleOptions {
 
 		let current: HTMLElement | null = target;
 		while (current && current !== this.list_node) {
-			const item_id = current.dataset.reorderable_item_id as ReorderableItemId | undefined;
+			const item_id = current.dataset.reorderable_item_id;
 			if (item_id) {
 				const index = this.indices.get(item_id);
 				const element = this.elements.get(item_id);
@@ -476,7 +476,7 @@ export class Reorderable implements ReorderableStyleOptions {
 		return (node) => {
 			const { index } = params;
 
-			let item_id = node.dataset.reorderable_item_id as ReorderableItemId | undefined;
+			let item_id = node.dataset.reorderable_item_id;
 			if (!item_id) {
 				item_id = `i${create_client_id()}`;
 				node.dataset.reorderable_item_id = item_id;

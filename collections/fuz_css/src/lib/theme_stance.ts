@@ -10,7 +10,8 @@
  * A consequence of mirroring into the theme layer: the mirror re-declares the
  * scheme-adaptive defaults in `fuz.theme`, which outranks the
  * `fuz.preferences` OS mappings - so under a stanced theme
- * `prefers-contrast: more` has no effect. Compose the high-contrast modifier
+ * `prefers-contrast: more` keeps only its stronger `--border_color` and the
+ * panel ring, not the ground and text stretch. Compose the high-contrast modifier
  * (`contrast_modifiers`) over the theme to raise contrast deliberately.
  *
  * @module
@@ -18,52 +19,49 @@
 
 import { scheme_adaptive_variables } from './scheme_adaptive_variables.ts';
 import type { StyleVariable, Theme } from './variable.ts';
+import { to_theme_stance, type ResolvedTheme } from './theme.ts';
 
 /**
  * Computes the mirror a single-scheme stance implies: every scheme-adaptive
- * default not overridden by `variables`, re-slotted with the stanced scheme's
- * value in the base (light) slot. A base-slot declaration in `fuz.theme`
- * applies in both color schemes - cascade-layer order beats the higher
- * specificity of the `fuz.base` `:root.dark` defaults - and keeping the
- * mirror out of the dark slot means later same-block declarations (the
- * theme's own variables, composed overlays, compiled cap overrides) always
- * win by source order.
+ * variable in `variables` (those carrying a dark slot), re-slotted with the
+ * stanced scheme's value in the `base` slot. A base-slot declaration in
+ * `fuz.theme` applies in both color schemes - cascade-layer order beats the
+ * higher specificity of the `fuz.base` dark-scheme defaults (`:root.dark` and
+ * its `prefers-color-scheme` twin) - and keeping the mirror out of the dark
+ * slot means later same-block declarations (the theme's own variables,
+ * composed overlays, compiled caps) always win by source order.
+ *
+ * The mirror depends on the stance alone, not on the theme: the renderer
+ * skips an entry whose name the theme or its caps set.
  *
  * @param scheme - the stance to mirror for
- * @param variables - the theme's own variables, whose names are left alone
+ * @param variables - the variable set to mirror, `scheme_adaptive_variables` by default
  * @returns the mirrored variables, to render before the theme's own
  */
 export const scheme_stance_variables = (
 	scheme: 'light' | 'dark',
-	variables: Array<StyleVariable>
+	variables: Array<StyleVariable> = scheme_adaptive_variables
 ): Array<StyleVariable> => {
-	const overridden = new Set(variables.map((v) => v.name));
 	const mirrored: Array<StyleVariable> = [];
-	for (const v of scheme_adaptive_variables) {
-		if (overridden.has(v.name)) continue;
-		const value = scheme === 'dark' ? v.dark : v.light;
-		if (value !== undefined) mirrored.push({ name: v.name, light: value });
+	for (const v of variables) {
+		if (v.dark === undefined) continue; // the same in both schemes already
+		const value = scheme === 'dark' ? v.dark : v.base;
+		if (value !== undefined) mirrored.push({ name: v.name, base: value });
 	}
 	return mirrored;
 };
 
 /**
- * Resolves a single-scheme theme by computing its stance mirror into
- * `scheme_mirror`, so `render_theme_style` needs no knowledge of the defaults.
- * A dual-scheme theme is returned unchanged.
- *
- * The mirror lands in its own field rather than merged into `variables` so the
- * authored knobs stay distinguishable from the derived ones - `compile_theme`
- * reads `variables` to detect author pins, and theme editors show it as the
- * theme's own surface.
- *
- * The shipped stanced themes apply this at their own module scope, so a
- * hand-rolled stanced theme is the only kind that needs the call.
+ * Resolves a theme for rendering: a single-scheme theme gets its stance
+ * mirror beside it, a dual-scheme theme nothing. Safe to call on any theme,
+ * and pure - the theme comes back as the same reference, never carrying the
+ * derived data, so persisting `resolved.theme` persists only what was
+ * authored.
  *
  * @param theme - the theme to resolve
- * @returns the theme carrying its stance mirror
+ * @returns the theme with its derived data, for `render_theme_style(r.theme, r)`
  */
-export const resolve_theme_stance = (theme: Theme): Theme => {
-	if (theme.scheme !== 'light' && theme.scheme !== 'dark') return theme;
-	return { ...theme, scheme_mirror: scheme_stance_variables(theme.scheme, theme.variables) };
+export const resolve_theme_stance = (theme: Theme): ResolvedTheme => {
+	const stance = to_theme_stance(theme.scheme);
+	return stance ? { theme, scheme_mirror: scheme_stance_variables(stance) } : { theme };
 };

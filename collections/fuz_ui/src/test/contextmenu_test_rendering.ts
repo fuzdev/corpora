@@ -5,7 +5,7 @@
 
 import { describe, test, assert, afterEach } from 'vitest';
 import { flushSync } from 'svelte';
-import { ContextmenuState, type ContextmenuActivateResult } from '$lib/contextmenu_state.svelte.ts';
+import { ContextmenuState, type ContextmenuActivateResult } from '#lib/contextmenu_state.svelte.ts';
 import { unmount_component } from './test_helpers.ts';
 import { mount_contextmenu_root, type SharedTestOptions } from './contextmenu_test_helpers.ts';
 

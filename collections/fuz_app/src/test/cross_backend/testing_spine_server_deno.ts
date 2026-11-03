@@ -16,13 +16,12 @@
 import { join } from 'node:path';
 
 import { start_testing_server } from '#lib/testing/cross_backend/testing_server_core.ts';
+import { TS_SPINE_DIR_ENV } from '#lib/testing/cross_backend/spine_surface_constants.ts';
 import { create_deno_testing_adapter } from '#lib/testing/cross_backend/testing_server_deno.ts';
 import { build_spine_app, resolve_spine_server_config } from './testing_spine_server.ts';
 
 declare const Deno: { exit: (code: number) => never };
 
-/** Dir env var whose `{dir}/run/daemon_token` matches `BackendConfig.bootstrap.daemon_token_path`. */
-const TS_SPINE_DIR_ENV = 'FUZ_TESTING_TS_SPINE_DIR';
 const DAEMON_NAME = 'fuz_app_ts_spine_deno';
 
 const start = async (): Promise<void> => {
@@ -41,11 +40,12 @@ const start = async (): Promise<void> => {
 		daemon_name: DAEMON_NAME,
 		host,
 		port,
-		build_app: () =>
+		build_app: ({ prepare_websocket }) =>
 			build_spine_app({
 				runtime: adapter.runtime,
 				get_connection_ip: adapter.get_connection_ip,
-				daemon_token_path
+				daemon_token_path,
+				prepare_websocket
 			})
 	});
 };

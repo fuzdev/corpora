@@ -1,5 +1,4 @@
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import type { BrowserTabJson } from './browser_tab.svelte.ts';
 
@@ -12,7 +11,7 @@ export const fake_sites = {
 			<div style="padding: 20px; font-family: system-ui;">
 				<h1>new tab</h1>
 				<ul>
-					<li><a href="https://www.zzz.software/about" target="_blank" rel="noopener">about Zzz</a></li>
+					<li><a href="/about" target="_blank" rel="noopener">about Zzz</a></li>
 					<li><a href="https://github.com/fuzdev/zzz" target="_blank" rel="noopener">source code</a></li>
 				</ul>
 			</div>
@@ -26,7 +25,7 @@ export const sample_tabs: Array<BrowserTabJson> = [
 	{
 		id: create_uuid(),
 		title: 'Zzz is a browser',
-		url: 'https://www.zzz.software/tabs',
+		url: 'https://github.com/fuzdev/zzz',
 		type: 'raw',
 		selected: true,
 		refresh_counter: 0,

@@ -1,12 +1,12 @@
 <script lang="ts">
 	// @slop Claude Opus 4
 
-	import { projects_context } from '$routes/projects/projects.svelte.ts';
-	import ProjectSidebar from '$routes/projects/ProjectSidebar.svelte';
-	import SectionSidebar from '$routes/projects/SectionSidebar.svelte';
-	import ProjectNotFound from '$routes/projects/ProjectNotFound.svelte';
+	import { projects_context } from '#routes/projects/projects.svelte.ts';
+	import ProjectSidebar from '#routes/projects/ProjectSidebar.svelte';
+	import SectionSidebar from '#routes/projects/SectionSidebar.svelte';
+	import ProjectNotFound from '#routes/projects/ProjectNotFound.svelte';
 	import { icon_delete } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from '#lib/Icon.svelte';
 
 	const projects = projects_context.get();
 
@@ -70,7 +70,7 @@
 						class="palette_c"
 						onclick={() => project_viewmodel.delete_current_project()}
 					>
-						<Svg data={icon_delete} />&nbsp; delete project
+						<Icon data={icon_delete} />&nbsp; delete project
 					</button>
 				</div>
 			</div>

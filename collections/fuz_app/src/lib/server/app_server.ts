@@ -8,11 +8,11 @@
  * @module
  */
 
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { logger } from 'hono/logger';
-import { bodyLimit } from 'hono/body-limit';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { z } from 'zod';
+import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import {
 	session_cookie_options,
@@ -23,16 +23,20 @@ import type { BootstrapAccountSuccess } from '../auth/bootstrap_account.ts';
 import type { EventSpec } from '../realtime/sse.ts';
 import {
 	create_audit_log_sse,
+	create_sse_connection_closer,
 	audit_log_event_specs,
 	type AuditLogSse
-} from '../realtime/sse_auth_guard.ts';
+} from '../realtime/audit_log_sse.ts';
 import { BaseServerEnv } from './env.ts';
 import {
-	create_rate_limiter,
+	RateLimiter,
+	announce_rate_limiters_disabled,
+	default_login_ip_rate_limit,
 	default_login_account_rate_limit,
 	default_action_account_rate_limit,
 	default_action_ip_rate_limit,
-	type RateLimiter
+	type RateLimiterMode,
+	type RateLimiterOptions
 } from '../rate_limiter.ts';
 import type { DaemonTokenState } from '../auth/daemon_token.ts';
 import type { MigrationResult } from '../db/migrate.ts';
@@ -44,6 +48,7 @@ import '../hono_context.ts';
 import { create_proxy_middleware_spec } from '../http/proxy.ts';
 import { create_static_middleware, type ServeStaticFactory } from './static.ts';
 import { log_startup_summary } from './startup.ts';
+import { create_app_error_handler } from './app_error_handler.ts';
 import {
 	create_app_surface_spec,
 	type AppSurfaceSpec,
@@ -56,36 +61,34 @@ import {
 	prefix_route_specs,
 	type RouteSpec
 } from '../http/route_spec.ts';
-import type { MiddlewareSpec } from '../http/middleware_spec.ts';
+import type { MiddlewareCarveOut, MiddlewareSpec } from '../http/middleware_spec.ts';
 import {
 	check_bootstrap_status,
 	create_bootstrap_route_specs,
 	type BootstrapStatus
 } from '../auth/bootstrap_routes.ts';
-import { create_surface_route_spec, type SurfaceRouteOptions } from '../http/common_routes.ts';
-import { flush_pending_effects, flush_post_commit_effects } from '../http/pending_effects.ts';
-import { create_auth_middleware_specs } from '../auth/middleware.ts';
+import { create_surface_route_spec, type SurfaceRouteOptions } from './surface_route.ts';
+import { flush_request_effects, type EffectErrorContext } from '../http/pending_effects.ts';
+import {
+	assert_credential_routes_in_auth_scope,
+	assert_endpoint_in_auth_scope,
+	assert_middleware_stack_mounted,
+	create_auth_middleware_specs
+} from '../auth/middleware.ts';
 import { fuz_auth_guard_resolver } from '../auth/auth_guard_resolver.ts';
 import { create_fuz_authorization_handler } from '../auth/request_context.ts';
-import { ERROR_PAYLOAD_TOO_LARGE } from '../http/error_schemas.ts';
+import { create_body_limit_middleware } from '../http/body_limit.ts';
+import { admit_origin_wildcards, ALLOWED_ORIGINS_VAR } from '../http/origin_wildcard.ts';
 import { create_rpc_endpoint } from '../actions/action_rpc.ts';
-import { register_ws_endpoint } from '../actions/register_ws_endpoint.ts';
-import type { WsEndpointSpec } from '../actions/ws_endpoint_spec.ts';
+import { register_action_ws } from '../actions/register_action_ws.ts';
 import {
-	create_ws_auth_guard,
-	create_ws_logout_closer
-} from '../actions/transports_ws_auth_guard.ts';
-import { BackendWebsocketTransport } from '../actions/transports_ws_backend.ts';
-
-/**
- * Context passed to `on_effect_error` when a pending effect rejects.
- */
-export interface EffectErrorContext {
-	/** HTTP method of the request that spawned the effect. */
-	method: string;
-	/** URL path of the request that spawned the effect. */
-	path: string;
-}
+	resolve_ws_endpoints,
+	type ResolvedWsEndpointSpec,
+	type WsEndpointSpec
+} from '../actions/ws_endpoint_spec.ts';
+import { create_revocation_guard } from '../actions/connection_closer.ts';
+import type { ConnectionRegistry } from '../actions/connection_registry.ts';
+import { start_auth_cleanup, type AuthCleanupScheduleOptions } from '../auth/cleanup.ts';
 
 /**
  * Bootstrap configuration for `AppServerOptions.bootstrap`.
@@ -116,14 +119,14 @@ export interface BootstrapDisabledOptions {
 
 export interface BootstrapSurfaceOnlyOptions {
 	mode: 'surface_only';
-	/** Route prefix for surface generation. Default `'/api/account'`. */
+	/** Route prefix for surface generation. Default `'/api/account'`; must sit under `/api/`. */
 	route_prefix?: string;
 }
 
 export interface BootstrapLiveOptions {
 	mode: 'live';
 	token_path: string;
-	/** Route prefix for bootstrap routes. Default `'/api/account'`. */
+	/** Route prefix for bootstrap routes. Default `'/api/account'`; must sit under `/api/`. */
 	route_prefix?: string;
 	/**
 	 * Called after successful bootstrap (account + session created).
@@ -143,8 +146,36 @@ export interface AppServerOptions {
 	backend: AppBackend;
 	/** Session options for cookie-based auth. */
 	session_options: SessionOptions<string>;
-	/** Parsed allowed origin patterns. */
+	/**
+	 * Parsed allowed origin patterns, as `parse_allowed_origins` returns them
+	 * (`validate_server_env`'s `allowed_origins`); assembly throws on a matcher
+	 * built any other way, since its wildcards can't be checked. Must not be
+	 * empty — an empty list would refuse every browser request, so assembly
+	 * throws.
+	 */
 	allowed_origins: Array<RegExp>;
+	/**
+	 * Admit a wildcard `allowed_origins` entry (`:*`, a `*` label) — the
+	 * operator's `FUZ_ALLOW_ORIGIN_WILDCARDS=true`, as `validate_server_env`
+	 * reads it. Without it assembly throws on one, naming each entry and what it
+	 * admits; with it each is logged at `warn`, on every assembly. Covers each
+	 * `ws_endpoints` spec's own `allowed_origins` too. Classifies the matchers
+	 * `parse_allowed_origins` built (`http/origin_wildcard.ts`); assembly throws
+	 * on any other matcher, flag or not. Defaults to `false`.
+	 */
+	allow_origin_wildcards?: boolean;
+	/**
+	 * Paths the origin check skips, each with its reason. The check covers
+	 * every path by default (`ORIGIN_MIDDLEWARE_PATH`) — a request with no
+	 * `Origin` passes it anyway, so probes and CLI clients need no carve-out;
+	 * one is for a path that refuses browser callers by other means. Copied at
+	 * assembly, so a later change to this array changes nothing; assembly
+	 * throws on a carve-out with no reason, or one that overlaps the auth
+	 * middleware's scope (`AUTH_MIDDLEWARE_PATH`) — every route that reads or
+	 * mints a credential, and every RPC, WS, and bootstrap endpoint, sits
+	 * there (`assert_origin_carve_outs_valid`).
+	 */
+	origin_carve_outs?: Array<MiddlewareCarveOut>;
 
 	/** Trusted proxy options. */
 	proxy: {
@@ -153,9 +184,20 @@ export interface AppServerOptions {
 	};
 
 	/**
+	 * What an omitted rate limiter becomes — `'enforced'` (the default) builds
+	 * a default instance for each `*_rate_limiter` option left out,
+	 * `'disabled_for_testing'` leaves each of them `null`. An explicit option
+	 * (an instance or `null`) always wins over the mode. The disabled mode adds
+	 * one surface warning, and prints a stderr banner once per module instance
+	 * (`announce_rate_limiters_disabled`). Never `'disabled_for_testing'` in production — see
+	 * `RateLimiterMode`.
+	 */
+	rate_limiters?: RateLimiterMode;
+	/**
 	 * Per-IP rate limiter for login + password change — the distributed-spray
 	 * backstop. Omit or `undefined` to use a default limiter (5 attempts per
-	 * 15 minutes). Pass `null` to explicitly disable rate limiting.
+	 * 15 minutes) under `rate_limiters: 'enforced'`, none under
+	 * `'disabled_for_testing'`. Pass `null` to explicitly disable rate limiting.
 	 * Also available on `AppServerContext` for route factory callbacks.
 	 *
 	 * One instance per auth surface, not one shared across all four. These
@@ -167,32 +209,34 @@ export interface AppServerOptions {
 	 */
 	login_ip_rate_limiter?: RateLimiter | null;
 	/**
-	 * Per-IP rate limiter for signup. Omit or `undefined` to use a default
-	 * limiter (5 attempts per 15 minutes). Pass `null` to explicitly disable.
+	 * Per-IP rate limiter for signup. Omit or `undefined` for the mode's
+	 * default (5 attempts per 15 minutes under `rate_limiters: 'enforced'`).
+	 * Pass `null` to explicitly disable.
 	 * Separate from `login_ip_rate_limiter` because an open-signup deployment
 	 * lets any unauthenticated caller spend it. Also available on
 	 * `AppServerContext` for route factory callbacks.
 	 */
 	signup_ip_rate_limiter?: RateLimiter | null;
 	/**
-	 * Per-IP rate limiter for bootstrap. Omit or `undefined` to use a default
-	 * limiter (5 attempts per 15 minutes). Pass `null` to explicitly disable.
+	 * Per-IP rate limiter for bootstrap. Omit or `undefined` for the mode's
+	 * default (5 attempts per 15 minutes under `rate_limiters: 'enforced'`).
+	 * Pass `null` to explicitly disable.
 	 * Separate from `login_ip_rate_limiter` so a fumbled bootstrap token can't
 	 * spend the operator's login budget. Wired directly into the factory-managed
 	 * bootstrap route; also on `AppServerContext` for symmetry.
 	 */
 	bootstrap_ip_rate_limiter?: RateLimiter | null;
 	/**
-	 * Per-account rate limiter for login attempts.
-	 * Omit or `undefined` to use a default limiter (10 attempts per 30 minutes).
-	 * Pass `null` to explicitly disable rate limiting.
+	 * Per-account rate limiter for login attempts. Omit or `undefined` for the
+	 * mode's default (10 attempts per 30 minutes under
+	 * `rate_limiters: 'enforced'`). Pass `null` to explicitly disable.
 	 * Also available on `AppServerContext` for route factory callbacks.
 	 */
 	login_account_rate_limiter?: RateLimiter | null;
 	/**
 	 * Per-account rate limiter for signup attempts, keyed by submitted username.
-	 * Omit or `undefined` to use a default limiter (10 attempts per 30 minutes).
-	 * Pass `null` to explicitly disable rate limiting.
+	 * Omit or `undefined` for the mode's default (10 attempts per 30 minutes
+	 * under `rate_limiters: 'enforced'`). Pass `null` to explicitly disable.
 	 * Also available on `AppServerContext` for route factory callbacks.
 	 */
 	signup_account_rate_limiter?: RateLimiter | null;
@@ -200,26 +244,31 @@ export interface AppServerOptions {
 	 * Per-IP rate limiter for the action dispatchers (HTTP RPC + WebSocket).
 	 * Consulted for actions whose spec declares `rate_limit: 'ip'` or `'both'`.
 	 * Same limiter applies across transports — one budget per action.
-	 * Omit or `undefined` to use a default limiter (600 attempts per
-	 * 15 minutes — permissive). Pass `null` to explicitly disable.
-	 * Also available on `AppServerContext` for consumers wiring
-	 * `register_action_ws`.
+	 * Omit or `undefined` for the mode's default (600 attempts per 15 minutes
+	 * — permissive — under `rate_limiters: 'enforced'`). Pass `null` to
+	 * explicitly disable.
+	 * Threaded into every endpoint mounted from `rpc_endpoints` and
+	 * `ws_endpoints`; also available on `AppServerContext`.
 	 */
 	action_ip_rate_limiter?: RateLimiter | null;
 	/**
-	 * Per-actor rate limiter for the action dispatchers (HTTP RPC + WebSocket).
-	 * Consulted for actions whose spec declares `rate_limit: 'account'` or
-	 * `'both'`. Keyed on `request_context.actor.id` (post-auth).
-	 * Omit or `undefined` to use a default limiter (1200 attempts per
-	 * 15 minutes — permissive). Pass `null` to explicitly disable.
-	 * Also available on `AppServerContext` for consumers wiring
-	 * `register_action_ws`.
+	 * Per-account rate limiter for the action dispatchers (HTTP RPC +
+	 * WebSocket). Consulted for actions whose spec declares
+	 * `rate_limit: 'account'` or `'both'`. Keyed on the authenticated account's
+	 * id, so every actor and credential of one account shares a budget.
+	 * Omit or `undefined` for the mode's default (1200 attempts per 15 minutes
+	 * — permissive — under `rate_limiters: 'enforced'`). Pass `null` to
+	 * explicitly disable.
+	 * Threaded into every endpoint mounted from `rpc_endpoints` and
+	 * `ws_endpoints`; also available on `AppServerContext`.
 	 */
 	action_account_rate_limiter?: RateLimiter | null;
 	/**
-	 * Maximum allowed request body size in bytes.
-	 * Omit or `undefined` to use the default (1 MiB).
-	 * Pass `null` to explicitly disable body size limiting.
+	 * Maximum allowed request body size in bytes, a safe integer `0` or more
+	 * (anything else throws at assembly). Omit or `undefined` to use the
+	 * default (1 MiB). Pass `null` to explicitly disable body size limiting,
+	 * which adds a security warning to the surface's diagnostics (logged at
+	 * startup).
 	 */
 	max_body_size?: number | null;
 	/** Daemon token state for keeper auth. Omit to disable. */
@@ -229,10 +278,19 @@ export interface AppServerOptions {
 	bootstrap?: BootstrapServerOptions;
 
 	/**
-	 * Set to `false` to disable the auto-created surface route (`GET /api/surface`).
-	 * Default: auto-created (authenticated).
+	 * Mount `GET /api/surface`, which serves this server's generated
+	 * `AppSurface` (every route, its auth, and its schemas) to an admin UI such
+	 * as `AdminSurface.svelte`. Off by default — the Rust spine serves no such
+	 * route, and a map of the API is nothing to publish unasked.
+	 *
+	 * When mounted the route is admin-only (`roles: ['admin']`, so it takes the
+	 * `?acting=` selector) and a rule-3 token surface
+	 * (`required_scope: 'surface:app_surface'`): a narrowed API token is refused
+	 * it whatever its method list says. See `server/surface_route.ts`.
+	 *
+	 * @default false
 	 */
-	surface_route?: false;
+	surface_route?: boolean;
 
 	/**
 	 * Build route specs from the initialized backend.
@@ -240,7 +298,23 @@ export interface AppServerOptions {
 	 */
 	create_route_specs: (context: AppServerContext) => Array<RouteSpec>;
 
-	/** Optional: transform middleware specs before applying. */
+	/**
+	 * Optional: transform middleware specs before applying.
+	 *
+	 * Receives shallow copies of the trusted-proxy spec followed by the auth
+	 * stack, in a fresh array — mutating them leaves the originals untouched.
+	 * Add layers anywhere (before the proxy spec, between it and the auth
+	 * stack, between the auth layers, or after), but keep each of those specs
+	 * — its `handler`, not just its `name` — mounted once at its original path
+	 * (`'*'` for the proxy and the origin check, `AUTH_MIDDLEWARE_PATH` for the
+	 * rest of the auth stack) in its original
+	 * order: the endpoint auth-scope check (`assert_endpoint_in_auth_scope`)
+	 * and client-IP rate limiting (`get_client_ip`) assume it, so assembly
+	 * throws (`assert_middleware_stack_mounted`) if the transform moves, drops,
+	 * duplicates, reorders, wraps, or replaces one. The check pins where those
+	 * layers sit, not what added layers do — a layer you add runs with full
+	 * context access.
+	 */
 	transform_middleware?: (specs: Array<MiddlewareSpec>) => Array<MiddlewareSpec>;
 
 	/**
@@ -248,77 +322,139 @@ export interface AppServerOptions {
 	 *
 	 * When truthy, creates an `AuditLogSse` instance internally, registers the SSE
 	 * listener via `backend.deps.audit.add_listener` (composing with the
-	 * consumer's `on_audit_event` callback rather than rebuilding `AppDeps`), and
-	 * auto-includes `audit_log_event_specs` in the surface. The result is exposed
-	 * on `AppServerContext` (for route factories) and `AppServer` (for the caller),
-	 * always typed as `AuditLogSse | null` — when this option is set, the field
-	 * is non-null. Use `require_audit_sse(ctx)` to assert the invariant in
-	 * route factories that depend on it.
+	 * consumer's `on_audit_event` callback rather than rebuilding `AppDeps`),
+	 * adds its registry to `backend.deps.connection_closer` so revocations close
+	 * its streams, and auto-includes `audit_log_event_specs` in the surface. The
+	 * result is exposed on `AppServerContext` (for route factories) and
+	 * `AppServer` (for the caller), always typed as `AuditLogSse | null` — when
+	 * this option is set, the field is non-null. Use `require_audit_sse(ctx)` to
+	 * assert the invariant in route factories that depend on it.
 	 *
-	 * Pass `true` for defaults (admin role), or `{role: 'custom'}` for a custom role.
-	 * Omit to wire audit SSE manually.
+	 * Pass `true` for defaults (admin role), or `{role: 'custom'}` for a custom
+	 * role; `keep_alive_ms` sets the streams' keep-alive interval (a test server
+	 * shortens it; default `SSE_KEEP_ALIVE_INTERVAL_MS`). Omit to wire audit SSE
+	 * manually.
 	 */
-	audit_log_sse?: true | { role?: string };
+	audit_log_sse?: true | { role?: string; keep_alive_ms?: number | null };
+
+	/**
+	 * Schedule the auth cleanup beside the server: `start_auth_cleanup` over
+	 * `backend.deps` — a pass as assembly finishes, then one per interval —
+	 * stopped by `AppServer.close`. Each pass deletes expired sessions and
+	 * closes the connections they opened through `deps.connection_closer`
+	 * (every WebSocket connection registry and audit stream this server mounts), and
+	 * audits each newly expired role_grant offer once.
+	 *
+	 * **Off by default; a production server should turn it on.** Without it
+	 * nothing sweeps: expired session rows accumulate and an offer's expiry is
+	 * never audited. Connections do not depend on it — each closes at its
+	 * credential's deadline (`auth/credential_deadline.ts`), and the sweep's
+	 * close repeats that one. The Rust spine's servers all schedule the twin
+	 * (`spawn_auth_cleanup`).
+	 *
+	 * Pass `true` for the default interval
+	 * (`DEFAULT_AUTH_CLEANUP_INTERVAL_MS`), or `{interval_ms}` for another.
+	 * Leave it off in an in-process test harness — a background pass deletes
+	 * rows and writes audit rows mid-test — and in a process that runs
+	 * `run_auth_cleanup` on a schedule of its own.
+	 */
+	auth_cleanup?: boolean | AuthCleanupScheduleOptions;
 
 	/** SSE event specs for surface generation. Defaults to `[]` (no SSE events). */
 	event_specs?: Array<EventSpec>;
 
 	/**
 	 * RPC endpoint specs — single source of truth for both surface generation
-	 * *and* live dispatch. Each entry is mounted via `create_rpc_endpoint`
-	 * against the assembled Hono app, so consumers no longer call
+	 * *and* live dispatch. Each entry becomes route specs via
+	 * `create_rpc_endpoint`, applied with the other routes, so consumers don't call
 	 * `create_rpc_endpoint` themselves inside `create_route_specs`.
 	 *
 	 * Accepts either an array (evaluated eagerly) or a factory
 	 * `(ctx: AppServerContext) => Array<RpcEndpointSpec>` (evaluated after the
 	 * server context is assembled). Use the factory form when action lists
 	 * depend on `ctx.deps` — e.g. `create_standard_rpc_actions(ctx.deps)`.
+	 *
+	 * Each path must sit inside the auth middleware's scope
+	 * (`AUTH_MIDDLEWARE_PATH`, `'/api/*'`) — assembly throws otherwise, since
+	 * an endpoint outside it would see every caller as unauthenticated.
 	 */
 	rpc_endpoints?: Array<RpcEndpointSpec> | ((context: AppServerContext) => Array<RpcEndpointSpec>);
 
 	/**
-	 * Hono adapter's `upgradeWebSocket` helper. Required whenever
-	 * `ws_endpoints` resolves to a non-empty array — `create_app_server`
-	 * throws at assembly otherwise. Omit (along with `ws_endpoints`)
-	 * when the consumer doesn't mount any WS endpoints. The same
-	 * adapter helper services every `WsEndpointSpec` mounted from
-	 * `ws_endpoints` — one adapter per app.
+	 * Returns the Hono runtime adapter's `upgradeWebSocket` helper for the
+	 * assembled app. `create_app_server` calls it once, with the app it
+	 * builds (the same instance as `AppServer.app`), after creating the app
+	 * and before mounting `ws_endpoints` — and only when `ws_endpoints`
+	 * resolves non-empty, so it is never called for a server with no
+	 * WebSocket endpoints. Required in that case: assembly throws without it.
+	 * One helper services every mounted endpoint.
 	 *
-	 * For Node, `import {upgradeWebSocket} from '@hono/node-ws'`. For
-	 * Deno, `import {upgradeWebSocket} from 'hono/deno'`. Test harnesses
-	 * use `create_stub_upgrade` from `$lib/testing/ws_round_trip.ts`.
+	 * A factory rather than the helper itself because Node's adapter needs
+	 * the app: `@hono/node-ws` has no module-level helper, only
+	 * `createNodeWebSocket({app})`, and `create_app_server` is what builds
+	 * the app. Deno and Bun ignore the argument:
+	 *
+	 * ```ts
+	 * import {upgradeWebSocket} from '@hono/deno'; // or '@hono/bun'
+	 * create_upgrade_websocket: () => upgradeWebSocket,
+	 * ```
+	 *
+	 * Node keeps the adapter so it can attach to the server after `serve()`:
+	 *
+	 * ```ts
+	 * let node_ws: NodeWebSocket | undefined;
+	 * const server = await create_app_server({
+	 *   ...,
+	 *   create_upgrade_websocket: (app) => (node_ws = createNodeWebSocket({app})).upgradeWebSocket,
+	 * });
+	 * node_ws?.injectWebSocket(serve({fetch: server.app.fetch, port}));
+	 * ```
+	 *
+	 * Test harnesses pass `() => stub.upgradeWebSocket` with
+	 * `create_stub_upgrade` from `testing/ws_round_trip.ts`.
 	 */
-	upgradeWebSocket?: UpgradeWebSocket;
+	create_upgrade_websocket?: (app: Hono) => UpgradeWebSocket;
 
 	/**
 	 * WebSocket endpoint specs — single source of truth for both surface
 	 * generation *and* live dispatch. Each entry is auto-mounted via
-	 * `register_ws_endpoint` against the assembled Hono app, so
-	 * consumers no longer call `register_ws_endpoint` themselves.
+	 * `register_action_ws` against the assembled Hono app on every
+	 * runtime, so consumers don't call `register_action_ws` themselves.
+	 *
+	 * An entry that omits `actions` serves the actions of the sole
+	 * `rpc_endpoints` entry (`to_ws_actions`: the protocol actions first, then
+	 * the RPC set), so one action set runs on both transports; assembly throws
+	 * unless exactly one RPC endpoint resolves.
 	 *
 	 * Accepts either an array (evaluated eagerly) or a factory
 	 * `(ctx: AppServerContext) => ReadonlyArray<WsEndpointSpec>`
 	 * (evaluated after the server context is assembled). Use the factory
-	 * form when action lists depend on `ctx.deps` /
-	 * `ctx.action_*_rate_limiter` — e.g. when spreading
-	 * `create_standard_rpc_actions(ctx.deps, ...)` over WS.
+	 * form when action lists depend on `ctx.deps` — e.g. when spreading
+	 * `create_standard_rpc_actions({...ctx.deps, notification_sender})` over WS.
 	 *
-	 * When non-empty, `upgradeWebSocket` must be supplied (throws
+	 * When non-empty, `create_upgrade_websocket` must be supplied (throws
 	 * otherwise). A factory returning `[]` does NOT trip the check —
 	 * feature-flag gated WS surfaces stay safe.
 	 *
-	 * Duplicate `path` values across two `WsEndpointSpec`s throw at
-	 * mount time (Hono would silently shadow them otherwise).
+	 * Every mount gets what the HTTP surface gets: the auth middleware (a
+	 * path outside `AUTH_MIDDLEWARE_PATH` throws at assembly, like
+	 * `rpc_endpoints`), the server's `allowed_origins` unless the spec
+	 * narrows them (a spec's own list gets the same wildcard check,
+	 * `allow_origin_wildcards`), and the same `action_ip_rate_limiter` /
+	 * `action_account_rate_limiter` instances the RPC endpoints charge — one
+	 * budget per action across both transports. The upgrade routes register
+	 * after the route specs and before `post_route_middleware` and
+	 * `static_serving`, so neither runs ahead of an upgrade.
 	 *
-	 * Each spec's `auth_guard?` defaults to `true` — the factory
-	 * composes `create_ws_auth_guard` + `create_ws_logout_closer`
-	 * against the mounted transport and registers them via
-	 * `deps.audit.add_listener`. Wiring is deduped by transport
-	 * **reference identity** so two specs sharing one
-	 * `BackendWebsocketTransport` instance get a single pair of
-	 * listeners; wrapped / proxied transports dedupe as separate
-	 * entries (set `auth_guard: false` on duplicates and compose
-	 * against the underlying transport once).
+	 * Duplicate `path` values across two `WsEndpointSpec`s, and a `path` a
+	 * GET `RouteSpec` already claims, throw at assembly before any endpoint
+	 * mounts (Hono would silently shadow them otherwise).
+	 *
+	 * Every mounted connection registry is added to `deps.connection_closer`, so
+	 * the revocation handlers' post-commit closes reach its sockets, and so
+	 * does the one revocation guard `create_app_server` registers on that
+	 * closer (`create_revocation_guard`) when it mounts a WS endpoint or the
+	 * audit stream. `AppServer.close` removes it again.
 	 */
 	ws_endpoints?:
 		ReadonlyArray<WsEndpointSpec> | ((context: AppServerContext) => ReadonlyArray<WsEndpointSpec>);
@@ -356,9 +492,9 @@ export interface AppServerOptions {
 	await_pending_effects?: boolean;
 
 	/**
-	 * Called when a pending effect rejects.
-	 * Use for monitoring, metrics, or alerting in production.
-	 * Only called when `await_pending_effects` is `false` (production mode).
+	 * Called when an eager pending effect rejects, on HTTP requests and on the
+	 * frames of every WS endpoint the server mounts, in either
+	 * `await_pending_effects` mode. Use for monitoring, metrics, or alerting.
 	 */
 	on_effect_error?: (error: unknown, context: EffectErrorContext) => void;
 
@@ -382,8 +518,8 @@ export interface AppServer {
 	audit_sse: AuditLogSse | null;
 	/**
 	 * Path-keyed map of mounted WS endpoints. Each value is the
-	 * `BackendWebsocketTransport` `create_app_server` registered
-	 * connections against — supplied via `WsEndpointSpec.transport` or
+	 * `ConnectionRegistry` `create_app_server` registered
+	 * connections against — supplied via `WsEndpointSpec.registry` or
 	 * auto-created when omitted. Retain for broadcast / fan-out:
 	 *
 	 * ```ts
@@ -392,8 +528,41 @@ export interface AppServer {
 	 *
 	 * Empty when no `ws_endpoints` were mounted.
 	 */
-	ws_endpoints: Readonly<Record<string, BackendWebsocketTransport>>;
-	/** Close the database connection. Propagated from `AppBackend`. */
+	ws_endpoints: Readonly<Record<string, ConnectionRegistry>>;
+	/**
+	 * Shut the server's resources down, in order:
+	 *
+	 * 1. stop the auth cleanup schedule when the `auth_cleanup` option started
+	 *    one, waiting for a pass in progress — that wait has no bound of its
+	 *    own, so a shutdown with a deadline races it
+	 * 2. close every live connection on `deps.connection_closer`
+	 *    (`close_all_connections`) — each WebSocket with `WS_CLOSE_GOING_AWAY`, each
+	 *    audit stream — including registries supplied through
+	 *    `WsEndpointSpec.registry` or added by hand, since they are registered
+	 *    on the backend's closer and the backend is going away; a close that
+	 *    throws is logged and the shutdown goes on. Each connection and SSE registry
+	 *    is left closing, so an upgrade or stream that registers afterward is
+	 *    born closed — refused at once rather than outliving the server — and
+	 *    a closed registry hosts no other server
+	 * 3. release what assembly acquired, last acquired first: remove the
+	 *    audit listeners `create_app_server` registered on `deps.audit` (the
+	 *    revocation guard, the audit-log SSE listener) and the closer members it added to
+	 *    `deps.connection_closer` (each mounted connection registry, the audit stream
+	 *    registry), and `dispose` the rate limiters it built for omitted
+	 *    options — never one passed in, which its caller owns. A release that
+	 *    throws is logged and the rest still run. The backend's emitter and
+	 *    closer are left as they were before assembly, so a failed assembly
+	 *    can be retried on the same backend, and a backend whose `close` you
+	 *    own (a test harness) can host another server
+	 * 4. close the database connection (`AppBackend.close`)
+	 *
+	 * Idempotent: a second call settles with the first one's outcome (a failed
+	 * close is not retried), and concurrent calls share one shutdown.
+	 *
+	 * Stop accepting new HTTP connections first — without awaiting the
+	 * listener's full drain, since live WebSockets hold it open until `close`
+	 * ends them — so no new request reaches a closed database.
+	 */
 	close: () => Promise<void>;
 }
 
@@ -423,74 +592,327 @@ export const require_audit_sse = (source: { audit_sse: AuditLogSse | null }): Au
 	return source.audit_sse;
 };
 
-/** Default maximum request body size: 1 MiB. */
-export const DEFAULT_MAX_BODY_SIZE = 1024 * 1024;
+/**
+ * Default maximum request body size: 1 MiB. Twin of the Rust spine's
+ * `fuz_http` `DEFAULT_BODY_LIMIT_BYTES`.
+ */
+export const DEFAULT_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/**
+ * Each `AppServerOptions` rate-limiter field, with the defaults an omitted one
+ * is built from under `rate_limiters: 'enforced'` and the name its
+ * explicitly-null diagnostic uses. Insertion order is the order limiters are
+ * built and their diagnostics are listed.
+ */
+const rate_limiter_slots = {
+	login_ip_rate_limiter: { label: 'login IP', defaults: default_login_ip_rate_limit },
+	signup_ip_rate_limiter: { label: 'signup IP', defaults: default_login_ip_rate_limit },
+	bootstrap_ip_rate_limiter: { label: 'bootstrap IP', defaults: default_login_ip_rate_limit },
+	login_account_rate_limiter: {
+		label: 'login account',
+		defaults: default_login_account_rate_limit
+	},
+	signup_account_rate_limiter: {
+		label: 'signup account',
+		defaults: default_login_account_rate_limit
+	},
+	action_ip_rate_limiter: { label: 'action IP', defaults: default_action_ip_rate_limit },
+	action_account_rate_limiter: {
+		label: 'action account',
+		defaults: default_action_account_rate_limit
+	}
+} as const satisfies Record<string, { label: string; defaults: RateLimiterOptions }>;
+
+/**
+ * Name of an `AppServerOptions` rate-limiter field — also the
+ * `AppServerContext` field its resolved limiter lands on.
+ *
+ * @internal
+ */
+export type AppServerRateLimiterKey = keyof typeof rate_limiter_slots;
+
+/**
+ * Every `AppServerOptions` rate-limiter field, in build order.
+ *
+ * @internal
+ */
+export const APP_SERVER_RATE_LIMITER_KEYS = Object.keys(
+	rate_limiter_slots
+) as ReadonlyArray<AppServerRateLimiterKey>;
+
+/**
+ * The rate limiters `create_app_server` resolved from its options.
+ *
+ * @internal
+ */
+export interface ResolvedRateLimiters {
+	/** The `rate_limiters` mode, defaulted to `'enforced'`. */
+	mode: RateLimiterMode;
+	/** Each limiter by option name — `null` when off. */
+	limiters: Record<AppServerRateLimiterKey, RateLimiter | null>;
+	/**
+	 * The limiters built here for omitted options, in build order — the
+	 * server's to dispose. Never one passed in, which its caller owns.
+	 */
+	built: Array<RateLimiter>;
+}
+
+/**
+ * Resolve each rate-limiter option: an explicit option (instance or `null`)
+ * wins; an omitted one is a default instance under `'enforced'` and `null`
+ * under `'disabled_for_testing'`, which also announces the mode on stderr
+ * (`announce_rate_limiters_disabled`). One instance per surface — see
+ * `AppServerOptions.login_ip_rate_limiter` for why these are not a single
+ * shared bucket.
+ *
+ * @param options - the rate-limiter fields and `rate_limiters` mode of `AppServerOptions`
+ * @internal
+ */
+export const resolve_rate_limiters = (
+	options: Pick<AppServerOptions, AppServerRateLimiterKey | 'rate_limiters'>
+): ResolvedRateLimiters => {
+	const mode: RateLimiterMode = options.rate_limiters ?? 'enforced';
+	const limiters = {} as Record<AppServerRateLimiterKey, RateLimiter | null>;
+	const built: Array<RateLimiter> = [];
+	for (const key of APP_SERVER_RATE_LIMITER_KEYS) {
+		const option = options[key];
+		if (option !== undefined) {
+			limiters[key] = option;
+		} else if (mode === 'disabled_for_testing') {
+			announce_rate_limiters_disabled();
+			limiters[key] = null;
+		} else {
+			const limiter = new RateLimiter({ ...rate_limiter_slots[key].defaults });
+			built.push(limiter);
+			limiters[key] = limiter;
+		}
+	}
+	return { mode, limiters, built };
+};
+
+/**
+ * Inputs to `collect_config_diagnostics`.
+ *
+ * @internal
+ */
+export interface ConfigDiagnosticsInput {
+	/** The session cookie overrides, from `AppServerOptions.session_options`. */
+	cookie_options: Partial<SessionCookieOptions> | undefined;
+	/** The `rate_limiters` mode, defaulted. */
+	rate_limiter_mode: RateLimiterMode;
+	/** The resolved limiters, from `resolve_rate_limiters`. */
+	rate_limiters: Record<AppServerRateLimiterKey, RateLimiter | null>;
+	/** `AppServerOptions.max_body_size` as passed; `null` disables the body size limit. */
+	max_body_size: number | null | undefined;
+}
+
+/**
+ * The config-level diagnostics `create_app_server` appends to the surface's
+ * spec-level ones: a weakened session cookie, and an open rate-limited
+ * surface — one warning for `'disabled_for_testing'`, otherwise one per
+ * explicitly-null limiter, so a deployment that disables login's limiter but
+ * keeps signup's reads differently from one that disables both — and a
+ * disabled request body size limit (`max_body_size: null`).
+ *
+ * @internal
+ */
+export const collect_config_diagnostics = (
+	input: ConfigDiagnosticsInput
+): Array<AppSurfaceDiagnostic> => {
+	const diagnostics: Array<AppSurfaceDiagnostic> = [];
+	const { cookie_options } = input;
+	if (cookie_options) {
+		if (cookie_options.secure === false) {
+			diagnostics.push({
+				level: 'warning',
+				category: 'security',
+				message: 'Session cookie secure=false — cookies sent over HTTP'
+			});
+		}
+		if (cookie_options.sameSite && cookie_options.sameSite !== session_cookie_options.sameSite) {
+			diagnostics.push({
+				level: 'warning',
+				category: 'security',
+				message: `Session cookie sameSite='${cookie_options.sameSite}' — weakened from default '${
+					session_cookie_options.sameSite
+				}'`
+			});
+		}
+		if (cookie_options.httpOnly === false) {
+			diagnostics.push({
+				level: 'warning',
+				category: 'security',
+				message: 'Session cookie httpOnly=false — cookie accessible to JS'
+			});
+		}
+	}
+	if (input.rate_limiter_mode === 'disabled_for_testing') {
+		// one warning for the mode rather than one per limiter it nulled
+		diagnostics.push({
+			level: 'warning',
+			category: 'security',
+			message:
+				"rate limiters disabled for testing (rate_limiters: 'disabled_for_testing') — " +
+				'every limiter not passed explicitly is off; never use in production'
+		});
+	} else {
+		for (const key of APP_SERVER_RATE_LIMITER_KEYS) {
+			if (input.rate_limiters[key] === null) {
+				diagnostics.push({
+					level: 'warning',
+					category: 'security',
+					message: `${rate_limiter_slots[key].label} rate limiter explicitly disabled (null)`
+				});
+			}
+		}
+	}
+	if (input.max_body_size === null) {
+		diagnostics.push({
+			level: 'warning',
+			category: 'security',
+			message:
+				'request body size limit explicitly disabled (max_body_size: null) — ' +
+				'every route must cap its own body'
+		});
+	}
+	return diagnostics;
+};
 
 /**
  * Create a fully assembled Hono app with auth, middleware, and routes.
  *
- * Handles the assembly lifecycle: proxy middleware → auth middleware →
- * bootstrap status → route specs → surface generation → Hono app assembly →
- * static serving. Database migrations belong to the backend lifecycle —
+ * Handles the assembly lifecycle: rate limiters → audit SSE → proxy
+ * middleware → auth middleware → bootstrap status → route specs (consumer,
+ * bootstrap, RPC endpoints, surface) → surface generation → Hono app assembly
+ * (routes, then WS endpoints) → post-route middleware → static serving → the
+ * auth cleanup schedule. Database migrations belong to the backend lifecycle —
  * pass `migration_namespaces` to `create_app_backend`.
  *
  * When `audit_log_sse` is set, the SSE registry's listener is registered via
- * `backend.deps.audit.add_listener` — no shallow-copy of `AppDeps`. The
+ * `backend.deps.audit.add_listener` — no shallow-copy of `AppDeps`. That
+ * registry and every WebSocket connection registry mounted from `ws_endpoints` are added
+ * to `backend.deps.connection_closer`, so the revocation handlers built from
+ * `ctx.deps` close their connections with no further wiring, and — when the
+ * server mounts either — one `create_revocation_guard` listener on that closer
+ * repeats each close on the audit row.
+ * The
  * `audit_sse` field on the returned `AppServer` (and the
  * `AppServerContext` passed to `create_route_specs`) is non-null in that
  * case; consumers can call `require_audit_sse(ctx)` / `require_audit_sse(server)`
  * to assert the invariant.
  *
- * @returns assembled Hono app, backend, surface build, and bootstrap status
+ * Assembly acquires a few things that outlive it — the rate limiters it
+ * builds, the listeners it registers on `deps.audit`, the members it adds to
+ * `deps.connection_closer` — and records a release for each as it goes. When
+ * assembly throws, every release recorded so far runs, last acquired first
+ * (one that throws is logged and the rest still run), and the original error
+ * is rethrown: a failed assembly leaves the backend's emitter and closer as
+ * it found them and no limiter timer running. When `auth_cleanup` is set, the
+ * auth cleanup schedule starts as the last step of assembly — nothing after
+ * it can throw, so an assembly that throws leaves no schedule running.
+ *
+ * The returned `close` owns shutdown: it stops that schedule, closes every
+ * live connection on the backend's closer, runs the same releases, and
+ * closes the database (`AppServer.close`).
+ *
+ * @returns the assembled Hono app with its surface, bootstrap status, migration results,
+ *   audit SSE, mounted WS registries, and `close`
+ * @throws Error from any assembly step, after releasing what assembly acquired
  */
 export const create_app_server = async (options: AppServerOptions): Promise<AppServer> => {
+	const releases: Array<() => void> = [];
+	try {
+		return await assemble_app_server(options, releases);
+	} catch (error) {
+		run_releases(releases, options.backend.deps.log, 'a failed assembly');
+		throw error;
+	}
+};
+
+/**
+ * Run `releases` last-first and empty it. Each runs in its own `try`, so one
+ * that throws is logged and the rest still run.
+ */
+const run_releases = (releases: Array<() => void>, log: Logger, during: string): void => {
+	for (const release of releases.splice(0).reverse()) {
+		try {
+			release();
+		} catch (error) {
+			log.error(`create_app_server: a release during ${during} failed:`, error);
+		}
+	}
+};
+
+/**
+ * The body of `create_app_server`. Every acquisition that outlives assembly
+ * pushes its release onto `releases` as it happens, so a throw at any later
+ * step unwinds exactly what was acquired.
+ */
+const assemble_app_server = async (
+	options: AppServerOptions,
+	releases: Array<() => void>
+): Promise<AppServer> => {
 	const { backend } = options;
 	const { deps } = backend;
 	const { log } = deps;
 
-	// Rate limiter defaults (undefined = default, null = disable)
-	// One instance per surface — see `AppServerOptions.login_ip_rate_limiter`
-	// for why these are not a single shared bucket.
-	const login_ip_rate_limiter =
-		options.login_ip_rate_limiter === undefined
-			? create_rate_limiter()
-			: options.login_ip_rate_limiter;
-	const signup_ip_rate_limiter =
-		options.signup_ip_rate_limiter === undefined
-			? create_rate_limiter()
-			: options.signup_ip_rate_limiter;
-	const bootstrap_ip_rate_limiter =
-		options.bootstrap_ip_rate_limiter === undefined
-			? create_rate_limiter()
-			: options.bootstrap_ip_rate_limiter;
-	const login_account_rate_limiter =
-		options.login_account_rate_limiter === undefined
-			? create_rate_limiter(default_login_account_rate_limit)
-			: options.login_account_rate_limiter;
-	const signup_account_rate_limiter =
-		options.signup_account_rate_limiter === undefined
-			? create_rate_limiter(default_login_account_rate_limit)
-			: options.signup_account_rate_limiter;
-	const action_ip_rate_limiter =
-		options.action_ip_rate_limiter === undefined
-			? create_rate_limiter(default_action_ip_rate_limit)
-			: options.action_ip_rate_limiter;
-	const action_account_rate_limiter =
-		options.action_account_rate_limiter === undefined
-			? create_rate_limiter(default_action_account_rate_limit)
-			: options.action_account_rate_limiter;
+	// option checks first, before anything is acquired
+	if (options.allowed_origins.length === 0) {
+		throw new Error(
+			'create_app_server: allowed_origins is empty — list at least one origin pattern ' +
+				'(an empty list refuses every browser request)'
+		);
+	}
+	const wildcards = admit_origin_wildcards(
+		options.allowed_origins,
+		options.allow_origin_wildcards ?? false
+	);
+	if (!wildcards.ok) throw new Error(`create_app_server: ${wildcards.message}`);
+	for (const { entry, warning } of wildcards.wildcards) {
+		log.warn(`${ALLOWED_ORIGINS_VAR}: ${warning} (origin ${entry})`);
+	}
+	// body size limit — rejects oversized payloads before auth/validation; the
+	// middleware throws on a cap that is not a safe integer 0 or more
+	const body_limit_middleware: MiddlewareHandler | null =
+		options.max_body_size === null
+			? null
+			: create_body_limit_middleware(options.max_body_size ?? DEFAULT_BODY_LIMIT_BYTES);
+
+	// Rate limiters — the ones built here are the server's to dispose, on
+	// close or when assembly fails.
+	const {
+		mode: rate_limiter_mode,
+		limiters: rate_limiters,
+		built: built_rate_limiters
+	} = resolve_rate_limiters(options);
+	for (const limiter of built_rate_limiters) {
+		releases.push(() => limiter.dispose());
+	}
+	const { bootstrap_ip_rate_limiter, action_ip_rate_limiter, action_account_rate_limiter } =
+		rate_limiters;
 
 	// Factory-managed audit SSE — registers a listener on the bound emitter
 	// so SSE fan-out runs alongside the consumer's `on_audit_event`
-	// without rebuilding `AppDeps`.
+	// without rebuilding `AppDeps`, and adds the registry to the backend's
+	// closer so revocations close its streams. The closer membership is added
+	// here rather than through `create_audit_log_sse`'s option, so its remover
+	// is the server's.
 	const audit_sse: AuditLogSse | null = options.audit_log_sse
 		? create_audit_log_sse({
 				log,
-				role: typeof options.audit_log_sse === 'object' ? options.audit_log_sse.role : undefined
+				...(typeof options.audit_log_sse === 'object'
+					? { role: options.audit_log_sse.role, keep_alive_ms: options.audit_log_sse.keep_alive_ms }
+					: null),
+				connection_closer: null
 			})
 		: null;
 	if (audit_sse) {
-		deps.audit.add_listener(audit_sse.on_audit_event);
+		releases.push(
+			deps.connection_closer.add(
+				create_sse_connection_closer(audit_sse.registry, audit_sse.required_role)
+			)
+		);
+		releases.push(deps.audit.add_listener(audit_sse.on_audit_event));
 	}
 
 	// Proxy middleware
@@ -500,11 +922,16 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 	const auth_middleware = await create_auth_middleware_specs(deps, {
 		allowed_origins: options.allowed_origins,
 		session_options: options.session_options,
-		daemon_token_state: options.daemon_token_state
+		daemon_token_state: options.daemon_token_state,
+		origin_carve_outs: options.origin_carve_outs
 	});
-	let middleware_specs: Array<MiddlewareSpec> = [proxy_spec, ...auth_middleware];
+	const stack_specs: Array<MiddlewareSpec> = [proxy_spec, ...auth_middleware];
+	let middleware_specs = stack_specs;
 	if (options.transform_middleware) {
-		middleware_specs = options.transform_middleware(middleware_specs);
+		// the transform gets copies in a fresh array, so mutating what it was
+		// handed can't rewrite the originals the check matches against
+		middleware_specs = options.transform_middleware(stack_specs.map((spec) => ({ ...spec })));
+		assert_middleware_stack_mounted(stack_specs, middleware_specs);
 	}
 
 	// Bootstrap status
@@ -535,13 +962,7 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 		backend,
 		bootstrap_status,
 		session_options: options.session_options,
-		login_ip_rate_limiter,
-		signup_ip_rate_limiter,
-		bootstrap_ip_rate_limiter,
-		login_account_rate_limiter,
-		signup_account_rate_limiter,
-		action_ip_rate_limiter,
-		action_account_rate_limiter,
+		...rate_limiters,
 		audit_sse
 	};
 	const consumer_routes = options.create_route_specs(context);
@@ -561,7 +982,11 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 			bootstrap_ip_rate_limiter
 		});
 		const prefix = options.bootstrap.route_prefix ?? '/api/account';
-		factory_routes.push(...prefix_route_specs(prefix, bootstrap_routes));
+		const prefixed = prefix_route_specs(prefix, bootstrap_routes);
+		for (const route of prefixed) {
+			assert_endpoint_in_auth_scope('bootstrap.route_prefix', route.path);
+		}
+		factory_routes.push(...prefixed);
 	}
 
 	// RPC endpoint auto-mount — resolve specs then append their routes so
@@ -572,6 +997,7 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 			: options.rpc_endpoints;
 	if (resolved_rpc_endpoints) {
 		for (const endpoint of resolved_rpc_endpoints) {
+			assert_endpoint_in_auth_scope('rpc_endpoints', endpoint.path);
 			factory_routes.push(
 				...create_rpc_endpoint({
 					path: endpoint.path,
@@ -586,21 +1012,104 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 
 	// WS endpoint resolution — done here (alongside RPC) so the captured
 	// array threads into surface generation below. Actual mount happens
-	// after `apply_route_specs` because `register_ws_endpoint` mutates the
-	// live Hono `app` (origin / auth / role / authorization middleware +
-	// the `app.get(path, ...)` upgrade route), and `app` does not exist
-	// until the assembly phase below.
-	const resolved_ws_endpoints: ReadonlyArray<WsEndpointSpec> | undefined =
+	// after `apply_route_specs` because `register_action_ws` mutates the
+	// live Hono `app` (the `app.get(path, ...)` upgrade route with its
+	// origin / auth / scope / authorization / role chain), and `app` does not
+	// exist until the assembly phase below.
+	// A spec without `allowed_origins` takes the server's list, and one without
+	// `actions` the sole RPC endpoint's — resolved here, once, so the mount and
+	// the surface read the same values.
+	const resolved_ws_endpoints = resolve_ws_endpoints(
 		typeof options.ws_endpoints === 'function'
 			? options.ws_endpoints(context)
-			: options.ws_endpoints;
+			: options.ws_endpoints,
+		{ allowed_origins: options.allowed_origins, rpc_endpoints: resolved_rpc_endpoints }
+	);
+	// the endpoints to mount and the adapter factory they need — null when none resolve
+	let ws_mount: {
+		endpoints: Array<ResolvedWsEndpointSpec>;
+		create_upgrade_websocket: (app: Hono) => UpgradeWebSocket;
+	} | null = null;
+	if (resolved_ws_endpoints?.length) {
+		const create_upgrade_websocket = options.create_upgrade_websocket;
+		if (create_upgrade_websocket === undefined) {
+			throw new Error(
+				'create_app_server: ws_endpoints resolved non-empty but create_upgrade_websocket is missing. ' +
+					"Pass a factory returning the Hono adapter's upgradeWebSocket helper."
+			);
+		}
+		for (const endpoint of resolved_ws_endpoints) {
+			assert_endpoint_in_auth_scope('ws_endpoints', endpoint.path);
+		}
+		ws_mount = { endpoints: resolved_ws_endpoints, create_upgrade_websocket };
+	}
 
-	// Surface route (default: enabled)
-	if (options.surface_route !== false) {
+	// The one revocation listener, registered when a WS endpoint or the audit
+	// stream is mounted — on the backend's closer, so it reaches every member:
+	// each WS connection registry the mount below adds, the audit stream registry, and any
+	// the consumer added by hand. After the audit stream's listener, so a
+	// revocation's row reaches the stream before the guard can close it.
+	if (audit_sse || ws_mount) {
+		releases.push(deps.audit.add_listener(create_revocation_guard(deps.connection_closer, log)));
+	}
+
+	// Surface route (opt-in)
+	if (options.surface_route) {
 		factory_routes.push(create_surface_route_spec(surface_ref));
 	}
 
 	const route_specs = [...consumer_routes, ...factory_routes];
+	// a route that reads or mints a credential outside the auth scope would
+	// skip session parsing or fall under an origin carve-out — consumer
+	// prefixes included (account and signup specs are relative)
+	assert_credential_routes_in_auth_scope(route_specs);
+
+	// WS path checks — pure data, so they run before anything mounts.
+	// `register_action_ws` mounts a `GET path` upgrade route: a duplicate
+	// path, or one a `RouteSpec` already registered as `GET path`, would be
+	// silently shadowed by Hono's last-wins semantics — fail fast instead. An
+	// endpoint's own empty `allowed_origins` would refuse every browser upgrade.
+	if (ws_mount) {
+		const route_spec_get_paths: Set<string> = new Set();
+		for (const r of route_specs) {
+			if (r.method === 'GET') route_spec_get_paths.add(r.path);
+		}
+		const seen_paths: Set<string> = new Set();
+		for (const endpoint of ws_mount.endpoints) {
+			if (seen_paths.has(endpoint.path)) {
+				throw new Error(`create_app_server: duplicate ws_endpoints path: ${endpoint.path}`);
+			}
+			if (route_spec_get_paths.has(endpoint.path)) {
+				throw new Error(
+					`create_app_server: ws_endpoints path collides with a GET RouteSpec: ${endpoint.path}`
+				);
+			}
+			if (endpoint.allowed_origins.length === 0) {
+				throw new Error(
+					`create_app_server: ws_endpoints allowed_origins is empty for ${endpoint.path} — ` +
+						'list at least one origin pattern, or omit it to take the server list ' +
+						'(an empty list refuses every browser upgrade)'
+				);
+			}
+			// an endpoint's own list gets the server list's wildcard check (one
+			// that took the server list was checked above)
+			if (endpoint.allowed_origins !== options.allowed_origins) {
+				const label = `ws_endpoints allowed_origins for ${endpoint.path}`;
+				const endpoint_wildcards = admit_origin_wildcards(
+					endpoint.allowed_origins,
+					options.allow_origin_wildcards ?? false,
+					label
+				);
+				if (!endpoint_wildcards.ok) {
+					throw new Error(`create_app_server: ${endpoint_wildcards.message}`);
+				}
+				for (const { entry, warning } of endpoint_wildcards.wildcards) {
+					log.warn(`${label}: ${warning} (origin ${entry})`);
+				}
+			}
+			seen_paths.add(endpoint.path);
+		}
+	}
 
 	// Surface + logging
 	const surface_middleware = options.post_route_middleware
@@ -620,50 +1129,12 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 	});
 
 	// Config-level diagnostics (concatenated after spec-level from generate_app_surface)
-	const config_diagnostics: Array<AppSurfaceDiagnostic> = [];
-	const cookie_opts: Partial<SessionCookieOptions> | undefined =
-		options.session_options.cookie_options;
-	if (cookie_opts) {
-		if (cookie_opts.secure === false) {
-			config_diagnostics.push({
-				level: 'warning',
-				category: 'security',
-				message: 'Session cookie secure=false — cookies sent over HTTP'
-			});
-		}
-		if (cookie_opts.sameSite && cookie_opts.sameSite !== session_cookie_options.sameSite) {
-			config_diagnostics.push({
-				level: 'warning',
-				category: 'security',
-				message: `Session cookie sameSite='${cookie_opts.sameSite}' — weakened from default '${
-					session_cookie_options.sameSite
-				}'`
-			});
-		}
-		if (cookie_opts.httpOnly === false) {
-			config_diagnostics.push({
-				level: 'warning',
-				category: 'security',
-				message: 'Session cookie httpOnly=false — cookie accessible to JS'
-			});
-		}
-	}
-	// One diagnostic per surface — a deployment that disables login's limiter
-	// but keeps signup's is a different posture than one that disables both,
-	// and a single collapsed warning hid which surface was open.
-	for (const [name, limiter] of [
-		['login', login_ip_rate_limiter],
-		['signup', signup_ip_rate_limiter],
-		['bootstrap', bootstrap_ip_rate_limiter]
-	] as const) {
-		if (limiter === null) {
-			config_diagnostics.push({
-				level: 'warning',
-				category: 'config',
-				message: `${name} IP rate limiter explicitly disabled (null)`
-			});
-		}
-	}
+	const config_diagnostics = collect_config_diagnostics({
+		cookie_options: options.session_options.cookie_options,
+		rate_limiter_mode,
+		rate_limiters,
+		max_body_size: options.max_body_size
+	});
 	if (config_diagnostics.length) {
 		surface_spec.surface.diagnostics = [...surface_spec.surface.diagnostics, ...config_diagnostics];
 	}
@@ -674,14 +1145,23 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 
 	// Hono app assembly
 	const app = new Hono();
+	// A throw that escapes every route catch — a credential leg's failed read
+	// above all — answers here: 503 for a failed pool checkout, Hono's default
+	// 500 for anything else.
+	app.onError(create_app_error_handler(log));
 
 	// Two-queue side-effect flush. `pending_effects` collects eager
 	// fire-and-forget promises (audit emits, api-token usage). `post_commit_effects` collects deferred thunks pushed via
 	// `emit_after_commit` (WS notifications, anything that must observe a
 	// committed transaction). Both queues drain here, after the handler
-	// (and any wrapping `db.transaction`) returns. In test mode both are
-	// awaited before the response returns; in production, eager-queue
-	// rejections are reported via `on_effect_error`.
+	// (and any wrapping `db.transaction`) returns, through the flush the WS
+	// dispatcher shares (`flush_request_effects`). In test mode the flush is
+	// awaited before the response returns; in production it runs
+	// fire-and-forget. Either way eager rejections reach `on_effect_error`,
+	// and the deferred thunks are invoked without waiting for the eager
+	// writes to settle — a revocation's connection close must not sit behind
+	// a slow audit INSERT.
+	const on_effect_error = options.on_effect_error;
 	app.use('*', async (c, next) => {
 		c.set('pending_effects', []);
 		c.set('post_commit_effects', []);
@@ -691,23 +1171,19 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 			const eager = c.var.pending_effects;
 			const deferred = c.var.post_commit_effects;
 			if (eager.length || deferred.length) {
-				if (options.await_pending_effects) {
-					await flush_pending_effects(eager, log);
-					await flush_post_commit_effects(deferred, log);
-				} else {
-					const error_ctx: EffectErrorContext = { method: c.req.method, path: c.req.path };
-					const callback = options.on_effect_error;
-					void flush_pending_effects(
-						eager,
-						log,
-						callback ? (reason) => callback(reason, error_ctx) : undefined
-					);
-					// `flush_post_commit_effects` is non-throwing: per-thunk
-					// errors are routed through `log.error` inside the helper,
-					// so production fire-and-forget skips the `on_effect_error`
-					// fan-out (deferred thunks are wrapped end-to-end already).
-					void flush_post_commit_effects(deferred, log);
-				}
+				const error_ctx: EffectErrorContext = {
+					transport: 'http',
+					method: c.req.method,
+					path: c.req.path
+				};
+				const flushed = flush_request_effects(
+					eager,
+					deferred,
+					log,
+					on_effect_error ? (reason) => on_effect_error(reason, error_ctx) : undefined
+				);
+				if (options.await_pending_effects) await flushed;
+				else void flushed;
 			}
 		}
 	});
@@ -716,16 +1192,9 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 		app.use(logger((msg) => log.info(msg)));
 	}
 
-	// Body size limit — rejects oversized payloads before auth/validation.
-	// Default 1 MiB; pass null to disable.
-	if (options.max_body_size !== null) {
-		const max_size = options.max_body_size ?? DEFAULT_MAX_BODY_SIZE;
-		app.use(
-			bodyLimit({
-				maxSize: max_size,
-				onError: (c) => c.json({ error: ERROR_PAYLOAD_TOO_LARGE }, 413)
-			})
-		);
+	// body size limit, built with the option checks above
+	if (body_limit_middleware) {
+		app.use(body_limit_middleware);
 	}
 
 	apply_middleware_specs(app, middleware_specs);
@@ -734,78 +1203,42 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 
 	// WS endpoint auto-mount — must run after `app` exists and
 	// `apply_route_specs` has registered the request routes. Each spec
-	// becomes a `register_ws_endpoint` call, plus optional `auth_guard`
-	// wiring onto the audit chain. `post_route_middleware` and static
+	// becomes a `register_action_ws` call. `post_route_middleware` and static
 	// serving register after this loop, so WS upgrade routes sit
 	// adjacent to the consumer routes and ahead of the static fallback —
 	// matches the "WS mount is route registration" mental model.
-	const mounted_ws_endpoints: Record<string, BackendWebsocketTransport> = {};
-	if (resolved_ws_endpoints?.length) {
-		if (options.upgradeWebSocket === undefined) {
-			throw new Error(
-				'create_app_server: ws_endpoints resolved non-empty but upgradeWebSocket is missing. ' +
-					"Pass the Hono adapter's upgradeWebSocket helper as a top-level option."
-			);
-		}
-		// Cross-surface collision: `register_ws_endpoint` mounts a `GET path`
-		// upgrade route. If a `RouteSpec` already registered `GET path`,
-		// Hono's last-wins semantics would silently shadow the consumer's
-		// GET route — fail fast instead.
-		const route_spec_get_paths: Set<string> = new Set();
-		for (const r of route_specs) {
-			if (r.method === 'GET') route_spec_get_paths.add(r.path);
-		}
-		const seen_paths: Set<string> = new Set();
-		// Dedupe `auth_guard` wiring by transport reference — two specs
-		// sharing one transport instance get a single pair of listeners,
-		// otherwise revocation events would fire `close_sockets_for_*`
-		// twice per event (idempotent on the transport but log-spammy).
-		// Cross-spec OR-semantics: any spec with `auth_guard !== false`
-		// wires the guard for that transport; once wired, sibling specs
-		// (even with explicit `auth_guard: false`) cannot opt out. To
-		// disable, every spec sharing the transport must pass `auth_guard: false`.
-		const guarded_transports: WeakSet<BackendWebsocketTransport> = new WeakSet();
-		for (const endpoint of resolved_ws_endpoints) {
-			if (seen_paths.has(endpoint.path)) {
-				throw new Error(`create_app_server: duplicate ws_endpoints path: ${endpoint.path}`);
-			}
-			if (route_spec_get_paths.has(endpoint.path)) {
-				throw new Error(
-					`create_app_server: ws_endpoints path collides with a GET RouteSpec: ${endpoint.path}`
-				);
-			}
-			seen_paths.add(endpoint.path);
-
-			const endpoint_transport = endpoint.transport ?? new BackendWebsocketTransport();
-			register_ws_endpoint({
+	const mounted_ws_endpoints: Record<string, ConnectionRegistry> = {};
+	if (ws_mount) {
+		// the adapter helper — built from this app, which Node's
+		// `createNodeWebSocket({app})` needs, and only when there is something to mount
+		const upgrade_websocket = ws_mount.create_upgrade_websocket(app);
+		for (const endpoint of ws_mount.endpoints) {
+			const { registry: endpoint_registry } = register_action_ws({
 				app,
 				path: endpoint.path,
-				upgradeWebSocket: options.upgradeWebSocket,
+				upgradeWebSocket: upgrade_websocket,
 				allowed_origins: endpoint.allowed_origins,
 				db: deps.db,
 				actions: endpoint.actions,
-				transport: endpoint_transport,
-				heartbeat: endpoint.heartbeat,
-				artificial_delay: endpoint.artificial_delay,
+				registry: endpoint.registry,
+				// added below instead, so the remover is the server's
+				connection_closer: null,
+				max_connections_per_account: endpoint.max_connections_per_account,
+				outbound_queue_bytes: endpoint.outbound_queue_bytes,
+				receive_timeout: endpoint.receive_timeout,
+				max_message_bytes: endpoint.max_message_bytes,
 				on_socket_open: endpoint.on_socket_open,
 				on_socket_close: endpoint.on_socket_close,
 				log,
 				required_roles: endpoint.required_roles,
 				action_ip_rate_limiter,
-				action_account_rate_limiter
+				action_account_rate_limiter,
+				on_effect_error
 			});
-			mounted_ws_endpoints[endpoint.path] = endpoint_transport;
-
-			if (endpoint.auth_guard !== false && !guarded_transports.has(endpoint_transport)) {
-				guarded_transports.add(endpoint_transport);
-				deps.audit.add_listener(create_ws_auth_guard(endpoint_transport, log));
-				deps.audit.add_listener(create_ws_logout_closer(endpoint_transport, log));
-			}
-			if (endpoint.extra_audit_handlers?.length) {
-				for (const handler of endpoint.extra_audit_handlers) {
-					deps.audit.add_listener(handler);
-				}
-			}
+			mounted_ws_endpoints[endpoint.path] = endpoint_registry;
+			// every revocation's close — the handlers' and the guard's — reaches
+			// this registry
+			releases.push(deps.connection_closer.add(endpoint_registry));
 		}
 	}
 
@@ -822,6 +1255,33 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 		}
 	}
 
+	// Auth cleanup — opt-in, and last: nothing after it can throw, so a failed
+	// assembly never leaves a schedule running. Its own throw (an invalid
+	// `interval_ms`) comes before any pass starts, and unwinds `releases` like
+	// any other. Its closes go through `deps.connection_closer`, which the
+	// mounts above have filled.
+	const auth_cleanup = options.auth_cleanup
+		? start_auth_cleanup(deps, options.auth_cleanup === true ? undefined : options.auth_cleanup)
+		: null;
+
+	// One shutdown, shared by every call — see `AppServer.close` for the order.
+	let closing: Promise<void> | null = null;
+	const shutdown = async (): Promise<void> => {
+		// the schedule first, so a pass in progress finishes on a live pool
+		if (auth_cleanup) await auth_cleanup.stop();
+		// then the connections, so none outlives the server — a failure here
+		// must not keep the database open
+		try {
+			deps.connection_closer.close_all_connections();
+		} catch (error) {
+			log.error('create_app_server: closing live connections on shutdown failed:', error);
+		}
+		// then what assembly acquired — the audit listeners and closer members
+		// this server added, and the limiters it built
+		run_releases(releases, log, 'shutdown');
+		await backend.close();
+	};
+
 	return {
 		app,
 		surface_spec,
@@ -829,6 +1289,6 @@ export const create_app_server = async (options: AppServerOptions): Promise<AppS
 		migration_results: backend.migration_results,
 		audit_sse,
 		ws_endpoints: mounted_ws_endpoints,
-		close: backend.close
+		close: () => (closing ??= shutdown())
 	};
 };

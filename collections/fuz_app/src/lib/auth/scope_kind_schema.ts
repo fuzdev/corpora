@@ -18,7 +18,7 @@
  * `create_scope_kind_schema(consumer_kinds)` and pass the result to
  * `create_role_schema` so `RoleSpec.applicable_scope_kinds` can be
  * validated at construction time. Mirrors the open-string registry
- * pattern used for `RoleName`, `AuditEventTypeName`, and `CredentialType`.
+ * pattern used for `RoleName`, `AuditEventTypeName`, and `CredentialTypeName`.
  *
  * The literal `'GLOBAL'` (uppercase) appears as an index expression
  * inside the partial unique indexes on `role_grant` and `role_grant_offer`
@@ -32,6 +32,8 @@
 
 import { z } from 'zod';
 
+import { bounded_string } from '../primitive_schemas.ts';
+
 /**
  * Letter (lowercase a-z) start and end (or single letter), with letters
  * and underscores in between. Mirrors `RoleName`. Rejects empty strings,
@@ -40,13 +42,25 @@ import { z } from 'zod';
  */
 export const SCOPE_KIND_NAME_REGEX = /^[a-z][a-z_]*[a-z]$|^[a-z]$/;
 
+/**
+ * Maximum length of a `scope_kind`, in UTF-16 code units (what
+ * `String.length` measures; enforced by `bounded_string`). Bounds the tag where it enters
+ * — the grant inputs (`role_grant_offer_create`, `role_grant_assign`) copy it
+ * into the row and its audit metadata — and a registered name, so no
+ * registry declares a kind the grant inputs would refuse. Same value as
+ * `ROLE_NAME_LENGTH_MAX`, whose grammar the name mirrors, and as the Rust
+ * spine's `SCOPE_KIND_LENGTH_MAX`.
+ */
+export const SCOPE_KIND_LENGTH_MAX = 64;
+
 /** Zod schema for valid scope-kind name strings. */
-export const ScopeKindName = z
-	.string()
-	.regex(
-		SCOPE_KIND_NAME_REGEX,
-		'Scope-kind names must be lowercase letters and underscores (a-z_), no leading/trailing underscore'
-	);
+export const ScopeKindName = bounded_string({
+	max: SCOPE_KIND_LENGTH_MAX,
+	max_message: `Scope-kind names must be at most ${SCOPE_KIND_LENGTH_MAX} characters`
+}).regex(
+	SCOPE_KIND_NAME_REGEX,
+	'Scope-kind names must be lowercase letters and underscores (a-z_), no leading/trailing underscore'
+);
 export type ScopeKindName = z.infer<typeof ScopeKindName>;
 
 /**
@@ -121,9 +135,7 @@ export const create_scope_kind_schema = (
 	}
 
 	const ScopeKind: z.ZodType<string> =
-		names.length === 0
-			? (z.never() as unknown as z.ZodType<string>)
-			: z.enum(names as [string, ...Array<string>]);
+		names.length === 0 ? z.never() : z.enum(names as [string, ...Array<string>]);
 
 	const scope_kinds: Map<string, ScopeKindMeta> = new Map();
 	for (const name of names) {

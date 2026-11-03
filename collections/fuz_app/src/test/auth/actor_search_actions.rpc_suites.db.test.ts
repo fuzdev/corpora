@@ -2,7 +2,7 @@
  * Composable RPC suite coverage for the `actor_search` action.
  *
  * Wires `describe_rpc_attack_surface_tests` (stub-deps, no DB) and
- * `describe_rpc_round_trip_tests` (PGlite) against the single action
+ * `describe_rpc_round_trip_tests` (the default test database) against the single action
  * produced by `create_actor_search_actions`. Auto-covers per-method auth
  * enforcement, adversarial envelopes, adversarial params, and output-
  * schema validation. Method-specific wire semantics (admin-only on empty
@@ -14,15 +14,15 @@
 
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app_surface_spec } from '$lib/testing/stubs.ts';
-import { describe_rpc_attack_surface_tests } from '$lib/testing/rpc_attack_surface.ts';
-import { describe_rpc_round_trip_tests } from '$lib/testing/rpc_round_trip.ts';
-import { default_in_process_suite_options } from '$lib/testing/cross_backend/in_process_setup.ts';
-import { create_actor_search_actions } from '$lib/auth/actor_search_actions.ts';
-import { ROLE_ADMIN, ROLE_KEEPER } from '$lib/auth/role_schema.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app_surface_spec } from '#lib/testing/stubs.ts';
+import { describe_rpc_attack_surface_tests } from '#lib/testing/rpc_attack_surface.ts';
+import { describe_rpc_round_trip_tests } from '#lib/testing/rpc_round_trip.ts';
+import { default_in_process_suite_options } from '#lib/testing/cross_backend/in_process_setup.ts';
+import { create_actor_search_actions } from '#lib/auth/actor_search_actions.ts';
+import { ROLE_ADMIN, ROLE_KEEPER } from '#lib/auth/role_schema.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
 
 const log = new Logger('test', { level: 'off' });
 const session_options = create_session_config('test_actor_search_rpc');

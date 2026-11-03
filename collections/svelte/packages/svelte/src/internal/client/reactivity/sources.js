@@ -25,10 +25,7 @@ import {
 	MAYBE_DIRTY,
 	BLOCK_EFFECT,
 	ROOT_EFFECT,
-	ASYNC,
-	WAS_MARKED,
-	CONNECTED,
-	REACTION_IS_UPDATING
+	ASYNC
 } from '#client/constants';
 import * as e from '../errors.js';
 import { legacy_mode_flag, tracing_mode_flag } from '../../flags/index.js';
@@ -40,7 +37,8 @@ import {
 	batch_values,
 	eager_block_effects,
 	schedule_effect,
-	legacy_updates
+	legacy_updates,
+	source_stacks
 } from './batch.js';
 import { proxy } from '../proxy.js';
 import { execute_derived } from './deriveds.js';
@@ -49,7 +47,7 @@ import { set_signal_status, update_derived_status } from './status.js';
 /** @type {Set<Effect>} */
 export let eager_effects = new Set();
 
-/** @type {Map<Source, any>} */
+/** @type {Map<Value, any>} */
 export const old_values = new Map();
 
 /**
@@ -73,9 +71,9 @@ export function set_eager_effects_deferred() {
  */
 // TODO rename this to `state` throughout the codebase
 export function source(v, stack) {
-	/** @type {Value} */
+	/** @type {Source<V>} */
 	var signal = {
-		f: 0, // TODO ideally we could skip this altogether, but it causes type errors
+		f: 0,
 		v,
 		reactions: null,
 		equals,
@@ -144,7 +142,7 @@ export function mutate(source, value) {
 
 /**
  * @template V
- * @param {Source<V>} source
+ * @param {Value<V>} source
  * @param {V} value
  * @param {boolean} [should_proxy]
  * @returns {V}
@@ -172,8 +170,19 @@ export function set(source, value, should_proxy = false) {
 }
 
 /**
+ * A set of signals we have already seen while traversing in mark_reactions.
+ * Not always set to balance the common case of sources only having a couple
+ * of (transitive) dependencies (where always creating a Set would be bad for perf)
+ * with the edge case of extremely deep or wide dependency arrays with cycles.
+ * @type {Set<any> | null}
+ */
+var seen = null;
+/** Number of transitive dependencies, see {@link seen} for more info */
+var count_deps = 0;
+
+/**
  * @template V
- * @param {Source<V>} source
+ * @param {Value<V>} source
  * @param {V} value
  * @param {Effect[] | null} [updated_during_traversal]
  * @returns {V}
@@ -194,6 +203,7 @@ export function internal_set(source, value, updated_during_traversal = null) {
 		if (DEV) {
 			if (tracing_mode_flag || active_effect !== null) {
 				source.updated ??= new Map();
+				source_stacks.add(source);
 
 				// For performance reasons, when not using $inspect.trace, we only start collecting stack traces
 				// after the same source has been updated more than 5 times in the same flush cycle.
@@ -240,7 +250,10 @@ export function internal_set(source, value, updated_during_traversal = null) {
 
 		// For debugging, in case you want to know which reactions are being scheduled:
 		// log_reactions(source);
+		seen = null;
+		count_deps = 0;
 		mark_reactions(source, DIRTY, updated_during_traversal);
+		seen = null;
 
 		// It's possible that the current reaction might not have up-to-date dependencies
 		// whilst it's actively running. So in the case of ensuring it registers the reaction
@@ -347,6 +360,18 @@ function mark_reactions(signal, status, updated_during_traversal) {
 	var runes = is_runes();
 	var length = reactions.length;
 
+	count_deps += length;
+	// Activate the `seen` Set if we think from the unusually high number of deps that
+	// there might be cycles in the graph, to avoid repeated lookups for reactions
+	// Example: https://github.com/sveltejs/svelte/issues/16658 has a graph with one source
+	// reaching ~10000 distinct deriveds/effects each, resulting in 65 million walks through repeated visits.
+	if (count_deps > 100000 && seen === null) seen = new Set();
+
+	if (seen !== null) {
+		if (seen.has(signal)) return;
+		seen.add(signal);
+	}
+
 	for (var i = 0; i < length; i++) {
 		var reaction = reactions[i];
 		var flags = reaction.f;
@@ -370,18 +395,7 @@ function mark_reactions(signal, status, updated_during_traversal) {
 			var derived = /** @type {Derived} */ (reaction);
 
 			batch_values?.delete(derived);
-
-			if ((flags & WAS_MARKED) === 0) {
-				// Only connected deriveds being executed outside the update cycle can be reliably unmarked right away
-				if (
-					flags & CONNECTED &&
-					(active_effect === null || (active_effect.f & REACTION_IS_UPDATING) === 0)
-				) {
-					reaction.f |= WAS_MARKED;
-				}
-
-				mark_reactions(derived, MAYBE_DIRTY, updated_during_traversal);
-			}
+			mark_reactions(derived, MAYBE_DIRTY, updated_during_traversal);
 		} else if (not_dirty) {
 			var effect = /** @type {Effect} */ (reaction);
 

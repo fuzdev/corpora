@@ -11,6 +11,7 @@
  */
 
 import { describe, test, assert, vi, beforeEach, afterEach } from 'vitest';
+import { z } from 'zod';
 
 vi.mock('esm-env', () => ({ BROWSER: true, DEV: true, NODE: true }));
 
@@ -25,15 +26,29 @@ import {
 	DEFAULT_HEARTBEAT_INTERVAL,
 	DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT,
 	DEFAULT_QUEUE_MAX_SIZE,
+	HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR,
+	resolve_heartbeat_receive_timeout,
 	socket_status_to_async_status
-} from '$lib/actions/socket.svelte.ts';
+} from '#lib/actions/socket.svelte.ts';
 import {
 	WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT,
+	WS_CLOSE_CONNECTION_LIMIT,
+	WS_CLOSE_CONNECTION_LIMIT_REASON,
+	WS_CLOSE_GOING_AWAY,
+	WS_CLOSE_GOING_AWAY_REASON,
+	WS_CLOSE_OUTBOUND_OVERFLOW,
+	WS_CLOSE_OUTBOUND_OVERFLOW_REASON,
+	WS_CLOSE_PERMISSION_REVOKED,
+	WS_CLOSE_PERMISSION_REVOKED_REASON,
 	WS_CLOSE_SESSION_REVOKED
-} from '$lib/actions/transports.ts';
-import { cancel_action_spec } from '$lib/actions/cancel.ts';
-import { heartbeat_action_spec } from '$lib/actions/heartbeat.ts';
-import { JSONRPC_ERROR_CODES, ThrownJsonrpcError } from '$lib/http/jsonrpc_errors.ts';
+} from '#lib/actions/transports.ts';
+import { cancel_action_spec } from '#lib/actions/cancel.ts';
+import { heartbeat_action_spec } from '#lib/actions/heartbeat.ts';
+import { FrontendWebsocketTransport } from '#lib/actions/transports_ws.ts';
+import { create_frontend_rpc_client } from '#lib/actions/frontend_rpc_client.ts';
+import type { ActionSpecUnion } from '#lib/actions/action_spec.ts';
+import { create_jsonrpc_request } from '#lib/http/jsonrpc_helpers.ts';
+import { JSONRPC_ERROR_CODES, ThrownJsonrpcError } from '#lib/http/jsonrpc_errors.ts';
 
 // --- mock WebSocket ---
 
@@ -581,6 +596,46 @@ describe('auto-reconnect', () => {
 		assert.strictEqual(client.status, 'connecting');
 	});
 
+	test('a server shutdown close (WS_CLOSE_GOING_AWAY) reconnects and is not terminal', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_GOING_AWAY, WS_CLOSE_GOING_AWAY_REASON);
+
+		assert.strictEqual(client.status, 'reconnecting');
+		assert.strictEqual(client.reconnect_count, 1);
+		assert.strictEqual(client.current_reconnect_delay, DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(client.revoked, false);
+		assert.strictEqual(client.superseded, false);
+		assert.strictEqual(client.last_close_code, WS_CLOSE_GOING_AWAY);
+
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+		assert.strictEqual(client.status, 'connecting');
+	});
+
+	test('an outbound overflow close (WS_CLOSE_OUTBOUND_OVERFLOW) reconnects and is not terminal', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_OUTBOUND_OVERFLOW, WS_CLOSE_OUTBOUND_OVERFLOW_REASON);
+
+		// an ordinary reconnectable close: the credential is good and nothing
+		// took the connection's place
+		assert.strictEqual(client.status, 'reconnecting');
+		assert.strictEqual(client.reconnect_count, 1);
+		assert.strictEqual(client.current_reconnect_delay, DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(client.revoked, false);
+		assert.strictEqual(client.superseded, false);
+		assert.strictEqual(client.last_close_code, WS_CLOSE_OUTBOUND_OVERFLOW);
+
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+		assert.strictEqual(client.status, 'connecting');
+	});
+
 	test('exponential backoff increments delay', () => {
 		vi.useFakeTimers();
 		const client = new FrontendWebsocketClient(TEST_URL);
@@ -728,6 +783,220 @@ describe('revoked getter', () => {
 
 		assert.strictEqual(client.status, 'closed');
 		assert.strictEqual(client.revoked, false);
+	});
+});
+
+describe('permission revoked', () => {
+	test('WS_CLOSE_PERMISSION_REVOKED closes without reconnecting, revoking, or superseding', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+
+		last_ws().fire_close(WS_CLOSE_PERMISSION_REVOKED, WS_CLOSE_PERMISSION_REVOKED_REASON);
+		assert.strictEqual(client.status, 'closed');
+		// the credential is still good — the session is not lost
+		assert.strictEqual(client.revoked, false);
+		assert.strictEqual(client.superseded, false);
+		assert.strictEqual(client.ws, null);
+		assert.strictEqual(client.last_close_code, WS_CLOSE_PERMISSION_REVOKED);
+		assert.strictEqual(client.last_close_reason, WS_CLOSE_PERMISSION_REVOKED_REASON);
+		assert.strictEqual(socket_status_to_async_status(client.status, client.revoked), 'initial');
+
+		// a reconnect would be refused at the role gate
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY_MAX * 2);
+		assert.strictEqual(MockWebSocket.instances.length, 1);
+		assert.strictEqual(client.status, 'closed');
+
+		// an explicit connect() reopens — `connect` is not a no-op as after 4001
+		client.connect();
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+		assert.strictEqual(client.status, 'connecting');
+	});
+
+	test('a permission-revoked close during a reconnect loop cancels it', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(1006);
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(client.reconnect_count, 1);
+
+		last_ws().fire_close(WS_CLOSE_PERMISSION_REVOKED);
+		assert.strictEqual(client.status, 'closed');
+		assert.strictEqual(client.reconnect_count, 0);
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY_MAX * 2);
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+	});
+
+	test('rejects in-flight and queued requests with forbidden', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		const queued = client.request('queued', {});
+		client.connect();
+		last_ws().fire_close(WS_CLOSE_PERMISSION_REVOKED);
+
+		const queued_err = await assert_rejects(() => queued, /permission revoked/);
+		assert.instanceOf(queued_err, ThrownJsonrpcError);
+		assert.strictEqual(queued_err.code, JSONRPC_ERROR_CODES.forbidden);
+
+		client.connect();
+		last_ws().fire_open();
+		const in_flight = client.request('in_flight', {});
+		last_ws().fire_close(WS_CLOSE_PERMISSION_REVOKED);
+
+		const in_flight_err = await assert_rejects(() => in_flight, /permission revoked/);
+		assert.instanceOf(in_flight_err, ThrownJsonrpcError);
+		assert.strictEqual(in_flight_err.code, JSONRPC_ERROR_CODES.forbidden);
+		assert.strictEqual(client.revoked, false, 'requests after it are not refused as revoked');
+	});
+});
+
+describe('connection limit', () => {
+	test('WS_CLOSE_CONNECTION_LIMIT closes without reconnecting or revoking', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		assert.strictEqual(client.superseded, false);
+		client.connect();
+		last_ws().fire_open();
+
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT, WS_CLOSE_CONNECTION_LIMIT_REASON);
+		assert.strictEqual(client.status, 'closed');
+		assert.strictEqual(client.superseded, true);
+		assert.strictEqual(client.revoked, false);
+		assert.strictEqual(client.ws, null);
+		assert.strictEqual(client.last_close_code, WS_CLOSE_CONNECTION_LIMIT);
+		assert.strictEqual(client.last_close_reason, WS_CLOSE_CONNECTION_LIMIT_REASON);
+		// closed and not trying — the same projection as a clean close
+		assert.strictEqual(socket_status_to_async_status(client.status, client.revoked), 'initial');
+
+		// reconnecting would supersede the newer socket in turn
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY_MAX * 2);
+		assert.strictEqual(MockWebSocket.instances.length, 1);
+		assert.strictEqual(client.status, 'closed');
+	});
+
+	test('an explicit connect() reopens and clears superseded', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+		assert.strictEqual(client.superseded, true);
+
+		client.connect();
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+		assert.strictEqual(client.superseded, false);
+		assert.strictEqual(client.status, 'connecting');
+		last_ws().fire_open();
+		assert.strictEqual(client.status, 'connected');
+
+		// the reconnect policy is intact — an ordinary close retries again
+		last_ws().fire_close(1006);
+		assert.strictEqual(client.status, 'reconnecting');
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(MockWebSocket.instances.length, 3);
+	});
+
+	test('a connection-limit close during a reconnect loop cancels it', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(1006);
+		assert.strictEqual(client.status, 'reconnecting');
+
+		// the retry's socket is the one the server supersedes — closed before it
+		// opens, so the backoff counters are still raised
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY);
+		assert.strictEqual(client.reconnect_count, 1);
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+		assert.strictEqual(client.status, 'closed');
+		assert.strictEqual(client.superseded, true);
+		assert.strictEqual(client.reconnect_count, 0);
+		assert.strictEqual(client.current_reconnect_delay, 0);
+
+		vi.advanceTimersByTime(DEFAULT_RECONNECT_DELAY_MAX * 2);
+		assert.strictEqual(MockWebSocket.instances.length, 2);
+	});
+
+	test('only the connection-limit close sets superseded', () => {
+		for (const code of [DEFAULT_CLOSE_CODE, 1006, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT]) {
+			const client = new FrontendWebsocketClient(TEST_URL, { reconnect: false });
+			client.connect();
+			last_ws().fire_open();
+			last_ws().fire_close(code);
+			assert.strictEqual(client.superseded, false, `code ${code}`);
+		}
+
+		const revoked = new FrontendWebsocketClient(TEST_URL);
+		revoked.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_SESSION_REVOKED);
+		assert.strictEqual(revoked.superseded, false);
+
+		const disconnected = new FrontendWebsocketClient(TEST_URL);
+		disconnected.connect();
+		last_ws().fire_open();
+		disconnected.disconnect();
+		assert.strictEqual(disconnected.superseded, false);
+	});
+
+	test('rejects in-flight and queued requests with service_unavailable', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		// buffered before the socket opens, so still queued at the close
+		const queued = client.request('queued', {});
+		client.connect();
+		// closes before `open`, so the queue was never flushed
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+
+		const queued_err = await assert_rejects(() => queued, /connection superseded/);
+		assert.instanceOf(queued_err, ThrownJsonrpcError);
+		assert.strictEqual(queued_err.code, JSONRPC_ERROR_CODES.service_unavailable);
+
+		client.connect();
+		last_ws().fire_open();
+		const in_flight = client.request('in_flight', {});
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+
+		const in_flight_err = await assert_rejects(() => in_flight, /connection superseded/);
+		assert.instanceOf(in_flight_err, ThrownJsonrpcError);
+		assert.strictEqual(in_flight_err.code, JSONRPC_ERROR_CODES.service_unavailable);
+	});
+
+	test('disconnect() leaves superseded set — only connect() clears it', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+		const queued = client.request('queued', {});
+
+		// the client is already closed, so this only drops what buffered since
+		client.disconnect();
+		assert.strictEqual(client.superseded, true);
+		assert.strictEqual(client.last_close_code, WS_CLOSE_CONNECTION_LIMIT);
+		const err = await assert_rejects(() => queued, /client disconnected/);
+		assert.instanceOf(err, ThrownJsonrpcError);
+		assert.strictEqual(err.code, JSONRPC_ERROR_CODES.service_unavailable);
+
+		client.connect();
+		assert.strictEqual(client.superseded, false);
+	});
+
+	test('requests made while superseded queue and flush on the explicit connect()', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT);
+
+		// not `unauthenticated` like a revoked client — the credential is good
+		const promise = client.request<string>('echo', { n: 1 });
+		client.connect();
+		last_ws().fire_open();
+		const frame = JSON.parse(last_ws().sent[0]!);
+		assert.strictEqual(frame.method, 'echo');
+		last_ws().fire_message(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: 'ok' }));
+		assert.strictEqual(await promise, 'ok');
 	});
 });
 
@@ -1057,14 +1326,57 @@ describe('request()', () => {
 		assert.deepStrictEqual(await promise, { value: 'echoed' });
 	});
 
-	test('default params to {} when omitted', async () => {
+	test('omits params from the frame when not given', async () => {
+		// the absent form is the one shape every server admits for a `z.void()`
+		// input, including servers that refuse `{}` with `invalid_params`
 		const client = new FrontendWebsocketClient(TEST_URL);
 		client.connect();
 		last_ws().fire_open();
 
-		const promise = client.request('ping');
+		const omitted = client.request('ping');
+		const explicit_undefined = client.request('ping', undefined);
+		for (const sent of last_ws().sent) {
+			assert.notProperty(JSON.parse(sent), 'params', `params must be omitted: ${sent}`);
+		}
+
+		last_ws().fire_message(make_response(1, null));
+		last_ws().fire_message(make_response(2, null));
+		await omitted;
+		await explicit_undefined;
+	});
+
+	test('a parameterless request through FrontendWebsocketTransport reaches the wire without params', async () => {
+		// the path a `z.void()` action takes from the frontend RPC client: the
+		// request message has no `params` key, the transport hands the
+		// connection `message.params` (`undefined`), and the frame must keep it
+		// absent rather than defaulting it
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+		const transport = new FrontendWebsocketTransport(client, async () => null);
+
+		const response = transport.send(create_jsonrpc_request('session_load', undefined, 'req_1'));
+		assert.strictEqual(last_ws().sent.length, 1);
 		const frame = JSON.parse(last_ws().sent[0]!);
-		assert.deepStrictEqual(frame.params, {});
+		assert.strictEqual(frame.method, 'session_load');
+		assert.strictEqual(frame.id, 'req_1');
+		assert.notProperty(frame, 'params');
+
+		last_ws().fire_message(JSON.stringify({ jsonrpc: '2.0', id: 'req_1', result: { ok: true } }));
+		assert.deepStrictEqual(await response, {
+			jsonrpc: '2.0',
+			id: 'req_1',
+			result: { ok: true }
+		});
+	});
+
+	test('sends an explicit empty params object as given', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+
+		const promise = client.request('echo', {});
+		assert.deepStrictEqual(JSON.parse(last_ws().sent[0]!).params, {});
 
 		last_ws().fire_message(make_response(1, null));
 		await promise;
@@ -1102,6 +1414,21 @@ describe('request()', () => {
 		const err = await assert_rejects(() => promise, /unknown error/);
 		assert.instanceOf(err, ThrownJsonrpcError);
 		assert.strictEqual(err.code, JSONRPC_ERROR_CODES.internal_error);
+	});
+
+	test('an error frame whose code is outside the JSON-RPC set falls back to internal_error', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		client.connect();
+		last_ws().fire_open();
+
+		const promise = client.request('echo', {});
+		last_ws().fire_message(make_error_response(1, 42, 'odd code', { field: 'x' }));
+
+		const err = await assert_rejects(() => promise, /odd code/);
+		assert.instanceOf(err, ThrownJsonrpcError);
+		assert.strictEqual(err.code, JSONRPC_ERROR_CODES.internal_error);
+		assert.strictEqual(err.message, 'odd code');
+		assert.deepStrictEqual(err.data, { field: 'x' });
 	});
 
 	test('monotonic ids across concurrent requests', () => {
@@ -1441,6 +1768,22 @@ describe('durable queue', () => {
 		assert.strictEqual(await p2, 'B');
 	});
 
+	test('a queued request without params flushes without params', async () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		const promise = client.request('ping');
+
+		client.connect();
+		last_ws().fire_open();
+
+		assert.strictEqual(last_ws().sent.length, 1);
+		const frame = JSON.parse(last_ws().sent[0]!);
+		assert.strictEqual(frame.method, 'ping');
+		assert.notProperty(frame, 'params');
+
+		last_ws().fire_message(make_response(frame.id, null));
+		await promise;
+	});
+
 	test('overflow rejects the new call with a queue_overflow-shaped error', async () => {
 		const client = new FrontendWebsocketClient(TEST_URL, { queue: { max_size: 2 } });
 		const p1 = client.request('a', {});
@@ -1594,57 +1937,132 @@ describe('client heartbeat', () => {
 		assert.strictEqual(last_ws().sent.length, 1);
 		const frame = JSON.parse(last_ws().sent[0]!);
 		assert.strictEqual(frame.method, heartbeat_action_spec.method);
-		assert.deepStrictEqual(frame.params, {});
+		assert.notProperty(frame, 'params', 'parameterless — params omitted');
 	});
 
-	test('outgoing send resets the idle window — no heartbeat emitted', () => {
+	test('traffic in both directions defers the heartbeat', () => {
 		vi.useFakeTimers();
 		const client = new FrontendWebsocketClient(TEST_URL, {
-			heartbeat: { interval: 100, receive_timeout: 10_000 }
+			heartbeat: { interval: 200, receive_timeout: 10_000 }
 		});
 		client.connect();
 		last_ws().fire_open();
 
-		// send chatter just before a tick; advance past the original interval
-		vi.advanceTimersByTime(40);
+		// send + receive chatter just before the tick at t=200
+		vi.advanceTimersByTime(150);
 		client.send({ some: 'data' });
-		vi.advanceTimersByTime(60); // total 100 — would have ticked without the send
+		last_ws().fire_message('{"jsonrpc":"2.0","method":"note","params":{}}');
+		vi.advanceTimersByTime(100); // tick at t=200 sees 50ms idle both ways
 
 		// Only the chatter frame is on the wire — no heartbeat yet.
 		assert.strictEqual(last_ws().sent.length, 1);
 		assert.deepStrictEqual(JSON.parse(last_ws().sent[0]!), { some: 'data' });
 	});
 
-	test('incoming message resets the receive-silence timer', () => {
+	test('send-only chatter still heartbeats so the receive side stays fed', () => {
 		vi.useFakeTimers();
-		// tick runs at max(100, interval/2). interval=400 → tick=200, which
-		// means the receive-silence check runs every 200ms. Setting
-		// receive_timeout=200 keeps the close threshold one tick wide so we
-		// can observe an activity reset between ticks.
 		const client = new FrontendWebsocketClient(TEST_URL, {
-			heartbeat: { interval: 400, receive_timeout: 200 }
+			heartbeat: { interval: 200, receive_timeout: 10_000 }
 		});
 		client.connect();
 		last_ws().fire_open();
 
-		// Just before the first tick at t=200, server sends something.
+		// fire-and-forget sends earn no responses — receive silence keeps growing
+		vi.advanceTimersByTime(150);
+		client.send({ some: 'data' });
+		vi.advanceTimersByTime(100); // tick at t=200: 200ms without a receive
+
+		const methods = last_ws().sent.map((f) => JSON.parse(f).method);
+		assert.include(methods, heartbeat_action_spec.method);
+	});
+
+	test('receive-only chatter still heartbeats so the server side stays fed', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 200, receive_timeout: 10_000 }
+		});
+		client.connect();
+		last_ws().fire_open();
+
+		// server pushes notifications; this client never writes
 		vi.advanceTimersByTime(150);
 		last_ws().fire_message('{"jsonrpc":"2.0","method":"note","params":{}}');
-		// First tick fires at t=200; with last_receive=150 silence=50 < 200.
+		vi.advanceTimersByTime(100); // tick at t=200: 200ms without a send
+
+		assert.strictEqual(last_ws().sent.length, 1);
+		assert.strictEqual(JSON.parse(last_ws().sent[0]!).method, heartbeat_action_spec.method);
+	});
+
+	test('no second heartbeat while one is unanswered', async () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 100, receive_timeout: 10_000 }
+		});
+		client.connect();
+		last_ws().fire_open();
+		const heartbeats = () =>
+			last_ws().sent
+				.map((f) => JSON.parse(f))
+				.filter((f) => f.method === heartbeat_action_spec.method);
+
+		// idle across many intervals with the first heartbeat unanswered
+		vi.advanceTimersByTime(1000);
+		assert.strictEqual(heartbeats().length, 1);
+
+		// answering it frees the slot — the next idle interval sends another
+		last_ws().fire_message(make_response(heartbeats()[0]!.id, {}));
+		await vi.advanceTimersByTimeAsync(50);
+		assert.strictEqual(heartbeats().length, 1);
+		await vi.advanceTimersByTimeAsync(100);
+		assert.strictEqual(heartbeats().length, 2);
+	});
+
+	test('an error response to the heartbeat also frees the slot', async () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 100, receive_timeout: 10_000 }
+		});
+		client.connect();
+		last_ws().fire_open();
+		vi.advanceTimersByTime(100);
+		const first = JSON.parse(last_ws().sent[0]!);
+		last_ws().fire_message(
+			JSON.stringify({ jsonrpc: '2.0', id: first.id, error: { code: -32603, message: 'x' } })
+		);
+		await vi.advanceTimersByTimeAsync(150);
+		const methods = last_ws().sent.map((f) => JSON.parse(f).method);
+		assert.strictEqual(methods.filter((m) => m === heartbeat_action_spec.method).length, 2);
+	});
+
+	test('incoming message resets the receive-silence timer', () => {
+		vi.useFakeTimers();
+		// tick runs at max(100, interval/2). interval=100 → tick=100, and
+		// receive_timeout=200 is the clamp floor (2 × interval), so the close
+		// fires on the tick at t=200 absent a receive.
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 100, receive_timeout: 200 }
+		});
+		client.connect();
+		last_ws().fire_open();
+
+		// Just before the tick at t=200, server sends something.
+		vi.advanceTimersByTime(150);
+		last_ws().fire_message('{"jsonrpc":"2.0","method":"note","params":{}}');
+		// Tick at t=200: last_receive=150 → silence=50 < 200.
 		vi.advanceTimersByTime(100);
 		assert.isNull(last_ws().close_code);
-		// Would have closed at t=200 without the reset — tick at t=200 would
-		// have seen silence=200. Advance another tick to confirm still no close.
+		// Tick at t=300: silence=150 < 200. Without the reset the tick at
+		// t=200 would have closed.
 		vi.advanceTimersByTime(100);
 		assert.isNull(last_ws().close_code);
 	});
 
 	test('receive silence past receive_timeout closes with 4002', () => {
 		vi.useFakeTimers();
-		// interval=400 → tick=200; receive_timeout=200 means the first tick
-		// after open fires the close.
+		// interval=100 → tick=100; receive_timeout=200 → the unanswered
+		// heartbeat at t=100 is followed by the close on the tick at t=200.
 		const client = new FrontendWebsocketClient(TEST_URL, {
-			heartbeat: { interval: 400, receive_timeout: 200 },
+			heartbeat: { interval: 100, receive_timeout: 200 },
 			reconnect: false
 		});
 		client.connect();
@@ -1654,6 +2072,49 @@ describe('client heartbeat', () => {
 		vi.advanceTimersByTime(250);
 
 		assert.strictEqual(ws.close_code, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT);
+	});
+
+	test('receive_timeout below the floor is clamped up to 2 × interval', () => {
+		vi.useFakeTimers();
+		// interval=400 → tick=200. An unclamped 200ms timeout would close on
+		// the first tick; the clamp raises it to 800ms.
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 400, receive_timeout: 200 },
+			reconnect: false
+		});
+		client.connect();
+		last_ws().fire_open();
+		const ws = last_ws();
+
+		vi.advanceTimersByTime(700);
+		assert.isNull(ws.close_code);
+		vi.advanceTimersByTime(200); // tick at t=800
+		assert.strictEqual(ws.close_code, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT);
+	});
+
+	test('a long interval alone keeps an idle socket open while heartbeats are answered', async () => {
+		vi.useFakeTimers();
+		// interval past the default receive timeout, no receive_timeout given —
+		// the default 60s would close the socket before the first heartbeat
+		const interval = 300_000;
+		const client = new FrontendWebsocketClient(TEST_URL, { heartbeat: { interval } });
+		client.connect();
+		last_ws().fire_open();
+		const ws = last_ws();
+
+		// answer every heartbeat as it goes out, across several intervals
+		for (let elapsed = 0; elapsed < interval * 4; elapsed += interval / 2) {
+			await vi.advanceTimersByTimeAsync(interval / 2);
+			const sent = ws.sent.length;
+			if (sent > 0) {
+				const frame = JSON.parse(ws.sent[sent - 1]!);
+				if (frame.method === heartbeat_action_spec.method) {
+					ws.fire_message(make_response(frame.id, {}));
+				}
+			}
+			assert.isNull(ws.close_code, `closed at ${elapsed + interval / 2}ms`);
+		}
+		assert.ok(ws.sent.length >= 3, 'heartbeats went out');
 	});
 
 	test('heartbeat: false disables the timer (no close, no ping)', () => {
@@ -1687,6 +2148,73 @@ describe('client heartbeat', () => {
 		// Smoke-test the defaults without running the whole interval.
 		assert.strictEqual(DEFAULT_HEARTBEAT_INTERVAL, 30_000);
 		assert.strictEqual(DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT, 60_000);
+		assert.isAtLeast(
+			DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT,
+			DEFAULT_HEARTBEAT_INTERVAL * HEARTBEAT_RECEIVE_TIMEOUT_MIN_FACTOR
+		);
+	});
+});
+
+describe('traffic timestamps', () => {
+	test('last_send_time and last_receive_time start null', () => {
+		const client = new FrontendWebsocketClient(TEST_URL);
+		assert.isNull(client.last_send_time);
+		assert.isNull(client.last_receive_time);
+	});
+
+	test('request frames and the responses request consumes are both recorded', async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(1_000);
+		const client = new FrontendWebsocketClient(TEST_URL, { heartbeat: false });
+		client.connect();
+		last_ws().fire_open();
+		assert.isNull(client.last_send_time, 'open is not a send');
+
+		const p = client.request('echo', {});
+		assert.strictEqual(client.last_send_time, 1_000);
+		assert.isNull(client.last_receive_time);
+
+		vi.setSystemTime(2_000);
+		last_ws().fire_message(make_response(1, { ok: true }));
+		await p;
+		assert.strictEqual(client.last_receive_time, 2_000);
+		assert.strictEqual(client.last_send_time, 1_000);
+	});
+
+	test('heartbeat frames are recorded as sends', () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const client = new FrontendWebsocketClient(TEST_URL, {
+			heartbeat: { interval: 100, receive_timeout: 10_000 }
+		});
+		client.connect();
+		last_ws().fire_open();
+
+		vi.advanceTimersByTime(150);
+		assert.strictEqual(JSON.parse(last_ws().sent[0]!).method, heartbeat_action_spec.method);
+		assert.strictEqual(client.last_send_time, 10_100);
+	});
+});
+
+describe('resolve_heartbeat_receive_timeout', () => {
+	test('defaults to DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT for short intervals', () => {
+		assert.strictEqual(
+			resolve_heartbeat_receive_timeout(10_000),
+			DEFAULT_HEARTBEAT_RECEIVE_TIMEOUT
+		);
+	});
+
+	test('the default scales with a long interval', () => {
+		assert.strictEqual(resolve_heartbeat_receive_timeout(300_000), 600_000);
+	});
+
+	test('an explicit value at or above the floor is kept', () => {
+		assert.strictEqual(resolve_heartbeat_receive_timeout(1000, 5000), 5000);
+		assert.strictEqual(resolve_heartbeat_receive_timeout(1000, 2000), 2000);
+	});
+
+	test('an explicit value below the floor is raised to it', () => {
+		assert.strictEqual(resolve_heartbeat_receive_timeout(1000, 500), 2000);
 	});
 });
 
@@ -1748,8 +2276,8 @@ describe('set_heartbeat', () => {
 		client.connect();
 		last_ws().fire_open();
 
-		// Tighten to a window that fires on the next tick.
-		client.set_heartbeat({ interval: 400, receive_timeout: 200 });
+		// Tighten to a window that fires two ticks after the unanswered heartbeat.
+		client.set_heartbeat({ interval: 100, receive_timeout: 200 });
 		vi.advanceTimersByTime(250);
 
 		assert.strictEqual(last_ws().close_code, WS_CLOSE_CLIENT_HEARTBEAT_TIMEOUT);
@@ -2047,4 +2575,89 @@ describe('full lifecycle', () => {
 		assert.strictEqual(client.status, 'closed');
 		assert.deepStrictEqual(messages, ['one', 'two']);
 	});
+});
+
+describe('will_reconnect and ws.queue routing', () => {
+	const echo_spec = {
+		method: 'echo',
+		kind: 'request_response',
+		initiator: 'frontend',
+		auth: { account: 'none', actor: 'none' },
+		side_effects: true,
+		input: z.strictObject({ message: z.string() }),
+		output: z.strictObject({ message: z.string() }),
+		async: true,
+		description: 'Echo back the input'
+	} satisfies ActionSpecUnion;
+
+	/** A connected client behind `create_frontend_rpc_client` with `ws.queue`, HTTP answering every call. */
+	const setup = (options?: ConstructorParameters<typeof FrontendWebsocketClient>[1]) => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL, options);
+		client.connect();
+		last_ws().fire_open();
+		const fetch_spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+			const { id } = JSON.parse(init!.body as string);
+			return new Response(
+				JSON.stringify({ jsonrpc: '2.0', id, result: { message: 'over http' } }),
+				{
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				}
+			);
+		});
+		const { api_result } = create_frontend_rpc_client<{
+			echo: (input: { message: string }) => Promise<{ ok: boolean; value?: unknown }>;
+		}>({ specs: [echo_spec], ws: { client, queue: true } });
+		return { client, fetch_spy, api_result };
+	};
+
+	test('will_reconnect holds only while the socket is opening on its own', () => {
+		vi.useFakeTimers();
+		const client = new FrontendWebsocketClient(TEST_URL);
+		assert.isFalse(client.will_reconnect, 'initial');
+		client.connect();
+		assert.isTrue(client.will_reconnect, 'connecting');
+		last_ws().fire_open();
+		assert.isFalse(client.will_reconnect, 'connected');
+		last_ws().fire_close(1006);
+		assert.isTrue(client.will_reconnect, 'reconnecting');
+		client.cancel_reconnect();
+		assert.isFalse(client.will_reconnect, 'reconnect cancelled');
+	});
+
+	test('during a reconnect a queued request waits for the socket', async () => {
+		const { client, fetch_spy, api_result } = setup();
+		last_ws().fire_close(1006);
+		assert.strictEqual(client.status, 'reconnecting');
+		const pending = api_result.echo({ message: 'x' });
+		await vi.advanceTimersByTimeAsync(DEFAULT_RECONNECT_DELAY);
+		last_ws().fire_open();
+		const frame = JSON.parse(last_ws().sent.at(-1)!);
+		assert.strictEqual(frame.method, 'echo');
+		last_ws().fire_message(
+			JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { message: 'over ws' } })
+		);
+		const result = await pending;
+		assert.deepStrictEqual(result.value, { message: 'over ws' });
+		assert.strictEqual(fetch_spy.mock.calls.length, 0, 'never went over HTTP');
+	});
+
+	const no_reconnect_cases: Array<[string, (client: FrontendWebsocketClient) => void, object?]> = [
+		['a superseded close', () => last_ws().fire_close(WS_CLOSE_CONNECTION_LIMIT)],
+		['a permission-revoked close', () => last_ws().fire_close(WS_CLOSE_PERMISSION_REVOKED)],
+		['disconnect()', (client) => client.disconnect()],
+		['a close with reconnect disabled', () => last_ws().fire_close(1006), { reconnect: false }]
+	];
+	for (const [label, close, options] of no_reconnect_cases) {
+		test(`after ${label} a queued request goes over HTTP`, async () => {
+			const { client, fetch_spy, api_result } = setup(options);
+			close(client);
+			assert.strictEqual(client.status, 'closed');
+			assert.isFalse(client.will_reconnect);
+			const result = await api_result.echo({ message: 'x' });
+			assert.deepStrictEqual(result.value, { message: 'over http' });
+			assert.strictEqual(fetch_spy.mock.calls.length, 1);
+		});
+	}
 });

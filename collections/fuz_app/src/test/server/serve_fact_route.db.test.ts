@@ -26,6 +26,13 @@
  *   reference identical bytes (one fact row); B's viewer reads via B's cell,
  *   but cannot reach A's reference, and the bare-hash endpoint admits no
  *   non-admin via B's public cell to A's bytes.
+ * - a disk-backed fact streams from the facts dir; a row whose `external_url`
+ *   names **another fact's file** is a 404 (the URL must address its own hash),
+ *   so a private fact's bytes never serve under a public cell's hash
+ * - a disk fact whose file is gone → 404 with an empty body; one whose file
+ *   can't be opened → 500 `internal_error` (both before any 200 is committed,
+ *   twin of the Rust `fuz_fact_serving` disk branch); HEAD answers the same
+ *   statuses and leaves no handle on the file
  * - **soft-deleted (tombstoned) actor in the public-read resolution**: a
  *   1-active-+-1-tombstone reader resolves as the owner (the tombstone is
  *   excluded from the active-actor count), and a tombstoned-only reader
@@ -36,17 +43,31 @@
  */
 
 import { test, assert } from 'vitest';
+import { chmod, mkdtemp, readdir, readlink, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { PgFactStore } from '$lib/db/fact_store.ts';
+import { Db } from '#lib/db/db.ts';
+import { PgFactStore } from '#lib/db/fact_store.ts';
 import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
-import { ERROR_INVALID_QUERY_PARAMS, ERROR_INVALID_ROUTE_PARAMS } from '$lib/http/error_schemas.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { TestApp } from '$lib/testing/app_server.ts';
-import { create_test_extra_actor, soft_delete_test_actor } from '$lib/testing/db_entities.ts';
+import { ERROR_INVALID_QUERY_PARAMS, ERROR_INVALID_ROUTE_PARAMS } from '#lib/http/error_schemas.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { TestApp } from '#lib/testing/app_server.ts';
+import { TEST_ORIGIN } from '#lib/testing/test_origin.ts';
+import { create_test_extra_actor, soft_delete_test_actor } from '#lib/testing/db_entities.ts';
 import { create_cell_test_app, create_cell } from '../auth/cell_test_helpers.ts';
+import { query_cell_create } from '#lib/db/cell_queries.ts';
+import { query_put_fact } from '#lib/db/fact_queries.ts';
+import { query_put_fact_holder } from '#lib/db/fact_holder_queries.ts';
+import { fact_hash_bytes } from '@fuzdev/fuz_util/fact_hash.ts';
+import { create_node_runtime } from '#lib/runtime/node.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
 import { describe_db } from '../cell_db_fixture.ts';
 
-const PUBLIC_HEADERS = { host: 'localhost:5173', origin: 'http://localhost:5173' };
+const PUBLIC_HEADERS = { host: 'localhost:5173', origin: TEST_ORIGIN };
+
+/** A well-formed hash no seeded cell references. */
+const UNREFERENCED_HASH = `blake3:${'0'.repeat(64)}`;
 
 const encode = (s: string): Uint8Array => new TextEncoder().encode(s);
 
@@ -62,6 +83,37 @@ const get_cell_fact = (
 		headers: { ...PUBLIC_HEADERS, ...headers }
 	});
 
+/** HEAD `/api/cells/:cell_id/facts/:hash` — Hono runs the GET handler and drops the body. */
+const head_cell_fact = (app: TestApp, cell_id: string, hash: string) =>
+	app.app.request(`/api/cells/${cell_id}/facts/${hash}`, {
+		method: 'HEAD',
+		headers: PUBLIC_HEADERS
+	});
+
+/**
+ * Count this process's open file descriptors on `path`, read from
+ * `/proc/self/fd` — `null` where that isn't available (non-Linux).
+ */
+const count_open_fds = async (path: string): Promise<number | null> => {
+	let fds: Array<string>;
+	try {
+		fds = await readdir('/proc/self/fd');
+	} catch {
+		return null;
+	}
+	// fd links name the resolved path, so a symlinked tmpdir still matches
+	const target = await realpath(path);
+	let count = 0;
+	for (const fd of fds) {
+		try {
+			if ((await readlink(join('/proc/self/fd', fd))) === target) count++;
+		} catch {
+			// the fd closed while listing
+		}
+	}
+	return count;
+};
+
 /** GET `/api/facts/:hash` — the bare-hash (admin-only) read. */
 const get_bare_fact = (app: TestApp, hash: string, headers?: Record<string, string>) =>
 	app.app.request(`/api/facts/${hash}`, {
@@ -70,9 +122,17 @@ const get_bare_fact = (app: TestApp, hash: string, headers?: Record<string, stri
 	});
 
 describe_db('serve_fact_route', (get_db) => {
-	/** Store embedded bytes directly in the test DB and return the hash. */
-	const put_embedded = (bytes: Uint8Array, content_type: string): Promise<FactHash> =>
-		new PgFactStore({ deps: { db: get_db() } }).put(bytes, { content_type });
+	/**
+	 * Store embedded bytes directly in the test DB and return the hash. `holder`
+	 * is the actor the put records as holding the bytes — the non-admin owner
+	 * whose cell will reference them (`null` for a system put).
+	 */
+	const put_embedded = (
+		bytes: Uint8Array,
+		content_type: string,
+		holder: Uuid | null
+	): Promise<FactHash> =>
+		new PgFactStore({ deps: { db: get_db() } }).put(bytes, { content_type, holder });
 
 	test('malformed hash param → 400', async () => {
 		const app = await create_cell_test_app(get_db);
@@ -105,7 +165,7 @@ describe_db('serve_fact_route', (get_db) => {
 		// A public cell exists, and the fact bytes exist — but the cell does
 		// not reference this hash. A caller naming this (cell, hash) pair must
 		// get 404, never "the fact exists elsewhere".
-		const hash = await put_embedded(encode('unreferenced bytes'), 'text/plain');
+		const hash = await put_embedded(encode('unreferenced bytes'), 'text/plain', null);
 		const cell = await create_cell(app, {
 			kind: 'note',
 			data: { text: 'no refs' },
@@ -120,7 +180,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		const owner = await app.create_account({ username: 'fact_pub_owner' });
 		const bytes = encode('public cover bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', owner.actor.id);
 		const cell = await create_cell(app, {
 			kind: 'image',
 			data: { cover: hash },
@@ -144,7 +204,11 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		// Store the bytes AS text/html — the exact stored-XSS shape the headers
 		// neutralize.
-		const hash = await put_embedded(encode('<script>alert(1)</script>'), 'text/html');
+		const hash = await put_embedded(
+			encode('<script>alert(1)</script>'),
+			'text/html',
+			app.backend.actor.id
+		);
 		const cell = await create_cell(app, {
 			kind: 'image',
 			data: { cover: hash },
@@ -164,7 +228,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const owner = await app.create_account({ username: 'fact_priv_owner' });
 		const other = await app.create_account({ username: 'fact_priv_other' });
 		const bytes = encode('secret cover bytes');
-		const hash = await put_embedded(bytes, 'application/octet-stream');
+		const hash = await put_embedded(bytes, 'application/octet-stream', owner.actor.id);
 		const cell = await create_cell(app, {
 			kind: 'image',
 			data: { cover: hash }, // private (default visibility)
@@ -186,12 +250,61 @@ describe_db('serve_fact_route', (get_db) => {
 		assert.deepEqual(back, bytes);
 	});
 
+	test('a non-viewer does the same reads whether or not the private cell references the hash', async () => {
+		// The view check runs before the edge check, so a caller that can't
+		// view a cell can't time its refs: a referenced hash and an unreferenced
+		// one issue the same statements and answer the same bodyless 404.
+		const recorded: Array<string> = [];
+		const inner = get_db();
+		const recording_db = new Db({
+			client: {
+				query: <T>(text: string, values?: Array<unknown>) => {
+					recorded.push(text);
+					return inner.client.query<T>(text, values);
+				}
+			},
+			transaction: (fn) => inner.transaction(fn)
+		});
+		const app = await create_cell_test_app(() => recording_db);
+		const owner = await app.create_account({ username: 'fact_order_owner' });
+		const other = await app.create_account({ username: 'fact_order_other' });
+		const hash = await put_embedded(encode('order secret'), 'text/plain', owner.actor.id);
+		const cell = await create_cell(app, {
+			kind: 'image',
+			data: { cover: hash }, // private (default visibility)
+			headers: owner.create_session_headers()
+		});
+
+		const ask = async (
+			asked: string,
+			headers?: Record<string, string>
+		): Promise<{ status: number; body: string; reads: Array<string> }> => {
+			recorded.length = 0;
+			const res = await get_cell_fact(app, cell.id, asked, headers);
+			return { status: res.status, body: await res.text(), reads: [...recorded] };
+		};
+
+		for (const [caller, headers] of [
+			['anonymous', undefined],
+			['signed-in non-viewer', other.create_session_headers()]
+		] as const) {
+			// the signed-in arm carries the order pin (anonymous makes no queries)
+			// warm the caller's session so a once-per-window touch can't skew the traces
+			await ask(UNREFERENCED_HASH, headers);
+			const referenced = await ask(hash, headers);
+			const unreferenced = await ask(UNREFERENCED_HASH, headers);
+			assert.strictEqual(referenced.status, 404, caller);
+			assert.strictEqual(referenced.body, '', caller);
+			assert.deepEqual(unreferenced, referenced, caller);
+		}
+	});
+
 	test('bare-hash endpoint is admin-only: anon → 403, non-admin → 403, admin → 200', async () => {
 		const app = await create_cell_test_app(get_db);
 		const member = await app.create_account({ username: 'bare_member' });
 		const admin = await app.create_account({ username: 'bare_admin', roles: [ROLE_ADMIN] });
 		const bytes = encode('bare-hash admin bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', app.backend.actor.id);
 		// Reference it from a public cell so the only thing gating the bare-hash
 		// read is the admin auth, not reachability.
 		await create_cell(app, { kind: 'image', data: { cover: hash }, visibility: 'public' });
@@ -253,7 +366,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		const admin = await app.create_account({ username: 'qs_dup_admin', roles: [ROLE_ADMIN] });
 		const bytes = encode('query-shape bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', null);
 
 		// First occurrence is the admin's real actor; the second is garbage.
 		// Hono keeps the first, so the request succeeds — last-wins (or a
@@ -292,8 +405,8 @@ describe_db('serve_fact_route', (get_db) => {
 
 		// Identical bytes. Content-dedup collapses them to ONE fact row.
 		const shared = encode('identical bytes from two owners');
-		const hash_a = await put_embedded(shared, 'text/plain');
-		const hash_b = await put_embedded(shared, 'text/plain');
+		const hash_a = await put_embedded(shared, 'text/plain', a.actor.id);
+		const hash_b = await put_embedded(shared, 'text/plain', b.actor.id);
 		assert.strictEqual(hash_a, hash_b); // same hash → same fact row (dedup)
 		const hash = hash_a;
 
@@ -334,6 +447,152 @@ describe_db('serve_fact_route', (get_db) => {
 		assert.strictEqual(bare_anon.status, 401);
 	});
 
+	test("a disk fact streams; an external_url naming another fact's file → 404", async () => {
+		const facts_dir = await mkdtemp(join(tmpdir(), 'fuz_serve_fact_disk_'));
+		try {
+			const app = await create_cell_test_app(get_db, [], { facts_dir });
+			const owner = await app.create_account({ username: 'disk_fact_owner' });
+			const disk_store = new PgFactStore({
+				deps: { db: get_db() },
+				embedded_threshold: 0,
+				disk_root: facts_dir,
+				fs: create_node_runtime()
+			});
+
+			// the private bytes, on disk, referenced by no public cell
+			const secret = encode('private bytes on disk');
+			const secret_hash = await disk_store.put(secret, {
+				content_type: 'text/plain',
+				holder: null
+			});
+			const secret_row = await get_db().query_one<{ external_url: string }>(
+				'SELECT external_url FROM fact WHERE hash = $1',
+				[secret_hash]
+			);
+			assert.ok(secret_row?.external_url.startsWith('file:'));
+
+			// control: a disk fact of its own serves through a public cell
+			const own = encode('public bytes on disk');
+			const own_hash = await disk_store.put(own, {
+				content_type: 'text/plain',
+				holder: owner.actor.id
+			});
+			const own_cell = await create_cell(app, {
+				kind: 'image',
+				data: { cover: own_hash },
+				visibility: 'public',
+				headers: owner.create_session_headers()
+			});
+			const own_res = await get_cell_fact(app, own_cell.id, own_hash);
+			assert.strictEqual(own_res.status, 200);
+			assert.deepEqual(new Uint8Array(await own_res.arrayBuffer()), own);
+
+			// a row written past the store: another hash whose URL is the private
+			// fact's file, referenced from a public cell
+			const hijack_hash = fact_hash_bytes(encode('the hijacking row'));
+			await query_put_fact(
+				{ db: get_db() },
+				{
+					hash: hijack_hash,
+					bytes: null,
+					external_url: secret_row!.external_url,
+					content_type: 'text/plain',
+					size: secret.length
+				}
+			);
+			await query_put_fact_holder({ db: get_db() }, owner.actor.id, hijack_hash);
+			const hijack_cell = await create_cell(app, {
+				kind: 'image',
+				data: { cover: hijack_hash },
+				visibility: 'public',
+				headers: owner.create_session_headers()
+			});
+			const hijack = await get_cell_fact(app, hijack_cell.id, hijack_hash);
+			assert.strictEqual(hijack.status, 404);
+			assert.strictEqual(await hijack.text(), '');
+			// and the store's own read refuses it
+			assert.strictEqual(await disk_store.get(hijack_hash), null);
+		} finally {
+			await rm(facts_dir, { recursive: true, force: true });
+		}
+	});
+
+	test('a disk fact whose file is missing → 404; unopenable → 500; HEAD closes the file', async () => {
+		const facts_dir = await mkdtemp(join(tmpdir(), 'fuz_serve_fact_disk_missing_'));
+		try {
+			const app = await create_cell_test_app(get_db, [], { facts_dir });
+			const owner = await app.create_account({ username: 'disk_missing_owner' });
+			const disk_store = new PgFactStore({
+				deps: { db: get_db() },
+				embedded_threshold: 0,
+				disk_root: facts_dir,
+				fs: create_node_runtime()
+			});
+			const put_public = async (
+				text: string
+			): Promise<{ cell_id: Uuid; hash: FactHash; path: string }> => {
+				const hash = await disk_store.put(encode(text), {
+					content_type: 'text/plain',
+					holder: owner.actor.id
+				});
+				const row = await get_db().query_one<{ external_url: string }>(
+					'SELECT external_url FROM fact WHERE hash = $1',
+					[hash]
+				);
+				assert.ok(row?.external_url.startsWith('file:'));
+				const cell = await create_cell(app, {
+					kind: 'image',
+					data: { cover: hash },
+					visibility: 'public',
+					headers: owner.create_session_headers()
+				});
+				return {
+					cell_id: cell.id,
+					hash,
+					path: join(facts_dir, row!.external_url.slice('file:'.length))
+				};
+			};
+
+			// large enough that a stream built for the dropped body stalls on
+			// backpressure instead of reading to EOF and closing on its own
+			const present_text = 'bytes a HEAD reads the headers of '.repeat(64 * 1024);
+			const present = await put_public(present_text);
+			const head_res = await head_cell_fact(app, present.cell_id, present.hash);
+			assert.strictEqual(head_res.status, 200);
+			assert.strictEqual(
+				head_res.headers.get('Content-Length'),
+				String(encode(present_text).byteLength)
+			);
+			assert.strictEqual(await head_res.text(), '');
+			const open_fds = await count_open_fds(present.path);
+			if (open_fds !== null) {
+				assert.strictEqual(open_fds, 0, 'HEAD must not leave the fact file open');
+			}
+
+			const missing = await put_public('bytes whose file goes missing');
+			await rm(missing.path);
+			const missing_res = await get_cell_fact(app, missing.cell_id, missing.hash);
+			assert.strictEqual(missing_res.status, 404);
+			assert.strictEqual(await missing_res.text(), '');
+			assert.strictEqual((await head_cell_fact(app, missing.cell_id, missing.hash)).status, 404);
+
+			// root opens a mode-0 file anyway, so the 500 half can't be forced there
+			if (process.getuid?.() !== 0) {
+				const unopenable = await put_public('bytes whose file is unreadable');
+				await chmod(unopenable.path, 0o000);
+				const unopenable_res = await get_cell_fact(app, unopenable.cell_id, unopenable.hash);
+				assert.strictEqual(unopenable_res.status, 500);
+				assert.deepEqual(await unopenable_res.json(), { error: 'internal_error' });
+				assert.strictEqual(
+					(await head_cell_fact(app, unopenable.cell_id, unopenable.hash)).status,
+					500
+				);
+			}
+		} finally {
+			await rm(facts_dir, { recursive: true, force: true });
+		}
+	});
+
 	// A6 follow-up: the pure-public read path
 	// (`build_public_request_context` → `query_active_actors_by_account`) counts
 	// only **active** actors, so a soft-deleted (tombstoned) actor neither
@@ -350,7 +609,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		const owner = await app.create_account({ username: 'tomb_control_owner' });
 		const bytes = encode('control private bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', owner.actor.id);
 		const cell = await create_cell(app, {
 			kind: 'image',
 			data: { cover: hash }, // private (default)
@@ -370,7 +629,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		const owner = await app.create_account({ username: 'tomb_extra_owner' });
 		const bytes = encode('extra-actor private bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', owner.actor.id);
 		const cell = await create_cell(app, {
 			kind: 'image',
 			data: { cover: hash }, // private (default)
@@ -397,7 +656,7 @@ describe_db('serve_fact_route', (get_db) => {
 		const app = await create_cell_test_app(get_db);
 		const ghost = await app.create_account({ username: 'tomb_ghost_owner' });
 		const bytes = encode('ghost private bytes');
-		const hash = await put_embedded(bytes, 'text/plain');
+		const hash = await put_embedded(bytes, 'text/plain', ghost.actor.id);
 		// Create the private cell while the actor is still active (so it owns it).
 		const cell = await create_cell(app, {
 			kind: 'image',
@@ -415,5 +674,43 @@ describe_db('serve_fact_route', (get_db) => {
 		// cell. An unfiltered count would resolve the deleted actor → owner → 200.
 		const res = await get_cell_fact(app, cell.id, hash, ghost.create_session_headers());
 		assert.strictEqual(res.status, 404);
+	});
+
+	test('a pending contribution flipped public serves its author and steward only', async () => {
+		const app = await create_cell_test_app(get_db);
+		const root_owner = await app.create_account({ username: 'fact_steward_root' });
+		const author = await app.create_account({ username: 'fact_steward_author' });
+		const stranger = await app.create_account({ username: 'fact_steward_stranger' });
+		const bytes = encode('pending post bytes');
+		const hash = await put_embedded(bytes, 'application/octet-stream', author.actor.id);
+		const root = await create_cell(app, {
+			kind: 'forum',
+			data: {},
+			visibility: 'public',
+			headers: root_owner.create_session_headers()
+		});
+		const post = await query_cell_create(
+			{ db: get_db() },
+			{
+				data: { cover: hash },
+				kind: 'post',
+				visibility: 'public',
+				parent_id: root.id,
+				root_id: root.id,
+				moderation: 'pending',
+				created_by: author.actor.id
+			}
+		);
+
+		assert.strictEqual((await get_cell_fact(app, post.id, hash)).status, 404, 'anon');
+		const status = async (headers: Record<string, string>) =>
+			(await get_cell_fact(app, post.id, hash, headers)).status;
+		assert.strictEqual(await status(stranger.create_session_headers()), 404, 'stranger');
+		assert.strictEqual(await status(author.create_session_headers()), 200, 'author');
+		assert.strictEqual(await status(root_owner.create_session_headers()), 200, 'steward');
+
+		// a tombstoned root stewards nothing
+		await get_db().query('UPDATE cell SET deleted_at = NOW() WHERE id = $1', [root.id]);
+		assert.strictEqual(await status(root_owner.create_session_headers()), 404, 'deleted root');
 	});
 });

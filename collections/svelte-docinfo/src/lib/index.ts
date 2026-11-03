@@ -13,8 +13,8 @@
 
 export { analyze, analyzeFromFiles } from './analyze.ts';
 export type { AnalyzeOptions, AnalyzeFromFilesOptions } from './analyze.ts';
-export { throwOnDuplicates, AnalyzeResultJson } from './analyze-core.ts';
-export type { AnalyzeResultJsonWire, OnDuplicates, OnDuplicatesCallback } from './analyze-core.ts';
+export { AnalyzeResultJson, parseAnalyzeResult } from './analyze-core.ts';
+export type { AnalyzeResultJsonWire, OnDuplicates } from './analyze-core.ts';
 export { createAnalysisSession } from './session.ts';
 export type {
 	AnalysisSession,
@@ -27,7 +27,7 @@ export type {
 export { normalizeResolveImport } from './dep-resolver.ts';
 export type { ImportResolver, ResolveImport, ResolveImportFn } from './dep-resolver.ts';
 
-// Types (Zod schemas + TypeScript interfaces)
+// Types (valibot schemas, parse helpers, and TypeScript interfaces)
 
 export {
 	DeclarationKind,
@@ -39,6 +39,7 @@ export {
 	TupleElementJson,
 	ParameterJson,
 	ComponentPropJson,
+	ComponentCssPropertyJson,
 	OverloadJson,
 	FunctionMemberJson,
 	VariableMemberJson,
@@ -56,7 +57,8 @@ export {
 	DeclarationJson,
 	ReExportJson,
 	ExternalReExportJson,
-	ModuleJson
+	ModuleJson,
+	parseModuleJson
 } from './types.ts';
 
 // Declaration helpers
@@ -88,15 +90,10 @@ export type {
 
 // Post-processing
 
-export {
-	findDuplicates,
-	mergeReExports,
-	resolveComponentAliases,
-	resolveExportSurface
-} from './postprocess.ts';
-export type { DuplicateDeclaration, ExportSurface, ExportSurfaceEntry } from './postprocess.ts';
+export { mergeReExports, resolveComponentAliases, resolveExportSurface } from './postprocess.ts';
+export type { ExportSurface, ExportSurfaceEntry } from './postprocess.ts';
 
-// File system constants
+// File system helpers
 
 export { deriveIncludePatterns } from './files.ts';
 
@@ -120,6 +117,7 @@ export {
 	formatDiagnostic,
 	DiagnosticSeverity,
 	DiagnosticKind,
-	Diagnostic
+	Diagnostic,
+	parseDiagnostics
 } from './diagnostics.ts';
 export type { AnalysisLog } from './log.ts';

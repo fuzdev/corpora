@@ -8,89 +8,70 @@ import '../assert_dev_env.ts';
  * implement. No `if (config.name === 'rust')` branches anywhere — name-
  * checking is a code smell that says capability vocabulary is missing.
  *
- * In-process Hono via `default_in_process_setup` declares every
- * capability `true` (see `in_process_capabilities`). Cross-process
- * backends opt in per-flag on their `BackendConfig`.
+ * In-process Hono via `default_in_process_setup` declares every capability
+ * its transport can exercise (see `in_process_capabilities` — the
+ * cross-process-only flags stay `false`). Cross-process backends opt in
+ * per-flag on their `BackendConfig`.
  *
  * **Where the per-backend declarations live** (this file owns only the
  * vocabulary + the in-process preset):
  *
- * - `in_process_capabilities` — here; every flag `true`.
+ * - `in_process_capabilities` — here; every flag `true` except the
+ *   cross-process-only ones.
  * - `ts_default_capabilities` / `rust_default_capabilities` — consumer-facing
- *   family defaults, in `default_backend_configs.ts` (full literals, so adding
- *   a capability is a compile error until each family declares it).
+ *   family defaults, in `default_backend_configs.ts` — every flag but the
+ *   `MountFlag`s (`FamilyDefaultCapabilities`), as full literals, so adding a
+ *   non-mount capability is a compile error until each family declares it.
  * - `ts_spine_capabilities` / `ts_spine_bun_capabilities` — fuz_app's own TS
- *   spine presets, in `ts_spine_backend_config.ts` (deltas off the family
- *   default; Bun flips `oversized_reject_closes_connection`).
+ *   spine presets, in `ts_spine_backend_config.ts` (the family
+ *   default plus every mount flag; Bun flips `ws_handshake_pipelining`).
  * - `rust_spine_stub_capabilities` — fuz_app's Rust spine-stub preset, in
- *   `rust_spine_stub_backend_config.ts` (delta off the rust family default).
+ *   `rust_spine_stub_backend_config.ts` (the rust family default plus every mount flag).
  *
- * **Gating flags vs shape notes.** `BackendCapabilities` holds only flags a
- * suite actually gates on (each has a `test_if(capabilities.X, ...)` reader).
- * Wiring facts that gate nothing — `bearer_auth` / `trusted_proxy` /
- * `login_rate_limit` — live in the parallel `BackendShapeNotes` record
- * (`in_process_shape_notes` here, `ts_default_shape_notes` /
- * `rust_default_shape_notes` in `default_backend_configs.ts`) so the
- * capability type never claims gating power it doesn't have.
+ * **Mount flags have no default.** A flag naming something a backend mounts
+ * (a `MountFlag`) is never inherited, nor is the `testing_backdoors` list: the
+ * family defaults are `FamilyDefaultCapabilities`, which omits them, so every
+ * backend config states each one. The family defaults carry only what the family guarantees — the
+ * declared spine surface's mounts (`account_lifecycle`, `account_status`) and
+ * the runtime behavior of its reference runtime (`ws_handshake_pipelining`,
+ * `ws_refusal_body`: Node for TS, hyper for Rust), which a backend on another
+ * runtime overrides.
+ *
+ * **Gating flags only.** `BackendCapabilities` holds only flags a suite
+ * actually gates on (each has a `test_if(capabilities.X, ...)` reader, or —
+ * `ws_refusal_body` — picks how a case reads a refusal), plus the
+ * `testing_backdoors` list the backdoor suite and `describe_spine_cross_suites`
+ * read. A wiring fact no suite reads is not a capability.
  *
  * @module
  */
 
 import { test } from 'vitest';
 
-/**
- * Backend wiring facts recorded for documentation — **not** gating flags.
- *
- * The companion to `BackendCapabilities`: where each capability flag has a
- * `test_if(capabilities.X, ...)` reader that skips a suite the backend doesn't
- * implement, nothing reads these. They record middleware / limiter wiring that
- * differs between the TS and Rust families (a backend-shape record) but gates
- * no cross test today. They live in their own type precisely so
- * `BackendCapabilities` stops claiming gating power it doesn't have — fold a
- * flag in here the moment it has no `test_if` reader, and promote it back the
- * day a suite genuinely gates on it.
- */
-export interface BackendShapeNotes {
-	/**
-	 * Bearer-token auth (`Authorization: Bearer <token>`) is wired through the
-	 * backend's middleware stack. `true` on every spine — the bearer-token cases
-	 * in `describe_standard_integration_tests` / `describe_rate_limiting_tests`
-	 * run unconditionally.
-	 */
-	readonly bearer_auth: boolean;
-	/**
-	 * Trusted-proxy XFF parsing (`X-Forwarded-For` etc.) is wired. Records the
-	 * proxy-default difference between the TS family (`false` — the test binary
-	 * leaves proxy parsing off) and the Rust family (`true` — the client-IP
-	 * middleware is always wired; the env-gate only chooses XFF vs the TCP peer).
-	 */
-	readonly trusted_proxy: boolean;
-	/**
-	 * Per-account login rate limiting is wired. `false` for the TS family (the
-	 * canonical path leaves the limiter null in test mode), `true` for the Rust
-	 * family (env-gated bucket on `/login` + `/password`).
-	 */
-	readonly login_rate_limit: boolean;
-}
+import type { TestingBackdoorMethod } from './spine_surface_constants.ts';
 
 /**
  * Optional behaviors a backend may support. Each flag's TSDoc names the
  * tests that gate on it; add a new flag here before referencing it from
- * a suite body, and document the gating tests inline. Wiring facts that gate
- * nothing belong in `BackendShapeNotes`, not here.
+ * a suite body, and document the gating tests inline. A wiring fact no
+ * suite reads doesn't belong here.
  */
 export interface BackendCapabilities {
 	/**
 	 * WebSocket transport is reachable end-to-end. Gates the cross-process
-	 * WS round-trip suite; the in-process `describe_ws_round_trip_tests`
-	 * runs against `register_action_ws` directly and ignores this flag.
+	 * WS round-trip suite, the per-account connection-cap suite
+	 * (`describe_ws_connection_cap_cross_tests`), and the front door's
+	 * WS-path cases (`describe_transport_composition_cross_tests`) — the
+	 * upgrade rows, and the rows that ask for no upgrade, which run in-process
+	 * too; the in-process `describe_ws_round_trip_tests` runs against
+	 * `register_action_ws` directly and ignores this flag.
 	 */
 	readonly ws: boolean;
 	/**
 	 * SSE transport is reachable end-to-end. Gates the cross-process SSE
 	 * suite (`describe_cross_process_sse_tests` — connect, audit data frame,
-	 * close-on-revoke); in-process SSE uses the `on_audit_event` hook and
-	 * ignores this flag.
+	 * close-on-revoke, the per-session stream cap); in-process SSE uses the
+	 * `on_audit_event` hook and ignores this flag.
 	 */
 	readonly sse: boolean;
 	/**
@@ -131,15 +112,31 @@ export interface BackendCapabilities {
 	 */
 	readonly account_lifecycle: boolean;
 	/**
-	 * The cell-gated fact-serving routes (`GET /api/cells/:cell_id/facts/:hash`
-	 * + the admin-only `GET /api/facts/:hash`) are live-mounted on the backend,
-	 * its DB carries the `fuz_facts` migration namespace, and it registers the
-	 * `_testing_put_fact` seeder. Gates `describe_fact_serving_cross_tests` —
-	 * the per-reference read model (cell-scoped admit via a viewable cell,
-	 * cross-owner-dedup-no-leak, 404-mask, bare-hash admin-only). Like cells,
-	 * the serve routes stay off the standard declared surface.
+	 * The cell-gated fact-serving route (`GET /api/cells/:cell_id/facts/:hash`)
+	 * is live-mounted on the backend, its DB carries the `fuz_facts` migration
+	 * namespace, and it mounts the `_testing_put_fact` seeder — declared in
+	 * `testing_backdoors`, which `describe_spine_cross_suites` requires. Gates
+	 * `describe_fact_serving_cross_tests`' per-reference read model (cell-scoped
+	 * admit via a viewable cell, cross-owner-dedup-no-leak, 404-mask),
+	 * `describe_cell_ref_admission_cross_tests` (its grant, item, and clone
+	 * cases with `cell_relations`), and the fact cases of the
+	 * moderation suite. Like cells, the serve route stays off the standard
+	 * declared surface. The admin bare-hash route is its own flag,
+	 * `fact_serving_admin_hash`. The suite's missing-disk-file case assumes the
+	 * backend serves external facts from disk: one with X-Accel delivery on
+	 * hands off with a `200` (nginx would answer the missing file) and fails it.
 	 */
 	readonly fact_serving: boolean;
+	/**
+	 * The admin-only bare-hash fact route (`GET /api/facts/:hash`) is
+	 * live-mounted. Gates the bare-hash cases of
+	 * `describe_fact_serving_cross_tests` (with `fact_serving`, whose seeder
+	 * they use), `describe_query_shape_cross_tests` and
+	 * `describe_token_scope_surface_cross_tests`. A backend serving only the
+	 * cell-gated route states `fact_serving: true, fact_serving_admin_hash:
+	 * false`.
+	 */
+	readonly fact_serving_admin_hash: boolean;
 	/**
 	 * The `/ready` readiness deploy gate (`GET /ready`) is live-mounted on the
 	 * backend — the public column-presence schema-drift probe over the committed
@@ -161,25 +158,6 @@ export interface BackendCapabilities {
 	 */
 	readonly account_status: boolean;
 	/**
-	 * On an oversized-body `413` reject the backend **closes the connection
-	 * without reading the body** (the defense-in-depth posture), rather than
-	 * draining the declared `Content-Length` and keeping the socket alive.
-	 * Gates the strong half of `describe_body_size_smuggling_cross_tests`: when
-	 * `true`, the pipelined GET is never reached (at most one response); when
-	 * `false`, the suite instead asserts the weaker but still-load-bearing
-	 * no-desync property (the body is framed on `Content-Length`, not reparsed
-	 * as request bytes).
-	 *
-	 * `true` for the Node / Deno (`@hono/node-server` graceful close) and Rust
-	 * (hyper RST) backends; `false` for Bun — `Bun.serve` reads the full body
-	 * and processes the correctly-framed pipelined request even when the `413`
-	 * carries `Connection: close`. Bun is not insecure (no desync — it answers
-	 * the cleanly-delimited GET with a proper `400`); the flag records the
-	 * connection-handling divergence so the suite stays green without losing the
-	 * smuggle detector. See `docs/security.md` §"Body Size Limiting".
-	 */
-	readonly oversized_reject_closes_connection: boolean;
-	/**
 	 * The backend can **initiate** a JSON-RPC request to a connected client
 	 * and await its typed reply (the server→client request/response direction
 	 * ActionPeer adds). Gates `describe_peer_ping_ws_tests` — the on-demand
@@ -187,18 +165,51 @@ export interface BackendCapabilities {
 	 * rejection, per-connection id isolation, never-replying `Timeout`,
 	 * wrong-shape reply rejection).
 	 *
-	 * `true` for both the Rust spine (server-initiated requests landed
-	 * Rust-first canonical) and the TS spine
-	 * (`BackendWebsocketTransport.request_connection` drives the round-trip,
-	 * correlated by `register_action_ws`). The conservative
-	 * `ts_default_capabilities` keeps it `false` like sse/ready — a TS backend
-	 * opts in once it mounts `peer/ping` on a WS endpoint **and** the HTTP RPC
-	 * endpoint (the no-transport refusal). Like ws/sse/cells, `peer/ping` stays
+	 * `true` on fuz_app's own spine presets — the Rust `testing_spine_stub` and
+	 * the TS spine (`ConnectionRegistry.request_connection` drives the
+	 * round-trip, correlated by `register_action_ws`). A `MountFlag`: a backend
+	 * states `true` once it mounts `peer/ping` on a WS endpoint **and** the HTTP
+	 * RPC endpoint (the no-transport refusal).
+	 * Like ws/sse/cells, `peer/ping` stays
 	 * off the standard declared surface (it's a protocol action,
 	 * manifest-excluded), so this flag is the only opt-in into the peer parity
 	 * coverage.
 	 */
 	readonly peer_request: boolean;
+	/**
+	 * The backend's HTTP server accepts WebSocket frames written in the same
+	 * TCP write as the upgrade request, handing them to the socket once the
+	 * handshake completes. Gates the `frames sent with the handshake` case in
+	 * `describe_cross_process_ws_tests` — the deterministic form of "frames
+	 * that arrive before the connection is admitted wait for admission", since
+	 * those frames are in the backend's hands before it can have admitted
+	 * anything.
+	 *
+	 * `true` for Node (`ws`), Deno, and the Rust spine (hyper hands the
+	 * leftover bytes to the upgraded stream); `false` for a Bun backend that
+	 * upgrades after an asynchronous check, as one behind auth does — `Bun.serve`
+	 * answers such a request `400` (observed on Bun 1.4.3). A backend
+	 * without it still runs the suite's client-library case (requests sent the
+	 * moment the socket opens), which pins the same contract without forcing
+	 * the ordering.
+	 */
+	readonly ws_handshake_pipelining: boolean;
+	/**
+	 * The backend's WebSocket endpoint mounts the self-service account actions
+	 * (`account_session_revoke_all` among them), so a socket can revoke the
+	 * session it is running on. Gates the self-revocation case in
+	 * `describe_cross_process_ws_tests`: the socket reads the reply to its
+	 * request, then is closed with `WS_CLOSE_SESSION_REVOKED`. Also gates that
+	 * suite's WS-mutation audit case (with `rpc_path`; it calls
+	 * `_testing_drain_effects`).
+	 *
+	 * `true` on fuz_app's own spine presets — the TS spine binary mounts its
+	 * full action set on `/api/ws`, and the Rust `testing_spine_stub` serves
+	 * one action registry on RPC and WS. A `MountFlag`: a consumer's WS endpoint
+	 * carries whatever its domain mounts, so it states `true` once the account
+	 * actions are there.
+	 */
+	readonly ws_account_actions: boolean;
 	/**
 	 * A test `CellCreateAuthorize` policy is live-mounted on the backend's cell
 	 * layer — creating a `kind: 'gated'` cell requires the `participant` role
@@ -210,20 +221,110 @@ export interface BackendCapabilities {
 	 * catches one. `true` only on the reference spine binaries that mount the
 	 * test policy (the TS spine `full_spine_mount` + the Rust
 	 * `testing_spine_stub`); consumers and the in-process default app don't
-	 * mount it.
+	 * mount it. The same binaries mount the steward-revoke test policy
+	 * (`test_cell_grant_steward_revoke_authorize`) beside it, so the flag also
+	 * gates `describe_cell_grant_steward_cross_tests` (with `cell_relations`).
 	 */
 	readonly cell_gated_create: boolean;
+	/**
+	 * The backend mounts a second, role-gated WebSocket endpoint at
+	 * `SPINE_ROLE_GATED_WS_PATH`, gated on `SPINE_ROLE_GATED_WS_ROLES`, beside
+	 * its ungated `ws_path`. Gates `describe_ws_role_gated_cross_tests`: a
+	 * revoked global grant of a listed role closes the account's gated socket
+	 * with `WS_CLOSE_PERMISSION_REVOKED`, its ungated socket stays open and
+	 * still receives the account's pushes, a re-upgrade is refused at the gate,
+	 * and a scoped revoke closes nothing. `true` only on the reference spine binaries that
+	 * mount that endpoint (the TS spine binary + the Rust `testing_spine_stub`).
+	 */
+	readonly ws_role_gated: boolean;
+	/**
+	 * A refused WebSocket upgrade carries its refusal body — the flat
+	 * `{error, ...}` the same refusal answers over plain HTTP. Not a gate: it
+	 * forks how `describe_transport_composition_cross_tests` reads its WS rows.
+	 * `true`, an empty refusal body fails the case; `false`, an empty body is
+	 * allowed (the case pins the status alone) and a non-empty one is still
+	 * asserted.
+	 *
+	 * `false` on Node: `@hono/node-ws` writes a refused upgrade to the raw
+	 * socket with `Content-Length: 0`, dropping the response body. `true` on
+	 * Deno, Bun, and the Rust spine, which send the response as built.
+	 */
+	readonly ws_refusal_body: boolean;
+	/**
+	 * The `_testing_*` backdoors the backend mounts on its RPC endpoint, from
+	 * `TESTING_BACKDOOR_METHODS` (a consumer's own seams stay off it). Not a
+	 * flag, but declared like a `MountFlag`: no family default, so every config
+	 * states it. `describe_testing_backdoor_cross_tests` checks the declaration
+	 * against the backend — a declared method must be mounted, an undeclared one
+	 * must answer `method_not_found` — and runs its credential-gate rows over
+	 * the declared ones; `describe_spine_cross_suites` requires `_testing_reset`
+	 * and `_testing_drain_effects` (the per-test reset and the audit barrier),
+	 * skips a suite whose backdoor is undeclared, naming it — `credential_deadline`
+	 * (`_testing_shorten_credential_expiry`), `origin_conformance`
+	 * (`_testing_origin_check`), `ws_outbound_overflow`
+	 * (`_testing_flood_notifications`) — and requires `_testing_put_fact` of a
+	 * backend declaring `fact_serving`.
+	 *
+	 * fuz_app's spine presets declare every one; the in-process transport none
+	 * (the backdoor suites are cross-process only).
+	 */
+	readonly testing_backdoors: ReadonlyArray<TestingBackdoorMethod>;
 }
+
+/**
+ * The capabilities that describe a backend's own mounts, never a runtime
+ * trait: what a consumer chooses to serve. They have no family default —
+ * state each flag in your backend config's `capabilities`; a missing one
+ * would silently skip its suites, so leaving one out is a type error.
+ *
+ * `Pick` keeps the list honest: a name that is not a `BackendCapabilities`
+ * flag fails to compile.
+ */
+export type MountFlag = keyof Pick<
+	BackendCapabilities,
+	| 'ws'
+	| 'sse'
+	| 'cell_crud'
+	| 'cell_relations'
+	| 'cell_gated_create'
+	| 'fact_serving'
+	| 'fact_serving_admin_hash'
+	| 'ready'
+	| 'peer_request'
+	| 'ws_account_actions'
+	| 'ws_role_gated'
+>;
+
+/**
+ * A family's default capabilities: every flag but the `MountFlag`s and the
+ * `testing_backdoors` list, which each backend config states itself. Spread
+ * one and add every mount flag and the backdoor list:
+ *
+ * ```ts
+ * capabilities: {
+ *   ...rust_default_capabilities,
+ *   ws: true, sse: true, ready: true, peer_request: true,
+ *   cell_crud: false, cell_relations: false, cell_gated_create: false,
+ *   fact_serving: false, fact_serving_admin_hash: false,
+ *   ws_account_actions: false, ws_role_gated: false,
+ *   testing_backdoors: ['_testing_reset', '_testing_drain_effects'],
+ * }
+ * ```
+ */
+export type FamilyDefaultCapabilities = Omit<BackendCapabilities, MountFlag | 'testing_backdoors'>;
 
 /**
  * Capability declarations for the in-process Hono transport. Nearly every
  * flag is `true` because in-process testing exercises the full backend
- * with no missing optional behaviors. The one exception is `peer_request`:
- * `describe_peer_ping_ws_tests` is cross-process-only (it needs a real bound
- * socket with an `on_request` responder via `create_ws_transport`), so the
- * in-process driver never runs it — the transport itself supports
- * server-initiated requests. Cross-process consumers declare each flag
- * explicitly per backend.
+ * with no missing optional behaviors. The exceptions are the flags whose
+ * cases are cross-process-only: `peer_request` (`describe_peer_ping_ws_tests`
+ * needs a real bound socket with an `on_request` responder via
+ * `create_ws_transport`, so the in-process driver never runs it — the
+ * transport itself supports server-initiated requests),
+ * `ws_handshake_pipelining` (raw bytes on a real socket),
+ * `ws_account_actions` (a real socket's reply-then-close ordering),
+ * `cell_gated_create`, and `ws_role_gated`. Cross-process consumers declare each flag explicitly
+ * per backend.
  */
 export const in_process_capabilities: BackendCapabilities = Object.freeze({
 	ws: true,
@@ -232,24 +333,27 @@ export const in_process_capabilities: BackendCapabilities = Object.freeze({
 	cell_relations: true,
 	account_lifecycle: true,
 	fact_serving: true,
+	fact_serving_admin_hash: true,
 	ready: true,
 	account_status: true,
-	oversized_reject_closes_connection: true,
 	peer_request: false,
+	// Cross-process-only, like `peer_request`: the case needs a real bound socket
+	// to write raw bytes to.
+	ws_handshake_pipelining: false,
+	// Cross-process-only: the case reads a real socket's frames in wire order.
+	ws_account_actions: false,
 	// Cross-process-only: the test `CellCreateAuthorize` policy is mounted on the
 	// spine binaries' full mount + the Rust stub, not the in-process default app.
-	cell_gated_create: false
-});
-
-/**
- * Shape notes for the in-process Hono transport — every wiring fact present
- * (the in-process app exercises the full middleware stack). Documentation
- * only, like every `BackendShapeNotes` (nothing reads it).
- */
-export const in_process_shape_notes: BackendShapeNotes = Object.freeze({
-	bearer_auth: true,
-	trusted_proxy: true,
-	login_rate_limit: true
+	cell_gated_create: false,
+	// Cross-process-only: the gated endpoint is a spine-binary mount, and the
+	// case reads a real socket's close.
+	ws_role_gated: false,
+	// Read only by the front-door table's WS rows, which skip in-process (no
+	// socket to upgrade); Hono's own refusals carry their bodies.
+	ws_refusal_body: true,
+	// The in-process app mounts no `_testing_*` action; the suites reading this
+	// are cross-process only.
+	testing_backdoors: Object.freeze([])
 });
 
 /**

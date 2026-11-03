@@ -14,8 +14,8 @@ import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import {
 	query_role_grant_offer_create,
 	RoleGrantOfferSelfTargetError
-} from '$lib/auth/role_grant_offer_queries.ts';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
+} from '#lib/auth/role_grant_offer_queries.ts';
+import { create_uuid } from '#lib/primitive_schemas.ts';
 
 import { describe_db } from '../db_fixture.ts';
 import { make_account, future, hour } from './role_grant_offer_queries.fixtures.ts';

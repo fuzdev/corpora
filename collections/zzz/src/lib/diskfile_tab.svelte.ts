@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { CellJson } from './cell_types.ts';
@@ -47,5 +47,3 @@ export class DiskfileTab extends Cell<typeof DiskfileTabJson> {
 		this.init();
 	}
 }
-
-export const DiskfileTabSchema = z.instanceof(DiskfileTab);

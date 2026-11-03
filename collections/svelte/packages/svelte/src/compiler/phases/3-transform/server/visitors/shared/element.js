@@ -1,9 +1,10 @@
 /** @import { ArrayExpression, Expression, Literal, ObjectExpression } from 'estree' */
 /** @import { AST } from '#compiler' */
 /** @import { ComponentContext, ComponentServerTransformState } from '../../types.js' */
+/** @import { ExpressionMetadata } from '../../../../nodes.js' */
 import { is_event_attribute, is_text_attribute } from '../../../../../utils/ast.js';
 import { binding_properties } from '../../../../bindings.js';
-import { ExpressionMetadata, is_custom_element_node } from '../../../../nodes.js';
+import { is_custom_element_node } from '../../../../nodes.js';
 import { regex_starts_with_newline } from '../../../../patterns.js';
 import * as b from '#compiler/builders';
 import {
@@ -80,6 +81,14 @@ export function build_element_attributes(node, context, transform) {
 				) {
 					events_to_capture.add(attribute.name);
 				}
+			} else if (
+				node.type === 'RegularElement' &&
+				node.name === 'input' &&
+				(attribute.name === 'defaultValue' || attribute.name === 'defaultChecked')
+			) {
+				attributes.push(attribute);
+				// deopt to spread at runtime, where we can handle interaction of value/defaultValue etc
+				has_spread = true;
 				// the defaultValue/defaultChecked properties don't exist as attributes
 			} else if (attribute.name !== 'defaultValue' && attribute.name !== 'defaultChecked') {
 				if (attribute.name === 'class') {
@@ -306,12 +315,14 @@ function get_attribute_name(element, attribute) {
  * @param {(expression: Expression, metadata: ExpressionMetadata) => Expression} transform
  */
 export function build_spread_object(element, attributes, context, transform) {
+	const is_select = element.type === 'RegularElement' && element.name === 'select';
 	const object = b.object(
 		attributes.map((attribute) => {
 			if (attribute.type === 'transformed') {
 				return b.prop('init', b.key(attribute.name), attribute.expression);
 			} else if (attribute.type === 'Attribute') {
-				const name = get_attribute_name(element, attribute);
+				let name = get_attribute_name(element, attribute);
+				if (is_select && name === 'defaultvalue') name = 'defaultValue';
 				const value = build_attribute_value(
 					attribute.value,
 					context,
@@ -322,10 +333,9 @@ export function build_spread_object(element, attributes, context, transform) {
 				return b.prop('init', b.key(name), value);
 			} else if (attribute.type === 'BindDirective') {
 				const name = get_attribute_name(element, attribute);
+				const expression = /** @type {Expression} */ (context.visit(attribute.expression));
 				const value =
-					attribute.expression.type === 'SequenceExpression'
-						? b.call(attribute.expression.expressions[0])
-						: /** @type {Expression} */ (context.visit(attribute.expression));
+					expression.type === 'SequenceExpression' ? b.call(expression.expressions[0]) : expression;
 
 				return b.prop('init', b.key(name), value);
 			}

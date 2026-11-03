@@ -1,12 +1,12 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import Breadcrumb from '$lib/Breadcrumb.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import Breadcrumb from '#lib/Breadcrumb.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
 	import BreadcrumbExample from './BreadcrumbExample.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 
 	const TOME_SLUG = 'Breadcrumb';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -27,8 +27,7 @@
 			The root link defaults to the <Code inline content="site_context" /> icon, rendered as an
 			<Code inline content="Svg" />. Set the <Code inline content="SiteState" /> once at your app's
 			root layout and every <Code inline content="Breadcrumb" /> picks it up. It falls back to the
-			<Code inline content="site_context" />
-			glyph, then a bullet.
+			<Code inline content="site_context" /> glyph, then a bullet.
 		</p>
 		<Code
 			lang="ts"
@@ -50,7 +49,18 @@ site_context.set(new SiteState({icon: logo_fuz, glyph: '🧶'}));`}
 	{#snippet separator()}.{/snippet}
 </Breadcrumb>`}
 		/>
-		<Breadcrumb>{#snippet separator()}.{/snippet}</Breadcrumb>
+		<Breadcrumb>
+			{#snippet separator()}.{/snippet}
+		</Breadcrumb>
+	</TomeSection>
+	<TomeSection>
+		<TomeSectionHeader text="With a custom root link" />
+		<p>
+			<Code inline content="root_path" /> sets where the root link goes, relative to the base path.
+			On a home page the root link would link to the page itself, so it can lead elsewhere:
+		</p>
+		<Code content={`<Breadcrumb root_path="/docs" />`} />
+		<Breadcrumb root_path="/docs" />
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="With custom paths" />

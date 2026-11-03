@@ -1,26 +1,26 @@
 <!--
 	@component
-	Generates an SVG stacked column chart. It uses the z-scale for color assignments and assumes both `xScale` and `zScale` are ordinal scales. It assumes your data is in a [D3 stack format](https://github.com/d3/d3-shape#stack).
+	Generates an SVG stacked column chart. Each series takes its color from the `c` scale and the x scale must be a band scale. The data must be in [D3 stack format](https://github.com/d3/d3-shape#stack).
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, xGet, yGet, zGet, xScale } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 </script>
 
 <g class="column-group">
-	{#each $data as series, i}
-		{#each series as d}
-			{@const yVals = $yGet(d)}
+	{#each k.data as series}
+		{#each series as d, i}
+			{@const yVals = k.yGet(d)}
 			{@const columnHeight = yVals[0] - yVals[1]}
 			<rect
 				class="group-rect"
 				data-id={i}
-				x={$xGet(d)}
+				x={k.xGet(d)}
 				y={yVals[1]}
-				width={$xScale.bandwidth()}
+				width={k.xScale.bandwidth()}
 				height={columnHeight}
-				fill={$zGet(series)}
+				fill={k.cGet?.(series) ?? '#ccc'}
 			></rect>
 		{/each}
 	{/each}

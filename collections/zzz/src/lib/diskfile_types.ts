@@ -4,7 +4,18 @@ import { CellJson } from './cell_types.ts';
 import { is_path_absolute } from './diskfile_helpers.ts';
 import { PathWithTrailingSlash } from './zod_helpers.ts';
 
-export const DiskfileChangeType = z.enum(['add', 'change', 'delete']);
+/**
+ * What happened to a file the backend indexes:
+ *
+ * - `add` — it's newly indexed
+ * - `change` — its contents differ
+ * - `touch` — its metadata changed and the contents the backend holds for
+ *   it didn't (a `touch`, a rewrite of the same bytes), so they aren't sent
+ *   again. The backend holds no contents for a file it didn't load
+ *   (`contents: null`), so every change to such a file is a `touch`
+ * - `delete` — it's gone
+ */
+export const DiskfileChangeType = z.enum(['add', 'change', 'touch', 'delete']);
 export type DiskfileChangeType = z.infer<typeof DiskfileChangeType>;
 
 /** An absolute Unix-style file path. */
@@ -37,19 +48,32 @@ export const SerializableDisknode = z.strictObject({
 });
 export type SerializableDisknode = z.infer<typeof SerializableDisknode>;
 
-// Directly extend the base schema with Diskfile-specific properties
+/**
+ * A disknode without its contents — what a `touch` change carries. It has no
+ * `contents` key, which is not `contents: null`: `null` says the file's
+ * contents aren't loaded, and this says nothing about them — whoever holds
+ * the file keeps the contents it has.
+ */
+export const DisknodeMetadata = SerializableDisknode.omit({ contents: true });
+export type DisknodeMetadata = z.infer<typeof DisknodeMetadata>;
+
+/**
+ * A file on disk. `path` and `source_dir` are required — a diskfile is
+ * always for one file. `content` is `null` when it wasn't loaded (see
+ * `Diskfile.content_loaded`).
+ */
 export const DiskfileJson = CellJson.extend({
-	path: DiskfilePath.nullable().default(null),
+	path: DiskfilePath,
 	source_dir: DiskfileDirectoryPath,
 	content: z.string().nullable().default(null),
-	dependents: z
-		.array(z.tuple([DiskfilePath, SerializableDisknode]))
-		.nullable()
-		.default(null),
-	dependencies: z
-		.array(z.tuple([DiskfilePath, SerializableDisknode]))
-		.nullable()
-		.default(null)
+	/**
+	 * When the file was last modified on disk, in milliseconds since the
+	 * epoch — `null` when the backend couldn't say. It moves whenever the
+	 * file's bytes do, including for a file whose content isn't loaded.
+	 */
+	mtime: z.number().nullable().default(null),
+	dependents: SerializableDisknode.shape.dependents.default(() => []),
+	dependencies: SerializableDisknode.shape.dependencies.default(() => [])
 }).meta({ cell_class_name: 'Diskfile' });
 export type DiskfileJson = z.infer<typeof DiskfileJson>;
 export type DiskfileJsonInput = z.input<typeof DiskfileJson>;

@@ -114,6 +114,9 @@ export const account_status_route_shape = {
 	method: 'GET',
 	path: '/status',
 	auth: { account: 'none', actor: 'none' },
+	// no gate — the handler answers an anonymous caller with its own 401 — but
+	// it reads the account the auth middleware resolved
+	reads_credential: true,
 	description: 'Current account info (unauthenticated: 401 with bootstrap status)',
 	input: AccountStatusInput,
 	output: AccountStatusOutput,
@@ -149,8 +152,16 @@ export const create_account_route_shapes = (
 	{
 		method: 'GET',
 		path: '/verify',
-		auth: { account: 'required', actor: 'none' },
-		description: 'Session-validity probe for nginx auth_request (empty body, 200 or 401)',
+		// a non-RPC surface: the probe answers 200 for the account behind a
+		// credential, so a narrowed token is refused it (it would otherwise pass
+		// an nginx `auth_request` gate as its account)
+		auth: {
+			account: 'required',
+			actor: 'none',
+			required_scope: 'surface:account_verify'
+		},
+		description:
+			'Session-validity probe for nginx auth_request (empty body; 200, 401, or 403 for a narrowed token)',
 		input: z.null(),
 		output: z.null()
 	},
@@ -158,10 +169,15 @@ export const create_account_route_shapes = (
 		method: 'POST',
 		path: '/login',
 		auth: { account: 'none', actor: 'none' },
+		mints_credential: true,
 		description: 'Exchange credentials for session',
 		input: LoginInput,
 		output: LoginOutput,
 		rate_limit: 'both',
+		// The handler opens its own transaction around just the session writes,
+		// so a reservation waiting for a slot, and the Argon2 verify, hold no
+		// database connection.
+		transaction: false,
 		errors: {
 			400: z.looseObject({
 				error: z.enum([ERROR_INVALID_JSON_BODY, ERROR_INVALID_REQUEST_BODY])
@@ -190,6 +206,10 @@ export const create_account_route_shapes = (
 		input: PasswordChangeInput,
 		output: PasswordChangeOutput,
 		rate_limit: options.login_account_rate_limited ? 'both' : 'ip',
+		// The handler opens its own transaction around just the password update
+		// and the revocations, so a reservation waiting for a slot, and the
+		// Argon2 verify and hash, hold no database connection.
+		transaction: false,
 		errors: {
 			400: z.looseObject({
 				error: z.enum([ERROR_INVALID_JSON_BODY, ERROR_INVALID_REQUEST_BODY])

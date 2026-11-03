@@ -9,14 +9,29 @@
  */
 
 import { describe, test, assert } from 'vitest';
+import { z } from 'zod';
 
 import {
 	FrontendWebsocketTransport,
+	create_message_too_large_error,
 	type WebsocketRpcConnection
-} from '$lib/actions/transports_ws.ts';
-import { JSONRPC_ERROR_CODES, ThrownJsonrpcError } from '$lib/http/jsonrpc_errors.ts';
-import type { JsonrpcRequest, JsonrpcNotification, JsonrpcRequestId } from '$lib/http/jsonrpc.ts';
-import { PEER_PING_METHOD, PEER_PROTOCOL_VERSION } from '$lib/actions/peer_ping.ts';
+} from '#lib/actions/transports_ws.ts';
+import { JSONRPC_ERROR_CODES, ThrownJsonrpcError } from '#lib/http/jsonrpc_errors.ts';
+import type {
+	JsonrpcErrorResponse,
+	JsonrpcRequest,
+	JsonrpcNotification,
+	JsonrpcRequestId
+} from '#lib/http/jsonrpc.ts';
+import { PEER_PING_METHOD, PEER_PROTOCOL_VERSION } from '#lib/actions/peer_ping.ts';
+import { DEFAULT_WS_MAX_MESSAGE_BYTES } from '#lib/actions/transports.ts';
+import { create_frontend_rpc_client } from '#lib/actions/frontend_rpc_client.ts';
+import type { ActionSpecUnion } from '#lib/actions/action_spec.ts';
+
+import {
+	ForeignRpcError,
+	SecondCopyThrownJsonrpcError
+} from '../http/thrown_jsonrpc_error_helpers.ts';
 
 interface RequestCall {
 	method: string;
@@ -43,6 +58,7 @@ const create_fake_connection = (
 		get connected() {
 			return connected;
 		},
+		will_reconnect: false,
 		add_message_handler: (handler) => {
 			message_handler = handler;
 			return () => {
@@ -67,6 +83,107 @@ const create_fake_connection = (
 		}
 	};
 };
+
+describe('FrontendWebsocketTransport max_message_bytes', () => {
+	const MAX = 256;
+
+	test('an oversized request is refused without reaching the connection', async () => {
+		const fake = create_fake_connection();
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null, {
+			max_message_bytes: MAX
+		});
+		const message: JsonrpcRequest = {
+			jsonrpc: '2.0',
+			id: 'big',
+			method: 'upload',
+			params: { content: 'x'.repeat(MAX) }
+		};
+		const size = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+
+		const response = await transport.send(message);
+
+		assert.strictEqual(fake.request_calls.length, 0, 'never sent');
+		assert.deepStrictEqual(response, {
+			jsonrpc: '2.0',
+			id: 'big',
+			error: create_message_too_large_error(size, MAX)
+		});
+		const error = create_message_too_large_error(size, MAX);
+		assert.strictEqual(error.code, JSONRPC_ERROR_CODES.invalid_request);
+		assert.deepStrictEqual(error.data, { reason: 'payload_too_large' });
+	});
+
+	test('measures UTF-8 bytes, not string length', async () => {
+		const fake = create_fake_connection();
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null, {
+			max_message_bytes: MAX
+		});
+		// under MAX in characters, over it in bytes (3 bytes each)
+		const params = { content: '€'.repeat(MAX / 3) };
+		const response = await transport.send({ jsonrpc: '2.0', id: 1, method: 'm', params });
+		assert.strictEqual(fake.request_calls.length, 0);
+		assert.ok('error' in response);
+	});
+
+	test('a message within the limit is sent', async () => {
+		const fake = create_fake_connection({ request_impl: async () => 'ok' });
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null, {
+			max_message_bytes: MAX
+		});
+		const response = await transport.send({
+			jsonrpc: '2.0',
+			id: 2,
+			method: 'm',
+			params: { content: 'small' }
+		});
+		assert.strictEqual(fake.request_calls.length, 1);
+		assert.deepStrictEqual(response, { jsonrpc: '2.0', id: 2, result: 'ok' });
+	});
+
+	test('an oversized notification is refused without being sent', async () => {
+		const fake = create_fake_connection();
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null, {
+			max_message_bytes: MAX
+		});
+		const notification: JsonrpcNotification = {
+			jsonrpc: '2.0',
+			method: 'note',
+			params: { content: 'x'.repeat(MAX) }
+		};
+		const response = await transport.send(notification);
+		assert.strictEqual(fake.sent_messages.length, 0);
+		assert.ok(response && 'error' in response);
+		assert.strictEqual(response.id, null);
+		assert.deepStrictEqual(response.error.data, { reason: 'payload_too_large' });
+	});
+
+	test('defaults to DEFAULT_WS_MAX_MESSAGE_BYTES', async () => {
+		const fake = create_fake_connection();
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null);
+		const response = await transport.send({
+			jsonrpc: '2.0',
+			id: 3,
+			method: 'm',
+			params: { content: 'x'.repeat(DEFAULT_WS_MAX_MESSAGE_BYTES) }
+		});
+		assert.strictEqual(fake.request_calls.length, 0);
+		assert.ok('error' in response);
+	});
+
+	test('null skips the measurement', async () => {
+		const fake = create_fake_connection();
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null, {
+			max_message_bytes: null
+		});
+		await transport.send({
+			jsonrpc: '2.0',
+			id: 3,
+			method: 'm',
+			params: { content: 'x'.repeat(DEFAULT_WS_MAX_MESSAGE_BYTES) }
+		});
+		assert.strictEqual(fake.request_calls.length, 1);
+	});
+});
 
 describe('FrontendWebsocketTransport', () => {
 	test('request delegates to connection.request with peer id, signal, queue=false', async () => {
@@ -173,6 +290,41 @@ describe('FrontendWebsocketTransport', () => {
 			id: 1,
 			error: { code: -32602, message: 'invalid params', data: { field: 'x' } }
 		});
+	});
+
+	test('request wraps a ThrownJsonrpcError from a second fuz_app copy verbatim', async () => {
+		const fake = create_fake_connection({
+			request_impl: async () => {
+				throw new SecondCopyThrownJsonrpcError(-32602, 'invalid params', { field: 'x' });
+			}
+		});
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null);
+
+		const message: JsonrpcRequest = { jsonrpc: '2.0', id: 1, method: 'echo', params: {} };
+		const response = await transport.send(message);
+
+		assert.deepStrictEqual(response, {
+			jsonrpc: '2.0',
+			id: 1,
+			error: { code: -32602, message: 'invalid params', data: { field: 'x' } }
+		});
+	});
+
+	test('request wraps a foreign error class carrying a JSON-RPC code as internal_error', async () => {
+		const fake = create_fake_connection({
+			request_impl: async () => {
+				throw new ForeignRpcError(-32602, 'invalid params', { secret: 'x' });
+			}
+		});
+		const transport = new FrontendWebsocketTransport(fake.connection, async () => null);
+
+		const message: JsonrpcRequest = { jsonrpc: '2.0', id: 1, method: 'echo', params: {} };
+		const response = await transport.send(message);
+
+		assert.ok('error' in response, 'expected error envelope');
+		const { error } = response as JsonrpcErrorResponse;
+		assert.strictEqual(error.code, JSONRPC_ERROR_CODES.internal_error);
+		assert.isUndefined(error.data);
 	});
 
 	test('request wraps unknown errors into internal_error envelope', async () => {
@@ -437,5 +589,55 @@ describe('FrontendWebsocketTransport server→client receive', () => {
 
 		assert.strictEqual(fake.sent_messages.length, 0, 'no reply when the peer produced none');
 		transport.dispose();
+	});
+});
+
+describe('FrontendWebsocketTransport non-object results', () => {
+	test('null, primitive, and array results pass through as-is', async () => {
+		for (const result of [null, 0, 'text', false, [1, 2], []]) {
+			const fake = create_fake_connection({ request_impl: async () => result });
+			const transport = new FrontendWebsocketTransport(fake.connection, async () => null);
+			const response = await transport.send({ jsonrpc: '2.0', id: 'r', method: 'm' });
+			assert.deepStrictEqual(response, { jsonrpc: '2.0', id: 'r', result }, JSON.stringify(result));
+		}
+	});
+
+	const make_spec = (method: string, output: z.ZodType) =>
+		({
+			method,
+			kind: 'request_response',
+			initiator: 'frontend',
+			auth: { account: 'none', actor: 'none' },
+			side_effects: true,
+			input: z.null(),
+			output,
+			async: true,
+			description: method
+		}) satisfies ActionSpecUnion;
+
+	const specs = [
+		make_spec('returns_null', z.null()),
+		make_spec('returns_number', z.number()),
+		make_spec('returns_array', z.array(z.string()))
+	];
+	const results: Record<string, unknown> = {
+		returns_null: null,
+		returns_number: 42,
+		returns_array: ['a', 'b']
+	};
+
+	test('create_rpc_client over the WS transport validates and returns them', async () => {
+		const fake = create_fake_connection({
+			request_impl: async (call) => results[call.method]
+		});
+		const { api_result } = create_frontend_rpc_client<Record<string, (input?: unknown) => any>>({
+			specs,
+			transports: [new FrontendWebsocketTransport(fake.connection, async () => null)]
+		});
+		for (const [method, expected] of Object.entries(results)) {
+			const result = await api_result[method]!(null);
+			assert.ok(result.ok, `${method}: ${JSON.stringify(result)}`);
+			assert.deepStrictEqual(result.value, expected, method);
+		}
 	});
 });

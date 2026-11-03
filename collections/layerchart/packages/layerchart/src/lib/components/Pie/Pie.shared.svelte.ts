@@ -5,6 +5,8 @@ import { min, max } from 'd3-array';
 import { degreesToRadians } from '$lib/utils/math.js';
 import { createMotion, type MotionProp } from '$lib/utils/motion.svelte.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 
 export type PiePropsWithoutHTML = {
@@ -31,6 +33,9 @@ export type PiePropsWithoutHTML = {
   padAngle?: number;
   /** @default 0 */
   offset?: number;
+
+  /** On an `isometric` chart, stand every slice up `z` pixels, or between `[start, end]` */
+  z?: number | [start: number, end: number];
   /** Setup pointer events to show tooltip for related data */
   tooltip?: boolean;
   /** Sort function to sort the arcs */
@@ -48,6 +53,7 @@ export type PieProps = PiePropsWithoutHTML;
 export class PieState {
   #getProps: () => PieProps = () => ({}) as PieProps;
   ctx: ChartState = getChartContext();
+  markData = getMarkData();
 
   #motionEndAngle!: ReturnType<typeof createMotion<number>>;
 
@@ -89,5 +95,15 @@ export class PieState {
     return _pie;
   });
 
-  arcs = $derived(this.pie(this.#getProps().data ?? (Array.isArray(this.ctx.data) ? this.ctx.data : [])));
+  #layerIsometric = getLayerIsometric();
+
+  /** The slices in draw order: back to front on an isometric floor, else as laid out */
+  arcs = $derived.by(() => {
+    const arcs = this.pie(this.markData(this.#getProps().data));
+    const m = this.#layerIsometric();
+    if (!m) return arcs;
+    const depth = (arc: (typeof arcs)[number]) =>
+      this.ctx.isometric!.sectorDepth(arc.startAngle, arc.endAngle, m);
+    return arcs.sort((a, b) => depth(a) - depth(b));
+  });
 }

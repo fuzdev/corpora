@@ -1,10 +1,19 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { task as build_task } from '$lib/build.task.ts';
+import { task as build_task } from '#lib/build.task.ts';
 
 import { create_mock_build_task_context, create_mock_plugins } from './build_task_test_helpers.ts';
+import { MOCK_BUILD_CACHE_DEPENDENCIES } from './build_cache_test_helpers.ts';
 
 // Mock dependencies
+vi.mock('#lib/build_cache_dependencies.ts', () => ({
+	load_build_cache_dependencies: vi.fn(async () => ({
+		gro_version: '1.0.0',
+		node_version: 'v24.0.0',
+		package_lock_hash: 'lock123'
+	}))
+}));
+
 vi.mock('@fuzdev/fuz_util/git.js', () => ({
 	git_check_clean_workspace: vi.fn(),
 	git_current_commit_hash: vi.fn()
@@ -20,19 +29,19 @@ vi.mock('node:fs', () => ({
 	statSync: vi.fn()
 }));
 
-vi.mock('$lib/clean_fs.ts', () => ({
+vi.mock('#lib/clean_fs.ts', () => ({
 	clean_fs: vi.fn()
 }));
 
-vi.mock('$lib/plugin.ts', async (import_original) => ({
-	...(await import_original<typeof import('$lib/plugin.ts')>()),
+vi.mock('#lib/plugin.ts', async (import_original) => ({
+	...(await import_original<typeof import('#lib/plugin.ts')>()),
 	Plugins: {
 		create: vi.fn()
 	}
 }));
 
-vi.mock('$lib/build_cache.ts', async (import_original) => {
-	const original = await import_original<typeof import('$lib/build_cache.ts')>();
+vi.mock('#lib/build_cache.ts', async (import_original) => {
+	const original = await import_original<typeof import('#lib/build_cache.ts')>();
 	return {
 		...original,
 		is_build_cache_valid: vi.fn(),
@@ -41,7 +50,7 @@ vi.mock('$lib/build_cache.ts', async (import_original) => {
 	};
 });
 
-vi.mock('$lib/paths.ts', () => ({
+vi.mock('#lib/paths.ts', () => ({
 	paths: {
 		root: './',
 		source: './src/',
@@ -62,10 +71,10 @@ describe('build_task optimization', () => {
 
 		// Setup default mocks
 		const mock_plugins = create_mock_plugins();
-		const { Plugins } = vi.mocked(await import('$lib/plugin.ts'));
+		const { Plugins } = vi.mocked(await import('#lib/plugin.ts'));
 		vi.mocked(Plugins.create).mockResolvedValue(mock_plugins as any);
 
-		const { clean_fs } = vi.mocked(await import('$lib/clean_fs.ts'));
+		const { clean_fs } = vi.mocked(await import('#lib/clean_fs.ts'));
 		vi.mocked(clean_fs).mockResolvedValue(undefined);
 	});
 
@@ -77,7 +86,7 @@ describe('build_task optimization', () => {
 		const { git_check_clean_workspace, git_current_commit_hash } = vi.mocked(
 			await import('@fuzdev/fuz_util/git.ts')
 		);
-		const { is_build_cache_valid } = vi.mocked(await import('$lib/build_cache.ts'));
+		const { is_build_cache_valid } = vi.mocked(await import('#lib/build_cache.ts'));
 		const { hash_blake3 } = vi.mocked(await import('@fuzdev/fuz_util/hash_blake3.ts'));
 
 		vi.mocked(git_check_clean_workspace).mockResolvedValue(null);
@@ -123,7 +132,7 @@ describe('build_task optimization', () => {
 			await import('@fuzdev/fuz_util/git.ts')
 		);
 		const { is_build_cache_valid, create_build_cache_metadata } = vi.mocked(
-			await import('$lib/build_cache.ts')
+			await import('#lib/build_cache.ts')
 		);
 		const { hash_blake3 } = vi.mocked(await import('@fuzdev/fuz_util/hash_blake3.ts'));
 
@@ -133,7 +142,8 @@ describe('build_task optimization', () => {
 		vi.mocked(hash_blake3).mockReturnValue('hash123');
 
 		const mock_metadata = {
-			version: '1',
+			version: '2',
+			...MOCK_BUILD_CACHE_DEPENDENCIES,
 			git_commit: 'abc123',
 			build_cache_config_hash: 'hash123',
 			timestamp: '2025-10-21T10:00:00.000Z',
@@ -149,7 +159,8 @@ describe('build_task optimization', () => {
 		expect(is_build_cache_valid).toHaveBeenCalledWith(
 			ctx.config,
 			ctx.log,
-			'abc123' // pre-computed git commit
+			'abc123', // pre-computed git commit
+			MOCK_BUILD_CACHE_DEPENDENCIES
 		);
 
 		// create_build_cache_metadata should receive pre-computed commit
@@ -157,7 +168,8 @@ describe('build_task optimization', () => {
 			ctx.config,
 			ctx.log,
 			'abc123', // pre-computed git commit
-			undefined // build_dirs not pre-discovered in clean workspace path
+			undefined, // build_dirs not pre-discovered in clean workspace path
+			MOCK_BUILD_CACHE_DEPENDENCIES
 		);
 	});
 });

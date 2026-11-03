@@ -1,5 +1,6 @@
 <script>
-	import { LayerCake, ScaledSvg, Html, flatten } from 'layercake';
+	import { LayerCake, ScaledSvg, Html, groupLonger, flatten } from 'layercake';
+
 	import { scaleOrdinal } from 'd3-scale';
 	import { timeParse, timeFormat } from 'd3-time-format';
 	import { format } from 'd3-format';
@@ -10,43 +11,32 @@
 	import GroupLabels from '../../_components/GroupLabels.html.svelte';
 	import SharedTooltip from '../../_components/SharedTooltip.percent-range.html.svelte';
 
-	// This example loads csv data as json and converts numeric columns to numbers using @rollup/plugin-dsv. See vite.config.js for details
+	// The CSV rows are parsed, and their numbers typed, by @rollup/plugin-dsv. See vite.config.js
 	import data from '../../_data/fruit.csv';
 
-	/* --------------------------------------------
-	 * Set what is our x key to separate it from the other series
-	 */
+	// Name the x field so it can be told apart from the series fields
 	const xKey = 'month';
 	const yKey = 'value';
-	const zKey = 'fruit';
+	const cKey = 'fruit';
 
 	const seriesNames = Object.keys(data[0]).filter(d => d !== xKey);
 	const seriesColors = ['#ffe4b8', '#ffb3c0', '#ff7ac7', '#ff00cc'];
 
+	// Turn the date strings into Date objects, on copies so the imported rows stay as they are
 	const parseDate = timeParse('%Y-%m-%d');
-
-	/* --------------------------------------------
-	 * Create a "long" format that is a grouped series of data points
-	 * Layer Cake uses this data structure and the key names
-	 * set in xKey, yKey and zKey to map your data into each scale.
-	 */
-	const dataLong = seriesNames.map(key => {
-		return {
-			[zKey]: key,
-			values: data.map(d => {
-				// Put this in a conditional so that we don't recast the data on second render
-				d[xKey] = typeof d[xKey] === 'string' ? parseDate(d[xKey]) : d[xKey];
-				return {
-					[yKey]: +d[key],
-					[xKey]: d[xKey],
-					[zKey]: key
-				};
-			})
-		};
-	});
+	const rows = data.map(d => ({ ...d, [xKey]: parseDate(d[xKey]) }));
 
 	const formatLabelX = timeFormat('%b. %e');
-	const formatLabelY = d => format(`~s`)(d);
+	const formatLabelY = format('~s');
+
+	// One tick per month in the data, oldest first so the snapped labels sit at the right ends
+	const xTicks = rows.map(d => d[xKey]).sort((a, b) => a - b);
+
+	// Reshape the wide rows into one group per series, each with its own list of points
+	const groupedData = groupLonger(rows, seriesNames, {
+		groupTo: cKey,
+		valueTo: yKey
+	});
 </script>
 
 <div class="chart-container">
@@ -56,42 +46,30 @@
 		padding={{ top: 7, right: 10, bottom: 20, left: 25 }}
 		x={xKey}
 		y={yKey}
-		z={zKey}
-		zScale={scaleOrdinal()}
-		zRange={seriesColors}
-		flatData={flatten(dataLong, 'values')}
+		c={cKey}
 		yDomain={[0, null]}
-		data={dataLong}
+		cScale={scaleOrdinal()}
+		cRange={seriesColors}
+		flatData={flatten(groupedData, 'values')}
+		data={groupedData}
 	>
 		<Html>
-			<AxisX
-				gridlines={false}
-				ticks={data.map(d => d[xKey]).sort((a, b) => a - b)}
-				format={formatLabelX}
-				snapLabels
-				tickMarks
-			/>
-			<AxisY format={formatLabelY} />
+			<AxisX gridlines={false} ticks={xTicks} format={formatLabelX} snapLabels tickMarks />
+			<AxisY ticks={4} format={formatLabelY} />
 		</Html>
-
 		<ScaledSvg>
 			<MultiLine />
 		</ScaledSvg>
 
 		<Html>
 			<GroupLabels />
-			<SharedTooltip formatTitle={formatLabelX} dataset={data} />
+			<SharedTooltip formatTitle={formatLabelX} dataset={rows} />
 		</Html>
 	</LayerCake>
 </div>
 
 <style>
-	/*
-		The wrapper div needs to have an explicit width and height in CSS.
-		It can also be a flexbox child or CSS grid element.
-		The point being it needs dimensions since the <LayerCake> element will
-		expand to fill it.
-	*/
+	/* Give the wrapper a width and height. LayerCake fills it. */
 	.chart-container {
 		width: 100%;
 		height: 250px;

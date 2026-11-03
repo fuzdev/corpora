@@ -2,10 +2,10 @@
 	import { slide } from 'svelte/transition';
 	import { resolve } from '$app/paths';
 
-	import NavLink from '$lib/NavLink.svelte';
+	import NavLink from '#lib/NavLink.svelte';
 	import { projects_context } from './projects.svelte.ts';
 	import { icon_add } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from '#lib/Icon.svelte';
 
 	const projects = projects_context.get();
 
@@ -20,7 +20,7 @@
 				class="plain justify-content:start flex:1"
 				onclick={() => project_viewmodel.create_new_page()}
 			>
-				<Svg data={icon_add} />&nbsp; new page
+				<Icon data={icon_add} />&nbsp; new page
 			</button>
 		</div>
 
@@ -30,7 +30,10 @@
 					{#each project_viewmodel.project.pages as page (page.id)}
 						<li transition:slide>
 							<NavLink
-								href={resolve(`/projects/${project_viewmodel.project_id}/pages/${page.id}`)}
+								href={resolve('/projects/[project_id]/pages/[page_id]', {
+									project_id: project_viewmodel.project_id,
+									page_id: page.id
+								})}
 								selected={page.id === projects.current_page_id}
 								title={page.title}
 							>

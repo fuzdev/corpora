@@ -1,7 +1,7 @@
 /**
  * Role grant offer WebSocket notification specs, builders, and the narrow
  * `NotificationSender` interface that decouples offer/revoke send sites
- * from `BackendWebsocketTransport`.
+ * from `ConnectionRegistry`.
  *
  * Six `RemoteNotificationActionSpec`s cover the consentful-role-grants
  * lifecycle events the server pushes to affected accounts:
@@ -31,7 +31,7 @@
  */
 
 import { z } from 'zod';
-import { Uuid as UuidSchema, type Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid as UuidSchema, type Uuid, bounded_string } from '../primitive_schemas.ts';
 
 import type { RemoteNotificationActionSpec } from '../actions/action_spec.ts';
 import { create_action_event_spec } from '../actions/action_bridge.ts';
@@ -46,11 +46,11 @@ import { ROLE_GRANT_REVOKED_REASON_LENGTH_MAX } from './account_schema.ts';
  * Narrow structural capability for sending a JSON-RPC notification to every
  * socket bound to an account.
  *
- * `BackendWebsocketTransport` satisfies this interface — its
+ * `ConnectionRegistry` satisfies this interface — its
  * `send_to_account(account_id, message)` signature accepts the broader
  * `JsonrpcMessageFromServerToClient` type, which is contravariantly
  * compatible with `JsonrpcNotification` here. The interface stays local so
- * handlers don't couple to the concrete transport, and tests can inject a
+ * handlers don't couple to the concrete registry, and tests can inject a
  * capturing stub with no WS machinery.
  *
  * Returns the number of sockets the notification was sent to — callers
@@ -102,8 +102,9 @@ export type RoleGrantOfferDeclinedParams = z.infer<typeof RoleGrantOfferDeclined
 /**
  * Params for `role_grant_offer_supersede`. Fires to the grantor's sockets when
  * their pending offer is obsoleted — either by a sibling accept
- * (`reason: 'sibling_accepted'`), by revoke of the resulting role_grant
- * (`reason: 'role_grant_revoked'`), or by deletion of the parent scope row
+ * (`reason: 'sibling_accepted'`), by revoke of the resulting role_grant or of
+ * one of the grantor's own (`reason: 'role_grant_revoked'`), or by deletion of
+ * the parent scope row
  * the offer was bound to (`reason: 'scope_destroyed'`). `cause_id` points
  * at the accepted offer id, the revoked role_grant id, or the destroyed scope
  * row id respectively.
@@ -126,7 +127,7 @@ export const RoleGrantRevokeParams = z.strictObject({
 	role_grant_id: UuidSchema,
 	role: RoleName,
 	scope_id: UuidSchema.nullable(),
-	reason: z.string().max(ROLE_GRANT_REVOKED_REASON_LENGTH_MAX).nullable()
+	reason: bounded_string({ max: ROLE_GRANT_REVOKED_REASON_LENGTH_MAX }).nullable()
 });
 export type RoleGrantRevokeParams = z.infer<typeof RoleGrantRevokeParams>;
 

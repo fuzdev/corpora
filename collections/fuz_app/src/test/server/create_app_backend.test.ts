@@ -1,27 +1,29 @@
 /**
  * Tests for `create_app_backend` — isolated from `create_app_server.test.ts`
- * because each call creates an uncached PGlite instance (~1-2s cold start).
+ * because each call creates an uncached in-memory pglet instance.
  *
  * @module
  */
 
-import { describe, test, assert } from 'vitest';
-import { z } from 'zod';
+import { describe, test, assert, vi } from 'vitest';
+import { Logger } from '@fuzdev/fuz_util/log.ts';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 
-import { create_keyring } from '$lib/auth/keyring.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_health_route_spec } from '$lib/http/common_routes.ts';
-import { create_app_server, type AppServerOptions } from '$lib/server/app_server.ts';
-import { create_app_backend, type AppBackend, type AuditFactory } from '$lib/server/app_backend.ts';
-import { stub_password_deps } from '$lib/testing/app_server.ts';
-import { AUTH_MIGRATION_NAMESPACE } from '$lib/auth/migrations.ts';
-import type { MigrationNamespace } from '$lib/db/migrate.ts';
-import { create_audit_emitter } from '$lib/auth/audit_emitter.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_health_route_spec } from '#lib/http/common_routes.ts';
+import { create_app_server, type AppServerOptions } from '#lib/server/app_server.ts';
+import { create_app_backend, type AppBackend, type AuditFactory } from '#lib/server/app_backend.ts';
+import { create_loopback_app_server_options, stub_password_deps } from '#lib/testing/app_server.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { CELL_MIGRATION_NS } from '#lib/db/cell_ddl.ts';
+import { FACT_MIGRATION_NS } from '#lib/db/fact_ddl.ts';
+import type { MigrationNamespace } from '#lib/db/migrate.ts';
+import { create_audit_emitter } from '#lib/auth/audit_emitter.ts';
+import { create_test_keyring } from '../auth/session_test_helpers.ts';
 
 // 32+ char key for keyring
 const TEST_KEY = 'test-key-that-is-at-least-32-chars-long!!';
-const keyring = create_keyring(TEST_KEY)!;
+const keyring = create_test_keyring(TEST_KEY);
 const session_options = create_session_config('test_session');
 
 const fs_stubs = {
@@ -36,14 +38,9 @@ const test_audit_factory: AuditFactory = ({ db, log }) => create_audit_emitter({
 
 /** Shared option fields (everything except backend). */
 const base_config: Omit<AppServerOptions, 'backend'> = {
+	...create_loopback_app_server_options(),
 	session_options,
-	allowed_origins: [/^http:\/\/localhost/],
-	proxy: {
-		trusted_proxies: ['127.0.0.1'],
-		get_connection_ip: () => '127.0.0.1'
-	},
-	create_route_specs: () => [create_health_route_spec()],
-	env_schema: z.object({})
+	create_route_specs: () => [create_health_route_spec()]
 };
 
 /** Create options with a pre-initialized backend. */
@@ -57,6 +54,36 @@ const create_server_config = (
 });
 
 describe('create_app_backend', () => {
+	test('a checkout bound set over a pool-less driver is warned of, and the audit db is the db', async () => {
+		for (const set of [true, false]) {
+			const log = new Logger('test', { level: 'off' });
+			const warns: Array<string> = [];
+			vi.spyOn(log, 'warn').mockImplementation((...args: Array<unknown>) => {
+				warns.push(args.map(String).join(' '));
+			});
+			let audit_db: unknown = null;
+			const backend = await create_app_backend({
+				database_url: 'memory://',
+				keyring,
+				password: stub_password_deps,
+				...fs_stubs,
+				log,
+				audit_factory: ({ db, log }) => {
+					audit_db = db;
+					return create_audit_emitter({ db, log });
+				},
+				...(set ? { db_checkout_timeout_ms: 250, db_audit_checkout_timeout_ms: 1_000 } : {})
+			});
+			try {
+				const matching = warns.filter((w) => w.includes('FUZ_DB_CHECKOUT_TIMEOUT_MS'));
+				assert.strictEqual(matching.length, set ? 1 : 0, `set: ${set}`);
+				assert.strictEqual(audit_db, backend.deps.db, 'no pool, so no separate bound');
+			} finally {
+				await backend.close();
+			}
+		}
+	});
+
 	test(
 		'accepts pre-initialized backend (skips create_app_backend)',
 		{ timeout: 15_000 },
@@ -92,7 +119,7 @@ describe('create_app_backend', () => {
 			});
 
 			const namespaces = backend.migration_results.map((r) => r.namespace);
-			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NAMESPACE]);
+			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NS.namespace]);
 
 			await backend.close();
 		}
@@ -128,7 +155,7 @@ describe('create_app_backend', () => {
 			assert.deepStrictEqual(ran, ['a_v0']);
 
 			const namespaces = backend.migration_results.map((r) => r.namespace);
-			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NAMESPACE, 'test_ns_a']);
+			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NS.namespace, 'test_ns_a']);
 
 			// schema_version row should reflect the consumer namespace
 			const rows = await backend.deps.db.query<{ namespace: string; name: string }>(
@@ -180,7 +207,7 @@ describe('create_app_backend', () => {
 
 			assert.deepStrictEqual(ran, ['a', 'b']);
 			const namespaces = backend.migration_results.map((r) => r.namespace);
-			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NAMESPACE, 'order_a', 'order_b']);
+			assert.deepStrictEqual(namespaces, [AUTH_MIGRATION_NS.namespace, 'order_a', 'order_b']);
 
 			await backend.close();
 		}
@@ -198,10 +225,69 @@ describe('create_app_backend', () => {
 						password: stub_password_deps,
 						...fs_stubs,
 						audit_factory: test_audit_factory,
-						migration_namespaces: [{ namespace: AUTH_MIGRATION_NAMESPACE, migrations: [] }]
+						migration_namespaces: [{ namespace: AUTH_MIGRATION_NS.namespace, migrations: [] }]
 					}),
-				/reserved by fuz_app/
+				/reserved for the spine/
 			);
+		}
+	);
+
+	for (const ns of [CELL_MIGRATION_NS, FACT_MIGRATION_NS]) {
+		test(
+			`migration_namespaces rejects a copy of the reserved '${ns.namespace}' namespace`,
+			{ timeout: 15_000 },
+			async () => {
+				await assert_rejects(
+					() =>
+						create_app_backend({
+							database_url: 'memory://',
+							keyring,
+							password: stub_password_deps,
+							...fs_stubs,
+							audit_factory: test_audit_factory,
+							migration_namespaces: [{ namespace: ns.namespace, migrations: [] }]
+						}),
+					new RegExp(`"${ns.namespace}" is reserved for the spine`)
+				);
+				// a spread copy of the spine's own namespace is still a different object
+				await assert_rejects(
+					() =>
+						create_app_backend({
+							database_url: 'memory://',
+							keyring,
+							password: stub_password_deps,
+							...fs_stubs,
+							audit_factory: test_audit_factory,
+							migration_namespaces: [{ ...ns }]
+						}),
+					/reserved for the spine/
+				);
+			}
+		);
+	}
+
+	test(
+		'migration_namespaces admits the spine cell and fact namespaces by identity',
+		{ timeout: 15_000 },
+		async () => {
+			const backend = await create_app_backend({
+				database_url: 'memory://',
+				keyring,
+				password: stub_password_deps,
+				...fs_stubs,
+				audit_factory: test_audit_factory,
+				migration_namespaces: [CELL_MIGRATION_NS, FACT_MIGRATION_NS]
+			});
+			try {
+				const namespaces = backend.migration_results.map((r) => r.namespace);
+				assert.deepStrictEqual(namespaces, [
+					AUTH_MIGRATION_NS.namespace,
+					CELL_MIGRATION_NS.namespace,
+					FACT_MIGRATION_NS.namespace
+				]);
+			} finally {
+				await backend.close();
+			}
 		}
 	);
 
@@ -309,9 +395,9 @@ describe('create_app_backend', () => {
 							called = true;
 							return create_audit_emitter({ db, log });
 						},
-						migration_namespaces: [{ namespace: AUTH_MIGRATION_NAMESPACE, migrations: [] }]
+						migration_namespaces: [{ namespace: AUTH_MIGRATION_NS.namespace, migrations: [] }]
 					}),
-				/reserved by fuz_app/
+				/reserved for the spine/
 			);
 			assert.strictEqual(called, false, 'audit_factory must not run when validation rejects');
 		}
@@ -330,7 +416,7 @@ describe('create_app_backend', () => {
 			// Strongest signal we can grab without mocking `create_db`:
 			// the original error reaches the caller verbatim (the cleanup
 			// `try/catch` swallows close errors and re-throws the audit
-			// failure, not a teardown-shaped one). PGlite's `memory://`
+			// failure, not a teardown-shaped one). pglet's `memory://`
 			// driver has no observable resource state to assert against
 			// — verifying the close call itself would need a `vi.mock` of
 			// `create_db`, which conflicts with `.db.test.ts`'s

@@ -15,19 +15,21 @@ import {
 	assert_action_manifests_equal,
 	diff_action_manifests,
 	format_action_manifest_diffs
-} from '$lib/testing/cross_backend/action_manifest_parity.ts';
+} from '#lib/testing/cross_backend/action_manifest_parity.ts';
 import type {
 	ActionManifest,
 	ActionManifestEntry
-} from '$lib/testing/cross_backend/action_manifest.ts';
+} from '#lib/testing/cross_backend/action_manifest.ts';
 
 const entry = (overrides: Partial<ActionManifestEntry> = {}): ActionManifestEntry => ({
 	method: 'm',
+	input: 'object',
 	side_effects: false,
 	account: 'required',
 	actor: 'none',
 	roles: [],
 	credential_types: [],
+	rate_limit: null,
 	...overrides
 });
 
@@ -58,6 +60,14 @@ describe('diff_action_manifests', () => {
 		]);
 	});
 
+	test('input_differs', () => {
+		const diffs = diff_action_manifests(
+			manifest(entry({ method: 'm', input: 'void' })),
+			manifest(entry({ method: 'm', input: 'object' }))
+		);
+		assert.deepStrictEqual(diffs, [{ kind: 'input_differs', method: 'm', a: 'void', b: 'object' }]);
+	});
+
 	test('side_effects_differ', () => {
 		const diffs = diff_action_manifests(
 			manifest(entry({ method: 'm', side_effects: false })),
@@ -65,6 +75,43 @@ describe('diff_action_manifests', () => {
 		);
 		assert.deepStrictEqual(diffs, [
 			{ kind: 'side_effects_differ', method: 'm', a: false, b: true }
+		]);
+	});
+
+	test('rate_limit_differs: a declared class against none', () => {
+		const diffs = diff_action_manifests(
+			manifest(entry({ method: 'peer_ping', rate_limit: 'ip' })),
+			manifest(entry({ method: 'peer_ping', rate_limit: null }))
+		);
+		assert.deepStrictEqual(diffs, [
+			{ kind: 'rate_limit_differs', method: 'peer_ping', a: 'ip', b: null }
+		]);
+	});
+
+	test('rate_limit_differs: two declared classes', () => {
+		const diffs = diff_action_manifests(
+			manifest(entry({ rate_limit: 'account' })),
+			manifest(entry({ rate_limit: 'both' }))
+		);
+		assert.deepStrictEqual(diffs, [
+			{ kind: 'rate_limit_differs', method: 'm', a: 'account', b: 'both' }
+		]);
+	});
+
+	test('an equal rate_limit class produces no diff', () => {
+		const m = manifest(entry({ rate_limit: 'ip' }));
+		assert.deepStrictEqual(diff_action_manifests(m, m), []);
+	});
+
+	test('rate_limit drift is reported alongside the other per-method diffs', () => {
+		const diffs = diff_action_manifests(
+			manifest(entry({ side_effects: false, rate_limit: null, account: 'required' })),
+			manifest(entry({ side_effects: true, rate_limit: 'both', account: 'optional' }))
+		);
+		assert.deepStrictEqual(diffs.map((d) => d.kind).sort(), [
+			'auth_field_differs',
+			'rate_limit_differs',
+			'side_effects_differ'
 		]);
 	});
 
@@ -150,6 +197,24 @@ describe('format_action_manifest_diffs', () => {
 		);
 		assert.match(rendered, /ts=false/);
 		assert.match(rendered, /rust=true/);
+	});
+
+	test('input drift renders both sides', () => {
+		const rendered = format_action_manifest_diffs(
+			[{ kind: 'input_differs', method: 'account_verify', a: 'void', b: 'object' }],
+			{ a: 'ts', b: 'rust' }
+		);
+		assert.match(rendered, /account_verify input differs: ts=void, rust=object/);
+	});
+
+	test('rate_limit drift renders both sides, null included', () => {
+		const rendered = format_action_manifest_diffs(
+			[{ kind: 'rate_limit_differs', method: 'peer/ping', a: 'ip', b: null }],
+			{ a: 'ts', b: 'rust' }
+		);
+		assert.match(rendered, /peer\/ping rate_limit differs/);
+		assert.match(rendered, /ts="ip"/);
+		assert.match(rendered, /rust=null/);
 	});
 
 	test('renders a representative drift mix', () => {

@@ -8,7 +8,7 @@
 	import { logo_fuz_code } from '@fuzdev/fuz_ui/logos.ts';
 	import { resolve } from '$app/paths';
 
-	import Code from '$lib/Code.svelte';
+	import Code from '#lib/Code.svelte';
 
 	const site = site_context.get();
 
@@ -27,21 +27,28 @@
 		</section>
 		<section>
 			<p>
-				fuz_code is a syntax highlighter: it turns source code into HTML or highlighted ranges with
-				token CSS classes, and knows nothing about the DOM. It originated as a fork and by-hand
-				rewrite of
-				<a href="https://github.com/PrismJS/prism">Prism</a>
-				by <a href="https://lea.verou.me/">Lea Verou</a>, with a redesigned tokenizer that replaces
-				regular expressions with lexers per language emitting a flat token event stream.
+				fuz_code is a syntax styler: it turns source code into HTML with token CSS classes, or
+				ranges for the
+				<a href="https://developer.mozilla.org/en-US/docs/Web/API/CSS_Custom_Highlight_API">
+					CSS Custom Highlight API
+				</a>. It originated as a fork of <a href="https://prismjs.com/">Prism</a> by
+				<a href="https://lea.verou.me/">Lea Verou</a> and has since been rewritten: each language
+				has a lexer that scans without regular expressions and emits tokens as a flat stream in a
+				typed array, for high performance. The flat token stream is an idea borrowed from
+				<a href="https://pngwn.at/">pngwn</a>, the author of
+				<a href="https://twinkleplop.pngwn.at/">Twinkleplop</a> (a featureful alternative to
+				fuz_code). See
+				<a href="https://syntax-highlighter-bench.ryanatkn.com/">syntax-highlighter-bench</a> to
+				compare them with Prism and Shiki.
 			</p>
 		</section>
 		<section class="box width:100%">
 			<Code content={hero_example} />
 		</section>
 		<section class="box gap_md width:100%">
-			<Card href={DOCS_PATH}>docs{#snippet icon()}{/snippet}</Card>
-			<Card href={resolve('/docs/samples')}>samples{#snippet icon()}{/snippet}</Card>
-			<Card href={resolve('/docs/benchmark')}>benchmark{#snippet icon()}{/snippet}</Card>
+			<Card href={DOCS_PATH}>docs</Card>
+			<Card href={resolve('/docs/samples')}>samples</Card>
+			<Card href={resolve('/docs/benchmark')}>benchmark</Card>
 		</section>
 		<section>
 			<DocsFooter repo_url={site.repo_url} root_url={FUZ_DEV_URL} />

@@ -23,6 +23,7 @@
 
 import { z } from 'zod';
 
+import { bounded_string } from '../primitive_schemas.ts';
 import {
 	CREDENTIAL_TYPE_DAEMON_TOKEN,
 	type CredentialTypeSchemaResult
@@ -34,13 +35,25 @@ import {
 } from './grant_path_schema.ts';
 import type { ScopeKindSchemaResult } from './scope_kind_schema.ts';
 
-/** Valid role name: lowercase letters and underscores, no leading/trailing underscore. */
-export const RoleName = z
-	.string()
-	.regex(
-		/^[a-z][a-z_]*[a-z]$|^[a-z]$/,
-		'Role names must be lowercase letters and underscores (a-z_), no leading/trailing underscore'
-	);
+/**
+ * The longest role name `RoleName` admits, in characters. A role string is
+ * caller-chosen text until it passes the grammar, and the grant verbs record
+ * the role they refuse in a failure audit row, so the grammar bounds its
+ * length too. Same value as the Rust spine's `ROLE_NAME_LENGTH_MAX`.
+ */
+export const ROLE_NAME_LENGTH_MAX = 64;
+
+/**
+ * Valid role name: lowercase letters and underscores, no leading/trailing
+ * underscore, at most `ROLE_NAME_LENGTH_MAX` characters.
+ */
+export const RoleName = bounded_string({
+	max: ROLE_NAME_LENGTH_MAX,
+	max_message: `Role names must be at most ${ROLE_NAME_LENGTH_MAX} characters`
+}).regex(
+	/^[a-z][a-z_]*[a-z]$|^[a-z]$/,
+	'Role names must be lowercase letters and underscores (a-z_), no leading/trailing underscore'
+);
 export type RoleName = z.infer<typeof RoleName>;
 
 // Builtin roles — provided by fuz_app, always available.
@@ -59,9 +72,23 @@ export const BuiltinRole = z.enum(BUILTIN_ROLES);
 export type BuiltinRole = z.infer<typeof BuiltinRole>;
 
 /**
+ * Whether `name` is a builtin role (`keeper` / `admin`).
+ *
+ * Builtin roles are **global-only**: no grant path binds one to a scope
+ * (`role_grant_assign`, `role_grant_offer_create`, and
+ * `role_grant_offer_accept` refuse it), and every gate that reads one checks
+ * the global grant, so a scoped builtin row confers nothing.
+ *
+ * @param name - the role name to check
+ * @returns `true` for `keeper` or `admin`
+ */
+export const is_builtin_role = (name: string): name is BuiltinRole =>
+	name === ROLE_KEEPER || name === ROLE_ADMIN;
+
+/**
  * Configuration for a role.
  *
- * Each role declares the credential types its holders must use, the
+ * Each role declares the credential types its holders are meant to use, the
  * scope kinds it applies to, and the grant paths through which it can
  * be granted. Every cross-axis field is an open-registry string array —
  * `required_credential_types` against `create_credential_type_schema`,
@@ -85,15 +112,18 @@ export type BuiltinRole = z.infer<typeof BuiltinRole>;
  * `builtin_role_specs_by_name`.
  */
 export interface RoleSpec {
-	/** Unique role name. Must match `RoleName` regex; collisions with builtins throw. */
+	/** Unique role name. Must match `RoleName` — its regex and length cap; collisions with builtins throw. */
 	name: string;
 	/** Admin-UI-facing copy describing the role's intent. */
 	description?: string;
 	/**
-	 * Credential types whose holders are permitted to exercise this
-	 * role. Each entry is checked at construction time against the
-	 * `credential_types` registry passed to `create_role_schema`. Empty
-	 * array = any authenticated credential type.
+	 * Credential types whose holders are meant to exercise this role.
+	 * Informative only: each entry is checked at construction time against
+	 * the `credential_types` registry passed to `create_role_schema`, but no
+	 * middleware or dispatcher reads it per request — a route or action
+	 * gates credentials with its own `auth.credential_types` (the keeper
+	 * verbs declare `['daemon_token']` there). Empty array = any
+	 * authenticated credential type.
 	 */
 	required_credential_types?: ReadonlyArray<string>;
 	/**
@@ -193,13 +223,17 @@ const validate_registry_membership = (
  *
  * Call once at server init. The returned `Role` schema validates role
  * strings at I/O boundaries (grant endpoint, role_grant queries). The
- * `role_specs` map is read by middleware for `required_credential_types`
- * checks and by admin / self-service factories to derive their default
- * eligibility filters from `RoleSpec.grant_paths`.
+ * `role_specs` map is read by the admin / self-service factories to derive
+ * their default eligibility filters from `RoleSpec.grant_paths`, and by the
+ * cell grant verbs to refuse an unregistered role principal.
+ * `RoleSpec.required_credential_types` is validated here but enforced
+ * nowhere — credential gating lives on each route's and action's
+ * `auth.credential_types`.
  *
  * Construction-time guards (all fire on misconfiguration):
  *
- * 1. Every `consumer_roles[i].name` matches `RoleName` regex.
+ * 1. Every `consumer_roles[i].name` matches `RoleName` — its regex and its
+ *    `ROLE_NAME_LENGTH_MAX` length cap.
  * 2. No two consumer roles share a name.
  * 3. No consumer role collides with a builtin (`keeper` / `admin`).
  * 4. When `options.credential_types` is supplied, every entry in

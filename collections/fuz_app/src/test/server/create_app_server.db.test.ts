@@ -1,7 +1,7 @@
 /**
  * Tests for `create_app_server` factory.
  *
- * Uses a single cached PGlite WASM instance (via `create_pglite_factory`) shared
+ * Uses a single cached WASM database instance (via `create_default_db_factory`) shared
  * across all tests. Schema is reset before each `create_config` call, avoiding
  * repeated WASM cold starts while keeping tests isolated.
  *
@@ -10,29 +10,36 @@
 
 import { describe, test, assert, beforeAll } from 'vitest';
 import { wait } from '@fuzdev/fuz_util/async.ts';
+import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 import { z } from 'zod';
 
-import { create_keyring } from '$lib/auth/keyring.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_health_route_spec } from '$lib/http/common_routes.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_health_route_spec } from '#lib/http/common_routes.ts';
 import {
 	create_app_server,
-	DEFAULT_MAX_BODY_SIZE,
+	DEFAULT_BODY_LIMIT_BYTES,
 	type AppServerOptions,
 	type AppServer
-} from '$lib/server/app_server.ts';
-import { ERROR_PAYLOAD_TOO_LARGE, PayloadTooLargeError } from '$lib/http/error_schemas.ts';
-import type { AppBackend } from '$lib/server/app_backend.ts';
-import { create_audit_emitter } from '$lib/auth/audit_emitter.ts';
-import { stub_password_deps } from '$lib/testing/app_server.ts';
-import { create_pglite_factory } from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
+} from '#lib/server/app_server.ts';
+import {
+	ERROR_INVALID_CONTENT_LENGTH,
+	ERROR_PAYLOAD_TOO_LARGE,
+	PayloadTooLargeError
+} from '#lib/http/error_schemas.ts';
+import type { AppBackend } from '#lib/server/app_backend.ts';
+import { create_audit_emitter } from '#lib/auth/audit_emitter.ts';
+import { create_loopback_app_server_options, stub_password_deps } from '#lib/testing/app_server.ts';
+import { TEST_ORIGIN } from '#lib/testing/test_origin.ts';
+import { create_default_db_factory } from '#lib/testing/db.ts';
+import { run_migrations } from '#lib/db/migrate.ts';
+import { AUTH_MIGRATION_NS } from '#lib/auth/migrations.ts';
+import { create_realtime_closer } from '#lib/actions/connection_closer.ts';
+import { create_test_keyring } from '../auth/session_test_helpers.ts';
 
 // 32+ char key for keyring
 const TEST_KEY = 'test-key-that-is-at-least-32-chars-long!!';
-const keyring = create_keyring(TEST_KEY)!;
+const keyring = create_test_keyring(TEST_KEY);
 const session_options = create_session_config('test_session');
 
 const log = new Logger('test', { level: 'off' });
@@ -44,33 +51,28 @@ const fs_stubs = {
 	delete_file: async (_path: string) => {}
 };
 
-// Shared PGlite WASM instance — schema is reset on each factory.create() call,
+// Shared database WASM instance — schema is reset on each factory.create() call,
 // but the expensive WASM cold start only happens once per worker thread.
-const factory = create_pglite_factory(async () => {
+const factory = create_default_db_factory(async () => {
 	// No-op: create_config runs migrations manually to capture MigrationResult.
 });
 
 /** Shared option fields (everything except backend). */
 const base_config: Omit<AppServerOptions, 'backend'> = {
+	...create_loopback_app_server_options(),
 	session_options,
-	allowed_origins: [/^http:\/\/localhost/],
-	proxy: {
-		trusted_proxies: ['127.0.0.1'],
-		get_connection_ip: () => '127.0.0.1'
-	},
-	env_schema: z.object({}),
 	create_route_specs: () => [create_health_route_spec()]
 };
 
 /**
- * Create options from the cached PGlite. Resets schema and re-runs auth
+ * Create options from the cached database. Resets schema and re-runs auth
  * migrations on each call to keep tests isolated without WASM cold starts.
  */
 const create_config = async (overrides?: Partial<AppServerOptions>): Promise<AppServerOptions> => {
 	const db = await factory.create();
-	const migration_results = await run_migrations(db, [auth_migration_ns]);
+	const migration_results = await run_migrations(db, [AUTH_MIGRATION_NS]);
 	const backend: AppBackend = {
-		db_type: 'pglite-memory',
+		db_type: 'pglet-memory',
 		db_name: '(memory)',
 		migration_results,
 		close: async () => {},
@@ -80,6 +82,7 @@ const create_config = async (overrides?: Partial<AppServerOptions>): Promise<App
 			password: stub_password_deps,
 			db,
 			audit: create_audit_emitter({ db, log }),
+			connection_closer: create_realtime_closer(),
 			...fs_stubs
 		}
 	};
@@ -87,7 +90,7 @@ const create_config = async (overrides?: Partial<AppServerOptions>): Promise<App
 };
 
 describe('create_app_server', () => {
-	// Shared instance for read-only assertions (avoids repeated PGlite cold starts)
+	// Shared instance for read-only assertions (avoids repeated database cold starts)
 	let shared: AppServer;
 
 	beforeAll(async () => {
@@ -102,10 +105,9 @@ describe('create_app_server', () => {
 	});
 
 	test('surface contains correct route count', () => {
-		// health + auto-created surface route
-		assert.strictEqual(shared.surface_spec.surface.routes.length, 2);
+		// health only — the surface route is opt-in
+		assert.strictEqual(shared.surface_spec.surface.routes.length, 1);
 		assert.strictEqual(shared.surface_spec.surface.routes[0]!.path, '/health');
-		assert.strictEqual(shared.surface_spec.surface.routes[1]!.path, '/api/surface');
 	});
 
 	test('surface contains middleware specs', () => {
@@ -123,7 +125,7 @@ describe('create_app_server', () => {
 		assert.isFunction(shared.close);
 	});
 
-	// Tests below need custom options — each resets and reuses the cached PGlite.
+	// Tests below need custom options — each resets and reuses the cached database.
 
 	test('bootstrap_status is computed when bootstrap is in live mode', async () => {
 		const result = await create_app_server(
@@ -183,19 +185,27 @@ describe('create_app_server', () => {
 		assert.isDefined(port_entry);
 	});
 
-	test('surface route is auto-created by default', async () => {
+	test('surface route is not mounted by default', async () => {
 		const result = await create_app_server(await create_config());
 		const surface_route = result.surface_spec.surface.routes.find((r) => r.path === '/api/surface');
-		assert.isDefined(surface_route);
-		assert.strictEqual(surface_route.method, 'GET');
-		assert.deepEqual(surface_route.auth, { account: 'required', actor: 'none' });
+		assert.isUndefined(surface_route);
 	});
 
-	test('surface_route: false disables auto-created surface route', async () => {
-		const result = await create_app_server(await create_config({ surface_route: false }));
-		const surface_route = result.surface_spec.surface.routes.find((r) => r.path === '/api/surface');
-		assert.isUndefined(surface_route);
-		assert.strictEqual(result.surface_spec.surface.routes.length, 1); // health only
+	test('surface_route: true mounts the admin-gated surface route after the consumer routes', async () => {
+		const result = await create_app_server(await create_config({ surface_route: true }));
+		const { routes } = result.surface_spec.surface;
+		assert.deepStrictEqual(
+			routes.map((r) => r.path),
+			['/health', '/api/surface']
+		);
+		const surface_route = routes[1]!;
+		assert.strictEqual(surface_route.method, 'GET');
+		assert.deepEqual(surface_route.auth, {
+			account: 'required',
+			actor: 'required',
+			roles: ['admin'],
+			required_scope: 'surface:app_surface'
+		});
 	});
 
 	test('bootstrap routes created when live bootstrap options provided', async () => {
@@ -229,6 +239,17 @@ describe('create_app_server', () => {
 		assert.isDefined(bootstrap_route);
 	});
 
+	test('a bootstrap route_prefix outside /api/ is refused at assembly', async () => {
+		const error = await assert_rejects(async () =>
+			create_app_server(
+				await create_config({
+					bootstrap: { mode: 'surface_only', route_prefix: '/auth' }
+				})
+			)
+		);
+		assert.include(error.message, 'bootstrap.route_prefix path /auth/bootstrap');
+	});
+
 	test('on_bootstrap callback wires through to bootstrap routes (live mode)', async () => {
 		let callback_registered = false;
 		await create_app_server(
@@ -248,7 +269,7 @@ describe('create_app_server', () => {
 	});
 
 	test('on_effect_error is called when a pending effect rejects', async () => {
-		const errors: Array<{ error: unknown; method: string; path: string }> = [];
+		const errors: Array<{ error: unknown; transport: string; method: string; path: string }> = [];
 		const result = await create_app_server(
 			await create_config({
 				await_pending_effects: false,
@@ -268,12 +289,15 @@ describe('create_app_server', () => {
 					}
 				],
 				on_effect_error: (error, ctx) => {
-					errors.push({ error, method: ctx.method, path: ctx.path });
+					errors.push({ error, transport: ctx.transport, method: ctx.method, path: ctx.path });
 				}
 			})
 		);
 
-		await result.app.request('/effect-test', { method: 'POST' });
+		await result.app.request('/effect-test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
 
 		// Flush microtask queue — allSettled + .then chain settles in the next macrotask tick
 		await wait();
@@ -282,8 +306,43 @@ describe('create_app_server', () => {
 		const err = errors[0]!.error;
 		assert.ok(err instanceof Error);
 		assert.strictEqual(err.message, 'effect failed');
+		assert.strictEqual(errors[0]!.transport, 'http');
 		assert.strictEqual(errors[0]!.method, 'POST');
 		assert.strictEqual(errors[0]!.path, '/effect-test');
+	});
+
+	test('on_effect_error is called in await_pending_effects mode too, before the response', async () => {
+		const errors: Array<unknown> = [];
+		const result = await create_app_server(
+			await create_config({
+				await_pending_effects: true,
+				create_route_specs: () => [
+					{
+						method: 'POST',
+						path: '/effect-test',
+						auth: { account: 'none', actor: 'none' },
+						description: 'Route with failing effect',
+						input: z.null(),
+						output: z.strictObject({ ok: z.boolean() }),
+						handler: async (c) => {
+							c.var.pending_effects.push(Promise.reject(new Error('effect failed')));
+							return c.json({ ok: true });
+						}
+					}
+				],
+				on_effect_error: (error) => {
+					errors.push(error);
+				}
+			})
+		);
+
+		await result.app.request('/effect-test', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' }
+		});
+
+		// awaited mode: the flush settled before the response was returned
+		assert.strictEqual(errors.length, 1);
 	});
 
 	test('bootstrap routes skipped when bootstrap omitted', () => {
@@ -340,6 +399,49 @@ describe('create_app_server', () => {
 		PayloadTooLargeError.parse(body);
 	});
 
+	test('an oversized Content-Length is refused without reading the request body', async () => {
+		const result = await create_app_server(
+			await create_config({
+				max_body_size: 100, // 100 bytes
+				create_route_specs: () => [
+					{
+						method: 'POST',
+						path: '/echo',
+						auth: { account: 'none', actor: 'none' },
+						description: 'Echo input',
+						input: z.looseObject({ data: z.string() }),
+						output: z.looseObject({ ok: z.boolean() }),
+						handler: async (c) => c.json({ ok: true })
+					}
+				]
+			})
+		);
+		// The over-cap reject answers from the header alone: the spy fails the
+		// test if anything reads `request.body`, even without consuming it. What
+		// the connection does after the 413 is each runtime's, pinned by the
+		// cross-backend smuggling probe.
+		let body_read = false;
+		class BodySpyRequest extends Request {
+			override get body(): Request['body'] {
+				body_read = true;
+				return super.body;
+			}
+		}
+		const large_body = JSON.stringify({ data: 'x'.repeat(200) });
+		const res = await result.app.request(
+			new BodySpyRequest('http://localhost/echo', {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					'content-length': String(new TextEncoder().encode(large_body).length)
+				},
+				body: large_body
+			})
+		);
+		assert.strictEqual(res.status, 413);
+		assert.strictEqual(body_read, false, 'the 413 must not read the request body');
+	});
+
 	test('body size limit rejects a streaming (no Content-Length) oversized body', async () => {
 		const result = await create_app_server(
 			await create_config({
@@ -382,19 +484,19 @@ describe('create_app_server', () => {
 		PayloadTooLargeError.parse(body);
 	});
 
-	test('body size limit defaults to DEFAULT_MAX_BODY_SIZE', () => {
-		assert.strictEqual(DEFAULT_MAX_BODY_SIZE, 1024 * 1024);
+	test('body size limit defaults to DEFAULT_BODY_LIMIT_BYTES', () => {
+		assert.strictEqual(DEFAULT_BODY_LIMIT_BYTES, 1024 * 1024);
 	});
 
-	test('conflicting Transfer-Encoding and Content-Length does not bypass body limit', async () => {
+	test('a malformed Content-Length is refused with 400 before auth and validation', async () => {
 		const result = await create_app_server(
 			await create_config({
 				max_body_size: 100, // 100 bytes
 				create_route_specs: () => [
 					{
 						method: 'POST',
-						path: '/echo',
-						auth: { account: 'none', actor: 'none' },
+						path: '/api/echo',
+						auth: { account: 'required', actor: 'none' },
 						description: 'Echo input',
 						input: z.looseObject({ data: z.string() }),
 						output: z.looseObject({ ok: z.boolean() }),
@@ -403,22 +505,24 @@ describe('create_app_server', () => {
 				]
 			})
 		);
+		const request = (content_length: string): Response | Promise<Response> =>
+			result.app.request('/api/echo', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', 'Content-Length': content_length },
+				body: JSON.stringify({ data: 'x'.repeat(200) })
+			});
 
-		// Node.js HTTP parser handles this at the transport layer —
-		// requests with conflicting headers are rejected or the body
-		// is parsed per the spec (Transfer-Encoding takes precedence).
-		// This test documents that the behavior is safe via Hono's test client.
-		const body_str = JSON.stringify({ unexpected: true });
-		const res = await result.app.request('/echo', {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'Content-Length': '2'
-			},
-			body: body_str
-		});
-		// Should get a normal validation response (400 or 200 or 413), not a crash or bypass
-		assert.ok(res.status < 500, `expected non-500 status, got ${res.status}`);
+		// the route alone answers this anonymous caller 401
+		const well_formed = await request('2');
+		assert.strictEqual(well_formed.status, 401);
+
+		// a length the cap cannot read is refused first, whoever is asking
+		for (const content_length of ['abc', '-1', '5, 500']) {
+			const res = await request(content_length);
+			assert.strictEqual(res.status, 400, content_length);
+			assert.deepEqual(await res.json(), { error: ERROR_INVALID_CONTENT_LENGTH });
+			assert.strictEqual(res.headers.get('connection'), 'close');
+		}
 	});
 
 	test('max_body_size: null disables body size limit', async () => {
@@ -539,7 +643,7 @@ describe('create_app_server', () => {
 			method: 'POST',
 			headers: {
 				'content-type': 'application/json',
-				origin: 'http://localhost:5173'
+				origin: TEST_ORIGIN
 			},
 			body: JSON.stringify({ jsonrpc: '2.0', method: 'test_noop', id: 1 })
 		});
@@ -591,7 +695,7 @@ describe('create_app_server', () => {
 			method: 'POST',
 			headers: {
 				'content-type': 'application/json',
-				origin: 'http://localhost:5173'
+				origin: TEST_ORIGIN
 			},
 			body: JSON.stringify({ jsonrpc: '2.0', method: 'test_factory', id: 1 })
 		});
@@ -603,7 +707,7 @@ describe('create_app_server', () => {
 		// the combined admin+role-grant-offer+account helper should put all 29
 		// methods (14 admin + 8 role-grant-offer + 7 account) on the surface
 		// and auto-mount them.
-		const { create_standard_rpc_actions } = await import('$lib/auth/standard_rpc_actions.ts');
+		const { create_standard_rpc_actions } = await import('#lib/auth/standard_rpc_actions.ts');
 		const result = await create_app_server(
 			await create_config({
 				rpc_endpoints: (ctx) => [
@@ -637,7 +741,7 @@ describe('create_app_server', () => {
 			method: 'POST',
 			headers: {
 				'content-type': 'application/json',
-				origin: 'http://localhost:5173'
+				origin: TEST_ORIGIN
 			},
 			body: JSON.stringify({
 				jsonrpc: '2.0',

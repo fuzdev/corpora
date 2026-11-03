@@ -28,11 +28,11 @@ export const projects: Array<ProjectInfo> = [
 			'<a class="chip" href="https://github.com/fuzdev/fuz_css">source</a> <a class="chip" href="https://www.npmjs.com/package/@fuzdev/fuz_css">npm</a>'
 	},
 	{
-		description: '<a href="https://svelte.dev/">Svelte</a> UI library',
+		description: '<a href="https://svelte.dev/">Svelte</a> component library and frontend helpers',
 		homepage: 'https://ui.fuz.dev/',
 		tagline: 'friendly user zystem',
 		logo: 'logo.svg',
-		logo_alt: 'a friendly brown spider facing you',
+		logo_alt: 'a friendly red spider facing you',
 		glyph: '🧶',
 		name: 'fuz_ui',
 		repo: '@fuzdev/fuz_ui',
@@ -41,18 +41,17 @@ export const projects: Array<ProjectInfo> = [
 			'<a class="chip" href="https://github.com/fuzdev/fuz_ui">source</a> <a class="chip" href="https://www.npmjs.com/package/@fuzdev/fuz_ui">npm</a>'
 	},
 	{
-		description:
-			'precise language tools for <a href="https://typescriptlang.org/">TypeScript</a>/JS, CSS, and <a href="https://svelte.dev/">Svelte</a> in <a href="https://www.rust-lang.org/">Rust</a>',
-		homepage: 'https://tsv.fuz.dev/',
 		name: 'tsv',
 		repo: 'tsv',
+		homepage: 'https://tsv.fuz.dev/',
 		title: '<a href="https://tsv.fuz.dev/">tsv</a>',
+		description:
+			'precise language tools for <a href="https://typescriptlang.org/">TypeScript</a>/JS, CSS, and <a href="https://svelte.dev/">Svelte</a> in <a href="https://www.rust-lang.org/">Rust</a>',
 		subtitle:
 			'<a class="chip" href="https://github.com/fuzdev/tsv">source</a> <a class="chip" href="https://tsv.fuz.dev/">playground</a>'
 	},
 	{
-		description:
-			'task runner and toolkit extending <a href="https://kit.svelte.dev/">SvelteKit</a>',
+		description: 'security-first JS runtime and toolchain on V8',
 		homepage: 'https://gro.fuz.dev/',
 		tagline: 'generate, run, optimize',
 		logo: 'logo.svg',
@@ -82,7 +81,7 @@ export const projects: Array<ProjectInfo> = [
 		homepage: 'https://util.fuz.dev/',
 		tagline: 'ancient not extinct',
 		logo: 'logo.svg',
-		logo_alt: 'a green sauropod wearing a brown utility belt',
+		logo_alt: 'a green sauropod wearing a brown belt',
 		glyph: '🦕',
 		name: 'fuz_util',
 		repo: '@fuzdev/fuz_util',
@@ -104,14 +103,14 @@ export const projects: Array<ProjectInfo> = [
 	},
 	{
 		description: 'software garage for power users and devs',
-		homepage: 'https://www.zzz.software/',
+		homepage: 'https://github.com/fuzdev/zzz',
 		tagline: 'nice web things',
 		logo: 'logo.svg',
 		logo_alt: "three sleepy z's",
 		glyph: '💤',
 		name: 'zzz',
 		repo: '@fuzdev/zzz',
-		title: '<a href="https://www.zzz.software/">Zzz</a>',
+		title: '<a href="https://github.com/fuzdev/zzz">Zzz</a>',
 		subtitle: '<a class="chip" href="https://github.com/fuzdev/zzz">source</a>'
 	},
 	{

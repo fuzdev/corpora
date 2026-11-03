@@ -3,13 +3,13 @@
 	import { slide } from 'svelte/transition';
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
 
-	import ContextmenuEntry from '$lib/ContextmenuEntry.svelte';
-	import ContextmenuSubmenu from '$lib/ContextmenuSubmenu.svelte';
-	import Contextmenu from '$lib/Contextmenu.svelte';
-	import { ContextmenuState } from '$lib/contextmenu_state.svelte.ts';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import Glyph from '$lib/Glyph.svelte';
+	import ContextmenuEntry from '#lib/ContextmenuEntry.svelte';
+	import ContextmenuSubmenu from '#lib/ContextmenuSubmenu.svelte';
+	import Contextmenu from '#lib/Contextmenu.svelte';
+	import { ContextmenuState } from '#lib/contextmenu_state.svelte.ts';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import Glyph from '#lib/Glyph.svelte';
 	import { selected_contextmenu_root_component_context } from './selected_root_component.svelte.ts';
 
 	const selected = selected_contextmenu_root_component_context.get();
@@ -20,9 +20,10 @@
 
 	let selected_color: 'f' | 'g' | 'j' | undefined = $state.raw();
 
-	// @fuz-classes color_f_50 color_g_50 color_j_50 color_f color_g color_j
+	// @fuz-classes color_f_50 color_g_50 color_j_50
 	const selected_color_class = $derived(selected_color ? `color_${selected_color}_50` : undefined);
-	const selected_hue_class = $derived(selected_color ? `color_${selected_color}` : undefined);
+	// the `.palette_*` button rules are base styles, which ship with any `button`
+	const selected_palette_class = $derived(selected_color ? `palette_${selected_color}` : undefined);
 </script>
 
 <!-- eslint-disable svelte/no-useless-mustaches -->
@@ -73,8 +74,8 @@
 			<div class="panel p_md">
 				<p class="mb_md">
 					The <code>{root_component_name}</code> prop <code>contextmenu</code> accepts a custom
-					<code>ContextmenuState</code>
-					instance, allowing you to observe its reactive state and control it programmatically.
+					<code>ContextmenuState</code> instance, allowing you to observe its reactive state and
+					control it programmatically.
 				</p>
 				<Code lang="ts" content={`const contextmenu = new ContextmenuState();`} />
 				<Code
@@ -83,9 +84,8 @@
 				<p class="mb_md">
 					Try opening the contextmenu on this panel, then use the navigation buttons below to cycle
 					through entries -- just like the arrow keys. The color entries return
-					<code>{'{ok: true, close: false}'}</code>
-					to keep the menu open after activation, allowing you to select multiple colors using the
-					activate button (↵).
+					<code>{'{ok: true, close: false}'}</code> to keep the menu open after activation, allowing
+					you to select multiple colors using the activate button (↵).
 				</p>
 				<div class="mb_md {selected_color_class}">
 					<p>Reactive state:</p>
@@ -96,7 +96,7 @@
 							<code>{contextmenu.x} && contextmenu.y === {contextmenu.y}</code>
 						</li>
 						{#if contextmenu.error}
-							<li class="color_c_50">Error: <code>{contextmenu.error}</code></li>
+							<li class="negative_60">Error: <code>{contextmenu.error}</code></li>
 						{/if}
 					</ul>
 				</div>
@@ -105,7 +105,7 @@
 						<div class="box">
 							<button
 								type="button"
-								class="border_bottom_left_radius_0 border_bottom_right_radius_0 {selected_hue_class}"
+								class="border-bottom-left-radius:0 border-bottom-right-radius:0 {selected_palette_class}"
 								disabled={!contextmenu.can_select_sibling}
 								onmousedowncapture={(e) => {
 									swallow(e);
@@ -117,7 +117,7 @@
 							<div class="row">
 								<button
 									type="button"
-									class="border_bottom_right_radius_0 border_top_right_radius_0 {selected_hue_class}"
+									class="border-bottom-right-radius:0 border-top-right-radius:0 {selected_palette_class}"
 									disabled={!contextmenu.can_collapse}
 									onmousedowncapture={(e) => {
 										swallow(e);
@@ -128,7 +128,7 @@
 								</button>
 								<button
 									type="button"
-									class="border-radius:0 {selected_hue_class}"
+									class="border-radius:0 {selected_palette_class}"
 									disabled={!contextmenu.can_activate}
 									onmousedowncapture={async (e) => {
 										swallow(e);
@@ -139,7 +139,7 @@
 								</button>
 								<button
 									type="button"
-									class="border_bottom_left_radius_0 border_top_left_radius_0 {selected_hue_class}"
+									class="border-bottom-left-radius:0 border-top-left-radius:0 {selected_palette_class}"
 									disabled={!contextmenu.can_expand}
 									onmousedowncapture={(e) => {
 										swallow(e);
@@ -151,7 +151,7 @@
 							</div>
 							<button
 								type="button"
-								class="border_top_left_radius_0 border_top_right_radius_0 {selected_hue_class}"
+								class="border-top-left-radius:0 border-top-right-radius:0 {selected_palette_class}"
 								disabled={!contextmenu.can_select_sibling}
 								onmousedowncapture={(e) => {
 									swallow(e);

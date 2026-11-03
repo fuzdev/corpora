@@ -1,7 +1,7 @@
 <script lang="ts">
 	// TODO upstream to fuz_ui
 
-	import { numeric_scale_variants } from '$lib/variable_data.ts';
+	import { numeric_scale_variants } from '#lib/variable_data.ts';
 
 	const {
 		prefix,
@@ -15,8 +15,10 @@
 
 <!-- live feedback for the derived scales: each cell renders the current
 	computed stop, so dragging any knob repaints the strip -->
-<div class="ramp_strip">
-	<small class="ramp_label"><code class="ramp_name">{label}</code></small>
+<div class="ramp-strip">
+	<small class="ramp_label">
+		<code class="p_0 font_size_sm background-color:transparent">{label}</code>
+	</small>
 	<div class="cells">
 		{#each numeric_scale_variants as stop (stop)}
 			<div
@@ -29,18 +31,13 @@
 </div>
 
 <style>
-	.ramp_strip {
+	.ramp-strip {
 		display: flex;
 		flex-direction: column;
 		gap: var(--space_xs3);
 	}
 	.ramp_label {
 		line-height: 1;
-	}
-	.ramp_name {
-		background: transparent;
-		padding: 0;
-		font-size: var(--font_size_sm);
 	}
 	.cells {
 		display: flex;

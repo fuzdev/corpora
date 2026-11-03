@@ -27,7 +27,7 @@ export interface FetchCache {
  * cache is cleared (delete file) and starts fresh. This handles format changes.
  *
  * Uses `structuredClone` to track changes - only writes to disk if data modified.
- * Formatted with Prettier before writing for version control friendliness.
+ * Formatted with gro's `format_file` before writing for version control friendliness.
  *
  * @param name - cache filename (without .json extension)
  * @param dir - cache directory (defaults to `.gro/build/fetch/`)
@@ -59,7 +59,7 @@ export const create_fs_fetch_value_cache = async (
 				return false; // no changes to save
 			}
 			await mkdir(dirname(data_path), { recursive: true });
-			await writeFile(data_path, await format_file(serialize_cache(data), { filepath: data_path }));
+			await writeFile(data_path, format_file(serialize_cache(data), { lang: 'json' }));
 			return true;
 		}
 	};

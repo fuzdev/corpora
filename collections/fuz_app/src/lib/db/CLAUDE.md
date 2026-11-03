@@ -1,6 +1,6 @@
 # db/
 
-> Database layer: the `Db` abstraction over pg + PGlite, the migration
+> Database layer: the `Db` abstraction over pg, PGlite and pglet, the migration
 > runner, and the cell content-primitive schema + queries.
 
 For server assembly, `QueryDeps`, and migration-runner contract see the
@@ -12,26 +12,67 @@ the code.
 
 ## Generic db infrastructure
 
-- `db.ts` — `Db` abstraction over pg + PGlite, `query` / `query_one` /
+- `db.ts` — `Db` abstraction over pg, PGlite and pglet, `query` / `query_one` /
   `transaction`, `no_nested_transaction` guard.
+- `db_checkout_error.ts` — `DbCheckoutError` (a failed pool checkout,
+  realm-global brand) + `is_db_checkout_error`; `to_thrown_jsonrpc_error` maps
+  it to `service_unavailable` (503), the route catch and the server's
+  `onError` to the flat `{error: 'service_unavailable'}`.
 - `create_db.ts` — URL-based driver auto-detection (`postgres` /
-  `pglite-file` / `pglite-memory`).
-- `db_pg.ts` / `db_pglite.ts` — driver adapters. `db_pg.ts` also exports
-  `register_pg_type_parsers`, the shared int8→number coercion (so
+  `pglite-file` for `file://` / `pglet-memory` for `memory://`, over
+  `@fuzdev/pglet-wasm`). An in-memory PGlite is `create_pglite_db(new PGlite())`.
+- `db_pg.ts` / `db_pglite.ts` / `db_pglet.ts` — driver adapters. `db_pg.ts`'s
+  `create_pg_pool` builds the pool with a bounded checkout
+  (`connectionTimeoutMillis`, `DEFAULT_DB_CHECKOUT_TIMEOUT_MS`) whose failure
+  throws `DbCheckoutError`, plus `query_with_checkout_timeout` behind
+  `Db.with_checkout_timeout` (the audit emitter's longer wait,
+  `DEFAULT_DB_AUDIT_CHECKOUT_TIMEOUT_MS`); PGlite and pglet have no pool. It also
+  exports `register_pg_type_parsers`, the shared int8→number coercion (so
   `BIGSERIAL` columns read as JS numbers, matching PGlite) — called by both
   `create_db` and the test pg factory (`testing/db.ts`) so prod and tests
-  read the same wire shape from one registration site.
+  read the same wire shape from one registration site. `db_pglet.ts`'s
+  `PGLET_COERCION` is pglet's half of the same convention, which every pglet
+  instance fuz_app creates is given.
 - `migrate.ts` — advisory-lock migration runner (`run_migrations`,
-  `baseline`), `Migration` / `MigrationNamespace` / `MigrationError`.
+  `baseline`), `Migration` / `MigrationNamespace` / `MigrationError`, and the
+  reserved spine names (`reserved_migration_namespaces`): both runners refuse
+  a namespace under one unless `create_spine_migration_namespace` built it —
+  admission by object identity, so this module owns the names without
+  importing the auth, cell, or fact chains.
 - `query_deps.ts` — `QueryDeps = {db}`, the first param to every `query_*`.
 - `assert_row.ts` — `assert_row(row, context)` for INSERT … RETURNING.
-- `pg_error.ts` — `pg_error_code` (SQLSTATE extractor for `pg`/PGlite errors), `is_pg_unique_violation` (Postgres `23505`).
+- `pg_error.ts` — `pg_error_code` (SQLSTATE extractor for `pg`/PGlite/pglet errors), `is_pg_unique_violation` (Postgres `23505`).
 - `sql_identifier.ts` — `assert_valid_sql_identifier`.
 - `sql_columns.ts` — `columns_sql` / `qualify_columns` / `omit_columns`,
   the derivation helpers every `*_COLUMNS` projection const's variants
   (alias-qualified JOIN reads, the client-safe `minus token_hash` listing)
-  are built from, so the drift guard on the base const covers them.
-- `status.ts` — CLI DB status utility.
+  are built from, so the drift guard on the base const covers them. Both
+  renderers take an optional `ColumnExpr` — a per-column expression
+  override, twin of the third argument to `fuz_db::qualify_columns` — and
+  alias an overridden column back to its own name (TS reads rows by name;
+  the Rust twin decodes positionally and needs no output name). The one
+  override in this repo is `iso8601_timestamp_column(alias, column)`, twin
+  of `fuz_db::iso8601_timestamp_column` down to the format literal
+  (`to_char(… AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`): every
+  timestamp that reaches the wire projects through it, so both spines
+  serialize the same instant to the same 20-character second-precision UTC
+  string. Each query module builds its override once with
+  `iso8601_timestamp_expr(TABLE_COLUMNS, [...timestamp columns])` — typed
+  against the const, checked at load — and passes `expr(alias)` at each
+  read. `timestamp.ts` (`to_iso8601_seconds` / `ISO8601_SECONDS`) is that
+  shape for stamps minted in TS rather than read from a row. A cascade's
+  inner `RETURNING` inside a `WITH updated AS (…)` stays raw — the outer
+  select formats, and `to_char` over already-formatted text would fail.
+  `fact`'s store rows are the deliberate exception: `PgFactStore` feeds
+  `FactMeta.created_at`, a `Date` in the `@fuzdev/fuz_util` `FactStore`
+  contract, and nothing serializes it.
+- `status.ts` — CLI DB status utility: `query_db_status` (read-only;
+  per-namespace applied/pending plus name-divergence, mirroring the
+  runner's boot check), `format_db_status` (the report body — the
+  `database status` / `url:` header is the calling script's, using
+  `display_db_url`, which renders the URL from its parse without the
+  password or query). The connected body is byte-identical with the Rust
+  `fuz_db` twin's; `src/test/db/status.test.ts` pins the shared fixture.
 - `schema_ready.ts` — `/ready` deploy-gate core: `query_public_columns`
   (keeps `schema_version`, unlike `query_schema_snapshot`), pure
   `check_schema_drift` / `format_schema_drift`, `READY_ERROR`. Column-presence
@@ -43,8 +84,10 @@ the code.
 
 The universal mutable content primitive: a single `cell` table whose `data`
 JSONB is interpreted by view shape, with normalized relation + ACL sibling
-tables. `cell.refs` carries `blake3:` fact hashes auto-extracted from `data`
-on every write (cells-by-fact discovery). `path` is the **global** namespace
+tables. `cell.refs` carries the fact hashes derived from `data` on every write
+(`derive_cell_refs`: string values that are exactly a fact hash) — what fact
+serving admits reads through, gated on write by possession
+(`auth/cell_ref_admission.ts`). `path` is the **global** namespace
 axis — no tenant/hub scoping; globally unique on active rows. Soft delete via
 `deleted_at`; most indexes are partial on `deleted_at IS NULL`.
 
@@ -64,38 +107,62 @@ The wire schemas + RPC handlers + authz predicates for this layer live in
   `cell.moderation text` (nullable — `pending` / `approved` / `rejected`) is the
   approval-lifecycle marker, peer to `visibility` (partial `idx_cell_moderation_pending`
   on `root_id WHERE moderation = 'pending'` for the mod queue), set by the create
-  authorizer's verdict + the `cell_moderate` verb, never in `data`. Nullable
+  authorizer's verdict + the `cell_moderate` verb, never in `data`.
+  `cell.policy jsonb` (nullable) is a root's contribution policy, opaque to the
+  spine — a table CHECK holds it to roots and to JSON objects (`policy @> '{}'`,
+  the object test pglet runs too). Nullable
   `created_by` / `updated_by` FKs to `actor` (NULL = system origin). GIN on `data`
   / `refs`; global partial-unique on `path`.
-- **`cell_history_ddl.ts`** — dormant `cell_history` table
-  (`CELL_HISTORY_MIGRATION_NS`, namespace `fuz_cell_history`), FK → `cell.id`.
-  Ships present-but-unwritten; no snapshot lifecycle yet.
 - **`cell_queries.ts`** — `query_cell_create / get / get_by_path / update /
 delete / set_moderation`, `_list_by_kind / _list_by_creator`, the
   generic `query_cell_list` (filter + SQL-side visibility predicate mirroring
-  `can_view_cell`; the `kind` filter narrows by the `cell.kind` column, the
-  `ref` filter by `cell.refs`, plus `root_id` / `moderation` filters for the
-  per-root feed + mod queue), and
-  `query_cell_load_many` (bulk id load, no visibility filter — feeds the
-  strict relation-read filter). `query_cell_set_moderation` is the dedicated
+  `can_view_cell`, moderation admission included, bound through one
+  `viewer: CellViewer`; the `kind` filter narrows
+  by the `cell.kind` column, the `ref` filter by `cell.refs`, plus `root_id` /
+  `moderation` filters for the per-root feed + mod queue),
+  `query_cell_load_many` (bulk id load of full rows, no visibility filter —
+  the deep-clone walk), and `query_cell_view_load_many` (the
+  `CELL_VIEW_COLUMNS` view facts alone — feeds `filter_visible_target_ids`,
+  the in-memory relation filter the `cell_get` bundle and the clone walk
+  run). `query_cell_set_moderation` is the dedicated
   `cell_moderate` write (`moderation` is absent from `CellUpdatePatch`, so an
-  author can't self-approve via `cell_update`). `cell.refs` derived from
-  `data` via `extract_refs` on create/update. `CellRow.grant_count` is a
+  author can't self-approve via `cell_update`); approval moves only a
+  `pending` row and rejection a `pending` or `approved` one (the takedown) —
+  the `WHERE` carries the from-state. `query_cell_set_policy` is the dedicated
+  `cell_policy_set` write (`policy` is absent from `CellUpdatePatch`; its
+  `WHERE` matches roots only). `cell.refs` derived from
+  `data` via the exported `derive_cell_refs` on create/update (exact
+  whole-string hashes, sorted — byte-identical with the Rust `extract_refs`). `CellRow.grant_count` is a
   derived projection (correlated subquery on `idx_cell_grant_cell`).
+- **`cell_moderation.ts`** — the `cell.moderation` read rules in pure and
+  SQL form side by side (`cell_moderation_admits_audience` /
+  `_sql`: the allowlist unmoderated ‖ `'approved'`), composed by
+  `auth/cell_authorize.ts` and `query_cell_list` so the two can't drift; the
+  `CELL_MODERATION_*` literals. Twin of the Rust `fuz_cell::cell_moderation`.
+- **`cell_view_sql.ts`** — `can_view_cell` in SQL: `can_view_cell_sql`
+  (admin ‖ owner ‖ moderation-admitted public or grant), the
+  `caller_role_grants_cte` its role-shaped grant arm reads, and `CellViewer`
+  (the caller it binds — `auth/cell_authorize.ts`'s `cell_viewer_from_auth`
+  builds one; `CELL_VIEWER_UNRESTRICTED` filters nothing). `query_cell_list`
+  embeds it beside its steward arm, and the relation lists apply it to the
+  far end before `LIMIT`. Twin of the Rust `fuz_cell::cell_view_sql`.
 - **`cell_grant_queries.ts`** — resource-side ACL: `query_cell_grant_create`
   (UPSERT on the partial unique index, actor- vs role-shaped principal),
   `_get`, `_delete` (returns deleted row), `_list_for_cell`,
   `_list_for_cells` (bulk, for the relation-read filter), and
   `query_cell_grants_for_caller_in_cells` (caller-matched enrichment for
-  `shared_with: 'me'`).
+  `shared_with: 'me'`, taking the same `CellViewer` the list bound).
 - **`cell_field_queries.ts`** — named relations (`(source_id, name) →
 target_id`): `query_cell_field_set` (UPSERT), `_get`, `_delete`,
   `_list_for_source` (`{limit, name_after}`), `_list_for_target`. Reads JOIN
-  cell with `deleted_at IS NULL` so dangling relations don't surface.
+  cell with `deleted_at IS NULL` so dangling relations don't surface; the
+  list reads take a `CellViewer` and keep only edges whose far end it can
+  view, before `LIMIT`.
 - **`cell_item_queries.ts`** — ordered children (`(parent_id, position) →
 child_id`, fractional-index keyed): `query_cell_item_insert` (throws
   `23505` on collision), `_get`, `_move`, `_delete`, `_list_for_parent`
-  (`{limit, position_after}`), `_list_for_child`. Same soft-delete JOIN.
+  (`{limit, position_after}`), `_list_for_child`. Same soft-delete JOIN and
+  viewer filter.
 - **`cell_audit_queries.ts`** — `query_audit_log_list_by_cell`: matches
   `audit_log` rows whose `metadata` names the cell on any of six cell-domain
   keys (`cell_id` / `source_id` / `new_id` / `parent_id` / `child_id` /
@@ -105,7 +172,7 @@ child_id`, fractional-index keyed): `query_cell_item_insert` (throws
 **Named projections** (rationale + helpers: ../../../docs/architecture.md
 §Query Modules). The consts on this side: `CELL_COLUMNS`,
 `CELL_GRANT_COLUMNS`, `CELL_FIELD_COLUMNS`, `CELL_ITEM_COLUMNS`, `FACT_COLUMNS`
-(the meta read derives `minus bytes`). The derived `grant_count` stays an
+(the meta read derives `minus bytes`), `FACT_HOLDER_COLUMNS`. The derived `grant_count` stays an
 appended expression in the exported `cell_row_projection(alias)` rather than a
 `CELL_COLUMNS` entry, so the const is exactly the table's column set. Column
 order twins the Rust `fuz_cell` / `fuz_fact` `*_COLUMNS` consts. Every const is pinned to
@@ -116,64 +183,83 @@ exemption — by `src/test/db/column_projections.db.test.ts`; the cell
 ## Fact layer
 
 Content-addressed byte store. Cells reference facts by blake3 hash
-(`cell.refs`, auto-extracted from `data`); the fact layer stores the bytes.
-Optional — minimal consumers never migrate it.
+(`cell.refs`, derived from `data`); the fact layer stores the bytes and
+records who holds them. Optional — minimal consumers never migrate it.
 
 - **`fact_ddl.ts`** — `fact` (content-addressed bytes: embedded `bytes` xor
   `external_url`, CHECK enforces exactly one) + `fact_ref` (declared
   dependency edges; `target_hash` deliberately not an FK, for federation) +
-  `memo` (`(fn_id, input_hash) → output_hash`). `FACT_MIGRATION_NS`, namespace
-  `fuz_facts`.
+  `memo` (`(fn_id, input_hash) → output_hash`) + `fact_holder` (`(actor_id,
+  hash)` possession rows, both FKs cascading). `FACT_MIGRATION_NS`, namespace
+  `fuz_facts` — frozen and append-only (`full_fact_schema`, then
+  `fact_holder`), each entry statement-identical with the Rust `fuz_fact`
+  migration of the same name.
 - **`fact_queries.ts`** — mechanical `query_put_fact` (idempotent `ON CONFLICT
 DO NOTHING`), `_put_fact_refs`, `_get_fact` / `_get_fact_meta` / `_has_fact`
   / `_get_fact_refs`, `_delete_fact` (returns `{size, external_url}` for
   external unlink), and the cell-coupled orphan queries `query_orphan_facts_list`
-  / `_select_for_delete` (a fact is orphan when no active `cell.refs` names it).
-- **`fact_store.ts`** — `PgFactStore implements FactStore` (the interface lives
-  in `@fuzdev/fuz_util/fact_store.ts`): size-routed writes (embedded ≤
-  `embedded_threshold` / disk CAS above it / `put_ref` for an externally-managed
-  URL), JSON ref auto-extract, idempotent put, verify-on-read for external
-  content via an injected `FactExternalFetcher`. With `disk_root` + `fs` (the
+  / `_select_for_delete` (a fact is orphan when no active `cell.refs` names it;
+  the `older_than` cutoff keeps a fact whose `created_at` or any
+  `fact_holder.created_at` is within the window, so a deduplicated re-upload
+  survives any sweep whose window covers it).
+- **`fact_holder_queries.ts`** — `FACT_HOLDER_COLUMNS`, `query_put_fact_holder`
+  (idempotent upsert — a repeat put refreshes the row's `created_at` to the
+  most recent put), and the admission reads `query_fact_holder_table_exists` /
+  `query_fact_holder_unheld` (answered from holder rows alone).
+- **`fact_store.ts`** — `PgFactStore`, implementing `HeldFactStore` (reads per
+  the `@fuzdev/fuz_util/fact_store.ts` `FactStore` contract; puts take
+  `HeldFactPutOptions`, whose required `holder` — an actor id, or `null` for a
+  system put — is recorded in `fact_holder` on every put, a dedup hit included,
+  in one transaction with the fact row and its refs): size-routed writes
+  (embedded ≤ `embedded_threshold` / disk CAS above it), refs exactly as each
+  put declares them (the bytes are never scanned), idempotent put,
+  verify-on-read for disk-backed content. With `disk_root` + `fs` (the
   `runtime/*Deps`) configured, oversize `put` and the streaming `put_stream`
-  write to the `<shard>/<rest>` disk CAS and the default fetcher reads from it.
+  write to the `<shard>/<rest>` disk CAS and `get` reads from it; without them
+  an oversize write throws (`put_stream` needs `fs` for a body of any size).
+  The disk CAS is the only place `get` reads external bytes from; the store
+  makes no network request. A row whose `external_url` is not a
+  `file:<shard>/<rest>` URL (the store never writes one), and any external row
+  on a store with no disk CAS, reads as `null` with a warning; one naming another
+  fact's file reads as `null` with an error. The serve route 404s both.
 - **`file_fact_url.ts`** — the canonical `file:<shard>/<rest>` URL shape
   (`FileFactUrl` brand, `mint_file_fact_url` / `parse_file_fact_url` /
   `FILE_FACT_URL_PATTERN`) plus `fact_disk_path(hash) → {shard, rest}`, the
-  single source of truth for the on-disk layout (twins the Rust `fuz_fact`).
+  single source of truth for the on-disk layout, and `file_fact_url_addresses`,
+  the check that a URL names its own hash's file (twins the Rust `fuz_fact`).
 - **`fact_disk_storage.ts`** — the filesystem CAS over `runtime/{FsStream,FsWrite,FsRemove,FsRead}Deps`
-  (not raw `node:fs`): `stream_fact_to_disk` (bounded-memory blake3+sha256 single
-  pass, buffer→spill, fsync-then-atomic-rename, dedup-drop if the CAS path already
-  exists), `write_fact_bytes_to_disk` (buffering twin), `create_disk_fact_fetcher`,
-  and `sweep_orphan_temps` (reaps stale `.tmp` spills by mtime). The temp is
-  `fsync`ed before the rename publishes it (twins the Rust `fuz_fact` §fsync
-  posture: data-sync before rename, parent-dir fsync waived) — the serve path
-  streams the file without re-hashing, so write-time durability is the guard.
-- **`fact_store_errors.ts`** — `PayloadTooLargeError` / `StorageFullError` (+
+  (not raw `node:fs`): `stream_fact_to_disk` (bounded-memory blake3 as it
+  streams, buffer→spill, fsync-then-atomic-rename — over a file already at the
+  CAS path, so a repeat put heals a corrupt one), `write_fact_bytes_to_disk`
+  (buffering twin), `read_fact_bytes_from_disk`, and `sweep_orphan_temps`
+  (reaps stale `.tmp` spills by mtime). The temp is `fsync`ed before the
+  rename publishes it (twins the Rust `fuz_fact` §fsync posture: data-sync
+  before rename, parent-dir fsync waived) — the serve path streams the file
+  without re-hashing, so write-time durability is the guard.
+- **`fact_store_errors.ts`** — `FactPayloadTooLargeError` / `FactStorageFullError` (+
   `is_enospc_error`) thrown by `put_stream`, for a consumer route's 413 / 507.
-- The read-side fetcher + write/serve plumbing also live under `server/`
-  (`file_fact_fetcher.ts`, `serve_fact_route.ts`).
+- The HTTP serving plumbing lives under `server/` (`serve_fact_route.ts`,
+  `x_accel.ts`, `fact_security_headers.ts`).
 
 ### Migration namespace order
 
 FK dependency dictates order; consumers register via `migration_namespaces`
-on `create_app_backend` (after the built-in `fuz_auth` namespace). The fact
-namespace is FK-independent so its slot is free; the spine binary and every
-consumer place it last, keeping cell + its `cell_history` FK-child adjacent
-(cross-namespace order is immaterial to the `schema_version` rows — `sequence`
-is assigned per-namespace — so only the cell→cell_history FK constrains it):
+on `create_app_backend` (after the built-in `fuz_auth` namespace). Both
+`fuz_cell` and `fuz_facts` FK into `actor`, so both follow `fuz_auth`; the
+spine binary and every consumer place facts last (cross-namespace order is
+otherwise immaterial to the `schema_version` rows — `sequence` is assigned
+per-namespace):
 
 ```
-auth_migration_ns (built-in, fuz_auth)
-  → CELL_MIGRATION_NS         (fuz_cell — FKs actor.id)
-  → CELL_HISTORY_MIGRATION_NS (fuz_cell_history — FKs cell.id)
-  → FACT_MIGRATION_NS         (fuz_facts — no external FK; slot is free)
+AUTH_MIGRATION_NS (built-in, fuz_auth)
+  → CELL_MIGRATION_NS (fuz_cell — FKs actor.id)
+  → FACT_MIGRATION_NS (fuz_facts — fact_holder FKs actor.id)
 ```
 
 ### Pre-stable migration policy
 
-Scoped to the namespaces on this page (`fuz_cell` / `fuz_cell_history` /
-`fuz_facts`): each is a single `full_*_schema` entry, so when it needs to
+Scoped to `fuz_cell`: a single `full_cell_schema` entry, so when it needs to
 change shape, **rewrite the original in place** rather than appending a
-follow-up — consumers re-bootstrap dev DBs on upgrade. The `fuz_auth`
-namespace is the opposite — frozen and append-only, since consumers hold
-deployed databases on it. See ../../../docs/migrations.md §Schema stability.
+follow-up — consumers re-bootstrap dev DBs on upgrade. `fuz_facts` and
+`fuz_auth` are the opposite — frozen and append-only, since consumers hold
+deployed databases on them. See ../../../docs/migrations.md §Schema stability.

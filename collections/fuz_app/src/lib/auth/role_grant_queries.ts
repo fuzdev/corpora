@@ -7,12 +7,12 @@
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import type { RoleGrant, CreateRoleGrantInput } from './account_schema.ts';
 import { assert_row } from '../db/assert_row.ts';
-import { columns_sql, qualify_columns } from '../db/sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from '../db/sql_columns.ts';
 import {
 	ROLE_GRANT_OFFER_COLUMNS,
 	ROLE_GRANT_OFFER_SCOPE_KIND_GLOBAL_TOKEN,
@@ -20,6 +20,7 @@ import {
 	ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT
 } from './role_grant_offer_ddl.ts';
 import type { SupersededOffer } from './role_grant_offer_schema.ts';
+import { offer_pending_predicate, role_grant_active_sql } from './role_grant_sql.ts';
 
 /**
  * The full `role_grant` column set, named explicitly so a row read fails loud
@@ -45,9 +46,27 @@ export const ROLE_GRANT_COLUMNS = [
 ] as const satisfies ReadonlyArray<keyof RoleGrant>;
 
 /**
+ * The `role_grant` timestamp override; every read here is on the bare table.
+ * `created_at` / `expires_at` ride `RoleGrantSummaryJson` (twin of the
+ * spine's `role_grant_summary_columns`); `revoked_at` is what
+ * `is_role_grant_active` reads.
+ */
+const role_grant_expr = iso8601_timestamp_expr(ROLE_GRANT_COLUMNS, [
+	'created_at',
+	'expires_at',
+	'revoked_at'
+])('');
+
+/**
  * Grant a role_grant to an actor.
- * Idempotent — if an active role_grant already exists for this actor, role, and
- * scope, returns the existing role_grant instead of creating a duplicate.
+ * Idempotent — if an active (unrevoked and unexpired) role_grant already
+ * exists for this actor, role, and scope, returns it instead of creating a
+ * duplicate. An expired but unrevoked row in the slot is first revoked
+ * (`revoked_reason = 'expired'`, `revoked_by` null — nobody chose to revoke
+ * it) so the fresh grant can take its place; returning the expired row would
+ * report a grant that confers nothing. The revoke and the insert are two
+ * statements, atomic when the caller runs them in a transaction (the action
+ * and offer-accept paths do).
  *
  * The `ON CONFLICT` target and the fallback `SELECT` both collapse `NULL`
  * scopes via the same sentinel + index-side `'GLOBAL'` token used by the
@@ -62,12 +81,23 @@ export const ROLE_GRANT_COLUMNS = [
  * @param deps - query dependencies
  * @param input - the role_grant fields
  * @returns the created or existing active role_grant
- * @mutates `role_grant` table - inserts a row when no active role_grant matches `(actor_id, role, scope_kind, scope_id)`
+ * @mutates `role_grant` table - revokes an expired unrevoked row at `(actor_id, role, scope_kind, scope_id)`, then inserts a row when no active role_grant matches
  */
 export const query_create_role_grant = async (
 	deps: QueryDeps,
 	input: CreateRoleGrantInput
 ): Promise<RoleGrant> => {
+	// an expired row still holds the partial unique slot (`revoked_at IS NULL`)
+	await deps.db.query(
+		`UPDATE role_grant SET revoked_at = NOW(), revoked_by = NULL, revoked_reason = 'expired'
+		 WHERE actor_id = $1
+		   AND role = $2
+		   AND scope_kind IS NOT DISTINCT FROM $3
+		   AND scope_id IS NOT DISTINCT FROM $4
+		   AND revoked_at IS NULL
+		   AND expires_at <= NOW()`,
+		[input.actor_id, input.role, input.scope_kind ?? null, input.scope_id ?? null]
+	);
 	const inserted = await deps.db.query_one<RoleGrant>(
 		`INSERT INTO role_grant (actor_id, role, scope_kind, scope_id, expires_at, granted_by, source_offer_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -79,7 +109,7 @@ export const query_create_role_grant = async (
 		 )
 		   WHERE revoked_at IS NULL
 		 DO NOTHING
-		 RETURNING ${columns_sql(ROLE_GRANT_COLUMNS)}`,
+		 RETURNING ${columns_sql(ROLE_GRANT_COLUMNS, role_grant_expr)}`,
 		[
 			input.actor_id,
 			input.role,
@@ -93,7 +123,7 @@ export const query_create_role_grant = async (
 	if (inserted) return inserted;
 	// Active role_grant already exists — return it (idempotent grant).
 	const existing = await deps.db.query_one<RoleGrant>(
-		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS)} FROM role_grant
+		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS, role_grant_expr)} FROM role_grant
 		 WHERE actor_id = $1
 		   AND role = $2
 		   AND scope_kind IS NOT DISTINCT FROM $3
@@ -117,16 +147,17 @@ export const query_role_grant_by_id = async (
 	id: Uuid
 ): Promise<RoleGrant | undefined> =>
 	deps.db.query_one<RoleGrant>(
-		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS)} FROM role_grant WHERE id = $1`,
+		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS, role_grant_expr)} FROM role_grant WHERE id = $1`,
 		[id]
 	);
 
 /**
- * Look up the role of an active role_grant (constrained to a specific
- * actor) plus the actor's `account_id`.
+ * Look up the role and scope of an active role_grant (constrained to a
+ * specific actor) plus the actor's `account_id`.
  *
  * Used by admin routes to inspect the role_grant's role before acting
- * (e.g., enforcing the admin-grant-path gate on revoke). The actor constraint
+ * (e.g., enforcing the admin-grant-path gate and the global-`admin` guards on
+ * revoke). The actor constraint
  * mirrors `query_revoke_role_grant` so IDOR protection is consistent:
  * a caller can only see role_grants belonging to the target actor.
  *
@@ -143,15 +174,15 @@ export const query_role_grant_by_id = async (
  * @param deps - query dependencies
  * @param role_grant_id - the role_grant id to look up
  * @param actor_id - the actor that must own the role_grant
- * @returns `{role, account_id}` on a match, or `null`
+ * @returns `{role, scope_id, account_id}` on a match, or `null`
  */
 export const query_role_grant_find_active_role_for_actor = async (
 	deps: QueryDeps,
 	role_grant_id: string,
 	actor_id: string
-): Promise<{ role: string; account_id: Uuid } | null> => {
-	const row = await deps.db.query_one<{ role: string; account_id: Uuid }>(
-		`SELECT role_grant.role, actor.account_id
+): Promise<{ role: string; scope_id: Uuid | null; account_id: Uuid } | null> => {
+	const row = await deps.db.query_one<{ role: string; scope_id: Uuid | null; account_id: Uuid }>(
+		`SELECT role_grant.role, role_grant.scope_id, actor.account_id
 		   FROM role_grant
 		   JOIN actor ON actor.id = role_grant.actor_id
 		  WHERE role_grant.id = $1 AND role_grant.actor_id = $2 AND role_grant.revoked_at IS NULL`,
@@ -234,10 +265,8 @@ export const query_revoke_role_grant = async (
 			  AND o.to_account_id = a.account_id
 			  AND o.role = $2
 			  AND o.scope_id IS NOT DISTINCT FROM $3
-			  AND o.accepted_at IS NULL
-			  AND o.declined_at IS NULL
-			  AND o.retracted_at IS NULL
-			  AND o.superseded_at IS NULL
+			  AND ${offer_pending_predicate('o')}
+			-- raw columns; the outer grantor select formats them
 			RETURNING ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'o')}
 		)
 		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
@@ -260,51 +289,19 @@ export const query_role_grant_find_active_for_actor = async (
 	actor_id: string
 ): Promise<Array<RoleGrant>> => {
 	return deps.db.query<RoleGrant>(
-		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS)} FROM role_grant
+		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS, role_grant_expr)} FROM role_grant
 		 WHERE actor_id = $1
-		   AND revoked_at IS NULL
-		   AND (expires_at IS NULL OR expires_at > NOW())
-		 ORDER BY created_at`,
+		   AND ${role_grant_active_sql('')}
+		 ORDER BY role_grant.created_at`,
 		[actor_id]
 	);
-};
-
-/**
- * Check if an actor has an active role_grant for a given role.
- *
- * The `scope_id` parameter selects between global and scoped checks:
- * - Omitted or `null` — matches a global role_grant (`scope_id IS NULL`).
- *   Pre-scope callers keep their existing semantics.
- * - A scope uuid — matches a role_grant bound to that exact scope.
- *
- * The `IS NOT DISTINCT FROM` comparison handles the NULL case uniformly.
- */
-export const query_role_grant_has_role = async (
-	deps: QueryDeps,
-	actor_id: string,
-	role: string,
-	scope_id?: string | null
-): Promise<boolean> => {
-	const row = await deps.db.query_one<{ exists: boolean }>(
-		`SELECT EXISTS(
-			SELECT 1 FROM role_grant
-			WHERE actor_id = $1
-			  AND role = $2
-			  AND scope_id IS NOT DISTINCT FROM $3
-			  AND revoked_at IS NULL
-			  AND (expires_at IS NULL OR expires_at > NOW())
-		 ) AS exists`,
-		[actor_id, role, scope_id ?? null]
-	);
-	return row?.exists ?? false;
 };
 
 /**
  * Account-grain check: does any actor on `account_id` hold an active
  * global role_grant for `role`?
  *
- * Symmetric with `query_role_grant_has_role` but keyed on the account
- * instead of a single actor — for surfaces with `auth: actor: 'none'`
+ * Keyed on the account rather than a single actor — for surfaces with `auth: actor: 'none'`
  * that don't load `auth.role_grants` and can't use the in-memory
  * `has_scoped_role` predicate. Joins `role_grant` → `actor`; matches
  * only global role_grants (`scope_id IS NULL`) since the use case is
@@ -337,8 +334,7 @@ export const query_account_has_global_role = async (
 			WHERE actor_id IN (SELECT id FROM actor WHERE account_id = $1)
 			  AND role = $2
 			  AND scope_id IS NULL
-			  AND revoked_at IS NULL
-			  AND (expires_at IS NULL OR expires_at > NOW())
+			  AND ${role_grant_active_sql('')}
 		 ) AS exists`,
 		[account_id, role]
 	);
@@ -349,7 +345,7 @@ export const query_account_has_global_role = async (
  * Like `query_account_has_global_role`, but only counts the grant when the
  * **account and the granting actor are both active** (`deleted_at IS NULL`).
  * Used by the last-admin branch of the removability guard: a soft-deleted admin
- * can't log in and is excluded from `query_count_active_accounts_with_global_role`,
+ * can't log in and is excluded from `query_count_active_accounts_with_global_role_for_update`,
  * so the guard must use the same active predicate when testing whether the
  * *target* is an admin — otherwise removing an already-tombstoned admin is
  * falsely blocked as `cannot_delete_last_admin`. Soft-delete does **not** revoke
@@ -380,8 +376,7 @@ export const query_account_has_active_global_role = async (
 			  AND act.deleted_at IS NULL
 			  AND rg.role = $2
 			  AND rg.scope_id IS NULL
-			  AND rg.revoked_at IS NULL
-			  AND (rg.expires_at IS NULL OR rg.expires_at > NOW())
+			  AND ${role_grant_active_sql('rg')}
 		 ) AS exists`,
 		[account_id, role]
 	);
@@ -391,23 +386,44 @@ export const query_account_has_active_global_role = async (
 /**
  * Count **active** accounts (`deleted_at IS NULL`) holding an active global
  * role_grant for `role`, counting only grants on **active actors**
- * (`act.deleted_at IS NULL`). Used by the last-admin guard on `account_delete` /
- * `account_purge`: soft-delete revokes neither a tombstoned account's nor a
+ * (`act.deleted_at IS NULL`) — and lock what it counted. Used by the last-admin
+ * guards on `account_delete` / `account_purge` and on `role_grant_revoke` of an
+ * `admin` grant: soft-delete revokes neither a tombstoned account's nor a
  * tombstoned actor's admin grant, so an unfiltered count would include unusable
  * admins — this joins `account` *and* filters the actor, so an account whose
  * only admin grant sits on a tombstoned actor no longer counts (otherwise the
- * guard could fail-open and let the last usable admin be deleted).
+ * guard could fail-open and let the last usable admin be removed).
+ *
+ * **Locks** every counted `role_grant`, `actor`, and `account` row
+ * (`FOR UPDATE`) until the caller's transaction ends, so two guards racing to
+ * remove the last two admins serialize: the second waits for the first to
+ * commit, re-reads the rows it changed, and counts one. Run it inside the
+ * transaction that does the removal. Twin of the Rust
+ * `query_count_active_accounts_with_global_role_for_update`.
+ *
+ * `exclude_role_grant_id` leaves one grant out of the count, so a revoke asks
+ * whether any active admin account would remain without that grant — an
+ * account holding the grant on two actors keeps counting through the other.
+ * The excluded grant is still locked, so two revokes of each other's grant
+ * serialize rather than deadlock.
  *
  * @param deps - query dependencies
  * @param role - the role to count (e.g. `ROLE_ADMIN`)
+ * @param exclude_role_grant_id - a grant to leave out of the count (the one being revoked)
  * @returns the number of distinct active accounts with an active global `role` grant
+ * @mutates `role_grant` / `actor` / `account` rows - row-locks the counted rows for the transaction
  */
-export const query_count_active_accounts_with_global_role = async (
+export const query_count_active_accounts_with_global_role_for_update = async (
 	deps: QueryDeps,
-	role: string
+	role: string,
+	exclude_role_grant_id: Uuid | null = null
 ): Promise<number> => {
-	const row = await deps.db.query_one<{ count: string | number }>(
-		`SELECT COUNT(DISTINCT a.id) AS count
+	// `FOR UPDATE` refuses an aggregate, so the rows come back and are counted
+	// here. The excluded grant is dropped in code, not SQL: filtering it in the
+	// WHERE would leave it unlocked, and two cross-revokes (each locking only the
+	// other's grant, then updating it) would deadlock instead of serializing
+	const rows = await deps.db.query<{ account_id: Uuid; role_grant_id: Uuid }>(
+		`SELECT a.id AS account_id, rg.id AS role_grant_id
 		 FROM account a
 		 JOIN actor act ON act.account_id = a.id
 		 JOIN role_grant rg ON rg.actor_id = act.id
@@ -415,28 +431,23 @@ export const query_count_active_accounts_with_global_role = async (
 		   AND act.deleted_at IS NULL
 		   AND rg.role = $1
 		   AND rg.scope_id IS NULL
-		   AND rg.revoked_at IS NULL
-		   AND (rg.expires_at IS NULL OR rg.expires_at > NOW())`,
+		   AND ${role_grant_active_sql('rg')}
+		 FOR UPDATE`,
 		[role]
 	);
-	return Number(row?.count ?? 0);
+	const account_ids: Set<Uuid> = new Set();
+	for (const row of rows) {
+		if (row.role_grant_id !== exclude_role_grant_id) account_ids.add(row.account_id);
+	}
+	return account_ids.size;
 };
 
 /**
- * List all role_grants for an actor (including revoked/expired).
- */
-export const query_role_grant_list_for_actor = async (
-	deps: QueryDeps,
-	actor_id: string
-): Promise<Array<RoleGrant>> => {
-	return deps.db.query<RoleGrant>(
-		`SELECT ${columns_sql(ROLE_GRANT_COLUMNS)} FROM role_grant WHERE actor_id = $1 ORDER BY created_at DESC`,
-		[actor_id]
-	);
-};
-
-/**
- * Find the account ID of an account that holds an active role_grant for a given role.
+ * Find the account ID of an account that holds an active **global** role_grant
+ * for a given role.
+ *
+ * Global-only (`scope_id IS NULL`), like every builtin read: a scoped row of
+ * the role confers nothing, so it must not resolve the keeper identity.
  *
  * Joins role_grant → actor → account, counting only an **active account + active
  * actor** (`deleted_at IS NULL` on both). This *resolves* an identity (the
@@ -460,10 +471,10 @@ export const query_role_grant_find_account_id_for_role = async (
 		 JOIN actor act ON act.id = p.actor_id
 		 JOIN account a ON a.id = act.account_id
 		 WHERE p.role = $1
+		   AND p.scope_id IS NULL
 		   AND a.deleted_at IS NULL
 		   AND act.deleted_at IS NULL
-		   AND p.revoked_at IS NULL
-		   AND (p.expires_at IS NULL OR p.expires_at > NOW())
+		   AND ${role_grant_active_sql('p')}
 		 ORDER BY a.id ASC
 		 LIMIT 1`,
 		[role]
@@ -514,8 +525,8 @@ export interface RevokeForScopeResult {
  * orphan role_grants and offers. The cascade is **role-agnostic**: anything
  * attached to the destroyed scope is cleaned up.
  *
- * Both updates run as separate statements inside the caller's transaction
- * (mirrors `query_role_grant_revoke_role`'s shape). The two halves are
+ * Both updates run as separate statements inside the caller's transaction,
+ * the `role_grant` revoke first. The two halves are
  * independent — orphan pending offers can exist at a scope with no active
  * role_grants, so the supersede half always runs even when no role_grant was
  * revoked.
@@ -567,108 +578,12 @@ export const query_role_grant_revoke_for_scope = async (
 			UPDATE role_grant_offer o
 			SET superseded_at = NOW()
 			WHERE o.scope_id = $1
-			  AND o.accepted_at IS NULL
-			  AND o.declined_at IS NULL
-			  AND o.retracted_at IS NULL
-			  AND o.superseded_at IS NULL
+			  AND ${offer_pending_predicate('o')}
+			-- raw columns; the outer grantor select formats them
 			RETURNING ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'o')}
 		)
 		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
 		[scope_id]
-	);
-	return { revoked, superseded_offers };
-};
-
-/** Result of `query_role_grant_revoke_role` — every role_grant revoked plus the pending offers superseded by the bulk revoke. */
-export interface RevokeRoleResult {
-	/**
-	 * One entry per role_grant revoked by this call. Carries the revokee's
-	 * `account_id` so callers can fan out a `role_grant_revoke` notification per
-	 * scope-instance. Empty array means nothing was active for `(actor, role)`.
-	 */
-	revoked: Array<{
-		role_grant_id: string;
-		role: string;
-		scope_kind: string | null;
-		scope_id: string | null;
-		account_id: string;
-	}>;
-	/**
-	 * Pending offers for the actor's account+role (all scopes) superseded by
-	 * the bulk revoke. Each entry carries its grantor's `from_account_id` so
-	 * callers can fan out `role_grant_offer_supersede` notifications without a
-	 * second round-trip.
-	 */
-	superseded_offers: Array<SupersededOffer>;
-}
-
-/**
- * Revoke every active role_grant an actor holds for a given role.
- *
- * With scoped role_grants a single actor+role tuple can hold several active
- * role_grants (one per scope), so this revokes all of them. Pass
- * `query_revoke_role_grant(role_grant_id, ...)` when a single scoped role_grant
- * is the target.
- *
- * Also supersedes pending offers for the actor's account across every
- * scope of this role (the actor can no longer hold the role, so any
- * pending offer of the same role is a bypass vector).
- *
- * @param deps - query dependencies
- * @param actor_id - the actor whose role_grants to revoke
- * @param role - the role to revoke
- * @param revoked_by - the actor who revoked it (for audit trail)
- * @param reason - optional free-form reason, stamped on `role_grant.revoked_reason`.
- * @returns the list of revoked role_grants (empty if none were active) and superseded pending offers
- * @mutates `role_grant` table - sets `revoked_at`/`revoked_by`/`revoked_reason` on every active row for `(actor, role)`
- * @mutates `role_grant_offer` table - stamps `superseded_at` on every matching pending offer
- */
-export const query_role_grant_revoke_role = async (
-	deps: QueryDeps,
-	actor_id: string,
-	role: string,
-	revoked_by: string | null,
-	reason?: string | null
-): Promise<RevokeRoleResult> => {
-	// CTE pulls the revokee's `account_id` via a join on `actor` so callers
-	// can address the revokee without an extra round-trip.
-	const revoked = await deps.db.query<{
-		role_grant_id: string;
-		role: string;
-		scope_kind: string | null;
-		scope_id: string | null;
-		account_id: string;
-	}>(
-		`WITH updated AS (
-			UPDATE role_grant
-			SET revoked_at = NOW(), revoked_by = $3, revoked_reason = $4
-			WHERE actor_id = $1 AND role = $2 AND revoked_at IS NULL
-			RETURNING id, role, scope_kind, scope_id, actor_id
-		)
-		SELECT u.id AS role_grant_id, u.role, u.scope_kind, u.scope_id, a.account_id
-		FROM updated u
-		JOIN actor a ON a.id = u.actor_id`,
-		[actor_id, role, revoked_by ?? null, reason ?? null]
-	);
-	if (revoked.length === 0) {
-		return { revoked: [], superseded_offers: [] };
-	}
-	const superseded_offers = await deps.db.query<SupersededOffer>(
-		`WITH updated AS (
-			UPDATE role_grant_offer o
-			SET superseded_at = NOW()
-			FROM actor a
-			WHERE a.id = $1
-			  AND o.to_account_id = a.account_id
-			  AND o.role = $2
-			  AND o.accepted_at IS NULL
-			  AND o.declined_at IS NULL
-			  AND o.retracted_at IS NULL
-			  AND o.superseded_at IS NULL
-			RETURNING ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'o')}
-		)
-		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
-		[actor_id, role]
 	);
 	return { revoked, superseded_offers };
 };

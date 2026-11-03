@@ -30,7 +30,7 @@ import { z } from 'zod';
 /**
  * Closed enum of fixture-provisioned principals a case runs `as`. Each
  * value maps to a `TestFixture` accessor (or a seeded `extra_accounts`
- * entry) in the runner's `resolve_principal` — there is **no** inline
+ * entry) in the runner's `resolve_conformance_principal` — there is **no** inline
  * credential minting in a case (that would be the setup-DSL trap).
  *
  * - `keeper` — the per-test bootstrapped keeper (holds `ROLE_KEEPER` +
@@ -69,6 +69,11 @@ import { z } from 'zod';
  *   be replayed from a browser — wire-indistinguishable from sending no
  *   credential (the `token` principal is the honored counterpart: it suppresses
  *   `Origin`, so the same token authenticates).
+ * - `malformed_bearer` — the keeper's bearer api-token with its last character
+ *   dropped, non-browser context, fresh jar. A value that cannot be a token
+ *   fails each spine's shape precheck and soft-fails before any database work,
+ *   so the request arrives anonymous — wire-indistinguishable from sending no
+ *   credential.
  * - `scoped_token` — the keeper authenticated via a bearer api-token minted
  *   with a **narrowed** `TokenScope` (`{kind: 'methods', methods:
  *   [SCOPED_TOKEN_ADMITTED_METHOD]}`), non-browser context. Minted through the
@@ -99,6 +104,7 @@ export const ConformancePrincipal = z.enum([
 	'daemon_browser',
 	'token',
 	'bearer_browser',
+	'malformed_bearer',
 	'scoped_token',
 	'anonymous',
 	'fresh_non_admin',
@@ -120,6 +126,32 @@ export type ConformancePrincipal = z.infer<typeof ConformancePrincipal>;
  */
 export const SCOPED_TOKEN_ADMITTED_METHOD = 'account_verify';
 
+/**
+ * Which actor the runner writes into a case's `params.acting` at run time.
+ *
+ * An actor id exists only once a fixture has seeded it, so a case names the
+ * actor by its relation to the fixture and the runner fills in the id:
+ *
+ * - `principal` — the actor of the account the principal's credential names:
+ *   the keeper's bootstrap actor for the keeper-credential principals
+ *   (`keeper`, `daemon`, `token`, `scoped_token`, …), the account's one actor
+ *   for `fresh_non_admin` / `role_holder` / `wrong_role`. Binding it makes a
+ *   row hold whether the account has one actor or several: a single-actor
+ *   account resolves the same actor with or without the selector, a
+ *   multi-actor one needs it.
+ * - `extra_actor` — the keeper's first seeded extra actor
+ *   (`fixture.extra_actors[0]`); the fixture must declare `extra_actors`.
+ *   With a keeper-credential principal, the request acts as a sibling actor
+ *   on the keeper's own account that holds none of the keeper's roles.
+ * - `keeper_actor` — the keeper's bootstrap actor whatever the principal, so
+ *   a principal on another account names a real actor that is not its own.
+ *
+ * Unavailable for principals that present no account (`anonymous`,
+ * `bearer_browser`, `malformed_bearer`) — the runner throws.
+ */
+export const ConformanceActingBinding = z.enum(['principal', 'extra_actor', 'keeper_actor']);
+export type ConformanceActingBinding = z.infer<typeof ConformanceActingBinding>;
+
 /** The request a conformance case issues. */
 export const ConformanceCaseRequest = z.strictObject({
 	method: z.string().meta({
@@ -132,7 +164,21 @@ export const ConformanceCaseRequest = z.strictObject({
 		.unknown()
 		.optional()
 		.meta({ description: 'Request params / body. Omit for nullary methods.' }),
+	params_json: z
+		.string()
+		.optional()
+		.meta({
+			description:
+				'RPC params as raw JSON text, sent verbatim in place of `params` — for a ' +
+				'spelling `JSON.stringify` loses (`5.0`, `1e1`, `-0`). Exclusive with ' +
+				'`params` and `acting`; RPC methods only.'
+		}),
 	as: ConformancePrincipal,
+	acting: ConformanceActingBinding.optional().meta({
+		description:
+			'Bind `params.acting` at run time to the named actor (`ConformanceActingBinding`). ' +
+			'Params must be an object or omitted, and must not carry `acting` themselves.'
+	}),
 	verb: z
 		.enum(['POST', 'GET'])
 		.optional()

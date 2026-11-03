@@ -1,10 +1,8 @@
 // @slop Claude Opus 4
 
-import { z } from 'zod';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { create_uuid, type Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Repo } from './repo.svelte.ts';
 import type { RepoCheckout } from './projects_schema.ts';
@@ -121,7 +119,7 @@ export class RepoViewmodel {
 			this.projects.add_repo(this.project_id, repo);
 		}
 
-		void goto(resolve(`/projects/${this.project_id}/repos`));
+		void goto(resolve('/projects/[project_id]/repos', { project_id: this.project_id }));
 	}
 
 	/**
@@ -133,9 +131,7 @@ export class RepoViewmodel {
 		// eslint-disable-next-line no-alert
 		if (confirm('Are you sure you want to remove this repo? This action cannot be undone.')) {
 			this.projects.delete_repo(this.project_id, this.repo_id);
-			void goto(resolve(`/projects/${this.project_id}/repos`));
+			void goto(resolve('/projects/[project_id]/repos', { project_id: this.project_id }));
 		}
 	}
 }
-
-export const RepoViewmodelSchema = z.instanceof(RepoViewmodel);

@@ -1,23 +1,16 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, test, assert, vi, afterEach } from 'vitest';
+import { describe, test, assert, vi } from 'vitest';
 import { flushSync } from 'svelte';
 
-import KnobControl from '$routes/KnobControl.svelte';
-import { theme_knob_by_name, type ThemeKnob } from '$lib/knobs.ts';
-import { PALETTE_HUES } from '$lib/ramps.ts';
-import { palette_variants } from '$lib/variable_data.ts';
-import { mount_component, unmount_component, set_input_value } from './component_test_helpers.ts';
+import KnobControl from '#routes/KnobControl.svelte';
+import { theme_knob_by_name, type ThemeKnob } from '#lib/knobs.ts';
+import { PALETTE_HUES } from '#lib/ramps.ts';
+import { palette_variants } from '#lib/variable_data.ts';
+import { create_mount_tracker, set_input_value } from './component_test_helpers.ts';
 
-let mounted: { instance: Record<string, any>; container: HTMLElement } | null = null;
-
-afterEach(async () => {
-	if (mounted) {
-		await unmount_component(mounted.instance, mounted.container);
-		mounted = null;
-	}
-});
+const mount = create_mount_tracker();
 
 const get_knob = (name: string): ThemeKnob => {
 	const knob = theme_knob_by_name.get(name);
@@ -26,14 +19,12 @@ const get_knob = (name: string): ThemeKnob => {
 };
 
 const mount_knob = (props: Record<string, any>): HTMLElement => {
-	mounted = mount_component(KnobControl as any, {
+	return mount(KnobControl, {
 		changed: false,
 		onchange: () => {},
 		onreset: () => {},
 		...props
 	});
-	flushSync();
-	return mounted.container;
 };
 
 const number_input = (container: HTMLElement): HTMLInputElement => {
@@ -182,16 +173,23 @@ describe('bindable knobs', () => {
 		assert.deepEqual(onchange.mock.calls, [['var(--hue_b)']]);
 	});
 
-	test('detaching writes the resolved literal angle', () => {
+	test('detaching writes the angle the bound letter resolves to', () => {
 		const onchange = vi.fn();
-		const container = mount_knob({ knob: get_knob('hue_accent'), value: 'var(--hue_a)', onchange });
+		// a theme that moved the letter, so the default angle would be wrong
+		const resolve_hue = (letter: string) => (letter === 'a' ? 123 : PALETTE_HUES.b);
+		const container = mount_knob({
+			knob: get_knob('hue_accent'),
+			value: 'var(--hue_a)',
+			onchange,
+			resolve_hue
+		});
 		const custom = [...container.querySelectorAll('.letter_chip')].find(
 			(c) => c.textContent?.trim() === 'custom'
 		);
 		assert(custom instanceof HTMLButtonElement);
 		custom.click();
 		flushSync();
-		assert.deepEqual(onchange.mock.calls, [[String(PALETTE_HUES.a)]]);
+		assert.deepEqual(onchange.mock.calls, [['123']]);
 	});
 });
 
@@ -204,15 +202,33 @@ describe('reset', () => {
 			changed: true,
 			onreset
 		});
-		const reset = container.querySelector('.knob_reset');
+		const reset = container.querySelector('.knob-reset');
 		assert(reset instanceof HTMLButtonElement);
 		reset.click();
 		flushSync();
 		assert.strictEqual(onreset.mock.calls.length, 1);
 	});
 
+	test('clearing a text knob resets it instead of writing a blank value', () => {
+		const onchange = vi.fn();
+		const onreset = vi.fn();
+		const container = mount_knob({
+			knob: get_knob('font_family'),
+			value: 'serif',
+			onchange,
+			onreset
+		});
+		const input = container.querySelector('input[type="text"]');
+		assert(input instanceof HTMLInputElement, 'text input renders');
+		set_input_value(input, '  ', 'change');
+		assert.strictEqual(onchange.mock.calls.length, 0);
+		assert.strictEqual(onreset.mock.calls.length, 1);
+		// a knob at its base value doesn't change on reset, so the field restores it
+		assert.strictEqual(input.value, 'serif');
+	});
+
 	test('an unchanged knob has no reset button', () => {
 		const container = mount_knob({ knob: get_knob('chroma_scale'), value: '1' });
-		assert.isNull(container.querySelector('.knob_reset'));
+		assert.isNull(container.querySelector('.knob-reset'));
 	});
 });

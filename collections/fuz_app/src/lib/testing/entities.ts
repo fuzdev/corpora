@@ -2,7 +2,7 @@ import './assert_dev_env.ts';
 
 /**
  * Shared test entity factories for `Account`, `Actor`, `RoleGrant`, `AuditLogEvent`,
- * and `RequestContext`.
+ * `RequestContext`, and API tokens.
  *
  * Override types widen branded `Uuid` fields to `string` so tests can pass
  * literal ids without per-call-site casts. The factory brands internally.
@@ -13,11 +13,14 @@ import './assert_dev_env.ts';
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { Account, Actor, RoleGrant } from '../auth/account_schema.ts';
 import type { AuditLogEvent } from '../auth/audit_log_schema.ts';
-import type { RequestContext } from '../auth/request_context.ts';
+import type { RequestActorContext } from '../auth/request_context.ts';
+import { API_TOKEN_BODY_LENGTH, API_TOKEN_PREFIX } from '../auth/api_token.ts';
+import type { ValidatedApiToken } from '../auth/api_token_queries.ts';
+import { token_scope_full } from '../auth/token_scope.ts';
 
 /** Override type for `create_test_account` — id-like fields accept plain `string`. */
 export type TestAccountOverrides = Partial<Omit<Account, 'id' | 'created_by' | 'updated_by'>> & {
@@ -97,10 +100,13 @@ export const create_test_role_grant = (overrides?: TestRoleGrantOverrides): Role
 	return overrides ? { ...base, ...(overrides as Partial<RoleGrant>) } : base;
 };
 
-/** Create a test `RequestContext` with role_grants from partial overrides. */
+/**
+ * Create a test `RequestActorContext` (a `RequestContext` with a resolved
+ * actor) with role_grants from partial overrides.
+ */
 export const create_test_context = (
 	role_grants: Array<TestRoleGrantOverrides> = [{}]
-): RequestContext => ({
+): RequestActorContext => ({
 	account: create_test_account(),
 	actor: create_test_actor(),
 	role_grants: role_grants.map((p) => create_test_role_grant(p))
@@ -131,4 +137,50 @@ export const create_test_audit_event = (overrides?: TestAuditEventOverrides): Au
 	created_at: '2024-01-01T00:00:00Z',
 	metadata: null,
 	...(overrides as Partial<AuditLogEvent>)
+});
+
+/**
+ * Create a well-formed raw API token for tests that need a bearer value to
+ * pass the `is_api_token_shaped` precheck and reach token validation. The
+ * body is `label` padded with `A` to the generated length, so distinct labels
+ * give distinct tokens and a token in a failure message reads back to its
+ * test. Not a real credential — it authenticates only where a test mocks the
+ * lookup.
+ *
+ * @param label - base64url characters (`A-Z a-z 0-9 - _`) that start the token body
+ * @returns `API_TOKEN_PREFIX` plus an `API_TOKEN_BODY_LENGTH`-char body
+ * @throws Error when `label` is longer than the body or not base64url
+ */
+export const create_test_raw_api_token = (label = 'test'): string => {
+	if (label.length > API_TOKEN_BODY_LENGTH || !/^[A-Za-z0-9_-]*$/.test(label)) {
+		throw new Error(
+			`create_test_raw_api_token: label must be at most ${API_TOKEN_BODY_LENGTH} base64url chars, got '${label}'`
+		);
+	}
+	return API_TOKEN_PREFIX + label.padEnd(API_TOKEN_BODY_LENGTH, 'A');
+};
+
+/** Override type for `create_test_validated_api_token` — `account_id` accepts plain `string`. */
+export type TestValidatedApiTokenOverrides = Partial<Omit<ValidatedApiToken, 'account_id'>> & {
+	account_id?: string;
+};
+
+/**
+ * Create a test `ValidatedApiToken` — what `query_validate_api_token` returns
+ * for a live token — with a `full` scope by default.
+ */
+export const create_test_validated_api_token = (
+	overrides?: TestValidatedApiTokenOverrides
+): ValidatedApiToken => ({
+	id: 'tok_test',
+	account_id: 'acct-test' as Uuid,
+	name: 'test token',
+	token_hash: 'hash',
+	expires_at: null,
+	last_used_at: null,
+	last_used_ip: null,
+	created_at: '2024-01-01T00:00:00Z',
+	scope: token_scope_full(),
+	expires_in_ms: null,
+	...(overrides as Partial<ValidatedApiToken>)
 });

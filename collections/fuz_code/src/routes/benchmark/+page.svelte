@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 
-	import { samples as all_samples } from '$routes/samples/all.ts';
+	import { samples as all_samples } from '#routes/samples/all.ts';
 	import BenchmarkResults from './BenchmarkResults.svelte';
 	import BenchmarkHarness from './BenchmarkHarness.svelte';
 	import { run_all_benchmarks } from './benchmark_runner.ts';
@@ -40,7 +40,7 @@
 		if (running) return;
 
 		running = true;
-		should_stop = false as boolean;
+		should_stop = false;
 		current_test = '';
 		progress = 0;
 

@@ -2,9 +2,10 @@
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
 
 	import { icon_remove } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import type { DiskfileTab } from './diskfile_tab.svelte.ts';
 	import DiskfileContextmenu from './DiskfileContextmenu.svelte';
+	import { frontend_context } from './frontend.svelte.ts';
 
 	const {
 		tab,
@@ -18,9 +19,24 @@
 		onopen: (tab: DiskfileTab) => void;
 	} = $props();
 
+	const app = frontend_context.get();
+
 	const diskfile = $derived(tab.diskfile);
+	const editor_state = $derived(diskfile ? app.diskfiles.get_editor_state(diskfile) : null);
+	const dirty = $derived(editor_state?.dirty ?? false);
+	const conflict = $derived(editor_state?.has_conflict ?? false);
 
 	const path = $derived(diskfile?.path_relative ?? '[no diskfile found]'); // TODO ?
+	const deleted_on_disk = $derived(diskfile?.deleted_on_disk ?? false);
+	// the accessible name carries the status the ● and strikethrough show
+	const status = $derived(
+		[
+			deleted_on_disk && 'deleted on disk',
+			conflict ? 'unsaved changes, changed on disk' : dirty && 'unsaved changes'
+		]
+			.filter(Boolean)
+			.join(', ')
+	);
 </script>
 
 <DiskfileContextmenu {diskfile}>
@@ -35,6 +51,14 @@
 			class="diskfile-tab-button border-radius:0 plain px_sm py_xs"
 			class:selected={tab.is_selected}
 			class:preview={tab.is_preview}
+			class:deleted={deleted_on_disk}
+			title={deleted_on_disk
+				? `${path} — deleted on disk, has unsaved edits`
+				: conflict
+					? `${path} — changed on disk since you edited it`
+					: dirty
+						? `${path} — unsaved changes`
+						: undefined}
 			onclick={(e) => {
 				swallow(e);
 				// If it's a preview tab and it's double-clicked, promote it to permanent
@@ -45,20 +69,28 @@
 				}
 			}}
 			onkeydown={(e) => {
+				// leave keys on the nested close button alone — swallowing would cancel its click
+				if (e.target !== e.currentTarget) return;
 				if (e.key === 'Enter' || e.key === ' ') {
 					swallow(e);
 					onselect(tab);
 				}
 			}}
-			aria-label={`Tab ${path}`}
+			aria-label={status ? `Tab ${path} (${status})` : `Tab ${path}`}
 			aria-pressed={tab.is_selected}
 		>
 			<div class="ellipsis font-weight:400 flex:1">
 				<small class="ml_xs">{path}</small>
+				{#if deleted_on_disk}
+					<small class="ml_xs color_c_60" aria-hidden="true">(deleted)</small>
+				{/if}
+				{#if dirty}
+					<small class="ml_xs" class:color_c_50={conflict} aria-hidden="true">●</small>
+				{/if}
 			</div>
 			<button
 				type="button"
-				class="tab-close-button plain icon-button sm border_radius_md ml_sm"
+				class="tab-close-button plain icon-button sized_sm border_radius_md ml_sm"
 				onclick={(e) => {
 					swallow(e);
 					onclose(tab);
@@ -66,7 +98,7 @@
 				title="close tab"
 				aria-label={`close tab ${path}`}
 			>
-				<Svg data={icon_remove} />
+				<Icon data={icon_remove} />
 			</button>
 		</div>
 	</div>
@@ -130,6 +162,10 @@
 
 	.diskfile-tab-button.selected {
 		box-shadow: var(--tab_selected_shadow);
+	}
+
+	.diskfile-tab-button.deleted small:first-child {
+		text-decoration: line-through;
 	}
 
 	.diskfile-tab-button.preview {

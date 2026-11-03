@@ -13,15 +13,18 @@
     Text: Component<any>;
   };
 
-  export type AnnotationPointBaseProps = AnnotationPointProps &
-    AnnotationPointBaseLayerComponents;
+  export type AnnotationPointBaseProps = AnnotationPointProps & AnnotationPointBaseLayerComponents;
 </script>
 
 <script lang="ts">
   import { getChartContext } from '$lib/contexts/chart.js';
   import { getGeoContext } from '$lib/contexts/geo.js';
   import { isScaleBand } from '$lib/utils/scales.svelte.js';
+  import { getPointLabelLayout } from '$lib/utils/labelPlacement.js';
+  import { getPixelValue } from '../Text/Text.shared.svelte.js';
   import { cls } from '@layerstack/tailwind';
+  import type { CircleProps } from '../Circle/Circle.shared.svelte.js';
+  import type { TextProps } from '../Text/Text.shared.svelte.js';
 
   let {
     Circle,
@@ -29,12 +32,19 @@
     Text,
     x,
     y,
+    z,
     r = 4,
     label,
     labelPlacement = 'center',
     labelXOffset = 0,
     labelYOffset = 0,
+    labelX,
+    labelY,
+    seriesKey,
+    fontSize = 12,
+    labelGap = 2,
     link,
+    circle,
     details,
     props,
   }: AnnotationPointBaseProps = $props();
@@ -42,63 +52,86 @@
   const ctx = getChartContext();
   const geo = getGeoContext();
 
+  // Over a stack the point sits on its series' running total, not on the series' own value
+  const stackedX = $derived(ctx.valueAxis === 'x' ? ctx.stackedValue(seriesKey, y, x) : x);
+  const stackedY = $derived(ctx.valueAxis === 'y' ? ctx.stackedValue(seriesKey, x, y) : y);
+
   const point = $derived.by(() => {
     if (geo.projection && typeof x === 'number' && typeof y === 'number') {
       const [px, py] = geo.projection([x, y]) ?? [0, 0];
       return { x: px, y: py };
     }
     return {
-      x: x ? ctx.xScale(x) + (isScaleBand(ctx.xScale) ? ctx.xScale.bandwidth() / 2 : 0) : 0,
-      y: y
-        ? ctx.yScale(y) + (isScaleBand(ctx.yScale) ? ctx.yScale.bandwidth() / 2 : 0)
+      x: stackedX
+        ? ctx.xScale(stackedX) + (isScaleBand(ctx.xScale) ? ctx.xScale.bandwidth() / 2 : 0)
+        : 0,
+      y: stackedY
+        ? ctx.yScale(stackedY) + (isScaleBand(ctx.yScale) ? ctx.yScale.bandwidth() / 2 : 0)
         : ctx.height,
     };
   });
 
-  const labelProps = $derived.by(() => {
-    const dirX = labelPlacement.includes('left') ? -1 : labelPlacement.includes('right') ? 1 : 0;
-    const dirY = labelPlacement.includes('top') ? -1 : labelPlacement.includes('bottom') ? 1 : 0;
-    const mag = Math.hypot(dirX, dirY) || 1;
-    const signX = labelPlacement.includes('left') ? -1 : 1;
-    const signY = labelPlacement.includes('top') ? -1 : 1;
+  // Where `smart`/discrete placement puts the label — shared with `getPointLabelRect`
+  // consumers (e.g. occlusion) so the measured box matches the rendered label.
+  const labelLayout = $derived(
+    getPointLabelLayout({
+      x: point.x,
+      y: point.y,
+      r,
+      labelPlacement,
+      labelX,
+      labelY,
+      labelXOffset,
+      labelYOffset,
+      fontSize: getPixelValue(fontSize),
+      labelGap,
+      link: !!link,
+      verticalAnchor: props?.label?.verticalAnchor,
+    })
+  );
 
-    return {
-      x: point.x + (r * dirX) / mag + labelXOffset * signX,
-      y: point.y + (r * dirY) / mag + labelYOffset * signY,
-      dy: -2,
-      textAnchor: labelPlacement.includes('left')
-        ? 'end'
-        : labelPlacement.includes('right')
-          ? 'start'
-          : 'middle',
-      verticalAnchor: labelPlacement.includes('top')
-        ? 'end'
-        : labelPlacement.includes('bottom')
-          ? 'start'
-          : 'middle',
-    };
-  });
+  // Render `<Text>` with the raw `fontSize` (it resolves em/etc. itself)
+  const labelProps = $derived({ ...labelLayout.text, fontSize });
 
+  // Leader `<Link>` endpoints. The target is the anchor; the source sits on the
+  // ring — following the label for `smart`, but fixed to the placement direction
+  // otherwise. Spacing to the text is handled by `labelGap` (which moves the
+  // text, not the line).
   const linkEndpoints = $derived.by(() => {
     if (!link) return null;
+    const a = labelLayout.anchor;
 
-    const dirX = labelPlacement.includes('left') ? -1 : labelPlacement.includes('right') ? 1 : 0;
-    const dirY = labelPlacement.includes('top') ? -1 : labelPlacement.includes('bottom') ? 1 : 0;
-    if (dirX === 0 && dirY === 0) return null;
+    if (labelPlacement === 'smart') {
+      const dx = a.x - point.x;
+      const dy = a.y - point.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist <= r) return null;
+      return {
+        source: { x: point.x + (r * dx) / dist, y: point.y + (r * dy) / dist },
+        target: { x: a.x, y: a.y },
+      };
+    }
 
+    const { x: dirX, y: dirY } = labelLayout.direction;
+    if (dirX === 0 && dirY === 0) return null; // labelPlacement='center' — no line
     const mag = Math.hypot(dirX, dirY);
     return {
       source: { x: point.x + (r * dirX) / mag, y: point.y + (r * dirY) / mag },
-      target: { x: labelProps.x as number, y: labelProps.y as number },
+      target: { x: a.x, y: a.y },
     };
   });
 
   const linkProps = $derived(typeof link === 'object' ? link : {});
 
+  /** The point's height off an `isometric` floor, in pixels — its circle, label, and link all rise */
+  const height = $derived(z == null ? undefined : Number(ctx.zScale(z)) || 0);
+
   function onPointerMove(e: PointerEvent | MouseEvent | TouchEvent) {
     if (details) {
       e.stopPropagation();
-      ctx.tooltip.show(e, { annotation: { label, details } });
+      ctx.tooltip.show(e, {
+        annotation: { label: typeof label === 'string' ? label : undefined, details },
+      });
     }
   }
 
@@ -108,21 +141,35 @@
       ctx.tooltip.hide();
     }
   }
+
+  const resolvedCircleProps = $derived({
+    cx: point.x,
+    cy: point.y,
+    z: height,
+    r,
+    onpointermove: onPointerMove,
+    onmousemove: onPointerMove,
+    ontouchmove: onPointerMove,
+    onpointerleave: onPointerLeave,
+    onmouseleave: onPointerLeave,
+    ontouchend: onPointerLeave,
+    ...props?.circle,
+    class: cls('lc-annotation-point', link && 'lc-annotation-point-ring', props?.circle?.class),
+  } as CircleProps);
+
+  const resolvedLabelProps = $derived({
+    ...labelProps,
+    z: height,
+    ...props?.label,
+    class: cls('lc-annotation-point-label', props?.label?.class),
+  } as TextProps);
 </script>
 
-<Circle
-  cx={point.x}
-  cy={point.y}
-  {r}
-  onpointermove={onPointerMove}
-  onmousemove={onPointerMove}
-  ontouchmove={onPointerMove}
-  onpointerleave={onPointerLeave}
-  onmouseleave={onPointerLeave}
-  ontouchend={onPointerLeave}
-  {...props?.circle}
-  class={cls('lc-annotation-point', link && 'lc-annotation-point-ring', props?.circle?.class)}
-/>
+{#if circle}
+  {@render circle({ props: resolvedCircleProps })}
+{:else}
+  <Circle {...resolvedCircleProps} />
+{/if}
 
 {#if linkEndpoints && Link}
   <Link
@@ -130,6 +177,8 @@
     y1={linkEndpoints.source.y}
     x2={linkEndpoints.target.x}
     y2={linkEndpoints.target.y}
+    z1={height}
+    z2={height}
     type="straight"
     {...linkProps}
     class={cls(
@@ -139,19 +188,15 @@
   />
 {/if}
 
-{#if label}
-  <Text
-    value={label}
-    {...labelProps}
-    {...props?.label}
-    class={cls('lc-annotation-point-label', props?.label?.class)}
-  />
+{#if typeof label === 'function'}
+  {@render label({ props: resolvedLabelProps })}
+{:else if label}
+  <Text value={label} {...resolvedLabelProps} />
 {/if}
 
 <style>
   @layer components {
     :global(:where(.lc-annotation-point-label)) {
-      font-size: 12px;
       pointer-events: none;
     }
 

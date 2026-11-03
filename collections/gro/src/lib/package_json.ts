@@ -1,9 +1,9 @@
-import { z } from 'zod';
 import { join } from 'node:path';
 import { readFile, writeFile } from 'node:fs/promises';
 import { plural, strip_end } from '@fuzdev/fuz_util/string.ts';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 import { styleText as st } from 'node:util';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 import { PackageJson, PackageJsonExports } from '@fuzdev/fuz_util/package_json.ts';
 import { fs_search } from '@fuzdev/fuz_util/fs.ts';
 
@@ -15,10 +15,10 @@ import {
 	JS_MATCHER,
 	SVELTE_MATCHER,
 	JSON_MATCHER,
-	CSS_MATCHER
+	CSS_MATCHER,
+	LIB_PATH
 } from './constants.ts';
 import { has_sveltekit_library } from './sveltekit_helpers.ts';
-import { load_default_svelte_config } from './svelte_config.ts';
 import { GITHUB_REPO_MATCHER } from './github.ts';
 
 export type PackageJsonMapper = (
@@ -53,9 +53,7 @@ export const package_json_load = async (
 };
 
 /**
- * @param exports_dir - the directory whose files become the `exports`;
- * defaults to the Svelte config's `lib_path`, which `has_sveltekit_library`
- * has already resolved by the time it's read
+ * @param exports_dir - the directory whose files become the `exports`, defaults to `LIB_PATH`
  */
 export const package_json_sync = async (
 	map_package_json: PackageJsonMapper,
@@ -67,11 +65,7 @@ export const package_json_sync = async (
 	const updated = await package_json_update(
 		async (package_json) => {
 			if ((await has_sveltekit_library(package_json)).ok) {
-				// Reading the lib directory off the Svelte config rather than `paths.lib` is what honors
-				// a customized `kit.files.lib`. Searching the conventional `src/lib` instead would find
-				// nothing and quietly replace the library's whole `exports` map with a single entry.
-				const final_exports_dir =
-					exports_dir ?? join(paths.root, (await load_default_svelte_config()).lib_path);
+				const final_exports_dir = exports_dir ?? join(paths.root, LIB_PATH);
 				const exported_files = await fs_search(final_exports_dir);
 				package_json.exports = package_json_to_exports(exported_files.map((f) => f.path));
 			}
@@ -256,21 +250,20 @@ const parse_package_json = (schema: typeof PackageJson, value: any): PackageJson
 	) as any;
 };
 
-// TODO maybe extract to zod helpers? see also everything in `task_logging.ts`
-const parse_or_throw_formatted_error = <T extends z.ZodType>(
+const parse_or_throw_formatted_error = <T extends s.AnySchema>(
 	name: string,
 	schema: T,
-	value: any
-): z.infer<T> => {
-	const parsed = schema.safeParse(value);
-	if (!parsed.success) {
+	value: unknown
+): s.Infer<T> => {
+	const parsed = s.parse(schema, value);
+	if (!parsed.ok) {
 		let msg = st('red', `Failed to parse ${name}:\n`);
-		for (const issue of parsed.error.issues) {
-			msg += st('red', `\n\t"${issue.path}" ${issue.message}\n`);
+		for (const issue of parsed.issues) {
+			msg += st('red', `\n\t${s.format_issue(issue)}\n`);
 		}
 		throw Error(msg);
 	}
-	return parsed.data;
+	return parsed.value;
 };
 
 /**

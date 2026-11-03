@@ -10,13 +10,14 @@
 
 import { assert, describe, test } from 'vitest';
 
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { role_grant_offer_create_action_spec } from '$lib/auth/role_grant_offer_action_specs.ts';
-import { query_accept_offer } from '$lib/auth/role_grant_offer_queries.ts';
-import type { AuditLogEvent } from '$lib/auth/audit_log_schema.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { role_grant_offer_create_action_spec } from '#lib/auth/role_grant_offer_action_specs.ts';
+import { query_accept_offer } from '#lib/auth/role_grant_offer_queries.ts';
+import type { AuditLogEvent } from '#lib/auth/audit_log_schema.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
 
-import { RPC_PATH, describe_db } from './role_grant_offer_test_helpers.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { RPC_PATH } from './role_grant_offer_test_helpers.ts';
 import { create_multi_actor_helpers } from './role_grant_offer.multi_actor.fixtures.ts';
 
 describe_db('role_grant_offer.multi_actor — account_grain', (get_db) => {

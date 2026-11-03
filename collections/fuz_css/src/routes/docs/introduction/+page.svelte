@@ -7,7 +7,7 @@
 	import { tome_get_by_slug } from '@fuzdev/fuz_ui/tome.ts';
 	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
 
-	import Introduction from '$routes/Introduction.svelte';
+	import Introduction from '#routes/Introduction.svelte';
 
 	const LIBRARY_ITEM_NAME = 'introduction';
 
@@ -18,66 +18,22 @@
 	<section>
 		<Introduction />
 		<TomeSection>
-			<TomeSectionHeader text="Usage" />
-			<Code lang={null} content="npm i -D @fuzdev/fuz_css" />
-			<p>
-				Use the <TomeLink slug="classes" hash="Vite-plugin">Vite plugin</TomeLink> or
-				<TomeLink slug="classes" hash="Gro-generator">Gro generator</TomeLink>
-				for bundled CSS that includes theme variables, base styles, and utility classes in a single
-				import. Add the plugin to your Vite config:
-			</p>
-			<Code
-				lang="ts"
-				content={`// vite.config.ts
-import {vite_plugin_fuz_css} from '@fuzdev/fuz_css/vite_plugin_fuz_css.ts';
-
-export default defineConfig({plugins: [sveltekit(), vite_plugin_fuz_css()]});`}
-			/>
-			<p>Then import it, normally from your root layout:</p>
-			<Code
-				lang="ts"
-				content={`// bundled mode (recommended)
-// includes only used base styles, variables, and utilities
-import 'virtual:fuz.css'; // Vite plugin
-// or
-import './fuz.css'; // Gro generator, written to the filesystem`}
-			/>
-			<p>
-				That single import is all most projects need - it already contains the base styles and theme
-				variables, so importing the full stylesheets alongside it ships both layers twice. Those
-				stylesheets are the escape hatch, for projects managing their own theme or base styles;
-				using them means turning the generated ones off:
-			</p>
-			<Code
-				lang="ts"
-				content={`// utility-only mode - set \`base_css: null, variables: null\` on the plugin
-import '@fuzdev/fuz_css/style.css'; // all base styles
-import '@fuzdev/fuz_css/theme.css'; // all variables
-import 'virtual:fuz.css'; // used utilities only`}
-			/>
-			<p>
-				See the <TomeLink slug="classes" /> reference for setup details and configuration options.
-			</p>
-		</TomeSection>
-		<TomeSection>
-			<TomeSectionHeader text="Details" />
+			<TomeSectionHeader text="Design details" />
 			<ul>
 				<li>plain CSS</li>
-				<li>minimal dependencies, all optional (none needed if you only use the stylesheets)</li>
 				<li>
 					exports a reset stylesheet with <TomeLink slug="semantic" /> defaults that styles HTML
 					elements, and also exports the underlying data, helpers, and types for open-ended usage
 				</li>
 				<li>
-					supports <TomeLink slug="themes" /> as sets of style variables, applied at build time
-					through the generators' <code>theme</code> option or swapped at runtime - dark mode is a
-					first-class concept, not a theme; instead, each theme can support light and/or dark
-					<MdnLink path="Web/CSS/color-scheme">color-schemes</MdnLink>
+					supports <TomeLink slug="themes" /> as sets of style variables, baked in at build time or
+					swapped at runtime; dark mode isn't a theme but a
+					<MdnLink path="Web/CSS/color-scheme">color scheme</MdnLink> any theme can support
 				</li>
 				<li>
-					supports optional <TomeLink slug="classes">utility classes</TomeLink> with three types
-					(token, composite, CSS-literal) and modifiers for responsive, state, color-scheme, and
-					pseudo-elements
+					supports optional <TomeLink slug="classes">utility classes</TomeLink> with four types
+					(token, keyword, composite, CSS-literal) and modifiers for responsive, state,
+					color-scheme, and pseudo-elements
 				</li>
 				<li>
 					uses its own concept of style <TomeLink slug="variables" />, a specialization of CSS
@@ -87,18 +43,63 @@ import 'virtual:fuz.css'; // used utilities only`}
 				<li>
 					the stylesheets work with any framework and plain HTML; utility class generation supports
 					HTML/JS/TS, Svelte, and JSX - see the utility class
-					<TomeLink slug="classes" hash="Framework-support">framework support</TomeLink>, and for
-					the companion Svelte integration see
+					<TomeLink slug="setup" hash="Framework-support">framework support</TomeLink>, and for the
+					companion Svelte integration see
 					<a href="https://ui.fuz.dev/docs/ThemeRoot"><code>ThemeRoot</code></a> in
 					<a href="https://ui.fuz.dev/">fuz_ui</a>
 				</li>
 				<li>
-					see the <TomeLink slug="classes" hash="Compared-to-alternatives">
+					see the
+					<TomeLink slug="classes" hash="Compared-to-alternatives">
 						comparison to alternatives
 					</TomeLink>
 					to understand fuz_css relative to TailwindCSS and UnoCSS
 				</li>
 			</ul>
+		</TomeSection>
+		<TomeSection>
+			<TomeSectionHeader text="Usage" />
+			<Code lang={null} content="npm i -D @fuzdev/fuz_css" />
+			<p>
+				Add the Vite plugin, then import its virtual module once, from your root layout or entry
+				file. It generates the theme variables, base styles, and utility classes your code uses:
+			</p>
+			<Code
+				lang="ts"
+				content={`// vite.config.ts
+import {vite_plugin_fuz_css} from '@fuzdev/fuz_css/vite_plugin_fuz_css.ts';
+
+export default defineConfig({plugins: [sveltekit(), vite_plugin_fuz_css()]});
+
+// src/routes/+layout.svelte, or your entry file
+import 'virtual:fuz.css';`}
+			/>
+			<p>
+				See <TomeLink slug="setup" /> for SvelteKit, React, Preact, Solid, and plain HTML, and for
+				linking the stylesheets without a build step.
+			</p>
+			<p>
+				fuz_css sets the root font size to <code>62.5%</code>, so <code>1rem</code> is 10px - see
+				<TomeLink slug="setup" hash="Root-font-size">root font size</TomeLink>.
+			</p>
+		</TomeSection>
+		<TomeSection>
+			<TomeSectionHeader text="Browser support" />
+			<p>
+				The shipped CSS needs Chrome or Edge 120, Firefox 118, or Safari 16.2 - Safari 16.4 if you
+				use responsive modifier classes like <code>md:</code>, which emit media range syntax.
+			</p>
+			<p>
+				There are no fallbacks. Every rule sits in a cascade layer
+				(<MdnLink path="Web/CSS/@layer" />), the color scales are computed in CSS with
+				<MdnLink path="Web/CSS/color_value/oklch"><code>oklch()</code></MdnLink>,
+				<code>calc()</code>, and <MdnLink path="Web/CSS/pow"><code>pow()</code></MdnLink>, and
+				<MdnLink path="Web/CSS/color_value/color-mix"><code>color-mix()</code></MdnLink> drives
+				button fills, shadows, and the placeholder color. <code>pow()</code> sets the Chrome and
+				Firefox floors: a browser without it keeps the page background and color scheme (the ends of
+				each scale don't use it) but loses every stop between, which carry the text, border, and
+				accent colors. A browser without cascade layers drops every rule, leaving unstyled HTML.
+			</p>
 		</TomeSection>
 	</section>
 </TomeContent>

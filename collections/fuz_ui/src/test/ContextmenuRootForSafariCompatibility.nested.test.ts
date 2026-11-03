@@ -4,7 +4,7 @@
 import { vi } from 'vitest';
 
 import { create_shared_nested_tests } from './contextmenu_test_nested.ts';
-import ContextmenuRootForSafariCompatibility from '$lib/ContextmenuRootForSafariCompatibility.svelte';
+import ContextmenuRootForSafariCompatibility from '#lib/ContextmenuRootForSafariCompatibility.svelte';
 
 // ResizeObserver is not currently available in jsdom
 class ResizeObserverMock {

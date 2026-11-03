@@ -4,7 +4,6 @@
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 	import TomeSectionHeader from '@fuzdev/fuz_ui/TomeSectionHeader.svelte';
 	import DeclarationLink from '@fuzdev/fuz_ui/DeclarationLink.svelte';
-	import ModuleLink from '@fuzdev/fuz_ui/ModuleLink.svelte';
 	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
 	import { tome_get_by_slug } from '@fuzdev/fuz_ui/tome.ts';
 
@@ -14,105 +13,63 @@
 </script>
 
 <svelte:head>
-	<title>build-tool integration - svelte-docinfo</title>
+	<title>build tools - svelte-docinfo</title>
 </svelte:head>
 
 <TomeContent {tome}>
 	<section>
 		<p>
-			svelte-docinfo is build-tool agnostic. Files come in through
-			<DeclarationLink name="SourceFileInfo" /> objects (absolute path plus content, optionally with pre-resolved
-			dependencies), and the analyzer never touches disk on its own. This page covers the integration
-			surface for embedding analysis inside a bundler, watcher, or LSP-style tool that doesn't fit the
-			bundled <TomeLink slug="vite-plugin">Vite plugin</TomeLink>.
+			svelte-docinfo is build-tool agnostic: you hand it files as
+			<DeclarationLink name="SourceFileInfo" /> objects, from disk, a build pipeline, or editor
+			buffers. This page covers embedding analysis in a bundler, watcher, or editor tool, beyond the
+			<TomeLink slug="js-api">JS API</TomeLink> basics.
+		</p>
+		<p>
+			Apart from discovery in <code>analyzeFromFiles</code>, the analyzer reads the disk only for
+			the tsconfig, for type-checker context you don't supply, and, except in
+			<code>analyze()</code>, for the in-project files your inputs import that you didn't supply
+			(<TomeLink slug="session" hash="Context-files">context files</TomeLink>).
 		</p>
 	</section>
 
 	<TomeSection>
 		<TomeSectionHeader text="SourceFileInfo" />
 		<p>
-			Every analysis entry point, including <DeclarationLink name="analyze" />,
-			<DeclarationLink name="createAnalysisSession" />'s <code>setFile</code> /
-			<code>setFiles</code>, and even <DeclarationLink name="discoverSourceFiles" />'s output,
-			operates on <DeclarationLink name="SourceFileInfo" />:
+			<DeclarationLink name="analyze" /> and the session's <code>setFile</code> /
+			<code>setFiles</code> take <DeclarationLink name="SourceFileInfo" />, and
+			<DeclarationLink name="discoverSourceFiles" /> returns it:
 		</p>
 		<Code
 			lang="ts"
 			content={`interface SourceFileInfo {
   id: string;                  // absolute path (native ok at boundary)
   content: string;             // file contents
-  dependencies?: string[];     // optional: pre-resolved deps (opt-in)
+  dependencies?: ReadonlyArray<string>; // optional: pre-resolved deps
 }`}
 		/>
 		<ul>
 			<li>
-				<strong><code>id</code></strong>: absolute path. Native paths are accepted at the public-API
-				boundary and posixified at ingest (Windows backslash paths become forward-slash internally).
-				After ingest, every comparison and output field uses POSIX form.
+				<strong><code>id</code></strong>: absolute path. Native Windows paths are accepted (see
+				<a href="#Paths">Paths</a>).
 			</li>
 			<li>
-				<strong><code>content</code></strong>: required, since analysis functions don't read from
-				disk. Files may come from any source: filesystem, build pipeline, in-memory editor buffer.
+				<strong><code>content</code></strong>: required; inputs are never read from disk.
 			</li>
 			<li>
-				<strong><code>dependencies</code></strong>: opt-in. When supplied, the session skips its
-				lex+resolve pass for this entry and treats the array as authoritative. See "Pre-resolved
-				dependencies" below.
+				<strong><code>dependencies</code></strong>: optional absolute paths. When supplied, the
+				session skips its own import parsing for this file (see
+				<a href="#Pre-resolved-dependencies-fast-path">Pre-resolved dependencies</a>).
 			</li>
 		</ul>
-		<p>
-			Reverse edges (<code>dependents</code>) are computed inside the analyzer from forward edges,
-			never caller-supplied.
-		</p>
-	</TomeSection>
-
-	<TomeSection>
-		<TomeSectionHeader text="Three entry points by ownership" />
-		<p>Pick by what your tool already owns:</p>
-		<table>
-			<thead>
-				<tr>
-					<th class="white-space:nowrap">Use</th>
-					<th>When</th>
-				</tr>
-			</thead>
-			<tbody>
-				<tr>
-					<td><DeclarationLink name="analyzeFromFiles" /></td>
-					<td>
-						You own a project root and want everything in one call: file discovery, dependency
-						resolution, analysis. CLI-style.
-					</td>
-				</tr>
-				<tr>
-					<td><DeclarationLink name="analyze" /></td>
-					<td>
-						You already hold file contents in memory (a Rollup/esbuild plugin with files in the
-						bundle graph). Single-pass, one-shot.
-					</td>
-				</tr>
-				<tr>
-					<td><DeclarationLink name="createAnalysisSession" /></td>
-					<td>
-						You re-analyze the same source set across many cycles (Vite, watch mode, LSP). See the <TomeLink
-							slug="session"
-						/> guide.
-					</td>
-				</tr>
-			</tbody>
-		</table>
-		<p>
-			The one-shot APIs are thin wrappers over single-use sessions. They share the same two-phase
-			analysis loop, same diagnostic model, same output shape.
-		</p>
+		<p>Reverse edges (<code>dependents</code>) are always computed by the analyzer.</p>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="discoverSourceFiles (standalone)" />
 		<p>
-			<DeclarationLink name="discoverSourceFiles" /> runs file discovery without analysis. Useful when
-			your tool wants to know the source set up front (for watcher-glob registration, count displays,
-			pre-flight checks) but defers analysis to a separate pass.
+			<DeclarationLink name="discoverSourceFiles" /> runs file discovery without analysis, for tools
+			that need the source set up front (watcher registration, counts, pre-flight checks) and
+			analyze separately.
 		</p>
 		<Code
 			lang="ts"
@@ -130,31 +87,31 @@ const {files, diagnostics} = await discoverSourceFiles({
 //   but readFile failed on (permission denied, FS error)`}
 		/>
 		<p>
-			Discovery strategies match the CLI and Vite plugin: <code>'auto'</code> tries package.json
-			exports first and falls back to glob; <code>'exports'</code> is strict (throws if exports is
-			missing); <code>'glob'</code> skips exports entirely. Providing
-			<code>include</code> under <code>'auto'</code> collapses the chain to glob immediately, since
-			honoring it from exports discovery would silently drop the user's filter on packages with an
-			<code>exports</code> field.
+			The strategies are the ones
+			<TomeLink slug="source-files" hash="Discovery">discovery</TomeLink> describes.
 		</p>
 		<p>
-			<code>module_unreadable</code> is the discovery-time diagnostic; the session doesn't run
-			discovery, so direct session consumers own it. <code>analyzeFromFiles</code> merges discovery
-			diagnostics into the final return before handing back to the caller. Discovery is also the one
-			diagnostic source that doesn't normalize its own paths — its <code>message</code> wraps the fs
-			error, which embeds an absolute path — so call
-			<DeclarationLink name="normalizeDiagnosticPaths" /> on them before publishing anywhere a developer's
-			filesystem shouldn't go.
+			Unlike <code>analyzeFromFiles</code> and the Vite plugin, standalone discovery doesn't widen
+			<code>sourcePaths</code> to cover <code>include</code>, so files outside <code>src/lib</code>
+			would be dropped at analysis. To keep them, build the options with
+			<DeclarationLink name="createSourceOptionsWithInclude" /> (from
+			<code>svelte-docinfo/source-config.js</code>), passing the same <code>include</code>.
+		</p>
+		<p>
+			Session consumers own the discovery-time <code>module_unreadable</code> diagnostics, since
+			sessions don't run discovery (<code>analyzeFromFiles</code> merges them for you). Their
+			<code>message</code> embeds the filesystem error's absolute path, so pass them through
+			<DeclarationLink name="normalizeDiagnosticPaths" /> (from
+			<code>svelte-docinfo/analyze-core.js</code>) before publishing.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="Pre-resolved dependencies (fast path)" />
 		<p>
-			Build tools that already maintain a dependency graph (Gro's filer, Rollup's bundle graph,
-			webpack's module graph) can hand it over by populating
-			<code>SourceFileInfo.dependencies</code> with absolute paths. The session then skips its lex+resolve
-			pass for that entry entirely.
+			Build tools with their own dependency graph (Gro's filer, Rollup's bundle graph, webpack's
+			module graph) can hand it over in <code>SourceFileInfo.dependencies</code> as absolute paths.
+			The session then skips import parsing and resolution for that file.
 		</p>
 		<Code
 			lang="ts"
@@ -170,187 +127,76 @@ const files: Array<SourceFileInfo> = [...filer.modules].map(([id, mod]) => ({
 await session.setFiles(files);`}
 		/>
 		<p>
-			The cache key for the entry shifts to
-			<code>(content, dependencies-element-wise-equal)</code> instead of
-			<code>(content, resolverIdentity)</code>. A fresh array per call cache-hits cleanly as long as
-			the contents match, with no upstream memoization needed. The session snapshots the array at
-			ingest, so mid-flight mutation of the caller's array won't produce false hits.
+			A file re-ingested with the same content and an element-wise equal <code>dependencies</code>
+			array is a cache hit, so building a fresh array per call is fine. See
+			<TomeLink slug="session" hash="Cache-hit-semantics">Cache-hit semantics</TomeLink>.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="Trust contract" />
 		<p>
-			The pre-resolved path is trust mode: the session does not cross-check declared dependencies
-			against the file's <code>content</code>. Two consequences a buggy resolver upstream will hit
-			silently:
+			Pre-resolved dependencies are trusted: the session doesn't check them against
+			<code>content</code>. A buggy upstream resolver goes unnoticed:
 		</p>
 		<ul>
 			<li>
-				Edges declared in <code>dependencies</code> but absent from <code>content</code> are accepted
-				as-is.
+				Edges in <code>dependencies</code> but absent from <code>content</code> are accepted.
 			</li>
 			<li>
-				Edges present in <code>content</code> but missing from <code>dependencies</code> are silently
-				omitted.
+				Imports in <code>content</code> but missing from <code>dependencies</code> are omitted.
 			</li>
 		</ul>
 		<p>
-			There's no diagnostic for either case, because legitimate cross-batch sequences
-			(declare-then-set, declare-then-delete) would produce noise. The lex+resolve fallback path has
-			no such hole; its edges are always grounded in syntactic imports. If you don't fully trust the
-			dependency source you're handing in, use lex+resolve and pay the parse cost.
+			Neither case emits a diagnostic, because legitimate sequences across batches (declaring a
+			dependency on a file that is set later, or later deleted) would be flagged too. The default
+			lex+resolve path always follows the actual imports, so use it if you don't fully trust your
+			dependency source.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
 		<TomeSectionHeader text="Type-only edges" />
 		<p>
-			Whether <code>import type {`{X}`} from './x'</code> shows up as a dependency is the caller's decision
-			under the pre-resolved path. Two common stances:
+			With pre-resolved dependencies, you decide whether
+			<Code lang="ts" inline content={`import type {X} from './x'`} /> counts as a dependency. Two
+			common stances:
 		</p>
 		<ul>
 			<li>
-				<strong>Keep type-only edges</strong>: what default lex+resolve does (<code
-					>es-module-lexer</code
-				>
-				doesn't distinguish them). The output's <code>ModuleJson.dependencies</code> matches the syntactic
-				import set.
+				<strong>Keep type-only edges</strong>: what the default lex+resolve path does, for
+				<Code lang="ts" inline content="import type" />, inline <code>type</code> specifiers, and
+				type-only re-exports like <Code lang="ts" inline content={`export type {X} from`} />.
 			</li>
 			<li>
-				<strong>Drop type-only edges</strong>: what Gro's filer (<code>parse_imports</code> with
-				<code>ignore_types=true</code>) does. Type imports aren't runtime deps; the output reflects
+				<strong>Drop type-only edges</strong>: what Gro's filer does, so the output reflects the
 				runtime graph only.
 			</li>
 		</ul>
 		<p>
-			Both are valid; the pre-resolved path defers the policy to the caller. Switching from
-			lex+resolve to pre-resolved-via-Gro will visibly remove type-only edges from
-			<code>ModuleJson.dependencies</code> / <code>dependents</code> for affected modules.
+			Switching from lex+resolve to Gro's graph therefore removes type-only edges from
+			<code>ModuleJson.dependencies</code> and <code>dependents</code>.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
-		<TomeSectionHeader text="ImportResolver (lex+resolve path)" />
+		<TomeSectionHeader text="Custom import resolution" />
 		<p>
-			When you don't hand over pre-resolved dependencies, the session lexes specifiers from
-			<code>content</code> and passes them through an
-			<DeclarationLink name="ImportResolver" />. Build-tool integrations typically want to wire
-			their own resolver in so module resolution matches what the rest of the build does:
-		</p>
-		<Code
-			lang="ts"
-			content={`import {createAnalysisSession, createSourceOptions} from 'svelte-docinfo';
-import type {ImportResolver} from 'svelte-docinfo';
-
-const resolver: ImportResolver = {
-  identity: 'my-bundler@v1',
-  resolve: (specifier, fromFile) => bundler.resolve(specifier, fromFile),
-};
-
-const session = createAnalysisSession({
-  sourceOptions: createSourceOptions(process.cwd()),
-  resolveImport: resolver,
-});`}
-		/>
-		<p>
-			<code>identity</code> is the stable cache token. See the <TomeLink slug="session" /> guide for why
-			it's required and how to choose one. When omitted entirely, the session lazily constructs a TS +
-			tsconfig default on first use — reusing the compiler options its <code>LanguageService</code>
-			already parsed — but only if at least one file in any batch lacks
-			<code>dependencies</code>. Fully pre-resolved batches never trigger the default at all.
+			Without pre-resolved dependencies, the session parses import specifiers from
+			<code>content</code> and resolves them with TypeScript module resolution and your tsconfig. To
+			match the rest of your build instead, pass an <DeclarationLink name="ImportResolver" /> as
+			<code>resolveImport</code>; see the
+			<TomeLink slug="session" hash="ImportResolver-and-identity">session</TomeLink> guide.
 		</p>
 	</TomeSection>
 
 	<TomeSection>
-		<TomeSectionHeader text="Source options and the source root" />
+		<TomeSectionHeader text="Paths" />
 		<p>
-			<DeclarationLink name="createSourceOptions" /> builds the
-			<DeclarationLink name="ModuleSourceOptions" /> the session needs. Customize for non-default project
-			layouts:
-		</p>
-		<Code
-			lang="ts"
-			content={`import {createSourceOptions} from 'svelte-docinfo';
-
-// Default: single sourcePaths=['src/lib'], test/spec + internal/ exclude.
-const opts = createSourceOptions(process.cwd());
-
-// Monorepo: multiple source directories, optional explicit sourceRoot.
-const monorepoOpts = createSourceOptions(process.cwd(), {
-  sourcePaths: ['packages/a/src', 'packages/b/src'],
-  // sourceRoot derived as longest common prefix when omitted.
-});
-
-// Extend the default exclude (callback form — the array form replaces).
-const customOpts = createSourceOptions(process.cwd(), {
-  exclude: (defaults) => [...defaults, '**/fixtures/**'],
-});`}
-		/>
-		<p>
-			<code>sourceRoot</code> controls module-path stripping in <code>ModuleJson.path</code>: pass
-			<code>'.'</code>
-			for project-relative paths. <code>exclude</code> is the single source of truth for user
-			exclusions, applied at both discovery and analysis time, so a file dropped here never shows up
-			in the output regardless of how it was discovered. The defaults cover tests and the
-			<code>src/lib/internal/</code> convention (<code>**/internal/**</code> — internal modules ship
-			for public modules to import but aren't documented); an array override replaces them
-			wholesale, while the callback form extends them without restating them. Beneath both sits an
-			always-on baseline that
-			<code>exclude</code> overrides can't strip: <code>node_modules</code> and dot-directories
-			below a matched source path are never source. The baseline matches relative to the matched
-			source path, so an explicit dot-directory source path (<code
-				>sourcePaths: ['.hidden/src']</code
-			>) still works — that relativity is the opt-out.
-		</p>
-		<p>
-			<code>sourcePaths</code> entries and <code>sourceRoot</code> are projectRoot-relative;
-			absolute entries inside the root are accepted and stored root-relative, while an entry
-			resolving outside the root throws at options creation — out-of-root modules are
-			unrepresentable, since <code>ModuleJson.path</code> is <code>sourceRoot</code>-relative and
-			<code>Diagnostic.file</code> project-root-relative, and neither can reach outside the root.
-			The same accept-or-throw rule covers absolute
-			<code>exclude</code> globs (and <code>include</code> patterns at the discovery entry points), so
-			discovery and analysis always see the same relative pattern.
-		</p>
-	</TomeSection>
-
-	<TomeSection>
-		<TomeSectionHeader text="Paths: POSIX-form contract" />
-		<p>
-			Every path stored, compared, or used as a Map/Set key inside the analyzer is POSIX form
-			(forward slashes). Native paths are accepted at the public-API boundary and posixified at
-			ingest, so Windows callers can hand in
-			<code>C:\\repo\\src\\lib\\foo.ts</code> without thinking about it, but the resulting
-			<code>ModuleJson.path</code>, <code>Diagnostic.file</code>, and session
-			<code>list()</code> output report POSIX form.
-		</p>
-		<p>
-			Out of scope: drive-letter case normalization (<code>C:\\</code> vs <code>c:\\</code>) and
-			Windows extended-length <code>\\\\?\\</code> prefixes. See
-			<ModuleLink module_path="paths.ts">paths.ts</ModuleLink> for the chokepoint implementation.
-		</p>
-	</TomeSection>
-
-	<TomeSection>
-		<TomeSectionHeader text="Concurrency caps" />
-		<p>
-			Two bounded-concurrency caps protect against runaway parallelism in the integration paths:
-		</p>
-		<ul>
-			<li>
-				<code>MAX_FILE_CONCURRENCY</code> caps parallel <code>readFile</code> calls (used by
-				<code>files.globFiles</code>, <code>exports.discoverFromExports</code>).
-			</li>
-			<li>
-				<code>MAX_RESOLVE_CONCURRENCY</code> caps parallel resolver calls (used by the session's phase-2
-				lex+resolve pass).
-			</li>
-		</ul>
-		<p>
-			Same numerical value today, named separately for future independent tuning. Both run through a
-			fail-fast, order-preserving worker pool (<code>map_concurrent</code> in
-			<ModuleLink module_path="concurrency.ts">concurrency.ts</ModuleLink>).
+			Native paths are accepted at the API boundary, so Windows callers can pass
+			<code>C:\repo\src\lib\foo.ts</code>. Every path in the output, and the session's
+			<code>list()</code>, is POSIX form (forward slashes). Drive-letter case and <code>\\?\</code>
+			prefixes aren't normalized.
 		</p>
 	</TomeSection>
 </TomeContent>

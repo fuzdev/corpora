@@ -8,7 +8,7 @@ import '../assert_dev_env.ts';
  * these spawn fuz_app's own TS impl over real HTTP with no domain layer, so
  * the `cross_backend_ts_node` / `cross_backend_ts_deno` / `cross_backend_ts_bun`
  * self-test projects verify fuz_app's wire path in its own repo across all
- * three JS runtimes. All run against in-memory PGlite (`memory://`) — no
+ * three JS runtimes. All run against in-memory pglet (`memory://`) — no
  * external Postgres, unlike the Rust path.
  *
  * The binary writes its daemon token to `{FUZ_TESTING_TS_SPINE_DIR}/run/daemon_token`;
@@ -19,47 +19,84 @@ import '../assert_dev_env.ts';
  */
 
 import type { BackendConfig } from './backend_config.ts';
-import { build_test_backend_paths } from './build_test_backend_paths.ts';
+import type { BackendCapabilities } from './capabilities.ts';
+import { default_test_backend_paths } from './build_test_backend_paths.ts';
 import {
-	LOGIN_RATE_LIMIT_ENABLED_ENV,
+	action_rate_limit_env,
 	make_default_ts_backend_config,
+	timing_env,
 	ts_default_capabilities
 } from './default_backend_configs.ts';
-import { SPINE_SSE_PATH } from './spine_surface_constants.ts';
-
-/** Env var naming the backend root dir; `{dir}/run/daemon_token` must match `bootstrap.daemon_token_path`. */
-export const TS_SPINE_DIR_ENV = 'FUZ_TESTING_TS_SPINE_DIR';
+import {
+	LOGIN_RATE_LIMIT_ENABLED_ENV,
+	SPINE_SSE_PATH,
+	TESTING_BACKDOOR_METHODS,
+	TS_SPINE_DIR_ENV
+} from './spine_surface_constants.ts';
 
 /**
- * Capabilities for the TS spine binary — `ts_default_capabilities` plus `sse`
+ * Capabilities for the TS spine binary — `ts_default_capabilities` with every `MountFlag` stated, all `true`: `ws`
+ * (the binary mounts `/api/ws` through `create_app_server`'s `ws_endpoints`),
+ * `cell_crud` + `cell_relations` (`full_spine_mount` live-mounts the full cell
+ * surface over the `fuz_cell` namespace), `fact_serving` (the cell-gated serve
+ * route, the `fuz_facts` namespace and `_testing_put_fact`),
+ * `fact_serving_admin_hash` (the admin bare-hash route), `sse`
  * (the binary wires `audit_log_sse`), `ready` (the binary live-mounts the
  * `/ready` deploy gate in `build_spine_app`), `peer_request` (the backend
  * WS transport's `request_connection` path drives server→client `peer/ping`),
- * and `cell_gated_create` (the binary's `full_spine_mount` mounts the
- * `test_cell_gated_create_authorize` policy).
+ * `ws_account_actions` (the binary mounts its full action set on `/api/ws`,
+ * the account actions among them),
+ * `cell_gated_create` (the binary's `full_spine_mount` mounts the
+ * `test_cell_gated_create_authorize` policy), and `ws_role_gated` (the binary
+ * mounts the role-gated WS endpoint at `SPINE_ROLE_GATED_WS_PATH`), and every
+ * `TESTING_BACKDOOR_METHODS` entry as `testing_backdoors` (`full_spine_mount`
+ * mounts them all, on `/api/rpc` and `/api/ws`). The Node
+ * binary's preset; `ws_refusal_body` stays `false`, as `@hono/node-ws` drops a
+ * refused upgrade's body.
  */
-const ts_spine_capabilities = Object.freeze({
+const ts_spine_capabilities: BackendCapabilities = Object.freeze({
 	...ts_default_capabilities,
+	ws: true,
 	sse: true,
+	cell_crud: true,
+	cell_relations: true,
+	fact_serving: true,
+	fact_serving_admin_hash: true,
 	ready: true,
 	peer_request: true,
-	cell_gated_create: true
+	ws_account_actions: true,
+	cell_gated_create: true,
+	ws_role_gated: true,
+	testing_backdoors: TESTING_BACKDOOR_METHODS
+});
+
+/**
+ * Capabilities for the **Deno** spine binary — `ts_spine_capabilities` with
+ * `ws_refusal_body: true` (`Deno.upgradeWebSocket` leaves a refused upgrade's
+ * response to Hono, body included).
+ */
+const ts_spine_deno_capabilities = Object.freeze({
+	...ts_spine_capabilities,
+	ws_refusal_body: true
 });
 
 /**
  * Capabilities for the **Bun** spine binary — `ts_spine_capabilities` with
- * `oversized_reject_closes_connection: false`. `Bun.serve` drains the declared
- * `Content-Length` of an oversized-body `413` reject and keeps the socket
- * alive (processing the correctly-framed pipelined request) even when the
- * response carries `Connection: close`, unlike `@hono/node-server` / Deno /
- * hyper, which close. Bun is not insecure — it frames on `Content-Length`, so
- * there is no desync — but the smuggling suite's strong "connection closes"
- * assertion doesn't hold; this flag routes Bun onto the suite's no-desync arm.
- * See `docs/security.md` §"Body Size Limiting".
+ * `ws_handshake_pipelining: false` and `ws_refusal_body: true` (`Bun.serve`
+ * sends a refused upgrade's response as built).
+ *
+ * `Bun.serve` answers `400` to an upgrade request that carries WebSocket
+ * frames in the same TCP write when the handler upgrades after an await that
+ * yields to the event loop — a timer, I/O; the spine's does, behind the auth
+ * middleware's database reads — so the WS suite's frames-with-the-handshake
+ * case has nothing to drive there (observed on Bun 1.4.3; an upgrade made
+ * synchronously in `fetch`, or after an await that settles in the same
+ * microtask run, takes the frames).
  */
 const ts_spine_bun_capabilities = Object.freeze({
 	...ts_spine_capabilities,
-	oversized_reject_closes_connection: false
+	ws_handshake_pipelining: false,
+	ws_refusal_body: true
 });
 
 /** Default port for the Node TS spine binary — slots beside the Rust `spine_stub` (1177). */
@@ -83,8 +120,17 @@ export const TS_SPINE_BUN_ENTRY = 'src/test/cross_backend/testing_spine_server_b
 export interface TsSpineBackendConfigOptions {
 	/** Listening port. Defaults per runtime (`1178` Node, `1179` Deno, `1180` Bun). */
 	readonly port?: number;
-	/** Database URL. Default `'memory://'` (in-memory PGlite). */
+	/** Database URL. Default `'memory://'` (in-memory pglet). */
 	readonly database_url?: string;
+	/**
+	 * Backend name — labels the spawn in errors and logs, and names its
+	 * directory under `os.tmpdir()` (`default_test_backend_paths`, namespaced
+	 * by the running repo). Defaults per runtime (`ts_spine_node`,
+	 * `ts_spine_deno`, `ts_spine_bun`). Give each
+	 * backend spawned alongside another of its runtime its own name, so their
+	 * bootstrap and daemon-token files don't collide.
+	 */
+	readonly name?: string;
 	/**
 	 * Enable the per-IP + per-account login rate limiters on the spawned binary
 	 * (`FUZ_LOGIN_RATE_LIMIT_ENABLED=true`). Off by default — the standard cross
@@ -96,6 +142,46 @@ export interface TsSpineBackendConfigOptions {
 	 * client IP. Mirrors `SpineStubBackendConfigOptions.enable_login_rate_limit`.
 	 */
 	readonly enable_login_rate_limit?: boolean;
+	/**
+	 * Enable the action rate limiters (`FUZ_ACTION_RATE_LIMIT_ENABLED=true`) —
+	 * one per-IP and one per-account limiter shared by the RPC and WS
+	 * endpoints. Off by default, like `enable_login_rate_limit`; set only for
+	 * the dedicated security cross project, which drives them through
+	 * `ws_action_rate_limit.ts`. Mirrors `SpineStubBackendConfigOptions.enable_action_rate_limit`.
+	 */
+	readonly enable_action_rate_limit?: boolean;
+	/**
+	 * Replace both action limiters' `max_attempts`
+	 * (`FUZ_ACTION_RATE_LIMIT_MAX_ATTEMPTS`) so a suite reaches the cap in a few
+	 * calls. Requires `enable_action_rate_limit` — the binary refuses to boot
+	 * otherwise. Mirrors `SpineStubBackendConfigOptions.action_rate_limit_max_attempts`.
+	 */
+	readonly action_rate_limit_max_attempts?: number;
+	/**
+	 * Replace the audit stream's keep-alive interval
+	 * (`FUZ_AUDIT_SSE_KEEP_ALIVE_MS`), so a suite sees keep-alives without
+	 * waiting out the 15 s default. Mirrors
+	 * `SpineStubBackendConfigOptions.audit_sse_keep_alive_ms`.
+	 */
+	readonly audit_sse_keep_alive_ms?: number;
+	/**
+	 * Replace the WS endpoints' receive timeout (`FUZ_WS_RECEIVE_TIMEOUT_MS`),
+	 * so a suite sees a silent socket closed without waiting out the 60 s
+	 * default. Mirrors `SpineStubBackendConfigOptions.ws_receive_timeout_ms`.
+	 */
+	readonly ws_receive_timeout_ms?: number;
+	/**
+	 * Replace the request pool checkout bound (`FUZ_DB_CHECKOUT_TIMEOUT_MS`).
+	 * Postgres only — over `memory://` the binary warns and runs unbounded.
+	 * Mirrors `SpineStubBackendConfigOptions.db_checkout_timeout_ms`.
+	 */
+	readonly db_checkout_timeout_ms?: number;
+	/**
+	 * Replace the audit write pool checkout bound
+	 * (`FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS`), Postgres only. Mirrors
+	 * `SpineStubBackendConfigOptions.db_audit_checkout_timeout_ms`.
+	 */
+	readonly db_audit_checkout_timeout_ms?: number;
 }
 
 /**
@@ -109,14 +195,18 @@ const login_rate_limit_env = (enable: boolean | undefined): Record<string, strin
 
 /**
  * `BackendConfig` for the Node TS spine binary — spawned via `gro run`
- * (Gro's TS loader resolves the `$lib`-free entry's relative imports).
+ * (Gro's TS loader resolves the entry's relative imports).
  */
 export const ts_spine_node_backend_config = (
 	options: TsSpineBackendConfigOptions = {}
 ): BackendConfig => {
-	const { port = TS_SPINE_NODE_DEFAULT_PORT, database_url, enable_login_rate_limit } = options;
-	const name = 'ts_spine_node';
-	const paths = build_test_backend_paths(name);
+	const {
+		port = TS_SPINE_NODE_DEFAULT_PORT,
+		database_url,
+		enable_login_rate_limit,
+		name = 'ts_spine_node'
+	} = options;
+	const paths = default_test_backend_paths(name);
 	return {
 		...make_default_ts_backend_config({
 			name,
@@ -124,9 +214,11 @@ export const ts_spine_node_backend_config = (
 			start_command: ['gro', 'run', TS_SPINE_NODE_ENTRY],
 			database_url,
 			paths,
+			daemon_token_dir_env: TS_SPINE_DIR_ENV,
 			extra_env: {
-				[TS_SPINE_DIR_ENV]: paths.root,
-				...login_rate_limit_env(enable_login_rate_limit)
+				...login_rate_limit_env(enable_login_rate_limit),
+				...action_rate_limit_env(options),
+				...timing_env(options)
 			},
 			capabilities: ts_spine_capabilities
 		}),
@@ -135,17 +227,20 @@ export const ts_spine_node_backend_config = (
 };
 
 /**
- * `BackendConfig` for the Bun TS spine binary — spawned via `bun run`. Bun
- * resolves the entry's relative `.js`→`.ts` source specifiers natively (no
- * flag needed — unlike Deno's `--sloppy-imports`, and like Gro's loader on
- * the Node path), and `Bun.serve` + `hono/bun` need no extra deps.
+ * `BackendConfig` for the Bun TS spine binary — spawned via `bun run`.
+ * `Bun.serve` is built in; the WS upgrade comes from the optional `@hono/bun`
+ * peer dep.
  */
 export const ts_spine_bun_backend_config = (
 	options: TsSpineBackendConfigOptions = {}
 ): BackendConfig => {
-	const { port = TS_SPINE_BUN_DEFAULT_PORT, database_url, enable_login_rate_limit } = options;
-	const name = 'ts_spine_bun';
-	const paths = build_test_backend_paths(name);
+	const {
+		port = TS_SPINE_BUN_DEFAULT_PORT,
+		database_url,
+		enable_login_rate_limit,
+		name = 'ts_spine_bun'
+	} = options;
+	const paths = default_test_backend_paths(name);
 	return {
 		...make_default_ts_backend_config({
 			name,
@@ -153,9 +248,11 @@ export const ts_spine_bun_backend_config = (
 			start_command: ['bun', 'run', TS_SPINE_BUN_ENTRY],
 			database_url,
 			paths,
+			daemon_token_dir_env: TS_SPINE_DIR_ENV,
 			extra_env: {
-				[TS_SPINE_DIR_ENV]: paths.root,
-				...login_rate_limit_env(enable_login_rate_limit)
+				...login_rate_limit_env(enable_login_rate_limit),
+				...action_rate_limit_env(options),
+				...timing_env(options)
 			},
 			capabilities: ts_spine_bun_capabilities
 		}),
@@ -167,19 +264,17 @@ export const ts_spine_bun_backend_config = (
  * `BackendConfig` for the Deno TS spine binary. The `--allow-*` set mirrors
  * the cross-process needs (net + read/write for the daemon-token file + env
  * + sys); `--unstable-detect-cjs` matches the ecosystem's Deno test entries.
- *
- * `--sloppy-imports` is required because the binary imports fuz_app **source**
- * via relative `.js` specifiers (the `src/lib` convention) — Deno resolves
- * `.js`→`.ts` only under this flag, whereas Gro's loader (the Node path)
- * does so natively. (zzz's Deno entry sidesteps it by importing fuz_app as a
- * built package; this binary tests live source instead.)
  */
 export const ts_spine_deno_backend_config = (
 	options: TsSpineBackendConfigOptions = {}
 ): BackendConfig => {
-	const { port = TS_SPINE_DENO_DEFAULT_PORT, database_url, enable_login_rate_limit } = options;
-	const name = 'ts_spine_deno';
-	const paths = build_test_backend_paths(name);
+	const {
+		port = TS_SPINE_DENO_DEFAULT_PORT,
+		database_url,
+		enable_login_rate_limit,
+		name = 'ts_spine_deno'
+	} = options;
+	const paths = default_test_backend_paths(name);
 	return {
 		...make_default_ts_backend_config({
 			name,
@@ -195,16 +290,17 @@ export const ts_spine_deno_backend_config = (
 				'--allow-ffi',
 				'--allow-run',
 				'--unstable-detect-cjs',
-				'--sloppy-imports',
 				TS_SPINE_DENO_ENTRY
 			],
 			database_url,
 			paths,
+			daemon_token_dir_env: TS_SPINE_DIR_ENV,
 			extra_env: {
-				[TS_SPINE_DIR_ENV]: paths.root,
-				...login_rate_limit_env(enable_login_rate_limit)
+				...login_rate_limit_env(enable_login_rate_limit),
+				...action_rate_limit_env(options),
+				...timing_env(options)
 			},
-			capabilities: ts_spine_capabilities
+			capabilities: ts_spine_deno_capabilities
 		}),
 		sse_path: SPINE_SSE_PATH
 	};

@@ -20,26 +20,47 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			Analysis accumulates errors and warnings without halting. A failing declaration is marked
-			<code>partial: true</code> and the rest of the module still analyzes. Detail lands in an array
-			of <DeclarationLink name="Diagnostic" /> entries, alongside <code>modules</code> in the result.
+			Analysis accumulates errors and warnings without halting, as an array of
+			<DeclarationLink name="Diagnostic" /> entries alongside <code>modules</code> in the result.
+			Identical diagnostics are reported once.
 		</p>
 
 		<TomeSection>
 			<TomeSectionHeader text="Two-tier error model" />
 			<p>
-				<strong>Accumulated (non-fatal)</strong>: appended to the
-				<DeclarationLink name="Diagnostic" /> array, analysis continues. Covers type resolution failures,
-				member or prop extraction failures, and JSDoc tag misuse. The return value is still valid but
-				may carry <code>partial: true</code> on affected declarations.
+				<strong>Accumulated (non-fatal)</strong>: appended to the diagnostics array while analysis
+				continues. Covers type resolution failures, member or prop extraction failures, and JSDoc
+				tag misuse. The result is still valid (see <a href="#severity-vs-partial">partial</a>).
 			</p>
 			<p>
-				<strong>Thrown (fatal)</strong>: a small set of setup-level conditions throws from public
-				entry points: missing <code>tsconfig.json</code>, Svelte &lt;5 detected, or
-				<code>discovery: 'exports'</code> mode with no resolvable exports. Wrap the top-level
-				<code>analyze</code> / <code>analyzeFromFiles</code> call if you want to handle these.
-				svelte2tsx transformation failures are <em>not</em> thrown; they flow as
-				<code>transform_failed</code> diagnostics.
+				<strong>Thrown (fatal)</strong>: setup-level problems throw from the public entry points:
+			</p>
+			<ul>
+				<li>
+					a missing or unloadable <code>tsconfig.json</code>: one that fails to parse, or an
+					<code>extends</code> target that doesn't exist, like SvelteKit's generated tsconfig before
+					<code>svelte-kit sync</code> has run
+				</li>
+				<li>Svelte older than 5</li>
+				<li>
+					invalid source options: empty <code>sourcePaths</code>, a path or absolute pattern outside
+					<code>projectRoot</code>, or <code>sourcePaths</code> not under <code>sourceRoot</code>
+				</li>
+				<li>
+					conflicting options: <Code lang="ts" inline content="discovery: 'exports'" /> with
+					<code>include</code>, or <code>resolveImport</code> with
+					<Code lang="ts" inline content="resolveDependencies: false" />
+				</li>
+				<li>
+					<Code lang="ts" inline content="discovery: 'exports'" /> when <code>exports</code> is
+					missing or resolves to no files, or when the source paths share no common prefix
+				</li>
+				<li>a name collision under <Code lang="ts" inline content="onDuplicates: 'throw'" /></li>
+			</ul>
+			<p>
+				Wrap <code>analyze</code> / <code>analyzeFromFiles</code>, or
+				<code>createAnalysisSession</code> and <code>query</code>, to handle these. svelte2tsx
+				failures don't throw; they surface as <code>transform_failed</code>.
 			</p>
 		</TomeSection>
 
@@ -47,46 +68,36 @@
 			<TomeSectionHeader text="Shape" />
 			<p>
 				<code>diagnostics</code> is a plain
-				<code>Array&lt;<DeclarationLink name="Diagnostic" />&gt;</code>, no wrapper, no methods.
-				Round-trips through <code>JSON.stringify</code> / <code>z.array(Diagnostic).parse</code>, so
-				it serializes alongside <code>modules</code> in CLI output and rehydrates cleanly.
-			</p>
-			<Code
-				lang="ts"
-				content={`{
-  modules: ModuleJson[],
-  diagnostics: Diagnostic[]
-}`}
-			/>
-			<p>
-				Each <DeclarationLink name="Diagnostic" /> carries:
+				<code>Array&lt;<DeclarationLink name="Diagnostic" />&gt;</code> beside <code>modules</code>
+				in <DeclarationLink name="AnalyzeResultJson" />. It round-trips through
+				<code>JSON.stringify</code> and <DeclarationLink name="parseDiagnostics" />. Each entry
+				carries:
 			</p>
 			<ul>
 				<li><code>kind</code>: discriminant, one per failure mode (see table below)</li>
-				<li><code>severity</code>: <code>"error"</code> or <code>"warning"</code></li>
 				<li>
-					<code>file</code>: POSIX-form, project-relative (no leading <code>./</code>). Rejoin with
-					<code>projectRoot</code> for absolute paths — including a file outside the project, which
-					takes the <code>../</code> form so the rejoin still recovers it. It names a
-					<em>file</em>, not a module:
-					<code>ModuleJson.path</code> is relative to <code>sourceRoot</code>, so
-					<code>modules.find((m) =&gt; m.path === d.file)</code> is not a valid lookup (that idiom applies
-					to module paths in printed type text, which are a different string).
+					<code>severity</code>: <Code lang="ts" inline content={'"error"'} /> or
+					<Code lang="ts" inline content={'"warning"'} />
+				</li>
+				<li>
+					<code>file</code>: POSIX-form and relative to the project root, with no leading
+					<code>./</code>; a file outside the project takes the <code>../</code> form. Join with
+					<code>projectRoot</code> to get the absolute path. It names a <em>file</em>, not a module:
+					<code>ModuleJson.path</code> is relative to <code>sourceRoot</code>, so don't look modules
+					up by <code>file</code>.
 				</li>
 				<li>
 					<code>line</code>, <code>column</code>: 1-based, optional. Absent when there's no precise
-					AST node (e.g., a module-level skip). Positions from a Svelte
-					<code>&lt;script module&gt;</code> are remapped to the original <code>.svelte</code> source;
-					an unmappable position is dropped rather than published as a line in the svelte2tsx output
+					position (e.g., a module-level skip). Positions in Svelte files point at the original
+					<code>.svelte</code> source; one that can't be mapped is omitted
 				</li>
 				<li>
-					<code>message</code>: human-readable description. Scrubbed of project-root paths and
-					svelte2tsx virtual suffixes like <code>file</code>, so no diagnostic carries an absolute
-					path.
+					<code>message</code>: human-readable description, with project-root paths made relative
+					like <code>file</code>
 				</li>
 				<li>
-					additional fields specific to the variant: <code>symbolName</code>,
-					<code>className</code>, <code>tagName</code>, etc.
+					fields specific to the kind: <code>symbolName</code>, <code>className</code>,
+					<code>tagName</code>, etc.
 				</li>
 			</ul>
 		</TomeSection>
@@ -94,9 +105,17 @@
 		<TomeSection>
 			<TomeSectionHeader text="Diagnostic kinds" />
 			<p>
-				Severity is stable per kind: every kind below is <code>warning</code> severity except
+				Severity is fixed per kind: every kind is a <code>warning</code> except
 				<code>transform_failed</code> and <code>module_unreadable</code>, which are always
 				<code>error</code>.
+			</p>
+			<p>
+				The table below marks each kind's lifecycle. <strong>Ingest-time</strong> kinds surface when
+				files are ingested and persist with the file until it is re-ingested or deleted,
+				<strong>discovery-time</strong> comes from file discovery, and unmarked kinds are recomputed
+				on every analysis pass. See the
+				<TomeLink slug="session" hash="Diagnostics-ingest-time-vs-query-time">session</TomeLink>
+				guide for how they combine.
 			</p>
 			<table>
 				<thead>
@@ -109,171 +128,289 @@
 					<tr>
 						<td><code>type_extraction_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> type resolution threw on a symbol.
-							<strong>Consequence:</strong> declaration included with <code>partial: true</code> and
-							empty <code>typeSignature</code>.
+							<strong>Trigger:</strong> type resolution threw on a declaration or member.
+							<strong>Consequence:</strong> it's included with
+							<Code lang="ts" inline content="partial: true" />; <code>typeSignature</code> and
+							<code>typeInfo</code> may be absent.
 						</td>
 					</tr>
 					<tr>
 						<td><code>signature_analysis_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> function or method signature analysis threw, usually
-							circular generics or unresolved call signatures.
-							<strong>Consequence:</strong> declaration included with <code>partial: true</code>;
-							parameters and overloads may be empty.
+							<strong>Trigger:</strong> function or method signature analysis threw.
+							<strong>Consequence:</strong> declaration included with
+							<Code lang="ts" inline content="partial: true" />; parameters and overloads may be
+							empty.
 						</td>
 					</tr>
 					<tr>
 						<td><code>class_member_failed</code></td>
 						<td>
 							<strong>Trigger:</strong> one member of a class couldn't be analyzed.
-							<strong>Consequence:</strong> member included with <code>partial: true</code>;
-							siblings still extract normally.
+							<strong>Consequence:</strong> member included with
+							<Code lang="ts" inline content="partial: true" />; siblings still extract normally.
 						</td>
 					</tr>
 					<tr>
 						<td><code>svelte_prop_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> a Svelte component prop type couldn't be resolved through
-							the checker. <strong>Consequence:</strong> per-prop type resolution failures fall back
-							to <code>"any"</code> for that prop with siblings unaffected; when the whole
-							<code>$props&lt;T&gt;()</code> annotation type is itself unresolvable, the component's
-							<code>props</code> array drops to empty.
-						</td>
-					</tr>
-					<tr>
-						<td><code>legacy_props</code></td>
-						<td>
-							<strong>Trigger:</strong> a component declares props with legacy
-							<code>export let</code> syntax — still-legal Svelte 5, but prop extraction anchors on
-							<code>$props()</code>, so nothing was extracted. <code>propNames</code> lists the
-							detected props. <strong>Consequence:</strong> the component emits with empty
-							<code>props</code>; migrate to <code>$props()</code>.
+							<strong>Trigger:</strong> a Svelte component prop type couldn't be resolved.
+							<strong>Consequence:</strong> that prop's type falls back to
+							<Code lang="ts" inline content={'"any"'} />; if the whole props type on
+							<code>$props()</code> is unresolvable, <code>props</code> is empty. When the check for
+							a <code>children</code> snippet fails, only template use of <code>children</code> can
+							set <code>acceptsChildren</code>. A legacy
+							<Code lang="ts" inline content="export let" /> component whose svelte2tsx output has
+							no recognized props type reports each exported prop, at its export's line, and has
+							empty <code>props</code>.
 						</td>
 					</tr>
 					<tr>
 						<td><code>module_skipped</code></td>
 						<td>
-							<strong>Trigger:</strong> whole module skipped during the analysis pass.
-							<code>reason</code> narrows to <code>"not_in_program"</code>,
-							<code>"no_analyzer"</code>, or <code>"requires_program"</code>.
-							<strong>Consequence:</strong> module absent from <code>modules[]</code>.
+							<strong>Trigger:</strong> a whole module was skipped during analysis.
+							<code>reason</code> is <Code lang="ts" inline content={'"not_in_program"'} /> (the
+							file wasn't in the TypeScript program),
+							<Code lang="ts" inline content={'"no_analyzer"'} /> (unsupported extension), or
+							<Code lang="ts" inline content={'"requires_program"'} /> (a Svelte file passed to
+							<code>analyzeModule</code> directly). <strong>Consequence:</strong> module absent from
+							<code>modules[]</code>.
 						</td>
 					</tr>
 					<tr>
 						<td><code>module_unreadable</code></td>
 						<td>
-							<strong>Trigger:</strong> file named in <code>package.json</code> exports exists but
-							<code>readFile</code> failed (permission denied, FS error).
-							<strong>Consequence:</strong> file dropped from the discovered set.
-							<strong>Discovery-time.</strong>
+							<strong>Trigger:</strong> a file named by <code>package.json</code> exports couldn't
+							be read (permission denied, FS error). <strong>Consequence:</strong> the file is
+							dropped from the discovered set. <strong>Discovery-time.</strong>
 						</td>
 					</tr>
 					<tr>
 						<td><code>import_parse_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> import parsing failed during dependency resolution.
-							<strong>Consequence:</strong> the dependency edge is dropped; the module itself still
-							analyzes. <strong>Ingest-time.</strong>
+							<strong>Trigger:</strong> import scanning threw during dependency resolution (not
+							expected: the parse tolerates malformed source). <strong>Consequence:</strong> the
+							module's dependency edges are dropped; the module still analyzes.
+							<strong>Ingest-time.</strong>
 						</td>
 					</tr>
 					<tr>
 						<td><code>duplicate_comment</code></td>
 						<td>
-							<strong>Trigger:</strong> two sources supplied a comment for the same target (HTML
-							<code>@component</code> + script JSDoc, or multiple <code>@module</code> comments).
-							<code>commentType</code> narrows to <code>"module_comment"</code> or
-							<code>"doc_comment"</code>. <strong>Consequence:</strong> the higher-priority source
-							wins: JSDoc for doc comments; instance <code>&lt;script&gt;</code> &gt;
-							<code>&lt;script module&gt;</code> &gt; HTML comment for module comments.
+							<strong>Trigger:</strong> two sources supplied a comment for the same target: an HTML
+							<code>@component</code> comment plus script JSDoc, either with prose or a tag
+							(<Code lang="ts" inline content={'commentType: "doc_comment"'} />), or several
+							<code>@module</code> sources in a Svelte file
+							(<Code lang="ts" inline content={'"module_comment"'} />).
+							<strong>Consequence:</strong> the higher-priority source wins whole: script JSDoc for
+							doc comments, its prose and tags replacing the HTML comment's even when the JSDoc
+							holds tags alone; instance <Code lang="svelte" inline content={'<' + 'script>'} />,
+							then <Code lang="svelte" inline content={'<' + 'script module>'} />, then HTML for
+							module comments, skipping one that holds only dropped tags.
+						</td>
+					</tr>
+					<tr>
+						<td><code>component_comment_mismatch</code></td>
+						<td>
+							<strong>Trigger:</strong> svelte2tsx, and so editor hover, would document a component
+							with a different HTML comment than the analyzer: it takes the last comment containing
+							<code>@component</code> anywhere, the analyzer the first with <code>@component</code>
+							at a line start. A second component comment or a passing mention (a backticked
+							<code>@component</code> in a module comment) causes it. <strong>Consequence:</strong>
+							the analyzer's pick documents the component, and <code>line</code> points at
+							svelte2tsx's; reword that comment's <code>@component</code> so the two agree.
 						</td>
 					</tr>
 					<tr>
 						<td><code>misplaced_tag</code></td>
 						<td>
-							<strong>Trigger:</strong> symbol-scope tag (<code>@example</code>,
+							<strong>Trigger:</strong> a symbol-scope tag (<code>@example</code>,
 							<code>@deprecated</code>, <code>@internal</code>, <code>@since</code>,
-							<code>@see</code>, <code>@throws</code>, <code>@mutates</code>,
-							<code>@default</code>, <code>@nodocs</code>) found on a non-primary overload
-							signature, or
-							<code>@nodocs</code> in a <code>@module</code> comment (where it has no meaning;
-							<code>functionName</code> is absent in that case).
-							<strong>Consequence:</strong> the tag is dropped; move it to the primary signature —
-							or, to omit a module from analysis, use <code>exclude</code> patterns.
+							<code>@see</code>, <code>@throws</code>, <code>@mutates</code>, <code>@default</code>,
+							<code>@nodocs</code>) on a non-primary overload signature, or a tag that only
+							describes a declaration (<code>@param</code>, <code>@returns</code>,
+							<code>@mutates</code>, <code>@throws</code>, <code>@default</code>,
+							<code>@nodocs</code>, <code>@cssprop</code>) in a <code>@module</code> comment (then
+							<code>functionName</code> is absent), or a <code>@cssprop</code> on an exported
+							declaration other than a component (<code>functionName</code> names it).
+							<strong>Consequence:</strong> the tag is dropped. On an overload, move it to the
+							primary signature; a <code>@cssprop</code> belongs in the component's doc comment. To
+							omit a module, use <code>exclude</code> patterns rather than <code>@nodocs</code>.
+							Overloads a member borrows through its type
+							(<Code lang="ts" inline content="m: typeof fn" />) never warn; the lending function's
+							own analysis checks its tags.
+						</td>
+					</tr>
+					<tr>
+						<td><code>implementation_doc_hidden</code></td>
+						<td>
+							<strong>Trigger:</strong> an overloaded function, method, or constructor documents its
+							implementation: a TS implementation's JSDoc, or in JS a block with no
+							<code>@overload</code> tag beside the ones that have one, carrying prose or doc tags
+							(a block of types alone doesn't fire). <strong>Consequence:</strong> the
+							implementation's docs are hidden, as TypeScript's hover hides them, and an
+							implementation <code>@nodocs</code> hides nothing. Move the docs to the first
+							overload. <code>functionName</code> names the function.
 						</td>
 					</tr>
 					<tr>
 						<td><code>unknown_param</code></td>
 						<td>
-							<strong>Trigger:</strong> <code>@param</code> key didn't match any actual parameter
-							(typo or stale doc after a rename). <strong>Consequence:</strong> the description is dropped.
+							<strong>Trigger:</strong> a <code>@param</code> key matches no parameter (a typo, or a
+							stale doc after a rename). <strong>Consequence:</strong> the description is dropped.
+						</td>
+					</tr>
+					<tr>
+						<td><code>unknown_cssprop</code></td>
+						<td>
+							<strong>Trigger:</strong> a component's <code>@cssprop</code> names a property
+							(<code>propertyName</code>) the component never reads through <code>var()</code>, in
+							its <Code lang="svelte" inline content={'<' + 'style>'} /> or its markup's static
+							style text: a typo, a stale tag, or a property it leaves for its children (reads
+							aren't resolved across components). <code>line</code> is the tag's. Not emitted when
+							the style isn't read (<code>css_parse_failed</code>,
+							<code>css_lang_unsupported</code>). <strong>Consequence:</strong> none; the entry
+							stays in <code>cssCustomProperties</code>,
+							<Code lang="ts" inline content="documented: true" />.
+						</td>
+					</tr>
+					<tr>
+						<td><code>cssprop_default_mismatch</code></td>
+						<td>
+							<strong>Trigger:</strong> a component's <code>@cssprop</code> documents a default
+							(<code>[--a=1px]</code>, carried in <code>default</code>) that differs from the
+							fallback its style gives the property (<code>fallback</code>: the first
+							<code>var()</code> read's, or an <code>@property</code> rule's
+							<code>initial-value</code>), compared as text with whitespace runs collapsed, so an
+							equivalent spelling (<code>red</code> against <code>#f00</code>) warns too.
+							<code>line</code> is the read's. Not emitted when the style isn't read.
+							<strong>Consequence:</strong> none; the entry keeps both values.
+						</td>
+					</tr>
+					<tr>
+						<td><code>malformed_tag</code></td>
+						<td>
+							<strong>Trigger:</strong> a <code>@cssprop</code> (<code>tagName</code>) in a
+							component's doc comment whose text names no <code>--</code> property: a name without
+							the dashes, an unclosed <code>{'{…}'}</code> or <code>[…]</code>, an empty tag.
+							<code>line</code> is the tag's. On any other declaration the tag warns
+							<code>misplaced_tag</code> instead. <strong>Consequence:</strong> the tag is dropped.
+						</td>
+					</tr>
+					<tr>
+						<td><code>duplicate_tag</code></td>
+						<td>
+							<strong>Trigger:</strong> a <code>@cssprop</code> (<code>tagName</code>) in a
+							component's doc comment repeats a property (<code>key</code>) an earlier tag names.
+							<code>line</code> is the later tag's. <strong>Consequence:</strong> the first tag
+							wins; this one is dropped.
 						</td>
 					</tr>
 					<tr>
 						<td><code>alias_lost</code></td>
 						<td>
-							<strong>Trigger:</strong> an exported type alias's right-hand side (an indexed access
-							or conditional — <code>z.infer&lt;typeof S&gt;</code> and friends) resolves to a type
-							the checker keeps no name for, and nothing self-heals: losses the alias registry
-							recovers are suppressed (their <code>typeInfo</code> emits
-							<code>&#123;kind: 'reference', name&#125;</code> at use sites), as are literal-only
-							unions (<code>z.enum</code> outputs) and brand intersections — readable degradations
-							with no author-side fix. <code>aliasName</code> names the alias.
-							<strong>Consequence:</strong> unannotated positions document the alias's structure
-							instead of its name; where applicable, an author-side nominal symbol (<code
-								>interface Foo extends z.infer&lt;typeof S&gt; &#123;&#125;</code
-							>) restores it.
+							<strong>Trigger:</strong> TypeScript dropped the name of an exported type alias
+							(<code>aliasName</code>) whose right-hand side is an indexed access or conditional,
+							like <Code lang="ts" inline content={'z.infer<typeof S>'} /> or valibot's
+							<Code lang="ts" inline content={'v.InferOutput<typeof S>'} />, and svelte-docinfo
+							can't <TomeLink slug="structured-types" hash="Lost-alias-names">recover it</TomeLink>.
+							Literal-only unions (<code>z.enum</code>, <code>v.picklist</code>) and brand
+							intersections don't warn, since they read fine expanded, and neither do
+							<code>@nodocs</code> aliases. <strong>Consequence:</strong> unannotated positions
+							document the alias's structure instead of its name. Where applicable, a nominal symbol
+							(<Code lang="ts" inline content={'interface Foo extends z.infer<typeof S> {}'} />)
+							restores it.
+						</td>
+					</tr>
+					<tr>
+						<td><code>commonjs_unsupported</code></td>
+						<td>
+							<strong>Trigger:</strong> a JS module that TypeScript doesn't bind as a module (no
+							<code>import</code>/<code>export</code> under
+							<code>bundler</code>/<code>esnext</code>) exports through CommonJS
+							(<Code lang="ts" inline content="module.exports = …" />,
+							<Code lang="ts" inline content="exports.x = …" />), which isn't modeled. Under
+							<code>node16</code>/<code>nodenext</code> or
+							<Code lang="ts" inline content="moduleDetection: 'force'" /> the checker binds
+							CommonJS exports itself, and its named exports (<code>exports.x</code>,
+							<Code lang="ts" inline content={'module.exports = {a, b}'} />) document without this
+							warning; a <Code lang="ts" inline content="module.exports =" /> of a function or
+							literal documents nothing. <strong>Consequence:</strong> the module is in
+							<code>modules[]</code> with no declarations; its module comment still reads.
+							Converting it to ES exports documents it.
+						</td>
+					</tr>
+					<tr>
+						<td><code>css_parse_failed</code></td>
+						<td>
+							<strong>Trigger:</strong> Svelte's parser rejects a component that has a
+							<Code lang="svelte" inline content={'<' + 'style>'} />, or a <code>var()</code> in its
+							markup: malformed CSS, two top-level styles, or markup its loose parsing can't absorb
+							(any template error under a Svelte before 5.13). <strong>Consequence:</strong> the
+							component emits without <code>cssCustomProperties</code> beyond its
+							<code>@cssprop</code> tags; <code>line</code>/<code>column</code> are the parser's.
+						</td>
+					</tr>
+					<tr>
+						<td><code>css_lang_unsupported</code></td>
+						<td>
+							<strong>Trigger:</strong> a component's
+							<Code lang="svelte" inline content={'<' + 'style>'} /> names a preprocessor language
+							(<code>lang="scss"</code>, <code>lang="postcss"</code>,
+							<code>type="text/less"</code>), carried in <code>lang</code>.
+							<strong>Consequence:</strong> the style isn't read, so the component emits without
+							<code>cssCustomProperties</code> beyond its <code>@cssprop</code> tags.
 						</td>
 					</tr>
 					<tr>
 						<td><code>duplicate_declaration</code></td>
 						<td>
-							<strong>Trigger:</strong> a declaration name appears in more than one module, so the
-							flat-namespace assumption collides. <code>declarationName</code> and
-							<code>modules</code> name the conflict — <code>modules</code> holds
-							<code>ModuleJson.path</code> values, so it is on a different base than this record's
-							<code>file</code> and the two read differently for the same module.
-							<strong>Consequence:</strong> always emitted;
-							<code>onDuplicates</code> only controls whether to additionally throw, log, or invoke a
-							callback.
+							<strong>Trigger:</strong> a declaration name appears in more than one module, and the
+							opt-in <code>onDuplicates</code> check is on (for packages with a flat export
+							namespace). <code>declarationName</code> and <code>modules</code> name the conflict;
+							<code>modules</code> holds <code>ModuleJson.path</code> values, unlike
+							<code>file</code>. <strong>Consequence:</strong> none beyond the diagnostic, unless
+							<code>onDuplicates</code> is <Code lang="ts" inline content="'warn'" /> (logs) or
+							<Code lang="ts" inline content="'throw'" />.
 						</td>
 					</tr>
 					<tr>
 						<td><code>transform_failed</code></td>
 						<td>
 							<strong>Trigger:</strong> svelte2tsx threw on a <code>.svelte</code> file.
-							<strong>Consequence:</strong> the file's
-							<DeclarationLink name="ModuleJson" /> is synthesized as a placeholder (<code
-								>partial: true</code
-							>, empty <code>declarations</code>).
-							<strong>Ingest-time.</strong>
+							<strong>Consequence:</strong> the file's <DeclarationLink name="ModuleJson" /> is a
+							placeholder (<Code lang="ts" inline content="partial: true" />, empty
+							<code>declarations</code>). Its default and namespace re-exports document as
+							<code>partial</code> components or namespaces (a
+							<Code lang="svelte" inline content={'<' + 'script module>'} /> name stays a bare
+							variable), and a star over it is one <DeclarationLink name="resolveExportSurface" />
+							reports unresolved. <strong>Ingest-time.</strong>
 						</td>
 					</tr>
 					<tr>
 						<td><code>source_map_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> source map parsing failed for a Svelte virtual file.
-							<strong>Consequence:</strong> analysis continues without position mapping — query-time
-							diagnostics drop <code>line</code>/<code>column</code> rather than point into the
-							generated TS, while declaration <code>sourceLine</code>s fall back to virtual
-							positions.
-							<strong>Ingest-time.</strong>
+							<strong>Trigger:</strong> the source map svelte2tsx produced for a
+							<code>.svelte</code> file couldn't be parsed. <strong>Consequence:</strong> analysis
+							continues without position mapping: other diagnostics for the file omit
+							<code>line</code>/<code>column</code>, and declaration <code>sourceLine</code>s point
+							into the generated TypeScript. <strong>Ingest-time.</strong>
 						</td>
 					</tr>
 					<tr>
 						<td><code>resolver_failed</code></td>
 						<td>
-							<strong>Trigger:</strong> import resolver threw on a specifier (vs. legitimately
-							returning <code>null</code> for externals). <code>specifier</code> names the failing
-							import. <strong>Consequence:</strong> the dependency edge is dropped.
-							<strong>Ingest-time.</strong>
+							<strong>Trigger:</strong> the import resolver threw on <code>specifier</code> (as
+							opposed to returning <code>null</code> for an external). <strong>Consequence:</strong>
+							the dependency edge is deferred and retried when a later <code>setFile</code> /
+							<code>setFiles</code> adds files or the importer changes; the diagnostic clears once
+							it resolves. <strong>Ingest-time.</strong>
 						</td>
 					</tr>
 				</tbody>
 			</table>
 			<p>
-				Each variant is a strict Zod object with its own extra fields. Use
-				<DeclarationLink name="byKind" /> to narrow to a specific variant for typed access:
+				Use <DeclarationLink name="byKind" /> to narrow to one variant with typed fields:
 			</p>
 			<Code
 				lang="ts"
@@ -289,21 +426,20 @@ for (const d of byKind(diagnostics, 'misplaced_tag')) {
 		<TomeSection>
 			<TomeSectionHeader text="severity vs partial" />
 			<p>
-				<code>severity</code> says how loud to be about a problem;
-				<code>partial: true</code> says a specific declaration or member has incomplete data,
-				typically from <code>type_extraction_failed</code>, <code>signature_analysis_failed</code>,
-				<code>class_member_failed</code>, or <code>svelte_prop_failed</code>. Branch on
-				<code>partial</code> directly; no need to cross-reference diagnostics by file and line.
+				<code>severity</code> says how loud to be about a problem.
+				<Code lang="ts" inline content="partial: true" /> says a declaration or member has
+				incomplete data, from <code>type_extraction_failed</code>,
+				<code>signature_analysis_failed</code>, or <code>class_member_failed</code>, and a
+				<code>ModuleJson</code> is <code>partial</code> when it's a <code>transform_failed</code>
+				placeholder. <code>svelte_prop_failed</code> sets no flag; the prop's type falls back to
+				<code>any</code>. Check <code>partial</code> directly instead of matching diagnostics by
+				file and line.
 			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="Helpers" />
-			<p>
-				The diagnostics array is a plain
-				<code>Array&lt;<DeclarationLink name="Diagnostic" />&gt;</code>: construct with
-				<code>[]</code> and mutate with <code>Array.push</code>. Read helpers:
-			</p>
+			<p>Read helpers for the diagnostics array:</p>
 			<ul>
 				<li>
 					<DeclarationLink name="hasErrors" />, <DeclarationLink name="hasWarnings" />: boolean
@@ -318,19 +454,23 @@ for (const d of byKind(diagnostics, 'misplaced_tag')) {
 				</li>
 				<li>
 					<DeclarationLink name="formatDiagnostic" />: format as
-					<code>'./file.ts:10:5: error: message'</code> (the <code>'./'</code> prefix is fixed)
+					<Code lang="ts" inline content="'./file.ts:10:5: error: message'" /> (the
+					<Code lang="ts" inline content="'./'" /> prefix is fixed)
 				</li>
 			</ul>
+			<p>
+				See <ModuleLink module_path="diagnostics.ts">diagnostics.ts</ModuleLink> for the schemas and
+				helpers.
+			</p>
 		</TomeSection>
 
 		<TomeSection>
 			<TomeSectionHeader text="Consuming diagnostics" />
 			<p>
-				The <TomeLink slug="cli">CLI</TomeLink> emits the structured <code>diagnostics</code> field
-				alongside <code>modules</code> in JSON output — stripped from the wire when empty, so parse
-				through <DeclarationLink name="AnalyzeResultJson" /> to restore the default
-				<code>[]</code>. Progress messages go to stderr; the structured diagnostics appear only in
-				the JSON:
+				The <TomeLink slug="cli">CLI</TomeLink> includes <code>diagnostics</code> in its JSON
+				output, omitted when empty (<DeclarationLink name="parseAnalyzeResult" /> restores
+				<code>[]</code>). Progress messages go to stderr; structured diagnostics appear only in the
+				JSON:
 			</p>
 			<Code
 				lang="bash"
@@ -355,31 +495,19 @@ if (stale.length) {
 }`}
 			/>
 			<p>
-				The <TomeLink slug="vite-plugin">Vite plugin</TomeLink>'s virtual module exports both
-				<code>modules</code> and <code>diagnostics</code>, so SvelteKit apps can render a
-				doc-warnings page without re-running analysis:
+				The <TomeLink slug="vite-plugin">Vite plugin</TomeLink>'s virtual module exports
+				<code>diagnostics</code> too, so an app can render doc warnings without re-running analysis:
 			</p>
 			<Code
 				lang="ts"
 				content={`import {modules, diagnostics} from 'virtual:svelte-docinfo';
-import {hasErrors} from 'svelte-docinfo';
+// the diagnostics subpath keeps the TypeScript compiler out of the client bundle
+import {hasErrors} from 'svelte-docinfo/diagnostics.js';
 
 if (hasErrors(diagnostics)) {
   // surface in the UI or fail the build
 }`}
 			/>
-		</TomeSection>
-
-		<TomeSection>
-			<TomeSectionHeader text="Absence rule" />
-			<p>
-				Optional scalar fields (<code>line</code>, <code>column</code>) drop on serialize per the
-				same compact-output rules as the rest of the schema. See <TomeLink slug="output-format" /> for
-				the full rule. The Vite plugin's virtual module exposes <code>modules</code> and
-				<code>diagnostics</code> as separate ES module exports, so they're always present even when
-				empty. See <ModuleLink module_path="diagnostics.ts">diagnostics.ts</ModuleLink> for the Zod schemas
-				and helper signatures.
-			</p>
 		</TomeSection>
 	</section>
 </TomeContent>

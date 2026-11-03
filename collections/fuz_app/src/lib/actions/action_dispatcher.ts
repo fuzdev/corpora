@@ -23,9 +23,14 @@ import {
 	is_jsonrpc_notification
 } from '../http/jsonrpc_helpers.ts';
 import { jsonrpc_error_messages } from '../http/jsonrpc_errors.ts';
+import { to_input_params } from '../http/schema_helpers.ts';
 import { create_action_event } from './action_event.ts';
 import { Transports, type TransportName, type TransportSendOptions } from './transports.ts';
-import type { ActionEventEnvironment } from './action_event_types.ts';
+import {
+	resolve_action_log,
+	type ActionEventEnvironment,
+	type ActionLog
+} from './action_event_types.ts';
 
 // TODO @api @many refactor frontend_actions_api.ts with action_dispatcher.ts
 
@@ -72,10 +77,25 @@ export class ActionDispatcher {
 		this.default_send_options = options.default_send_options ?? {};
 	}
 
+	/** Diagnostics sink — see `resolve_action_log`. */
+	get #log(): ActionLog | null {
+		return resolve_action_log(this.environment);
+	}
+
 	/**
 	 * Resolve a transport (per-call name → default name → registry default)
 	 * and forward the message. Catches unexpected throws and converts them
 	 * to JSON-RPC error responses — this method never throws.
+	 *
+	 * A request's `queue` (per call, else `default_send_options.queue`) is
+	 * resolved once and drives both the transport choice and the send: with it
+	 * set, a disconnected transport that `queues` is chosen and the request
+	 * waits in its durable queue for the reconnect — or until its `signal`
+	 * aborts; the queue is size-bounded, not timed. A WebSocket transport
+	 * `queues` only while its connection will reopen on its own
+	 * (`will_reconnect`); after a close that schedules no reconnect, the
+	 * request goes to a ready transport (HTTP) instead. A notification never
+	 * queues.
 	 *
 	 * @returns the response envelope for requests, or `null` for successful
 	 *   notifications (`JsonrpcErrorResponse` if the notification's transport
@@ -95,32 +115,36 @@ export class ActionDispatcher {
 		options?: ActionDispatcherSendOptions
 	): Promise<JsonrpcMessageFromServerToClient | null> {
 		try {
+			// resolved once, for requests only: a notification has no queue — it
+			// fails fast when its transport is down rather than read as sent
+			const is_request = is_jsonrpc_request(message);
+			const queue = is_request
+				? (options?.queue ?? this.default_send_options.queue ?? false)
+				: false;
 			const transport = this.transports.get_transport(
-				options?.transport_name ?? this.default_send_options.transport_name
+				options?.transport_name ?? this.default_send_options.transport_name,
+				{ queue }
 			);
 
 			if (!transport) {
-				this.environment.log?.error('[peer] send failed: no transport available');
+				this.#log?.error('[peer] send failed: no transport available');
 				return create_jsonrpc_error_response(
 					to_jsonrpc_message_id(message),
 					jsonrpc_error_messages.service_unavailable('no transport available')
 				);
 			}
 
-			const message_type = is_jsonrpc_request(message) ? 'request' : 'notification';
-			this.environment.log?.debug(
+			const message_type = is_request ? 'request' : 'notification';
+			this.#log?.debug(
 				`[peer] send ${message_type}:`,
 				message.method,
 				`via ${transport.transport_name}`
 			);
 
-			const result = await transport.send(message, {
-				signal: options?.signal,
-				queue: options?.queue ?? this.default_send_options.queue
-			});
+			const result = await transport.send(message, { signal: options?.signal, queue });
 
 			if (result && 'error' in result) {
-				this.environment.log?.error(
+				this.#log?.error(
 					`[peer] send ${message_type} failed:`,
 					message.method,
 					result.error.message
@@ -130,7 +154,7 @@ export class ActionDispatcher {
 			return result;
 		} catch (error) {
 			// TODO add retry handling here?
-			this.environment.log?.error('[peer] send unexpected error:', error);
+			this.#log?.error('[peer] send unexpected error:', error);
 			return create_jsonrpc_error_response_from_thrown(to_jsonrpc_message_id(message), error);
 		} // TODO finally?
 	}
@@ -148,7 +172,7 @@ export class ActionDispatcher {
 			const result = await this.#receive_message(message);
 			return result;
 		} catch (error) {
-			this.environment.log?.error('[peer] receive unexpected error:', error);
+			this.#log?.error('[peer] receive unexpected error:', error);
 			// Return appropriate error response based on the message
 			return create_jsonrpc_error_response_from_thrown(to_jsonrpc_message_id(message), error);
 		} // TODO finally?
@@ -171,18 +195,23 @@ export class ActionDispatcher {
 	async #receive_request(request: JsonrpcRequest): Promise<JsonrpcMessageFromServerToClient> {
 		const spec = this.environment.lookup_action_spec(request.method);
 		if (!spec) {
-			this.environment.log?.warn(`[peer] receive request: method not found:`, request.method);
+			this.#log?.warn(`[peer] receive request: method not found:`, request.method);
 			return create_jsonrpc_error_response(
 				request.id,
 				jsonrpc_error_messages.method_not_found(request.method)
 			);
 		}
 
-		this.environment.log?.debug(`[peer] receive request:`, request.method);
+		this.#log?.debug(`[peer] receive request:`, request.method);
 
 		try {
 			// Create action event in receive_request phase
-			const event = create_action_event(this.environment, spec, request.params, 'receive_request');
+			const event = create_action_event(
+				this.environment,
+				spec,
+				to_input_params(spec.input, request.params),
+				'receive_request'
+			);
 			event.set_request(request);
 
 			// Parse and handle
@@ -203,11 +232,7 @@ export class ActionDispatcher {
 
 			// Check for terminal failure
 			if (event.data.step === 'failed') {
-				this.environment.log?.error(
-					`[peer] receive request failed:`,
-					request.method,
-					event.data.error
-				);
+				this.#log?.error(`[peer] receive request failed:`, request.method, event.data.error);
 				return create_jsonrpc_error_response(request.id, event.data.error);
 			}
 
@@ -221,17 +246,13 @@ export class ActionDispatcher {
 			}
 
 			// Fallback for unexpected states
-			this.environment.log?.error(
-				`[peer] receive request: unexpected state:`,
-				request.method,
-				event.data
-			);
+			this.#log?.error(`[peer] receive request: unexpected state:`, request.method, event.data);
 			return create_jsonrpc_error_response(
 				request.id,
 				jsonrpc_error_messages.internal_error('unknown error')
 			);
 		} catch (error) {
-			this.environment.log?.error(`[peer] receive request exception:`, request.method, error);
+			this.#log?.error(`[peer] receive request exception:`, request.method, error);
 			return create_jsonrpc_error_response_from_thrown(request.id, error);
 		}
 	}
@@ -239,36 +260,34 @@ export class ActionDispatcher {
 	async #receive_notification(notification: JsonrpcNotification): Promise<void> {
 		const spec = this.environment.lookup_action_spec(notification.method);
 		if (!spec) {
-			this.environment.log?.warn(
-				`[peer] receive notification: method not found:`,
-				notification.method
-			);
+			this.#log?.warn(`[peer] receive notification: method not found:`, notification.method);
 			return;
 		}
 
-		this.environment.log?.debug(`[peer] receive notification:`, notification.method);
+		this.#log?.debug(`[peer] receive notification:`, notification.method);
 
 		try {
 			// Create action event in receive phase
-			const event = create_action_event(this.environment, spec, notification.params, 'receive');
+			const event = create_action_event(
+				this.environment,
+				spec,
+				to_input_params(spec.input, notification.params),
+				'receive'
+			);
 			event.set_notification(notification);
 
 			// Parse and handle
 			await event.parse().handle_async();
 
 			if (event.data.step === 'failed') {
-				this.environment.log?.error(
+				this.#log?.error(
 					`[peer] receive notification failed:`,
 					notification.method,
 					event.data.error
 				);
 			}
 		} catch (error) {
-			this.environment.log?.error(
-				`[peer] receive notification exception:`,
-				notification.method,
-				error
-			);
+			this.#log?.error(`[peer] receive notification exception:`, notification.method, error);
 		}
 	}
 }

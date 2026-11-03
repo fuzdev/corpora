@@ -6,7 +6,8 @@
  * @module
  */
 
-import { mount, unmount, type Component } from 'svelte';
+import { afterEach } from 'vitest';
+import { flushSync, mount, unmount, type Component } from 'svelte';
 
 /**
  * Mounts a component into a fresh container appended to `document.body`.
@@ -33,6 +34,30 @@ export const unmount_component = async (
 };
 
 /**
+ * Creates the mount a test file shares: each call renders a component into a
+ * fresh container and flushes, and whatever was mounted is unmounted after
+ * each test. Call at the top level of a test file or inside a `describe`.
+ *
+ * @returns the mount, which resolves the component's container
+ */
+export const create_mount_tracker = (): ((
+	component: Component<any, any, any>,
+	props: Record<string, any>
+) => HTMLElement) => {
+	let mounted: { instance: Record<string, any>; container: HTMLElement } | null = null;
+	afterEach(async () => {
+		if (!mounted) return;
+		await unmount_component(mounted.instance, mounted.container);
+		mounted = null;
+	});
+	return (component, props) => {
+		mounted = mount_component(component, props);
+		flushSync();
+		return mounted.container;
+	};
+};
+
+/**
  * Sets an input's value and dispatches the event the component listens for.
  */
 export const set_input_value = (
@@ -42,4 +67,27 @@ export const set_input_value = (
 ): void => {
 	input.value = value;
 	input.dispatchEvent(new Event(event_type, { bubbles: true }));
+};
+
+/**
+ * Installs a `matchMedia` on the jsdom window, which has none, answering
+ * every query with one OS `prefers-color-scheme` preference. The returned
+ * setter flips it and fires each listening query's `change` event.
+ */
+export const install_match_media = (initial_dark = false): ((dark: boolean) => void) => {
+	let dark = initial_dark;
+	const listeners: Set<() => void> = new Set();
+	window.matchMedia = (query: string) =>
+		({
+			get matches() {
+				return query.includes('dark') ? dark : !dark;
+			},
+			media: query,
+			addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+			removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener)
+		}) as unknown as MediaQueryList;
+	return (next) => {
+		dark = next;
+		for (const listener of listeners) listener();
+	};
 };

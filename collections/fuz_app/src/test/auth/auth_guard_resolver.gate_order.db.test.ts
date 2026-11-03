@@ -2,7 +2,7 @@
  * REST guard ordering: credential type before the authorization phase.
  *
  * `require_credential_types` reads only what the auth middleware already set
- * (`ACCOUNT_ID_KEY` + `CREDENTIAL_TYPE_KEY`), never the resolved
+ * (`get_resolved_auth`), never the resolved
  * `RequestContext` — so `fuz_auth_guard_resolver` mounts it in
  * `pre_authorization`, ahead of the rule-3 scope guard and ahead of actor
  * resolution. That makes the REST order **presence → channel → scope → role**,
@@ -24,31 +24,19 @@
 import { assert, describe, test } from 'vitest';
 import { z } from 'zod';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { query_create_actor } from '$lib/auth/account_queries.ts';
-import { require_request_context } from '$lib/auth/request_context.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import {
-	auth_integration_truncate_tables,
-	create_describe_db,
-	create_pglite_factory
-} from '$lib/testing/db.ts';
-import { ActingActor } from '$lib/http/auth_shape.ts';
-import { ERROR_ACTOR_REQUIRED, ERROR_CREDENTIAL_TYPE_REQUIRED } from '$lib/http/error_schemas.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
-import type { Db } from '$lib/db/db.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { query_create_actor } from '#lib/auth/account_queries.ts';
+import { require_request_context } from '#lib/auth/request_context.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { ActingActor } from '#lib/http/auth_shape.ts';
+import { ERROR_ACTOR_REQUIRED, ERROR_CREDENTIAL_TYPE_REQUIRED } from '#lib/http/error_schemas.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const SESSION_ONLY_PATH = '/api/test_session_only';
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 /** Session-gated and actor-grain — the combination that makes the order observable. */
 const create_route_specs = (): Array<RouteSpec> => [

@@ -107,7 +107,6 @@
 
   onDestroy(() => {
     if (loaded && layer && map) {
-      // @ts-expect-error Mapbox/Maplibre types don't quite match
       map.removeControl(layer);
       map.off('zoom', handleZoom);
       map.off('zoomend', handleZoom);
@@ -142,7 +141,6 @@
         interleaved,
         layers: [new type(options)],
       });
-      // @ts-expect-error Mapbox/Maplibre types don't quite match
       map.addControl(layer);
     }
   });
@@ -152,6 +150,14 @@
     });
   });
 </script>
+
+<!-- @component
+Add a deck.gl layer to the map. Set `type` to the deck.gl layer class and `data` to the array of data items.
+
+The component loads `@deck.gl/mapbox` when it mounts, and adds a `MapboxOverlay` to the map as a control. All other props go to the deck.gl layer constructor. When a prop changes, the component makes a new layer instance with the new props. Set `interleaved` to draw the layer between the MapLibre layers. This prop is only used when the overlay is created.
+
+The layer is hidden when `visible` is `false` or when the map zoom is outside `minzoom` and `maxzoom`. When `interactive` is `true`, the layer handles clicks and hover, and `hovered` holds the data item under the mouse. Child components, such as `Popup`, render only after the overlay is created.
+-->
 
 {#if layer}
   {@render children?.()}

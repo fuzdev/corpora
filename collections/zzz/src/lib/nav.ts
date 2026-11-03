@@ -1,6 +1,8 @@
 import type { SvgData } from '@fuzdev/fuz_ui/svg.ts';
+import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
 import { page } from '$app/state';
+import { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import {
 	icon_capability,
@@ -13,10 +15,12 @@ import {
 	icon_provider,
 	icon_settings,
 	icon_terminal,
+	icon_list,
 	icon_workspace
 } from '@fuzdev/fuz_ui/icons.ts';
 
 import { logo_zzz } from './logos.ts';
+import { icon_microphone } from './media_icons.ts';
 import type { Frontend } from './frontend.svelte.ts';
 
 export interface NavLinkItem {
@@ -62,7 +66,9 @@ export const main_nav_items_default: Array<NavItem> = [
 			{ label: 'prompts', href: resolve('/prompts'), icon: icon_prompt },
 			{ label: 'files', href: resolve('/files'), icon: icon_file },
 			{ label: 'workspaces', href: resolve('/workspaces'), icon: icon_workspace },
-			{ label: 'terminals', href: resolve('/terminals'), icon: icon_terminal }
+			{ label: 'terminals', href: resolve('/terminals'), icon: icon_terminal },
+			{ label: 'recordings', href: resolve('/recordings'), icon: icon_microphone },
+			{ label: 'jobs', href: resolve('/jobs'), icon: icon_list }
 		]
 	},
 	{
@@ -83,3 +89,30 @@ export const main_nav_items_default: Array<NavItem> = [
 		]
 	}
 ];
+
+export const to_chats_url = (chat_id: Uuid | null): string =>
+	chat_id ? resolve('/chats/[chat_id]', { chat_id }) : resolve('/chats');
+
+export const to_prompts_url = (prompt_id: Uuid | null): string =>
+	prompt_id ? resolve('/prompts/[prompt_id]', { prompt_id }) : resolve('/prompts');
+
+/**
+ * Navigate to a path only if we're not already on that path.
+ * This avoids unnecessary navigation history changes when already at the destination.
+ */
+export const goto_unless_current = async (
+	path: string | URL,
+	options?: Parameters<typeof goto>[1]
+): Promise<void> => {
+	if (page.url.pathname === path) return;
+	await goto(path, options);
+};
+
+/**
+ * Parse and validate a UUID parameter value from the URL.
+ */
+export const parse_url_param_uuid = (value: unknown): Uuid | null => {
+	if (!value) return null;
+	const parsed = Uuid.safeParse(value);
+	return parsed.success ? parsed.data : null;
+};

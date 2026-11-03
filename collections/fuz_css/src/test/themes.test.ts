@@ -1,33 +1,21 @@
 import { test, assert, describe } from 'vitest';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 
-import { default_themes, DEFAULT_THEME, contrast_modifiers } from '$lib/themes.ts';
-import { StyleVariable, type Theme } from '$lib/variable.ts';
-import { validate_theme } from '$lib/theme_check.ts';
-import { theme_knob_by_name } from '$lib/knobs.ts';
-
-// every theme module ships from themes/, so discover them by glob - a new
-// module can't silently skip validation by being left off a hand-list
-const theme_modules = import.meta.glob('../lib/themes/*.ts', { eager: true });
-
-const is_theme = (value: unknown): value is Theme =>
-	value !== null &&
-	typeof value === 'object' &&
-	'name' in value &&
-	'variables' in value &&
-	Array.isArray((value as Theme).variables);
-
-/** Every theme exported from a `themes/` module, registry and exemplar alike. */
-const shipped_themes: Array<Theme> = Object.values(theme_modules).flatMap((mod) =>
-	Object.values(mod as Record<string, unknown>).filter(is_theme)
-);
+import { default_themes, DEFAULT_THEME, contrast_modifiers } from '#lib/themes.ts';
+import { StyleVariable, type Theme } from '#lib/variable.ts';
+import { validate_theme } from '#lib/theme_validate.ts';
+import { theme_knob_by_name } from '#lib/knobs.ts';
+import { compose_themes, to_theme_stance } from '#lib/theme.ts';
+import { create_theme_resolver } from '#lib/theme_resolver.ts';
+import { color_scheme_variants } from '#lib/variable_data.ts';
+import { low_contrast_theme } from '#lib/themes/low_contrast.ts';
+import { high_contrast_theme } from '#lib/themes/high_contrast.ts';
+import { shipped_themes, shipped_base_themes } from './theme_test_helpers.ts';
 
 const registry_names = new Set(default_themes.map((t) => t.name));
-const modifier_names = new Set(contrast_modifiers.map((t) => t.name));
 
 /** Shipped exemplar themes: outside the registry and not contrast modifiers. */
-const exemplar_themes = shipped_themes.filter(
-	(t) => !registry_names.has(t.name) && !modifier_names.has(t.name)
-);
+const exemplar_themes = shipped_base_themes.filter((t) => !registry_names.has(t.name));
 
 describe('default_themes', () => {
 	test('all shipped themes have valid names', () => {
@@ -40,8 +28,8 @@ describe('default_themes', () => {
 	test('all shipped theme variables pass StyleVariable validation', () => {
 		for (const theme of shipped_themes) {
 			for (const variable of theme.variables) {
-				const result = StyleVariable.safeParse(variable);
-				assert.isTrue(result.success, `Invalid variable ${variable.name} in theme ${theme.name}`);
+				const result = s.parse(StyleVariable, variable);
+				assert.isTrue(result.ok, `Invalid variable ${variable.name} in theme ${theme.name}`);
 			}
 		}
 	});
@@ -62,7 +50,7 @@ describe('default_themes', () => {
 
 	test('default_themes contains expected themes', () => {
 		const names = default_themes.map((t) => t.name);
-		assert.include(names, 'base');
+		assert.deepEqual(names, ['base', 'ledger']);
 	});
 
 	test('contrast is a modifier, not a registry theme', () => {
@@ -98,8 +86,22 @@ describe('shipped themes', () => {
 		for (const registered of default_themes) {
 			assert.include(names, registered.name);
 		}
-		for (const exemplar of ['smolder', 'parchment', 'concrete', 'phosphor', 'neon', 'nineties']) {
+		for (const exemplar of [
+			'zine',
+			'pebble',
+			'parchment',
+			'phosphor',
+			'guestbook',
+			'marquee',
+			'signage'
+		]) {
 			assert.include(names, exemplar);
+		}
+	});
+
+	test('every pickable theme carries a summary for pickers', () => {
+		for (const theme of shipped_base_themes) {
+			assert.ok(theme.summary?.trim(), `${theme.name} has a summary`);
 		}
 	});
 
@@ -108,8 +110,8 @@ describe('shipped themes', () => {
 		for (const theme of exemplar_themes) {
 			assert.isAbove(theme.variables.length, 0);
 			for (const variable of theme.variables) {
-				const result = StyleVariable.safeParse(variable);
-				assert.isTrue(result.success, `Invalid variable ${variable.name} in theme ${theme.name}`);
+				const result = s.parse(StyleVariable, variable);
+				assert.isTrue(result.ok, `Invalid variable ${variable.name} in theme ${theme.name}`);
 			}
 			const errors = validate_theme(theme).filter((issue) => issue.level === 'error');
 			assert.deepEqual(errors, [], `Exemplar "${theme.name}" has validation errors`);
@@ -127,8 +129,28 @@ describe('theme tiers', () => {
 		}
 	});
 
-	test('neon is the only palette-tier exemplar', () => {
+	test('marquee is the only palette-tier exemplar', () => {
 		const palette_tier = exemplar_themes.filter(sets_palette_tier).map((t) => t.name);
-		assert.deepEqual(palette_tier, ['neon']);
+		assert.deepEqual(palette_tier, ['marquee']);
+	});
+});
+
+describe('contrast modifiers over shipped themes', () => {
+	test("every theme's own ground sits between its low and high contrast compositions", () => {
+		// otherwise a modifier moves the ground the wrong way - high contrast
+		// lifting a darker dark ground lowers the contrast it names
+		const ground = (theme: Theme, scheme: 'light' | 'dark'): number =>
+			create_theme_resolver(theme).resolve('shade_lightness_00', scheme)!;
+		for (const theme of shipped_base_themes) {
+			const stance = to_theme_stance(theme.scheme);
+			for (const scheme of stance ? [stance] : color_scheme_variants) {
+				const own = ground(theme, scheme);
+				const low = ground(compose_themes(theme, low_contrast_theme), scheme);
+				const high = ground(compose_themes(theme, high_contrast_theme), scheme);
+				const label = `${theme.name} ${scheme}: low ${low}, own ${own}, high ${high}`;
+				assert.isAtLeast(own, Math.min(low, high), label);
+				assert.isAtMost(own, Math.max(low, high), label);
+			}
+		}
 	});
 });

@@ -1,32 +1,21 @@
 <script lang="ts">
-	import {
-		format_bytes,
-		format_gzip_size,
-		derive_size_groups,
-		type BaselineRow,
-		type BinarySize
-	} from './benchmark_data.ts';
+	import type { BaselineRow } from './benchmark_baseline.ts';
+	import { format_bytes, format_gzip_size } from './benchmark_display.ts';
+	import type { SizeCapabilityGroup } from './benchmark_sizes.ts';
 	import BenchmarksBaselineGroup from './BenchmarksBaselineGroup.svelte';
 
 	const {
-		sizes
+		groups
 	}: {
-		sizes: Array<BinarySize>;
+		/** One target's builds by capability (full toolchain / formatter / parser) — see `derive_size_targets`. */
+		groups: Array<SizeCapabilityGroup>;
 	} = $props();
 
-	// grouped by capability (full toolchain / formatter / parser) so each build
-	// sits beside its closest competitor; wasm and native mix within a group
-	const size_groups = $derived(derive_size_groups(sizes));
-
-	// a disabled placeholder (e.g. oxfmt's absent wasm build) has no gzip size of its
-	// own; when its group's other entries do carry one, fall back to 'n/a' rather than
-	// omitting the annotation entirely - otherwise that row drops the annotation
-	// column and its bar-track renders wider than its siblings'
-	const has_gzip = (entries: ReadonlyArray<{ gzip_bytes: number | null }>) =>
-		entries.some((e) => e.gzip_bytes != null);
-
-	const to_rows = (group: (typeof size_groups)[number]): Array<BaselineRow> => {
-		const group_has_gzip = has_gzip(group.entries);
+	// an enabled row the report gave no gzip size reads 'n/a' when its group's other
+	// entries carry one, so the gap is stated rather than blank; a disabled
+	// placeholder (oxfmt's absent wasm build) reads 'no wasm build' as its value
+	const to_rows = (group: SizeCapabilityGroup): Array<BaselineRow> => {
+		const group_has_gzip = group.entries.some((e) => e.gzip_bytes != null);
 		return group.entries.map((s) => ({
 			key: s.label,
 			label: s.label,
@@ -35,24 +24,22 @@
 			value: format_bytes(s.bytes),
 			raw: s.bytes,
 			annotation: s.disabled
-				? group_has_gzip
-					? 'n/a'
-					: undefined
-				: format_gzip_size(s.gzip_bytes),
-			disabled: s.disabled ?? false
+				? undefined
+				: (format_gzip_size(s.gzip_bytes) ?? (group_has_gzip ? 'n/a' : undefined)),
+			disabled: s.disabled ?? false,
+			placeholder: s.disabled ? 'no wasm build' : undefined
 		}));
 	};
 </script>
 
-{#each size_groups as group (group.capability)}
-	<div class="size-group">
-		<h3>{group.heading}</h3>
-		<BenchmarksBaselineGroup rows={to_rows(group)} direction="size" />
+{#each groups as group (group.capability)}
+	<div class="mb_xl5">
+		<!-- under the target's own section heading -->
+		<h4>{group.heading}</h4>
+		<BenchmarksBaselineGroup
+			rows={to_rows(group)}
+			label={group.heading}
+			default_anchor={group.anchor_label}
+		/>
 	</div>
 {/each}
-
-<style>
-	.size-group {
-		margin-bottom: var(--space_lg);
-	}
-</style>

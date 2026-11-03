@@ -5,7 +5,7 @@ import {
 	EntryState,
 	SubmenuState,
 	RootMenuState
-} from '$lib/contextmenu_state.svelte.ts';
+} from '#lib/contextmenu_state.svelte.ts';
 import { add_test_entry, add_test_submenu } from './contextmenu_state_test_helpers.ts';
 
 describe('ContextmenuState - Structure', () => {

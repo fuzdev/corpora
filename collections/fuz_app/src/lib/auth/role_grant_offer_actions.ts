@@ -1,9 +1,9 @@
 /**
  * Role grant offer RPC action handlers — the consentful-role-grants action surface.
  *
- * Eight actions: six offer-lifecycle methods (create / accept / decline /
- * retract / list / history) plus `role_grant_revoke` and `role_grant_assign`
- * (both admin-only). All mount
+ * The offer-lifecycle methods (create / accept / decline / retract / list /
+ * history) plus `role_grant_revoke` and `role_grant_assign` (both
+ * admin-only). All mount
  * on a consumer's JSON-RPC endpoint via `create_rpc_endpoint`. The action
  * specs themselves live in `auth/role_grant_offer_action_specs.ts`. Mutations
  * declare `side_effects: true` so the RPC dispatcher wraps the handler in
@@ -11,12 +11,18 @@
  * `side_effects: false` so they are addressable via GET.
  *
  * Authorization:
- * - `role_grant_offer_create` — the grantor must hold an active role_grant for the
- *   role being offered, and that role's `grant_paths` must include `'admin'`.
- *   Consumers needing a richer policy (e.g., "teacher may offer student in
- *   *their* classroom") pass an `authorize` callback that overrides the default.
+ * - `role_grant_offer_create` — the role's `grant_paths` must include `'admin'`,
+ *   and by default the grantor must hold a **global** `admin`. Consumers needing
+ *   a richer policy (e.g., "teacher may offer student in *their* classroom")
+ *   pass an `authorize` callback that overrides the default — for app roles
+ *   only: a builtin role (`admin` / `keeper`) is global-only (a scoped one is
+ *   refused with `role_grant_builtin_scoped`) and offered only by a global
+ *   admin, both decided before the callback runs.
  * - `role_grant_offer_accept` / `role_grant_offer_decline` — keyed to the caller's
- *   account; `query_*` helpers enforce the IDOR guard.
+ *   account; `query_*` helpers enforce the IDOR guard. Accept also refuses a
+ *   builtin-role offer that must not mint (`keeper`, scoped, or a grantor who
+ *   no longer holds a global admin), auditing the refusal and leaving the
+ *   offer pending.
  * - `role_grant_offer_retract` — keyed to the caller's actor.
  * - `role_grant_offer_list` / `role_grant_offer_history` — self by default;
  *   `{account_id}` is admin-only.
@@ -24,26 +30,31 @@
  *   dispatcher rejects non-admin callers before the handler runs.
  *   The admin-grant-path gate prevents revoking keeper / daemon-scoped
  *   roles via this surface. Keys on `actor_id` to survive multi-actor accounts.
- * - `role_grant_assign` — spec-level `auth: {role: 'admin'}`; the immediate
- *   consent-free conferral path. The admin-grant-path gate prevents assigning
- *   keeper / daemon-scoped roles via this surface. No holder-propagation — only
- *   admins confer (see participation-gates.md Decision 7).
+ * - `role_grant_assign` — spec-level `auth: {role: 'admin'}` (a **global**
+ *   grant, re-checked in the handler); the immediate consent-free conferral
+ *   path. The admin-grant-path gate prevents assigning keeper / daemon-scoped
+ *   roles via this surface, and a scoped `admin` is refused. No
+ *   holder-propagation — only a global admin confers; holding a role grants
+ *   no power to assign it.
  *
  * Audit events are emitted in-transaction by the query layer (atomic with
- * the role_grant write on accept/revoke) or by the handler via the bound
- * `deps.audit.emit_role_grant_target` helper for single-event lifecycle
- * transitions. `audit.notify` (SSE/WS broadcast) fires post-commit in both
- * paths.
+ * the role_grant write on accept) or by the handler via the bound
+ * `deps.audit.emit_role_grant_target` helper (revoke, assign, and the
+ * single-event lifecycle transitions — a success row written in the request
+ * transaction, a failure row on the pool). `audit.notify` (SSE/WS broadcast)
+ * fires post-commit in both paths.
  *
  * WS notifications fan out post-commit via `emit_after_commit` when a
  * `notification_sender` is wired: offer lifecycle transitions notify the
  * counterparty, `role_grant_revoke` notifies the revokee plus each superseded
- * pending offer's grantor.
+ * pending offer's grantor. `role_grant_revoke` of a global grant also closes
+ * the revokee's connections gated on the role through
+ * `deps.connection_closer`, after the commit.
  *
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import {
@@ -51,12 +62,15 @@ import {
 	type ActionActorContext,
 	type ActionContext,
 	type RpcAction
-} from '../actions/action_rpc.ts';
-import { jsonrpc_errors } from '../http/jsonrpc_errors.ts';
+} from '../actions/action_types.ts';
+import { jsonrpc_errors, type ThrownJsonrpcError } from '../http/jsonrpc_errors.ts';
 import { emit_after_commit } from '../http/pending_effects.ts';
+import { queue_connection_close } from '../actions/connection_closer.ts';
 import {
 	builtin_role_specs_by_name,
+	is_builtin_role,
 	ROLE_ADMIN,
+	ROLE_KEEPER,
 	role_has_grant_path,
 	type RoleSchemaResult
 } from './role_schema.ts';
@@ -75,11 +89,16 @@ import {
 	RoleGrantOfferActorAccountMismatchError,
 	RoleGrantOfferActorMismatchError,
 	RoleGrantOfferAlreadyTerminalError,
+	RoleGrantOfferBuiltinRefusedError,
 	RoleGrantOfferExpiredError,
 	RoleGrantOfferNotFoundError,
-	RoleGrantOfferSelfTargetError
+	RoleGrantOfferSelfTargetError,
+	query_role_grant_offer_supersede_outgoing
 } from './role_grant_offer_queries.ts';
 import {
+	query_account_has_active_global_role,
+	query_account_has_global_role,
+	query_count_active_accounts_with_global_role_for_update,
 	query_create_role_grant,
 	query_role_grant_find_active_role_for_actor,
 	query_revoke_role_grant
@@ -91,7 +110,7 @@ import {
 	type RequestActorContext,
 	type RequestContext
 } from './request_context.ts';
-import type { ActionFactoryDeps } from './deps.ts';
+import type { RevokingActionFactoryDeps } from './deps.ts';
 import type { AuditEmitter } from './audit_emitter.ts';
 import {
 	build_role_grant_offer_accepted_notification,
@@ -102,8 +121,15 @@ import {
 	build_role_grant_revoke_notification,
 	type NotificationSender
 } from './role_grant_offer_notifications.ts';
-import { ERROR_ROLE_GRANT_NOT_FOUND, ERROR_ROLE_NOT_WEB_GRANTABLE } from '../http/error_schemas.ts';
 import {
+	ERROR_INSUFFICIENT_PERMISSIONS,
+	ERROR_ROLE_GRANT_NOT_FOUND,
+	ERROR_ROLE_NOT_WEB_GRANTABLE
+} from '../http/error_schemas.ts';
+import {
+	ERROR_CANNOT_REVOKE_KEEPER_ADMIN,
+	ERROR_CANNOT_REVOKE_LAST_ADMIN,
+	ERROR_ROLE_GRANT_BUILTIN_SCOPED,
 	ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH,
 	ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH,
 	ERROR_ROLE_GRANT_OFFER_EXPIRED,
@@ -125,8 +151,9 @@ import {
 	type RoleGrantOfferAcceptInput,
 	type RoleGrantOfferAcceptOutput,
 	type RoleGrantOfferDeclineInput,
-	type RoleGrantOfferOkOutput,
+	type RoleGrantOfferDeclineOutput,
 	type RoleGrantOfferRetractInput,
+	type RoleGrantOfferRetractOutput,
 	type RoleGrantOfferListInput,
 	type RoleGrantOfferListOutput,
 	type RoleGrantOfferHistoryInput,
@@ -138,17 +165,32 @@ import {
 } from './role_grant_offer_action_specs.ts';
 
 /**
- * Authorization callback for `role_grant_offer_create`. Returns `true` to allow,
- * `false` to reject (handler converts to `forbidden`).
+ * Authorization callback for `role_grant_offer_create` and `role_grant_assign`.
+ * Returns `true` to allow, `false` to reject (handler converts to `forbidden`
+ * with `role_grant_offer_not_authorized`).
  *
  * Provided with the fully-resolved request context and the parsed input
  * (pre-TTL, pre-normalization). Consumers override the default to implement
  * policies like "teacher may offer classroom_student only in classrooms they
- * teach".
+ * teach". `role_grant_assign` — the global-admin path that confers a grant
+ * with no offer — runs it too, so a policy over which grants may exist (a
+ * role that must be scoped, a scope that must be real) holds on both paths.
+ * Twin of the Rust `OfferCreateAuthorize`.
+ *
+ * `ctx` is the request's: both verbs have side effects, so `ctx.db` is the
+ * request transaction, and a callback needing the database (a scope-existence
+ * check, say) reads through it. **Read-only** — the callback decides, it never
+ * writes; a write would commit or roll back with the request, and nothing
+ * enforces this but the callback.
  */
 export type RoleGrantOfferCreateAuthorize = (
 	auth: RequestContext,
-	input: { to_account_id: string; role: string; scope_id: string | null },
+	input: {
+		to_account_id: string;
+		role: string;
+		scope_kind: string | null;
+		scope_id: string | null;
+	},
 	deps: { log: Logger },
 	ctx: ActionContext
 ) => boolean | Promise<boolean>;
@@ -165,10 +207,13 @@ export interface RoleGrantOfferActionOptions {
 	/** TTL applied to newly-created offers. Defaults to `ROLE_GRANT_OFFER_DEFAULT_TTL_MS`. */
 	default_ttl_ms?: number;
 	/**
-	 * Custom authorization for `role_grant_offer_create`. The default requires the
-	 * caller to hold an active role_grant for the offered role *and* the role's
-	 * `RoleSpec.grant_paths` to include `'admin'`. Consumers with richer
-	 * policies (scope-aware, chained roles) override this.
+	 * Custom authorization for `role_grant_offer_create` and `role_grant_assign`. The default requires the
+	 * caller to hold a **global** `admin` grant; the role's
+	 * `RoleSpec.grant_paths` must include `'admin'` either way. Consumers with
+	 * richer policies (scope-aware, chained roles) override this. A builtin
+	 * role never reaches the callback unless the caller holds a global `admin`
+	 * and the offer is unscoped — the spine decides builtin-role offers itself,
+	 * so a callback needs no builtin handling of its own.
 	 */
 	authorize?: RoleGrantOfferCreateAuthorize;
 }
@@ -191,51 +236,64 @@ const fan_out_audit_events = (events: Array<AuditLogEvent>, audit: AuditEmitter)
 	}
 };
 
+/**
+ * Whether a grant input binds a builtin role to a scope — refused on every
+ * grant path (see `ERROR_ROLE_GRANT_BUILTIN_SCOPED`).
+ */
+const is_scoped_builtin = (role: string, scope_id: string | null | undefined): boolean =>
+	scope_id != null && is_builtin_role(role);
+
+/** The `invalid_params` a scoped builtin-role grant input answers. */
+const builtin_scoped_error = (): ThrownJsonrpcError =>
+	jsonrpc_errors.invalid_params('builtin roles are global-only and cannot be scoped', {
+		reason: ERROR_ROLE_GRANT_BUILTIN_SCOPED
+	});
+
 // eslint-disable-next-line @typescript-eslint/require-await
 const default_authorize: RoleGrantOfferCreateAuthorize = async (auth, _input, _deps, _ctx) => {
 	// Admin-only conferral: the caller must hold a *global* `admin` grant. Holding
-	// the offered role itself confers no power to offer it (no holder-propagation —
-	// see participation-gates.md Decision 6). The global check (scope_id null) stops
-	// a scoped `admin` escalating into global authority over the offer surface.
-	// Reads the in-memory `auth.role_grants` snapshot; no DB roundtrip.
+	// the offered role itself confers no power to offer it (no holder-propagation).
+	// The global check (scope_id null) stops a scoped `admin` escalating into
+	// global authority over the offer surface. Reads the in-memory
+	// `auth.role_grants` snapshot; no DB roundtrip.
 	return has_scoped_role(auth, ROLE_ADMIN, null);
 };
 
 // -- Action factory ---------------------------------------------------------
 
 /**
- * Create the eight role-grant-offer RPC actions (six offer-lifecycle methods
- * plus `role_grant_revoke` and the immediate `role_grant_assign`).
+ * Create the role-grant-offer RPC actions: the offer-lifecycle methods plus
+ * `role_grant_revoke` and the immediate `role_grant_assign`.
  *
- * @param deps - `ActionFactoryDeps` (`log`, `audit`) plus optional `notification_sender` for WS fan-out — when absent, WS fan-out is silently skipped (DB-only side effects still happen). Consumers wiring `BackendWebsocketTransport` assign its instance directly (the transport's `send_to_account` signature accepts the broader `JsonrpcMessageFromServerToClient`, which is contravariantly compatible)
+ * @param deps - `RevokingActionFactoryDeps` (`log`, `audit`, and the `connection_closer` a revoked global grant closes the revokee's role-gated connections through) plus optional `notification_sender` for WS fan-out — when absent, WS fan-out is silently skipped (DB-only side effects still happen). Consumers wiring `ConnectionRegistry` assign its instance directly (the registry's `send_to_account` signature accepts the broader `JsonrpcMessageFromServerToClient`, which is contravariantly compatible)
  * @param options - role schema, default TTL, authorization override
  * @returns the `RpcAction` array to spread into a `create_rpc_endpoint` call
  */
 export const create_role_grant_offer_actions = (
-	deps: ActionFactoryDeps & {
+	deps: RevokingActionFactoryDeps & {
 		notification_sender?: NotificationSender | null;
 	},
 	options: RoleGrantOfferActionOptions = {}
 ): Array<RpcAction> => {
-	const { log, audit, notification_sender = null } = deps;
+	const { log, audit, connection_closer, notification_sender = null } = deps;
 	const role_specs = options.roles?.role_specs ?? builtin_role_specs_by_name;
 	const default_ttl_ms = options.default_ttl_ms ?? ROLE_GRANT_OFFER_DEFAULT_TTL_MS;
 	const authorize = options.authorize ?? default_authorize;
 
-	// Four denial paths (admin-grant-path gate, authorize, self-target,
-	// actor-account mismatch) all emit the same failure-outcome audit
-	// event. `target_actor_id` is populated when the caller supplied a
-	// `to_actor_id` so failure rows match the success-shape envelope of
-	// actor-targeted offers.
-	const emit_create_failure_audit = (
+	// Every denial path (admin-grant-path gate, scoped builtin, builtin without a
+	// global admin, authorize, self-target, actor-account mismatch) emits the
+	// same failure-outcome audit event. `target_actor_id` is populated when the
+	// caller supplied a `to_actor_id` so failure rows match the success-shape
+	// envelope of actor-targeted offers.
+	const emit_create_failure_audit = async (
 		ctx: ActionContext,
 		auth: RequestActorContext,
 		input: Pick<
 			RoleGrantOfferCreateInput,
 			'to_account_id' | 'to_actor_id' | 'role' | 'scope_kind' | 'scope_id'
 		>
-	): void => {
-		audit.emit_role_grant_target(ctx, auth, {
+	): Promise<void> => {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_offer_create',
 			outcome: 'failure',
 			target_account_id: input.to_account_id,
@@ -246,6 +304,54 @@ export const create_role_grant_offer_actions = (
 				to_account_id: input.to_account_id
 			}
 		});
+	};
+
+	// Answer (and audit) an accept the query refused as a builtin-role offer that
+	// must not mint. The refusal is a forensic event — someone holds an offer of a
+	// builtin role the spine won't confer — so it is audited as a failed
+	// `role_grant_offer_accept` (pool-routed, surviving the rollback), like
+	// offer-create refusals. Metadata is the success row's shape minus
+	// `role_grant_id` (no grant was minted), plus the wire `reason`. The offer
+	// stays pending. Returns the error the verb answers.
+	const refuse_builtin_accept = async (
+		ctx: ActionContext,
+		auth: RequestActorContext,
+		err: RoleGrantOfferBuiltinRefusedError
+	): Promise<ThrownJsonrpcError> => {
+		let error: ThrownJsonrpcError;
+		let data: { reason: string };
+		switch (err.refusal) {
+			case 'bootstrap_only':
+				// `keeper`'s grant path is bootstrap-only — the offer-create answer
+				// for a role no offer may confer
+				data = { reason: ERROR_ROLE_GRANT_OFFER_ROLE_NOT_GRANTABLE };
+				error = jsonrpc_errors.forbidden('role not grantable', data);
+				break;
+			case 'scoped':
+				data = { reason: ERROR_ROLE_GRANT_BUILTIN_SCOPED };
+				error = jsonrpc_errors.invalid_request(data);
+				break;
+			case 'grantor_not_authorized':
+				data = { reason: ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED };
+				error = jsonrpc_errors.forbidden(
+					"the offer's grantor can no longer confer this role",
+					data
+				);
+				break;
+		}
+		await audit.emit_role_grant_target(ctx, auth, {
+			event_type: 'role_grant_offer_accept',
+			outcome: 'failure',
+			target_account_id: auth.account.id,
+			target_actor_id: auth.actor.id,
+			metadata: {
+				offer_id: err.offer.id,
+				role: err.offer.role,
+				scope_id: err.offer.scope_id,
+				reason: data.reason
+			}
+		});
+		return error;
 	};
 
 	// Returns {offer} only — no auto-accept. Recipient must call
@@ -261,9 +367,28 @@ export const create_role_grant_offer_actions = (
 
 		// Role must include the admin grant path — same gate as admin direct-grant.
 		if (!role_has_grant_path(role_specs, input.role, GRANT_PATH_ADMIN)) {
-			emit_create_failure_audit(ctx, auth, input);
+			await emit_create_failure_audit(ctx, auth, input);
 			throw jsonrpc_errors.forbidden('role not grantable', {
 				reason: ERROR_ROLE_GRANT_OFFER_ROLE_NOT_GRANTABLE
+			});
+		}
+
+		// Builtin roles are global-only — refused before the injected callback,
+		// so no consumer authorizer can admit a scoped `admin` / `keeper` offer.
+		if (is_scoped_builtin(input.role, input.scope_id)) {
+			await emit_create_failure_audit(ctx, auth, input);
+			throw builtin_scoped_error();
+		}
+
+		// Offering a builtin role is global-admin authority, decided here rather
+		// than by the injected callback: a consumer callback answering by holding
+		// the role (a scope-blind check) would otherwise let a scoped `admin`
+		// row offer a global `admin` to a second account it controls. Same denial
+		// the default callback gives.
+		if (is_builtin_role(input.role) && !has_scoped_role(auth, ROLE_ADMIN, null)) {
+			await emit_create_failure_audit(ctx, auth, input);
+			throw jsonrpc_errors.forbidden('not authorized to offer this role', {
+				reason: ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED
 			});
 		}
 
@@ -272,13 +397,14 @@ export const create_role_grant_offer_actions = (
 			{
 				to_account_id: input.to_account_id,
 				role: input.role,
+				scope_kind: input.scope_kind ?? null,
 				scope_id: input.scope_id ?? null
 			},
 			{ log },
 			ctx
 		);
 		if (!authorized) {
-			emit_create_failure_audit(ctx, auth, input);
+			await emit_create_failure_audit(ctx, auth, input);
 			throw jsonrpc_errors.forbidden('not authorized to offer this role', {
 				reason: ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED
 			});
@@ -298,13 +424,13 @@ export const create_role_grant_offer_actions = (
 			});
 		} catch (err) {
 			if (err instanceof RoleGrantOfferSelfTargetError) {
-				emit_create_failure_audit(ctx, auth, input);
+				await emit_create_failure_audit(ctx, auth, input);
 				throw jsonrpc_errors.invalid_params('cannot offer to self', {
 					reason: ERROR_ROLE_GRANT_OFFER_SELF_TARGET
 				});
 			}
 			if (err instanceof RoleGrantOfferActorAccountMismatchError) {
-				emit_create_failure_audit(ctx, auth, input);
+				await emit_create_failure_audit(ctx, auth, input);
 				throw jsonrpc_errors.invalid_params('to_actor_id does not belong to to_account_id', {
 					reason: ERROR_ROLE_GRANT_OFFER_ACTOR_ACCOUNT_MISMATCH
 				});
@@ -316,7 +442,7 @@ export const create_role_grant_offer_actions = (
 		// (per the offer's `to_actor_id`), null for account-grain offers
 		// — closes the audit hole where offer-shape events used to leave
 		// actor-grain forensics blank even when the binding was known.
-		audit.emit_role_grant_target(ctx, auth, {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_offer_create',
 			target_account_id: input.to_account_id,
 			target_actor_id: offer.to_actor_id,
@@ -369,16 +495,21 @@ export const create_role_grant_offer_actions = (
 					reason: ERROR_ROLE_GRANT_OFFER_ACTOR_MISMATCH
 				});
 			}
+			if (err instanceof RoleGrantOfferBuiltinRefusedError) {
+				throw await refuse_builtin_accept(ctx, auth, err);
+			}
 			throw err;
 		}
 
 		// Look up the grantor's account_id inside the transaction so the
 		// post-commit notification has a valid target. One cheap SELECT by
 		// PK — the alternative (widening `query_accept_offer` again) would
-		// bleed transport concerns into the query layer.
-		const grantor_actor = notification_sender
-			? await query_actor_by_id(ctx, result.offer.from_actor_id)
-			: null;
+		// bleed transport concerns into the query layer. A replay
+		// (`created: false`) notifies nothing, so it skips the lookup.
+		const grantor_actor =
+			notification_sender && result.created
+				? await query_actor_by_id(ctx, result.offer.from_actor_id)
+				: null;
 		const grantor_account_id = grantor_actor?.account_id ?? null;
 
 		const offer_json = to_role_grant_offer_json(result.offer);
@@ -393,27 +524,33 @@ export const create_role_grant_offer_actions = (
 		// grantor sees "accepted" and each superseded grantor sees "supersede"
 		// only once the accept has durably committed — and never if it rolls
 		// back (the dispatch site discards `post_commit_effects` on rollback).
-		emit_after_commit(ctx, () => {
-			fan_out_audit_events(result.audit_events, audit);
-			if (notification_sender && grantor_account_id) {
-				notification_sender.send_to_account(
-					grantor_account_id,
-					build_role_grant_offer_accepted_notification({ offer: offer_json })
-				);
-			}
-			if (notification_sender) {
-				for (const sib of supersede_payloads) {
+		// A replay (or a race loser) wrote nothing — the accept that minted the
+		// grant already audited it and notified the grantor — so it queues
+		// nothing; repeating the notification would let any replay send them
+		// without bound.
+		if (result.created) {
+			emit_after_commit(ctx, () => {
+				fan_out_audit_events(result.audit_events, audit);
+				if (notification_sender && grantor_account_id) {
 					notification_sender.send_to_account(
-						sib.from_account_id,
-						build_role_grant_offer_supersede_notification({
-							offer: sib.offer,
-							reason: 'sibling_accepted',
-							cause_id: result.offer.id
-						})
+						grantor_account_id,
+						build_role_grant_offer_accepted_notification({ offer: offer_json })
 					);
 				}
-			}
-		});
+				if (notification_sender) {
+					for (const sib of supersede_payloads) {
+						notification_sender.send_to_account(
+							sib.from_account_id,
+							build_role_grant_offer_supersede_notification({
+								offer: sib.offer,
+								reason: 'sibling_accepted',
+								cause_id: result.offer.id
+							})
+						);
+					}
+				}
+			});
+		}
 
 		return {
 			role_grant_id: result.role_grant.id,
@@ -425,7 +562,7 @@ export const create_role_grant_offer_actions = (
 	const decline_handler = async (
 		input: RoleGrantOfferDeclineInput,
 		ctx: ActionActorContext
-	): Promise<RoleGrantOfferOkOutput> => {
+	): Promise<RoleGrantOfferDeclineOutput> => {
 		const auth = ctx.auth;
 		let declined;
 		try {
@@ -450,7 +587,7 @@ export const create_role_grant_offer_actions = (
 		// (the grantor account, joined in the decline RETURNING via CTE).
 		// The "both populated → same account" invariant holds: the
 		// grantor's actor↔account binding is 1:1 by definition of `actor`.
-		audit.emit_role_grant_target(ctx, auth, {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_offer_decline',
 			target_account_id: declined.from_account_id,
 			target_actor_id: declined.from_actor_id,
@@ -462,12 +599,12 @@ export const create_role_grant_offer_actions = (
 			}
 		});
 
+		const offer_json = to_role_grant_offer_json(declined);
 		if (notification_sender) {
 			// Grantor's account_id rides on `declined.from_account_id` from
 			// the decline RETURNING — no second SELECT needed. The decline
 			// reason rides along on `offer.decline_reason` — the DB set it
 			// in the RETURNING above.
-			const offer_json = to_role_grant_offer_json(declined);
 			emit_after_commit(ctx, () => {
 				notification_sender.send_to_account(
 					declined.from_account_id,
@@ -476,13 +613,14 @@ export const create_role_grant_offer_actions = (
 			});
 		}
 
-		return { ok: true };
+		// the terminal offer, as accept answers its own
+		return { offer: offer_json };
 	};
 
 	const retract_handler = async (
 		input: RoleGrantOfferRetractInput,
 		ctx: ActionActorContext
-	): Promise<RoleGrantOfferOkOutput> => {
+	): Promise<RoleGrantOfferRetractOutput> => {
 		const auth = ctx.auth;
 		let retracted;
 		try {
@@ -501,7 +639,7 @@ export const create_role_grant_offer_actions = (
 		// `target_account_id` is the recipient account; `target_actor_id`
 		// inherits the offer's `to_actor_id` (set on actor-targeted
 		// offers, null on account-grain offers).
-		audit.emit_role_grant_target(ctx, auth, {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_offer_retract',
 			target_account_id: retracted.to_account_id,
 			target_actor_id: retracted.to_actor_id,
@@ -512,8 +650,8 @@ export const create_role_grant_offer_actions = (
 			}
 		});
 
+		const offer_json = to_role_grant_offer_json(retracted);
 		if (notification_sender) {
-			const offer_json = to_role_grant_offer_json(retracted);
 			emit_after_commit(ctx, () => {
 				notification_sender.send_to_account(
 					retracted.to_account_id,
@@ -522,7 +660,8 @@ export const create_role_grant_offer_actions = (
 			});
 		}
 
-		return { ok: true };
+		// the terminal offer, as accept answers its own
+		return { offer: offer_json };
 	};
 
 	const list_handler = async (
@@ -586,17 +725,49 @@ export const create_role_grant_offer_actions = (
 
 		// Admin-grant-path gate — keeper / daemon-scoped roles stay CLI-only
 		// (their `grant_paths` does not include `'admin'`).
-		if (!role_has_grant_path(role_specs, role_grant_row.role, GRANT_PATH_ADMIN)) {
-			audit.emit_role_grant_target(ctx, auth, {
+		const emit_revoke_failure = async (): Promise<void> => {
+			await audit.emit_role_grant_target(ctx, auth, {
 				event_type: 'role_grant_revoke',
 				outcome: 'failure',
 				target_account_id,
 				target_actor_id,
 				metadata: { role: role_grant_row.role, role_grant_id: input.role_grant_id }
 			});
+		};
+		if (!role_has_grant_path(role_specs, role_grant_row.role, GRANT_PATH_ADMIN)) {
+			await emit_revoke_failure();
 			throw jsonrpc_errors.forbidden('role not web-grantable', {
 				reason: ERROR_ROLE_NOT_WEB_GRANTABLE
 			});
+		}
+
+		// The global `admin` grant is guarded like the account that holds it:
+		// the keeper account's is never revoked (no web path re-grants it, so the
+		// keeper would be locked out of the admin surface for good), and the
+		// grant goes only when an active admin account remains without it — the
+		// count leaves this grant out, so a second admin actor on the same
+		// account still counts. The count locks what it counted, so a concurrent
+		// revoke or account removal can't pass the same guard.
+		if (role_grant_row.role === ROLE_ADMIN && role_grant_row.scope_id === null) {
+			if (await query_account_has_global_role(ctx, target_account_id, ROLE_KEEPER)) {
+				await emit_revoke_failure();
+				throw jsonrpc_errors.forbidden("cannot revoke the keeper account's admin grant", {
+					reason: ERROR_CANNOT_REVOKE_KEEPER_ADMIN
+				});
+			}
+			if (
+				(await query_account_has_active_global_role(ctx, target_account_id, ROLE_ADMIN)) &&
+				(await query_count_active_accounts_with_global_role_for_update(
+					ctx,
+					ROLE_ADMIN,
+					input.role_grant_id
+				)) === 0
+			) {
+				await emit_revoke_failure();
+				throw jsonrpc_errors.forbidden("cannot revoke the last admin's admin grant", {
+					reason: ERROR_CANNOT_REVOKE_LAST_ADMIN
+				});
+			}
 		}
 
 		const result = await query_revoke_role_grant(
@@ -611,8 +782,27 @@ export const create_role_grant_offer_actions = (
 			// the IDOR check and the UPDATE.
 			throw jsonrpc_errors.not_found('role_grant', { reason: ERROR_ROLE_GRANT_NOT_FOUND });
 		}
+		// The revokee's own pending offers end with the grant: an offer records
+		// no authority, so one made under this grant would still confer on
+		// accept. Every outgoing offer of the actor goes, superseded like the
+		// revokee's incoming siblings (same reason, same cause, same fan-out).
+		result.superseded_offers.push(
+			...(await query_role_grant_offer_supersede_outgoing(ctx, [input.actor_id]))
+		);
+		// Close the revokee's connections gated on the role once the revoke has
+		// committed — queued, so never before the commit or on rollback, and not
+		// riding on the audit row's announcement below (the revocation guard
+		// repeats it when the row is announced). Global grants only: a role gate admits on global grants
+		// alone, so a scoped revoke has nothing to close.
+		if (result.scope_id === null) {
+			queue_connection_close(ctx, connection_closer, {
+				kind: 'role',
+				account_id: target_account_id,
+				role: result.role
+			});
+		}
 
-		audit.emit_role_grant_target(ctx, auth, {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_revoke',
 			target_account_id,
 			target_actor_id,
@@ -628,7 +818,7 @@ export const create_role_grant_offer_actions = (
 		// `target_actor_id` inherits the offer's `to_actor_id` (actor-grain
 		// when the superseded offer was actor-targeted, null otherwise).
 		for (const offer of result.superseded_offers) {
-			audit.emit_role_grant_target(ctx, auth, {
+			await audit.emit_role_grant_target(ctx, auth, {
 				event_type: 'role_grant_offer_supersede',
 				target_account_id: offer.to_account_id,
 				target_actor_id: offer.to_actor_id,
@@ -676,40 +866,82 @@ export const create_role_grant_offer_actions = (
 	};
 
 	// The immediate admin-only conferral path — the consent-free sibling of
-	// `role_grant_offer_create`. Admin-gated at the dispatcher (`roles:
-	// ['admin']`), it re-checks admin-grantability (so keeper / CLI-only roles
-	// can't be web-assigned), resolves the target actor, writes the idempotent
-	// grant, and emits a `role_grant_create` audit row — the same event the
-	// offer-accept and self-service paths emit. No WS notification in v1 (the
-	// grantee picks the capability up on its next authenticated request).
+	// `role_grant_offer_create`. Gated at the dispatcher on a **global** admin
+	// (`roles: ['admin']`) and re-checked here, it re-checks admin-grantability
+	// (so keeper / CLI-only roles can't be web-assigned), refuses a scoped
+	// builtin role, runs the consumer's `authorize` callback, resolves the
+	// target actor, writes the idempotent grant with
+	// the input's `(scope_kind, scope_id)` pair, and emits a `role_grant_create`
+	// audit row — the same event the offer-accept and self-service paths emit.
+	// No WS notification in v1 (the grantee picks the capability up on its next
+	// authenticated request).
 	const assign_handler = async (
 		input: RoleGrantAssignInput,
 		ctx: ActionActorContext
 	): Promise<RoleGrantAssignOutput> => {
 		const auth = ctx.auth;
 
+		// Defense in depth behind the dispatcher's role gate: conferring roles is
+		// global-admin authority. A scoped `admin` must never reach the write, or
+		// it could assign itself a global `admin`.
+		if (!has_scoped_role(auth, ROLE_ADMIN, null)) {
+			throw jsonrpc_errors.forbidden('forbidden', { reason: ERROR_INSUFFICIENT_PERMISSIONS });
+		}
+
 		// Admin-grant-path gate — the same registry check the offer/revoke gates
-		// use; keeper / daemon-scoped roles stay CLI-only. Denial is
-		// forensic-audited (`role_grant_id` omitted — no grant was created).
-		if (!role_has_grant_path(role_specs, input.role, GRANT_PATH_ADMIN)) {
-			audit.emit_role_grant_target(ctx, auth, {
+		// use; keeper / daemon-scoped roles stay CLI-only. A builtin role asked
+		// for with a scope is refused the same way, with its own reason: builtin
+		// roles are global-only. Denial is forensic-audited (`role_grant_id`
+		// omitted — no grant was created).
+		const admin_grantable = role_has_grant_path(role_specs, input.role, GRANT_PATH_ADMIN);
+		const builtin_scoped = is_scoped_builtin(input.role, input.scope_id);
+		const emit_assign_failure_audit = async (): Promise<void> => {
+			await audit.emit_role_grant_target(ctx, auth, {
 				event_type: 'role_grant_create',
 				outcome: 'failure',
 				target_account_id: input.to_account_id,
 				target_actor_id: input.to_actor_id ?? null,
-				metadata: { role: input.role, scope_id: input.scope_id ?? null }
+				metadata: {
+					role: input.role,
+					scope_kind: input.scope_kind ?? null,
+					scope_id: input.scope_id ?? null
+				}
 			});
+		};
+		if (builtin_scoped || !admin_grantable) {
+			await emit_assign_failure_audit();
+			if (builtin_scoped && admin_grantable) throw builtin_scoped_error();
 			throw jsonrpc_errors.forbidden('role not web-grantable', {
 				reason: ERROR_ROLE_NOT_WEB_GRANTABLE
+			});
+		}
+
+		// The consumer's offer policy binds the immediate path too: assign is an
+		// offer the grantee doesn't get to decline, so a grant the `authorize`
+		// callback would refuse as an offer (a scope that doesn't exist, a role
+		// that must be scoped) is refused here, with the offer path's reason.
+		const authorized = await authorize(
+			auth,
+			{
+				to_account_id: input.to_account_id,
+				role: input.role,
+				scope_kind: input.scope_kind ?? null,
+				scope_id: input.scope_id ?? null
+			},
+			{ log },
+			ctx
+		);
+		if (!authorized) {
+			await emit_assign_failure_audit();
+			throw jsonrpc_errors.forbidden('not authorized to grant this role', {
+				reason: ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED
 			});
 		}
 
 		// Resolve the grant's target actor. A supplied `to_actor_id` must be an
 		// active actor of `to_account_id`; otherwise the account's sole active
 		// actor is used (a multi-actor account must name one). A missing /
-		// actorless account 404-masks. Inlined (not a helper) so the
-		// actor-account-mismatch throw stays in the handler body the
-		// error_reasons drift scan reads.
+		// actorless account 404-masks.
 		const actors = await query_active_actors_by_account(ctx, input.to_account_id);
 		let target_actor_id: Uuid;
 		if (input.to_actor_id != null) {
@@ -728,23 +960,24 @@ export const create_role_grant_offer_actions = (
 		}
 
 		// Idempotent write — re-assigning an already-held grant returns the
-		// existing row. `scope_kind` stays null: `scope_id` alone is the v1
-		// discriminator. `granted_by` is the assigning admin.
+		// existing row. `scope_kind` + `scope_id` land as the pair the input
+		// carried. `granted_by` is the assigning admin.
 		const grant = await query_create_role_grant(ctx, {
 			actor_id: target_actor_id,
 			role: input.role,
-			scope_kind: null,
+			scope_kind: input.scope_kind ?? null,
 			scope_id: input.scope_id ?? null,
 			granted_by: auth.actor.id
 		});
 
-		audit.emit_role_grant_target(ctx, auth, {
+		await audit.emit_role_grant_target(ctx, auth, {
 			event_type: 'role_grant_create',
 			target_account_id: input.to_account_id,
 			target_actor_id,
 			metadata: {
 				role: grant.role,
 				role_grant_id: grant.id,
+				scope_kind: input.scope_kind ?? null,
 				scope_id: grant.scope_id
 			}
 		});

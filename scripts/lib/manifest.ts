@@ -7,7 +7,7 @@
  */
 
 /** Who last formatted a collection's code — lets a consumer pick a fair subset. */
-export type ShapedBy = 'tsv' | 'prettier' | 'none';
+export type ShapedBy = 'tsv' | 'prettier' | 'oxfmt' | 'none';
 
 /**
  * Who wrote a collection's code: `own` for the fuz ecosystem's own authors (the `fuzdev`
@@ -77,7 +77,7 @@ export const PERMISSIVE_LICENSES: Record<string, RegExp> = {
 	'CC0-1.0': /CC0/
 };
 
-const SHAPED_BY: ReadonlySet<string> = new Set(['tsv', 'prettier', 'none']);
+const SHAPED_BY: ReadonlySet<string> = new Set(['tsv', 'prettier', 'oxfmt', 'none']);
 const ORIGINS: ReadonlySet<string> = new Set(['own', 'third_party']);
 
 /** The GitHub owners whose repos are `own` — `origin` must agree with the URL's owner. */

@@ -20,15 +20,15 @@
 
 	// Get modules from each repo's source_json
 	const repos_modules = $derived(
-		repos
-			.filter((repo): repo is Repo & { source_json: { modules: Array<unknown> } } =>
-				Boolean(repo.source_json.modules?.length)
-			)
-			.map((repo) => ({
-				repo,
-				modules: repo.source_json.modules
-			}))
+		repos.flatMap((repo) => {
+			const { modules } = repo.source_json;
+			return modules?.length ? [{ repo, modules }] : [];
+		})
 	);
+
+	// TODO this is a hack that could be fixed by adding an optional `base: './'` that defaults to './src/lib/'
+	const to_module_url = (repo: Repo, path: string): string =>
+		`${ensure_end(repo.repo_url, '/')}blob/${repo.branch}/${path === 'package.json' ? '' : 'src/lib/'}${path}`;
 
 	// TODO add favicon (from library? gro?)
 </script>
@@ -46,7 +46,7 @@
 			<li class="repo-module">
 				<header class="width:100% position:relative">
 					<a href="#{repo.name}" id={repo.name} class="subtitle">🔗</a>
-					<a href={resolve(`/tree/${repo.repo_name}`)}>{repo.name}</a>
+					<a href={resolve('/tree/[slug]', { slug: repo.repo_name })}>{repo.name}</a>
 				</header>
 				<ul class="modules panel unstyled">
 					{#each modules as repo_module (repo_module)}
@@ -59,18 +59,13 @@
 							class:json={path.endsWith('.json')}
 						>
 							<div class="module-file">
-								{#if repo.repo_url}
-									<div class="chip row">
-										<!-- TODO this is a hack that could be fixed by adding an optional `base: './'` that defaults to './src/lib/'  -->
-										<!-- eslint-disable-next-line svelte/no-navigation-without-resolve --><a
-											href="{ensure_end(repo.repo_url, '/')}blob/main/{path === 'package.json'
-												? ''
-												: 'src/lib/'}{path}">{path}</a
-										>
-									</div>
-								{:else}
-									<span class="chip">{path}</span>
-								{/if}
+								<div class="chip row">
+									<!-- eslint-disable-next-line svelte/no-navigation-without-resolve --><a
+										href={to_module_url(repo, path)}
+									>
+										{path}
+									</a>
+								</div>
 							</div>
 							{#if declarations?.length}
 								<ul class="declarations unstyled">
@@ -134,16 +129,16 @@
 		margin-bottom: var(--space_xs);
 	}
 	.ts {
-		--link_color: var(--color_a_50);
+		--link_color: var(--palette_a_50);
 	}
 	.svelte {
-		--link_color: var(--color_e_50);
+		--link_color: var(--palette_e_50);
 	}
 	.css {
-		--link_color: var(--color_b_50);
+		--link_color: var(--palette_b_50);
 	}
 	.json {
-		--link_color: var(--color_f_50);
+		--link_color: var(--palette_f_50);
 	}
 	/* TODO extract */
 	.declarations {
@@ -160,16 +155,16 @@
 		font-size: var(--font_size_sm);
 	}
 	.variable-declaration {
-		color: var(--color_d_50);
+		color: var(--palette_d_50);
 	}
 	.function-declaration {
-		color: var(--color_c_50);
+		color: var(--palette_c_50);
 	}
 	.type-declaration {
-		color: var(--color_g_50);
+		color: var(--palette_g_50);
 	}
 	.class-declaration {
-		color: var(--color_f_50);
+		color: var(--palette_f_50);
 	}
 	/* TODO extract  */
 	.nav-wrapper {

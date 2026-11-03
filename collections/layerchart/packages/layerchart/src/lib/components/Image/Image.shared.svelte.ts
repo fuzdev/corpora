@@ -4,12 +4,7 @@ import { get } from '@layerstack/utils';
 
 import type { Without } from '$lib/utils/types.js';
 import type { DataProp } from '$lib/utils/dataProp.js';
-import {
-  hasAnyDataProp,
-  resolveDataProp,
-  resolveGeoDataPair,
-} from '$lib/utils/dataProp.js';
-import { chartDataArray } from '$lib/utils/common.js';
+import { hasAnyDataProp, resolveDataProp, resolveGeoDataPair } from '$lib/utils/dataProp.js';
 import {
   createMotion,
   createDataMotionMap,
@@ -18,6 +13,9 @@ import {
   type MotionOptions,
 } from '$lib/utils/motion.svelte.js';
 import { getChartContext } from '$lib/contexts/chart.js';
+import { getLayerIsometric } from '$lib/contexts/isometric.js';
+import { markLift, raiseItems } from '$lib/utils/isometric.js';
+import { getMarkData } from '$lib/contexts/facet.js';
 import { getGeoContext } from '$lib/contexts/geo.js';
 import type { ChartState } from '$lib/states/chart.svelte.js';
 import type { GeoState } from '$lib/states/geo.svelte.js';
@@ -39,6 +37,13 @@ export type ImagePropsWithoutHTML = {
   r?: DataProp;
   /** Rotation in degrees clockwise. */
   rotate?: DataProp;
+  /**
+   * Height to raise the image off an `isometric` floor, defaulting to the chart's `z` in data mode.
+   * - `string`: data property name, resolved via zScale
+   * - `function(d)`: accessor called per data item, result passed through zScale
+   * - `number`: pixel height (also in pixel mode)
+   */
+  z?: DataProp;
   /** SVG preserveAspectRatio attribute. @default 'xMidYMid meet' */
   preserveAspectRatio?: string;
   /** CORS attribute for the image. */
@@ -74,32 +79,40 @@ export function imageMarkInfo(props: ImageProps, dataMode: boolean) {
 export class ImageState {
   #getProps: () => ImageProps = () => ({}) as ImageProps;
 
+  /**
+   * Memoized props — the component's props closure allocates a fresh object
+   * (it spreads `rest`), so calling it once per derived meant one allocation
+   * per derived per update. Read it once here instead.
+   */
+  #props: ImageProps = $derived(this.#getProps());
+
   chartCtx: ChartState = getChartContext();
+
+  markData = getMarkData();
   geo: GeoState = getGeoContext();
+  #layerIsometric = getLayerIsometric();
 
   dataMode = $derived(
     hasAnyDataProp(
-      this.#getProps().x,
-      this.#getProps().y,
-      this.#getProps().width,
-      this.#getProps().height,
-      this.#getProps().r
-    ) || typeof this.#getProps().href === 'function'
+      this.#props.x,
+      this.#props.y,
+      this.#props.width,
+      this.#props.height,
+      this.#props.r
+    ) || typeof this.#props.href === 'function'
   );
 
-  #resolvedData: any[] = $derived(
-    this.dataMode ? (this.#getProps().data ?? chartDataArray(this.chartCtx.data)) : []
-  );
+  #resolvedData: any[] = $derived(this.dataMode ? this.markData(this.#props.data) : []);
+
+  /** The chart's `isometricLift` when the image has a height, else `null` */
+  #lift = $derived(markLift(this.chartCtx, this.#layerIsometric, this.#props.z, this.dataMode));
 
   resolveImage(d: any) {
-    const props = this.#getProps();
-    const resolvedR =
-      props.r !== undefined ? resolveDataProp(props.r, d, null, 0) : undefined;
+    const props = this.#props;
+    const resolvedR = props.r !== undefined ? resolveDataProp(props.r, d, null, 0) : undefined;
     const defaultSize = resolvedR !== undefined ? resolvedR * 2 : 16;
     const resolvedWidth =
-      props.width !== undefined
-        ? resolveDataProp(props.width, d, null, defaultSize)
-        : defaultSize;
+      props.width !== undefined ? resolveDataProp(props.width, d, null, defaultSize) : defaultSize;
     const resolvedHeight =
       props.height !== undefined
         ? resolveDataProp(props.height, d, null, defaultSize)
@@ -124,7 +137,7 @@ export class ImageState {
   }
 
   resolveHref(d: any): string | undefined {
-    const href = this.#getProps().href;
+    const href = this.#props.href;
     if (!href) return undefined;
     if (typeof href === 'function') return href(d);
     const dataValue = get(d, href);
@@ -134,9 +147,9 @@ export class ImageState {
 
   resolvedItems = $derived.by(() => {
     if (!this.dataMode) return [];
-    const props = this.#getProps();
+    const props = this.#props;
     const keyFn = props.key ?? defaultKey;
-    return this.#resolvedData.map((d, i) => {
+    const items = this.#resolvedData.map((d, i) => {
       const key = keyFn(d, i);
       const resolved = this.resolveImage(d);
       const animated = this.#dataMotionMap?.get(key);
@@ -151,27 +164,31 @@ export class ImageState {
         rotate: resolved.rotate,
       };
     });
+
+    const m = this.#layerIsometric();
+    const lift = this.#lift;
+    if (!m || !lift) return items;
+
+    return raiseItems(
+      items,
+      ['x', 'y'],
+      m,
+      lift,
+      (item) => this.chartCtx.heightOf(item.d, props.z)[1]
+    );
   });
 
   // Pixel-mode helpers
-  defaultSize = $derived(
-    typeof this.#getProps().r === 'number' ? (this.#getProps().r as number) * 2 : 16
-  );
+  defaultSize = $derived(typeof this.#props.r === 'number' ? (this.#props.r as number) * 2 : 16);
   resolvedPixelWidth = $derived(
-    typeof this.#getProps().width === 'number'
-      ? (this.#getProps().width as number)
-      : this.defaultSize
+    typeof this.#props.width === 'number' ? (this.#props.width as number) : this.defaultSize
   );
   resolvedPixelHeight = $derived(
-    typeof this.#getProps().height === 'number'
-      ? (this.#getProps().height as number)
-      : this.defaultSize
+    typeof this.#props.height === 'number' ? (this.#props.height as number) : this.defaultSize
   );
-  pixelR = $derived(
-    typeof this.#getProps().r === 'number' ? (this.#getProps().r as number) : undefined
-  );
+  pixelR = $derived(typeof this.#props.r === 'number' ? (this.#props.r as number) : undefined);
   pixelRotate = $derived(
-    typeof this.#getProps().rotate === 'number' ? (this.#getProps().rotate as number) : undefined
+    typeof this.#props.rotate === 'number' ? (this.#props.rotate as number) : undefined
   );
 
   #dataMotionMap: ReturnType<typeof createDataMotionMap> = null;
@@ -180,11 +197,17 @@ export class ImageState {
   #motionWidth!: ReturnType<typeof createMotion<number>>;
   #motionHeight!: ReturnType<typeof createMotion<number>>;
 
+  /** Pixel mode: raised by `z` on an `isometric` floor */
+  #raise(axis: 'x' | 'y') {
+    const z = this.#props.z;
+    return this.#lift && typeof z === 'number' ? this.#lift[axis] * z : 0;
+  }
+
   get motionX() {
-    return this.#motionX.current;
+    return this.#motionX.current + this.#raise('x');
   }
   get motionY() {
-    return this.#motionY.current;
+    return this.#motionY.current + this.#raise('y');
   }
   get motionWidth() {
     return this.#motionWidth.current;
@@ -217,12 +240,12 @@ export class ImageState {
 
     this.#motionX = createMotion(
       initialX,
-      () => (typeof getProps().x === 'number' ? (getProps().x as number) : 0),
+      () => (typeof this.#props.x === 'number' ? (this.#props.x as number) : 0),
       motion === undefined ? undefined : parseMotionProp(motion, 'x')
     );
     this.#motionY = createMotion(
       initialY,
-      () => (typeof getProps().y === 'number' ? (getProps().y as number) : 0),
+      () => (typeof this.#props.y === 'number' ? (this.#props.y as number) : 0),
       motion === undefined ? undefined : parseMotionProp(motion, 'y')
     );
     this.#motionWidth = createMotion(
@@ -241,7 +264,7 @@ export class ImageState {
       const motionMap = this.#dataMotionMap;
       $effect(() => {
         if (!this.dataMode) return;
-        const props = getProps();
+        const props = this.#props;
         const keyFn = props.key ?? defaultKey;
         const activeKeys = new Set<any>();
         for (let i = 0; i < this.#resolvedData.length; i++) {

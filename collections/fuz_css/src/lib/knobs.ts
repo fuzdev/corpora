@@ -7,12 +7,13 @@
  * value form can't carry: what kind of value a knob takes (which widget edits
  * it), which axis of the theme space it moves, how much leverage it has (its
  * control size in the editor), and which tier of the two-tier theme policy it
- * belongs to. Defaults and light/dark slots are not duplicated here - join
+ * belongs to. Defaults and base/dark slots are not duplicated here - join
  * against `default_variables` by name.
  *
- * The catalog deliberately covers only the knob tier, not all ~560 variables:
- * derived ramp stops, color stops, and most site hooks are the escape-hatch
- * tier and stay out. A catalog entry may be a hook (`hook: true`) consumed by
+ * The catalog deliberately covers only the knob tier, not every variable:
+ * the internal ramp intermediates, color stops, and tokens stay out, and the
+ * contextual hooks the base styles read have their own catalog in
+ * `style_hooks.ts`. A catalog entry may be a hook (`hook: true`) consumed by
  * `style.css` with per-site fallbacks rather than a declared variable - it
  * exists here so themes can set it without tripping the no-invented-variables
  * check.
@@ -33,9 +34,11 @@ import {
 
 /**
  * Matches a `var(--hue_X)` palette-letter binding, capturing the letter -
- * the value form `bindable` hue knobs default to.
+ * the value form `bindable` hue knobs default to. It accepts the whitespace
+ * the theme checks do when they follow a binding, so a value the gates read
+ * as bound to a letter reads that way here too.
  */
-export const HUE_BINDING_MATCHER: RegExp = /^var\(--hue_([a-j])\)$/u;
+export const HUE_BINDING_MATCHER: RegExp = /^\s*var\(\s*--hue_([a-j])\s*\)\s*$/u;
 
 // the border-style keywords the shape knobs offer; `inset`/`outset` derive
 // their light and dark edges from the border color, which is what makes a
@@ -76,7 +79,8 @@ export type KnobAxis =
 
 /**
  * Leverage tier: how much of the system a knob reshapes, which the editor
- * renders as control size (`lg` headline knobs down to `sm` escape hatches).
+ * renders as control size through the matching `sized_*` composite (`lg`
+ * headline knobs down to `sm` escape hatches).
  */
 export type KnobLeverage = 'lg' | 'md' | 'sm';
 
@@ -188,7 +192,7 @@ const lightness_ramp = (family: string): Array<ThemeKnob> => [
  * The theme knobs in editor display order: by axis, high leverage first,
  * with the palette tier last within the color axis.
  */
-export const theme_knobs: Array<ThemeKnob> = [
+export const theme_knobs: ReadonlyArray<ThemeKnob> = [
 	// color - the leverage core
 	hue('hue_neutral', 'lg', 'semantic', true),
 	{
@@ -198,6 +202,20 @@ export const theme_knobs: Array<ThemeKnob> = [
 		leverage: 'lg',
 		tier: 'semantic',
 		range: [0, 0.1],
+		step: 0.001
+	},
+	{
+		// the ground's own tint - the shared chroma shape leaves the page
+		// untinted at any neutral_chroma, so a tinted page is this knob; it
+		// fades over the near-ground shade stops so raised surfaces keep the
+		// cast; a light ground near white has little gamut room, which the
+		// gates check
+		name: 'shade_chroma_00',
+		kind: 'number',
+		axis: 'color',
+		leverage: 'md',
+		tier: 'semantic',
+		range: [0, 0.03],
 		step: 0.001
 	},
 	hue('hue_accent', 'lg', 'semantic', true),
@@ -268,6 +286,33 @@ export const theme_knobs: Array<ThemeKnob> = [
 		range: [0, 0.15],
 		step: 0.001
 	},
+	{
+		// the role every default border paints through - repoint it at another
+		// stop (or a text stop, for opaque high-contrast rules) to move them all
+		name: 'border_color',
+		kind: 'color',
+		axis: 'color',
+		leverage: 'md',
+		tier: 'semantic'
+	},
+	{
+		// the sunken fill of inputs; at an extreme ground it has nowhere to go
+		name: 'input_fill',
+		kind: 'color',
+		axis: 'color',
+		leverage: 'sm',
+		tier: 'semantic'
+	},
+	{
+		// the embedded `.panel`'s fill, translucent ink by default so panels
+		// stack; an opaque value makes a card (white on a tinted page)
+		// TODO the gates don't pair text with it yet; neither is `input_fill`
+		name: 'panel_fill',
+		kind: 'color',
+		axis: 'color',
+		leverage: 'sm',
+		tier: 'semantic'
+	},
 	// color - micro-surface variables consumed by style.css
 	{
 		name: 'caret_color',
@@ -315,6 +360,22 @@ export const theme_knobs: Array<ThemeKnob> = [
 		step: 0.05
 	},
 	{
+		// a floor under every radius tier, which radius_scale can't express
+		name: 'border_radius_min',
+		kind: 'length',
+		axis: 'shape',
+		leverage: 'md',
+		tier: 'semantic'
+	},
+	{
+		// buttons and form fields (not checkboxes), apart from the surface tiers
+		name: 'control_radius',
+		kind: 'length',
+		axis: 'shape',
+		leverage: 'md',
+		tier: 'semantic'
+	},
+	{
 		name: 'border_style',
 		kind: 'enum',
 		axis: 'shape',
@@ -348,12 +409,23 @@ export const theme_knobs: Array<ThemeKnob> = [
 		leverage: 'sm',
 		tier: 'semantic'
 	},
+	{
+		// the focus ring's line; `none` would remove every ring, so it's left out
+		name: 'outline_style',
+		kind: 'enum',
+		axis: 'shape',
+		leverage: 'sm',
+		tier: 'semantic',
+		values: BORDER_STYLE_VALUES.filter((v) => v !== 'none')
+	},
+	// the focus ring's width, a tier of the border width ladder by default
+	length_knob('outline_width_focus', 'shape'),
 	length_knob('border_width', 'shape'),
 	...border_width_variants.map((v) => length_knob(`border_width_${v}`, 'shape')),
 	...border_radius_variants.map((v) => length_knob(`border_radius_${v}`, 'shape')),
 	// density
 	{
-		name: 'scale_factor',
+		name: 'space_scale',
 		kind: 'number',
 		axis: 'density',
 		leverage: 'lg',
@@ -393,6 +465,9 @@ export const theme_knobs: Array<ThemeKnob> = [
 	{ name: 'button_shadow', kind: 'shadow', axis: 'depth', leverage: 'md', tier: 'semantic' },
 	{ name: 'button_shadow_hover', kind: 'shadow', axis: 'depth', leverage: 'md', tier: 'semantic' },
 	{ name: 'button_shadow_active', kind: 'shadow', axis: 'depth', leverage: 'md', tier: 'semantic' },
+	// the surface shadows: a floating `.pane` and an embedded `.panel`
+	{ name: 'pane_shadow', kind: 'shadow', axis: 'depth', leverage: 'md', tier: 'semantic' },
+	{ name: 'panel_shadow', kind: 'shadow', axis: 'depth', leverage: 'md', tier: 'semantic' },
 	// typography
 	{
 		// the body font; the three stacks below stay what they say they are
@@ -401,6 +476,29 @@ export const theme_knobs: Array<ThemeKnob> = [
 		axis: 'typography',
 		leverage: 'lg',
 		tier: 'semantic'
+	},
+	{
+		// where the size ladder starts: every step, body text included, so
+		// small text keeps its proportion to body; 0.0625 is 1px of body text
+		name: 'font_size_scale',
+		kind: 'number',
+		axis: 'typography',
+		leverage: 'lg',
+		tier: 'semantic',
+		range: [0.75, 1.5],
+		step: 0.0625
+	},
+	{
+		// the ratio between font size steps above `md` - down flattens the
+		// heading hierarchy, up dramatizes it; body and small text stay put
+		// (the `sized_lg`/`sized_xl` composites step up the same ladder, so they follow)
+		name: 'type_scale_ratio',
+		kind: 'number',
+		axis: 'typography',
+		leverage: 'lg',
+		tier: 'semantic',
+		range: [1.1, 1.5],
+		step: 0.002
 	},
 	{
 		name: 'font_family_sans',
@@ -431,6 +529,15 @@ export const theme_knobs: Array<ThemeKnob> = [
 		tier: 'semantic'
 	},
 	{
+		// heading tracking - tighten it under heavy display type, open it for
+		// small capitals; an em value follows each heading tier's size
+		name: 'heading_letter_spacing',
+		kind: 'length',
+		axis: 'typography',
+		leverage: 'sm',
+		tier: 'semantic'
+	},
+	{
 		name: 'font_weight',
 		kind: 'number',
 		axis: 'typography',
@@ -449,6 +556,15 @@ export const theme_knobs: Array<ThemeKnob> = [
 		range: [100, 900],
 		step: 100,
 		hook: true
+	},
+	{
+		// how a link is marked at rest; hover and selected carry their own
+		name: 'text_decoration',
+		kind: 'enum',
+		axis: 'typography',
+		leverage: 'md',
+		tier: 'semantic',
+		values: ['none', 'underline', 'underline dotted', 'underline dashed']
 	},
 	...line_height_variants.map((v): ThemeKnob => ({
 		name: `line_height_${v}`,
@@ -476,7 +592,7 @@ export const theme_knobs: Array<ThemeKnob> = [
 /**
  * The theme-space axes in editor display order, with display titles.
  */
-export const theme_knob_axes: Array<{ axis: KnobAxis; title: string }> = [
+export const theme_knob_axes: ReadonlyArray<{ axis: KnobAxis; title: string }> = [
 	{ axis: 'color', title: 'Color' },
 	{ axis: 'shape', title: 'Shape' },
 	{ axis: 'density', title: 'Density' },
@@ -489,7 +605,7 @@ export const theme_knob_axes: Array<{ axis: KnobAxis; title: string }> = [
 /**
  * The catalog indexed by variable name.
  */
-export const theme_knob_by_name: Map<string, ThemeKnob> = new Map(
+export const theme_knob_by_name: ReadonlyMap<string, ThemeKnob> = new Map(
 	theme_knobs.map((k) => [k.name, k])
 );
 
@@ -498,6 +614,6 @@ export const theme_knob_by_name: Map<string, ThemeKnob> = new Map(
  * in `default_variables`. Theme validation unions these with the declared
  * variable names.
  */
-export const theme_knob_hook_names: Set<string> = new Set(
+export const theme_knob_hook_names: ReadonlySet<string> = new Set(
 	theme_knobs.filter((k) => k.hook).map((k) => k.name)
 );

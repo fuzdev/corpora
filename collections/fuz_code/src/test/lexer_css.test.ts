@@ -1,8 +1,8 @@
 import { describe, test, assert } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { syntax_events_to_tokens, validate_syntax_events } from '$lib/lexer.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { syntax_events_to_tokens, validate_syntax_events } from '#lib/lexer.ts';
 
 const tokens_of = (text: string): Array<[string, string]> =>
 	syntax_events_to_tokens(syntax_styler_global.lex(text, 'css')).map((t) => [
@@ -93,10 +93,56 @@ describe('lexer_css values', () => {
 		]);
 	});
 
-	test('numbers and bare identifiers in values stay plain (parity)', () => {
-		assert.deepEqual(picked('.a { margin: 10px; color: red; }', ['number', 'property']), [
-			['property', 'margin'],
-			['property', 'color']
+	test('bare identifiers in values stay plain', () => {
+		assert.deepEqual(picked('.a { color: red; display: contents; z: a-1 }', ['property']), [
+			['property', 'color'],
+			['property', 'display'],
+			['property', 'z']
+		]);
+		assert.deepEqual(picked('.a { color: red; display: contents; z: a-1 }', ['number']), []);
+	});
+
+	test('numbers take their unit and sign', () => {
+		assert.deepEqual(
+			picked('.a { margin: -.5em 1e3px 0 1em; width: calc(100% - 2px); top: +2px }', ['number']),
+			[
+				['number', '-.5em'],
+				['number', '1e3px'],
+				['number', '0'],
+				['number', '1em'],
+				['number', '100%'],
+				['number', '2px'],
+				['number', '+2px']
+			]
+		);
+	});
+
+	test('a sign without digits starts an identifier', () => {
+		assert.deepEqual(picked('.a { x: -webkit-box; --y: 1 }', ['number', 'property']), [
+			['property', 'x'],
+			['property', '--y'],
+			['number', '1']
+		]);
+	});
+
+	test('#hex colors of 3, 4, 6, or 8 digits', () => {
+		assert.deepEqual(
+			picked('.a { a: #f00; b: #f00a; c: #ff0000; d: #ff000080; e: #ggg; f: #ff00 }', ['color']),
+			[
+				['color', '#f00'],
+				['color', '#f00a'],
+				['color', '#ff0000'],
+				['color', '#ff000080'],
+				['color', '#ff00']
+			]
+		);
+		assert.deepEqual(picked('.a { a: #fffff; b: #abcx }', ['color']), []);
+	});
+
+	test('a selector keeps its #id and digits', () => {
+		assert.deepEqual(picked('#f00 { x: 1 } .a2 {}', ['selector', 'color']), [
+			['selector', '#f00'],
+			['selector', '.a2']
 		]);
 	});
 });
@@ -110,7 +156,7 @@ describe('lexer_css at-rules', () => {
 			['punctuation', '('],
 			['property', 'max-width'],
 			['punctuation', ':'],
-			['punctuation', ')']
+			['number', '600px']
 		]);
 	});
 

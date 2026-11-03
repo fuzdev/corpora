@@ -20,12 +20,13 @@ import './assert_dev_env.ts';
 
 import { assert } from 'vitest';
 
-import { middleware_applies } from '../http/schema_helpers.ts';
+import { middleware_spec_applies } from '../http/schema_helpers.ts';
 import type { AppSurface, AppSurfaceMiddleware } from '../http/surface.ts';
 import {
 	filter_protected_routes,
 	filter_role_routes,
 	filter_keeper_routes,
+	filter_credential_gated_routes,
 	filter_routes_with_input,
 	filter_routes_with_params,
 	filter_routes_with_query,
@@ -50,15 +51,21 @@ export const assert_protected_routes_declare_401 = (surface: AppSurface): void =
 };
 
 /**
- * Every role/keeper route has 403 in `error_schemas`.
+ * Every route with an authority gate that can answer 403 declares one — a
+ * role gate, or a credential-channel gate of any kind (keeper included).
+ *
+ * The credential half is not just the keeper routes: the session-only gates
+ * point the same axis the other way and refuse with the same status, so a
+ * route carrying one and no 403 schema would have its denial body go
+ * unvalidated by the DEV-only error-schema check.
  */
 export const assert_role_routes_declare_403 = (surface: AppSurface): void => {
 	const role_routes = filter_role_routes(surface);
-	const keeper_routes = filter_keeper_routes(surface);
-	for (const route of [...role_routes, ...keeper_routes]) {
+	const credential_gated_routes = filter_credential_gated_routes(surface);
+	for (const route of [...role_routes, ...credential_gated_routes]) {
 		assert.ok(
 			route.error_schemas && '403' in route.error_schemas,
-			`${format_route_key(route)} requires role/keeper but missing 403 error schema`
+			`${format_route_key(route)} has a role or credential gate but missing 403 error schema`
 		);
 	}
 };
@@ -133,7 +140,7 @@ export const assert_middleware_errors_propagated = (surface: AppSurface): void =
 	);
 	for (const route of surface.routes) {
 		for (const mw of middleware_with_errors) {
-			if (!middleware_applies(mw.path, route.path)) continue;
+			if (!middleware_spec_applies(mw, route.path)) continue;
 			for (const status of Object.keys(mw.error_schemas!)) {
 				assert.ok(
 					route.error_schemas && status in route.error_schemas,
@@ -500,7 +507,7 @@ export const assert_ws_endpoints_include_protocol_actions = (surface: AppSurface
 			assert.ok(
 				method_names.has(expected),
 				`WS endpoint '${ep.path}' is missing protocol action method '${expected}' — ` +
-					`spread \`protocol_actions\` from 'actions/protocol.js' into \`actions\``
+					`spread \`protocol_actions\` from 'actions/protocol.ts' into \`actions\``
 			);
 		}
 	}

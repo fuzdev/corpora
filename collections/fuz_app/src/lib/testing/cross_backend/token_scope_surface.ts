@@ -27,6 +27,20 @@ import '../assert_dev_env.ts';
  *   `required_scope` capability string, per surface. A spine that renamed a
  *   surface, dropped the `surface:` prefix, or emitted the JSON-RPC envelope
  *   from a REST route fails here.
+ * - **The audit stream's channel denial** — that surface is gated to
+ *   `credential_types: ['session']` on both spines, so a bearer never reaches
+ *   its scope gate and the observable is `credential_type_required` instead.
+ *   The case is kept here rather than moved: it is still the bearer-vs-surface
+ *   probe, and what it now pins is the coarser-gate-first ordering both spines
+ *   run (a spine that checked scope first would answer `token_scope_required`).
+ *   `surface:audit_stream`'s own capability string is consequently unreachable
+ *   on the default mount and has no cross-impl pin — each spine's census holds
+ *   its declaration, the way the WS upgrade's is held.
+ * - **The account status read answers a narrowed token as anonymous** —
+ *   `GET /api/account/status` answers anonymous callers, so rule 3 there is the
+ *   anonymous answer (`401` plus the bootstrap flag), byte for byte, never the
+ *   account's email, its verification, or its role grants. A full-scope bearer
+ *   reading the account is the control.
  * - **Scope outranks role** — a narrowed token whose account *also* lacks the
  *   gating role must hear `token_scope_required`, not
  *   `insufficient_permissions`. This is the observable the TS↔Rust ordering
@@ -38,37 +52,39 @@ import '../assert_dev_env.ts';
  * Two non-vacuity controls hold the negatives honest: the narrowed token must
  * still reach the RPC method it *does* name (otherwise a spine that rejected
  * the credential outright would pass every denial), and a **full** bearer must
- * reach the same surface (otherwise a route broken for all bearers would pass
- * too).
+ * reach `fact_bare` (otherwise a route broken for all bearers would pass too).
+ * The second has no audit-stream twin by construction — refusing every bearer
+ * is exactly what that route's channel gate is for.
  *
  * ## Why the WS upgrade isn't here
  *
  * Rule 3's third probeable surface is the WebSocket upgrade, and it is
  * deliberately omitted: `create_ws_transport` threads cookies, not bearer
  * headers, and a refused upgrade surfaces as a thrown connection error whose
- * body — the thing this suite exists to compare — isn't readable. The two HTTP
- * surfaces are where the denial body is observable, which is what the parity
+ * body — the thing this suite exists to compare — isn't readable. The HTTP
+ * surfaces are where a denial body is observable, which is what the parity
  * gate needs. The WS gate keeps its per-spine coverage (fuz_app's surface
  * census pins the call site; the Rust census pins its own).
- *
- * `$lib`-free by contract (relative specifiers only), like the sibling
- * cross-backend suites.
  *
  * @module
  */
 
 import { describe, assert } from 'vitest';
 
-import { account_token_create_action_spec } from '../../auth/account_action_specs.ts';
-import { ERROR_TOKEN_SCOPE_REQUIRED } from '../../http/error_schemas.ts';
+import {
+	ERROR_CREDENTIAL_TYPE_REQUIRED,
+	ERROR_TOKEN_SCOPE_REQUIRED
+} from '../../http/error_schemas.ts';
 import { test_if } from './capabilities.ts';
-import { cross_rpc_call } from './cell_cross_helpers.ts';
-import type { RpcPathCrossSuiteOptions } from './setup.ts';
+import { cross_rpc_call } from './cross_rpc.ts';
+import { mint_narrowed_api_token } from './narrowed_api_token.ts';
+import type { RpcPathCapabilityGatedCrossSuiteOptions } from './setup.ts';
 import type { FetchTransport } from '../transports/fetch_transport.ts';
-import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
-
-/** Default audit-log SSE path — the `audit_stream` surface. */
-const DEFAULT_SSE_PATH = '/api/admin/audit/stream';
+import {
+	SPINE_ACCOUNT_STATUS_PATH,
+	SPINE_RPC_PATH,
+	SPINE_SSE_PATH
+} from './spine_surface_constants.ts';
 
 /**
  * A well-formed hash that no fact has. The scope gate is a pre-authorization
@@ -82,7 +98,7 @@ const ABSENT_FACT_HASH = `blake3:${'0'.repeat(64)}`;
 const ADMITTED_METHOD = 'account_verify';
 
 /** Options for the token-scope surface parity suite. */
-export interface TokenScopeSurfaceCrossTestOptions extends RpcPathCrossSuiteOptions {
+export interface TokenScopeSurfaceCrossTestOptions extends RpcPathCapabilityGatedCrossSuiteOptions {
 	/** Audit-log SSE path. Default `/api/admin/audit/stream`. */
 	readonly sse_path?: string;
 }
@@ -92,33 +108,6 @@ const surface_denial_body = (surface: string): Record<string, unknown> => ({
 	error: ERROR_TOKEN_SCOPE_REQUIRED,
 	required_scope: `surface:${surface}`
 });
-
-/**
- * Mint a narrowed bearer token over a session, through the production
- * `account_token_create` path.
- *
- * Deliberately not a fixture-level credential: minting it here means the token
- * is produced by the same handler a real minter would use, on whichever
- * account the caller chose — which is what lets the ordering case put a
- * narrowed token on an account that lacks the gating role.
- */
-const mint_narrowed_token = async (
-	transport: FetchTransport,
-	rpc_path: string,
-	session_headers: Record<string, string>
-): Promise<string> => {
-	const res = await cross_rpc_call(
-		transport,
-		rpc_path,
-		account_token_create_action_spec.method,
-		{ scope: { kind: 'methods', methods: [ADMITTED_METHOD] }, lifetime: { kind: 'eternal' } },
-		session_headers
-	);
-	assert.ok(res.ok, `minting a narrowed token failed: ${JSON.stringify(res.error)}`);
-	const token = (res.result as { token?: unknown } | undefined)?.token;
-	assert.ok(typeof token === 'string' && token.length > 0, 'mint returned no token');
-	return token;
-};
 
 /**
  * Assert a bearer GET is refused with the canonical surface denial.
@@ -144,12 +133,41 @@ const assert_surface_denied = async (
 	);
 };
 
+/**
+ * Assert a bearer GET is refused by the *channel* gate rather than the scope
+ * gate — the shape a surface takes once it declares
+ * `credential_types: ['session']`.
+ *
+ * Distinct from `assert_surface_denied` on purpose: a channel-gated surface
+ * refuses **every** bearer, narrow or full, so the denial cannot name a scope.
+ * A narrowed token is still the right probe — it proves the channel gate runs
+ * *first*, since a scope-gated route would have answered
+ * `token_scope_required` instead.
+ */
+const assert_channel_denied = async (
+	fresh_transport: (options?: { readonly origin?: string | null }) => FetchTransport,
+	path: string,
+	token: string,
+	credential_types: ReadonlyArray<string>
+): Promise<void> => {
+	const res = await fresh_transport({ origin: null })(path, {
+		headers: { authorization: `Bearer ${token}` }
+	});
+	assert.strictEqual(res.status, 403, `${path} must refuse a bearer with 403`);
+	const body: unknown = await res.json();
+	assert.deepStrictEqual(
+		body,
+		{ error: ERROR_CREDENTIAL_TYPE_REQUIRED, required_credential_types: credential_types },
+		`${path} must return the canonical flat credential-type denial`
+	);
+};
+
 export const describe_token_scope_surface_cross_tests = (
 	options: TokenScopeSurfaceCrossTestOptions
 ): void => {
 	const { setup_test, capabilities } = options;
 	const rpc_path = options.rpc_path ?? SPINE_RPC_PATH;
-	const sse_path = options.sse_path ?? DEFAULT_SSE_PATH;
+	const sse_path = options.sse_path ?? SPINE_SSE_PATH;
 
 	describe('token scope non-RPC surface parity', () => {
 		/**
@@ -159,11 +177,12 @@ export const describe_token_scope_surface_cross_tests = (
 		 */
 		test_if(true, 'a narrowed token still reaches the method it names', async () => {
 			const fixture = await setup_test();
-			const token = await mint_narrowed_token(
-				fixture.transport,
+			const token = await mint_narrowed_api_token({
+				app: fixture.transport,
 				rpc_path,
-				fixture.create_session_headers()
-			);
+				session_headers: fixture.create_session_headers(),
+				methods: [ADMITTED_METHOD]
+			});
 			const res = await cross_rpc_call(
 				fixture.fresh_transport({ origin: null }),
 				rpc_path,
@@ -176,28 +195,30 @@ export const describe_token_scope_surface_cross_tests = (
 
 		test_if(
 			capabilities.sse,
-			'a narrowed token is refused the audit stream (surface:audit_stream)',
+			'the audit stream refuses a bearer at the channel gate (credential_types)',
 			async () => {
 				const fixture = await setup_test();
-				const token = await mint_narrowed_token(
-					fixture.transport,
+				const token = await mint_narrowed_api_token({
+					app: fixture.transport,
 					rpc_path,
-					fixture.create_session_headers()
-				);
-				await assert_surface_denied(fixture.fresh_transport, sse_path, token, 'audit_stream');
+					session_headers: fixture.create_session_headers(),
+					methods: [ADMITTED_METHOD]
+				});
+				await assert_channel_denied(fixture.fresh_transport, sse_path, token, ['session']);
 			}
 		);
 
 		test_if(
-			capabilities.fact_serving,
+			capabilities.fact_serving_admin_hash,
 			'a narrowed token is refused the bare-hash fact read (surface:fact_bare)',
 			async () => {
 				const fixture = await setup_test();
-				const token = await mint_narrowed_token(
-					fixture.transport,
+				const token = await mint_narrowed_api_token({
+					app: fixture.transport,
 					rpc_path,
-					fixture.create_session_headers()
-				);
+					session_headers: fixture.create_session_headers(),
+					methods: [ADMITTED_METHOD]
+				});
 				await assert_surface_denied(
 					fixture.fresh_transport,
 					`/api/facts/${ABSENT_FACT_HASH}`,
@@ -216,7 +237,7 @@ export const describe_token_scope_surface_cross_tests = (
 		 * response must *not* be.
 		 */
 		test_if(
-			capabilities.fact_serving,
+			capabilities.fact_serving_admin_hash,
 			'a full token is not refused by the scope gate on the same route',
 			async () => {
 				const fixture = await setup_test();
@@ -234,6 +255,47 @@ export const describe_token_scope_surface_cross_tests = (
 		);
 
 		/**
+		 * The status read answers anonymous callers, so a narrowed token is
+		 * answered as one — byte for byte, status and body — rather than refused.
+		 * The full-scope bearer of the same account reads the account, so the
+		 * 401 is the scope, not the bearer.
+		 */
+		test_if(
+			capabilities.account_status,
+			'a narrowed token reads the account status as the anonymous caller',
+			async () => {
+				const fixture = await setup_test();
+				const token = await mint_narrowed_api_token({
+					app: fixture.transport,
+					rpc_path,
+					session_headers: fixture.create_session_headers(),
+					methods: [ADMITTED_METHOD]
+				});
+				const anonymous = await fixture.fresh_transport({ origin: null })(
+					SPINE_ACCOUNT_STATUS_PATH,
+					{}
+				);
+				const narrowed = await fixture.fresh_transport({ origin: null })(
+					SPINE_ACCOUNT_STATUS_PATH,
+					{
+						headers: { authorization: `Bearer ${token}` }
+					}
+				);
+				assert.strictEqual(anonymous.status, 401, 'anonymous status must be 401');
+				assert.strictEqual(narrowed.status, 401, 'a narrowed token must read status as anonymous');
+				assert.strictEqual(
+					await narrowed.text(),
+					await anonymous.text(),
+					'the narrowed answer must be the anonymous one, byte for byte'
+				);
+				const full = await fixture.fresh_transport({ origin: null })(SPINE_ACCOUNT_STATUS_PATH, {
+					headers: fixture.create_bearer_headers()
+				});
+				assert.strictEqual(full.status, 200, 'a full-scope bearer must read the account');
+			}
+		);
+
+		/**
 		 * **Scope outranks role**, and this is the case that had no cross-impl
 		 * pin while the two spines disagreed about it.
 		 *
@@ -247,16 +309,17 @@ export const describe_token_scope_surface_cross_tests = (
 		 * exactly why this divergence survived as long as it did.
 		 */
 		test_if(
-			capabilities.fact_serving,
+			capabilities.fact_serving_admin_hash,
 			'scope outranks role — a narrowed token lacking the role hears about its scope',
 			async () => {
 				const fixture = await setup_test();
 				const non_admin = await fixture.create_account({ username: 'scope_before_role' });
-				const token = await mint_narrowed_token(
-					fixture.fresh_transport(),
+				const token = await mint_narrowed_api_token({
+					app: fixture.fresh_transport(),
 					rpc_path,
-					non_admin.create_session_headers()
-				);
+					session_headers: non_admin.create_session_headers(),
+					methods: [ADMITTED_METHOD]
+				});
 				await assert_surface_denied(
 					fixture.fresh_transport,
 					`/api/facts/${ABSENT_FACT_HASH}`,

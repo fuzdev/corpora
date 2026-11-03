@@ -4,7 +4,7 @@
 	import { hash_sha1, hash_sha256, hash_sha384, hash_sha512 } from '@fuzdev/fuz_util/hash.ts';
 	import { to_hex } from '@fuzdev/fuz_util/hex.ts';
 
-	import DataInput from '$lib/DataInput.svelte';
+	import DataInput from '#lib/DataInput.svelte';
 
 	type Algorithm = 'BLAKE3' | 'SHA-1' | 'SHA-256' | 'SHA-384' | 'SHA-512';
 
@@ -89,12 +89,12 @@
 				<div class="row gap_sm mb_xs">
 					<strong style:width="7rem">{algo}</strong>
 					{#if result}
-						<small class="color_c" style:width="6rem">{result.hash.length * 4}-bit</small>
-						<small class="color_c" style:width="6rem">
+						<small style:width="6rem">{result.hash.length * 4}-bit</small>
+						<small style:width="6rem">
 							{result.duration < 1 ? '<1' : result.duration.toFixed(1)}ms
 						</small>
 					{:else if algo === 'BLAKE3' && !blake3_loaded}
-						<small class="color_c">(loading)</small>
+						<small>(loading)</small>
 					{/if}
 				</div>
 				{#if result}

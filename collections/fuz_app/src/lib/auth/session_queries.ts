@@ -11,8 +11,9 @@ import { hash_blake3 } from '@fuzdev/fuz_util/hash_blake3.ts';
 
 import { generate_random_base64url } from '../crypto.ts';
 import type { QueryDeps } from '../db/query_deps.ts';
-import { columns_sql, qualify_columns } from '../db/sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from '../db/sql_columns.ts';
 import type { AuthSession, SessionId } from './account_schema.ts';
+import { EXPIRES_IN_MS_SQL } from './credential_deadline.ts';
 
 /**
  * Session lifetime in milliseconds (30 days).
@@ -85,8 +86,32 @@ export const AUTH_SESSION_COLUMNS = [
 	'expires_at'
 ] as const satisfies ReadonlyArray<keyof AuthSession>;
 
+/** The `auth_session` timestamp override, by row qualifier (`''` bare, `s` for the admin listing's JOIN). */
+const auth_session_expr = iso8601_timestamp_expr(AUTH_SESSION_COLUMNS, [
+	'created_at',
+	'expires_at'
+]);
+
 /**
- * Get a session if it exists, is not expired, and has not been revoked.
+ * A live `auth_session` row as `query_session_get_valid` returns it, with how
+ * long it has left.
+ */
+export interface ValidAuthSession extends AuthSession {
+	/**
+	 * Milliseconds until the session expires — `expires_at - NOW()`, measured on
+	 * the database clock in the statement that found it unexpired
+	 * (`EXPIRES_IN_MS_SQL`).
+	 */
+	expires_in_ms: number;
+}
+
+/**
+ * Get a session if it exists, is not expired, and has not been revoked, with
+ * how long it has left.
+ *
+ * The remaining lifetime is read in the same statement that checks the
+ * expiry, on the database clock, so it agrees with the check whatever the
+ * server's clock says (`auth/credential_deadline.ts`).
  *
  * @param deps - query dependencies
  * @param token_hash - blake3 hash of the session token
@@ -94,9 +119,9 @@ export const AUTH_SESSION_COLUMNS = [
 export const query_session_get_valid = async (
 	deps: QueryDeps,
 	token_hash: string
-): Promise<AuthSession | undefined> => {
-	return deps.db.query_one<AuthSession>(
-		`SELECT ${columns_sql(AUTH_SESSION_COLUMNS)} FROM auth_session WHERE id = $1 AND expires_at > NOW()`,
+): Promise<ValidAuthSession | undefined> => {
+	return deps.db.query_one<ValidAuthSession>(
+		`SELECT ${columns_sql(AUTH_SESSION_COLUMNS, auth_session_expr(''))}, ${EXPIRES_IN_MS_SQL} AS expires_in_ms FROM auth_session WHERE id = $1 AND expires_at > NOW()`,
 		[token_hash]
 	);
 };
@@ -169,7 +194,7 @@ export const query_session_list_for_account = async (
 	limit = 50
 ): Promise<Array<AuthSession>> => {
 	return deps.db.query<AuthSession>(
-		`SELECT ${columns_sql(AUTH_SESSION_COLUMNS)} FROM auth_session WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2`,
+		`SELECT ${columns_sql(AUTH_SESSION_COLUMNS, auth_session_expr(''))} FROM auth_session WHERE account_id = $1 ORDER BY auth_session.created_at DESC LIMIT $2`,
 		[account_id, limit]
 	);
 };
@@ -209,17 +234,23 @@ export const query_session_list_for_account = async (
  * Expired-but-unreaped rows count toward the cap (the predicate is `account_id`
  * alone). Matches the Rust twin `query_session_enforce_limit`.
  *
+ * Deleting a session row does not end the connections it opened: a WebSocket
+ * keeps the authority it resolved at upgrade and an SSE stream never rechecks.
+ * The returned ids are the token hashes those connections are registered
+ * under, so the caller closes them once the transaction commits
+ * (`queue_connection_close`) — `POST /login` does.
+ *
  * @param deps - query dependencies (must be transaction-scoped)
  * @param account_id - the account to enforce the limit for
  * @param max_sessions - maximum number of sessions to keep
- * @returns the number of sessions evicted
+ * @returns the evicted sessions' ids (their token hashes), empty when nothing was evicted
  * @mutates `auth_session` table - deletes the oldest rows past the cap
  */
 export const query_session_enforce_limit = async (
 	deps: QueryDeps,
 	account_id: string,
 	max_sessions: number
-): Promise<number> => {
+): Promise<Array<string>> => {
 	const rows = await deps.db.query<{ id: string }>(
 		`DELETE FROM auth_session
 		 WHERE id IN (
@@ -230,7 +261,7 @@ export const query_session_enforce_limit = async (
 		 ) RETURNING id`,
 		[account_id, max_sessions]
 	);
-	return rows.length;
+	return rows.map((row) => row.id);
 };
 
 /**
@@ -248,7 +279,7 @@ export const query_session_list_all_active = async (
 	limit = 200
 ): Promise<Array<AuthSession & { username: string }>> => {
 	return deps.db.query<AuthSession & { username: string }>(
-		`SELECT ${qualify_columns(AUTH_SESSION_COLUMNS, 's')}, a.username
+		`SELECT ${qualify_columns(AUTH_SESSION_COLUMNS, 's', auth_session_expr('s'))}, a.username
 		 FROM auth_session s
 		 JOIN account a ON a.id = s.account_id
 		 WHERE s.expires_at > NOW()
@@ -258,14 +289,34 @@ export const query_session_list_all_active = async (
 };
 
 /**
- * Delete expired sessions.
+ * Delete every expired session, returning the ids (token hashes) of the rows
+ * it deleted.
  *
- * @returns the number of sessions cleaned up
+ * The ids are the `session_hash` of the `session` close target
+ * (`ConnectionCloser.close_connections`).
+ * A row past `expires_at` already fails `query_session_get_valid`, but
+ * deleting it does not end the connections it opened: a WebSocket keeps the
+ * authority it resolved at upgrade and an SSE stream never rechecks. The row
+ * was also the only per-session handle on those connections —
+ * `account_session_revoke` closes only for a row it deleted — so the caller
+ * closes each returned session's connections once the delete has committed.
+ * `cleanup_expired_sessions` (`auth/cleanup.ts`) is that caller; reach for it
+ * rather than this query.
+ *
+ * One statement, so the returned ids are exactly the rows this call removed:
+ * a concurrent pass gets a disjoint set. Run it in a transaction, as the
+ * caller above does, so the ids are in hand before the delete commits — on a
+ * pool-level `Db` a connection lost on the response leaves the rows deleted
+ * and their ids unread. Served by `idx_auth_session_expires`. Twin of the
+ * Rust `query_session_cleanup_expired`.
+ *
+ * @param deps - query dependencies (transaction-scoped, see above)
+ * @returns the deleted sessions' ids (their token hashes), empty when nothing had expired
  * @mutates `auth_session` table - deletes every row past `expires_at`
  */
-export const query_session_cleanup_expired = async (deps: QueryDeps): Promise<number> => {
+export const query_session_cleanup_expired = async (deps: QueryDeps): Promise<Array<string>> => {
 	const rows = await deps.db.query<{ id: string }>(
 		`DELETE FROM auth_session WHERE expires_at <= NOW() RETURNING id`
 	);
-	return rows.length;
+	return rows.map((row) => row.id);
 };

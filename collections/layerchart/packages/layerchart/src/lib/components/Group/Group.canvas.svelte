@@ -1,8 +1,5 @@
 <script lang="ts" module>
-  export type {
-    GroupProps,
-    GroupPropsWithoutHTML,
-  } from './Group.shared.svelte.js';
+  export type { GroupProps, GroupPropsWithoutHTML } from './Group.shared.svelte.js';
 </script>
 
 <script lang="ts">
@@ -18,8 +15,8 @@
     canvasRender: {
       render: (ctx) => {
         ctx.translate(c.motionX ?? 0, c.motionY ?? 0);
-        if (rest.opacity != null) {
-          ctx.globalAlpha *= rest.opacity;
+        if (c.opacity != null) {
+          ctx.globalAlpha *= c.opacity;
         }
       },
       events: {
@@ -30,9 +27,11 @@
         pointerleave: (rest as any).onpointerleave,
         pointerdown: (rest as any).onpointerdown,
       },
-      deps: () => [c.motionX, c.motionY, rest.opacity],
+      deps: () => [c.motionX, c.motionY, c.opacity],
     },
   });
 </script>
 
-{@render children?.()}
+{#if !c.hidden}
+  {@render children?.()}
+{/if}

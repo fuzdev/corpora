@@ -12,7 +12,7 @@
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import { assert_row } from '../db/assert_row.ts';
@@ -20,11 +20,13 @@ import { columns_sql, qualify_columns } from '../db/sql_columns.ts';
 import type { RoleGrant } from './account_schema.ts';
 import {
 	ROLE_GRANT_OFFER_COLUMNS,
+	role_grant_offer_expr,
 	ROLE_GRANT_OFFER_SCOPE_KIND_GLOBAL_TOKEN,
 	ROLE_GRANT_OFFER_SCOPE_SENTINEL_UUID,
 	ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT
 } from './role_grant_offer_ddl.ts';
 import { query_create_role_grant, query_role_grant_by_id } from './role_grant_queries.ts';
+import { offer_pending_predicate, role_grant_active_sql } from './role_grant_sql.ts';
 import type {
 	CreateRoleGrantOfferInput,
 	RoleGrantOffer,
@@ -32,6 +34,7 @@ import type {
 } from './role_grant_offer_schema.ts';
 import { query_audit_log } from './audit_log_queries.ts';
 import type { AuditLogEvent } from './audit_log_schema.ts';
+import { is_builtin_role, ROLE_ADMIN, ROLE_KEEPER } from './role_schema.ts';
 
 /**
  * Error thrown by offer-lifecycle queries when the offer is in a non-pending
@@ -104,6 +107,42 @@ export class RoleGrantOfferActorMismatchError extends Error {
 }
 
 /**
+ * Why `query_accept_offer` refused to mint a builtin-role grant.
+ *
+ * Each is a row no current grant path creates but a database can still hold
+ * (a direct `query_role_grant_offer_create` call, or an offer made under a
+ * since-closed path), so accept — the chokepoint where an offer becomes a
+ * `role_grant` — checks them itself.
+ *
+ * - `bootstrap_only` — the offer is of `keeper`, which is bootstrap-only:
+ *   never conferred through an offer, whoever made it.
+ * - `scoped` — the offer binds a builtin role to a scope; builtin roles are
+ *   global-only.
+ * - `grantor_not_authorized` — the grantor no longer holds an active
+ *   **global** `admin` on an active actor of an active account. Conferring a
+ *   builtin role is global-admin authority, so it is re-checked when the
+ *   grant is minted, not only when the offer was made.
+ */
+export type BuiltinOfferRefusal = 'bootstrap_only' | 'scoped' | 'grantor_not_authorized';
+
+/**
+ * Error thrown by `query_accept_offer` when the offer confers a builtin role
+ * (`admin` / `keeper`) that this accept must not mint — `refusal` names the
+ * rule. Carries the locked (still pending, untouched) offer so the caller can
+ * audit the refusal with the offer's role and scope.
+ */
+export class RoleGrantOfferBuiltinRefusedError extends Error {
+	readonly offer: RoleGrantOffer;
+	readonly refusal: BuiltinOfferRefusal;
+	constructor(offer: RoleGrantOffer, refusal: BuiltinOfferRefusal) {
+		super(`Offer ${offer.id} is refused: ${refusal}`);
+		this.name = 'RoleGrantOfferBuiltinRefusedError';
+		this.offer = offer;
+		this.refusal = refusal;
+	}
+}
+
+/**
  * Error thrown when `query_role_grant_offer_create` is called with a
  * `to_actor_id` that does not exist or does not belong to `to_account_id`.
  * Surfaces the actor↔account binding mismatch at the boundary instead of
@@ -124,7 +163,9 @@ export class RoleGrantOfferActorAccountMismatchError extends Error {
  * `(to_account, role, scope)` while pending upserts the existing row,
  * refreshing `message` and `expires_at` (and `to_actor_id` — supplying
  * a different `to_actor_id` on re-offer narrows the existing row to the
- * named actor; supplying null widens it back to account-grain). A
+ * named actor; supplying null widens it back to account-grain) and clearing
+ * `expire_audited_at`, so a re-offer of an expired, already-audited row gets
+ * its own `role_grant_offer_expire` when the refreshed expiry passes. A
  * different grantor offering the same `(to_account, role, scope)` creates
  * a distinct row — multiple pending grantors coexist. After a terminal
  * state, a re-offer is a fresh INSERT.
@@ -182,12 +223,13 @@ export const query_role_grant_offer_create = async (
 		   COALESCE(scope_id, '${ROLE_GRANT_OFFER_SCOPE_SENTINEL_UUID}'::uuid),
 		   from_actor_id
 		 )
-		   WHERE accepted_at IS NULL AND declined_at IS NULL AND retracted_at IS NULL AND superseded_at IS NULL
+		   WHERE ${offer_pending_predicate('')}
 		 DO UPDATE SET
 			 to_actor_id = EXCLUDED.to_actor_id,
 			 message = EXCLUDED.message,
-			 expires_at = EXCLUDED.expires_at
-		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}`,
+			 expires_at = EXCLUDED.expires_at,
+			 expire_audited_at = NULL
+		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))}`,
 		[
 			input.from_actor_id,
 			input.to_account_id,
@@ -242,10 +284,8 @@ export const query_role_grant_offer_decline = async (
 			SET declined_at = NOW(), decline_reason = $3
 			WHERE id = $1
 			  AND to_account_id = $2
-			  AND accepted_at IS NULL
-			  AND declined_at IS NULL
-			  AND retracted_at IS NULL
-			  AND superseded_at IS NULL
+			  AND ${offer_pending_predicate('')}
+			-- raw columns; the outer grantor select formats them
 			RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}
 		)
 		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
@@ -276,11 +316,8 @@ export const query_role_grant_offer_retract = async (
 		 SET retracted_at = NOW()
 		 WHERE id = $1
 		   AND from_actor_id = $2
-		   AND accepted_at IS NULL
-		   AND declined_at IS NULL
-		   AND retracted_at IS NULL
-		   AND superseded_at IS NULL
-		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}`,
+		   AND ${offer_pending_predicate('')}
+		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))}`,
 		[offer_id, from_actor_id]
 	);
 	if (updated) return updated;
@@ -305,7 +342,7 @@ const resolve_terminal_or_missing = async (
 		params.push(scope.from_actor_id);
 	}
 	const row = await deps.db.query_one<RoleGrantOffer>(
-		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)} FROM role_grant_offer WHERE ${conditions.join(' AND ')}`,
+		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))} FROM role_grant_offer WHERE ${conditions.join(' AND ')}`,
 		params
 	);
 	if (!row) return null;
@@ -320,21 +357,18 @@ const resolve_terminal_or_missing = async (
  *
  * Expired offers are filtered server-side (`expires_at > NOW()`) so the
  * inbox never surfaces a row that can no longer be accepted. The periodic
- * sweep (`query_role_grant_offer_sweep_expired`) handles audit tombstoning.
+ * sweep (`query_role_grant_offer_sweep_expired`) audits each expiry once.
  */
 export const query_role_grant_offer_list = async (
 	deps: QueryDeps,
 	to_account_id: string
 ): Promise<Array<RoleGrantOffer>> => {
 	return deps.db.query<RoleGrantOffer>(
-		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)} FROM role_grant_offer
+		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))} FROM role_grant_offer
 		 WHERE to_account_id = $1
-		   AND accepted_at IS NULL
-		   AND declined_at IS NULL
-		   AND retracted_at IS NULL
-		   AND superseded_at IS NULL
+		   AND ${offer_pending_predicate('')}
 		   AND expires_at > NOW()
-		 ORDER BY expires_at ASC`,
+		 ORDER BY role_grant_offer.expires_at ASC`,
 		[to_account_id]
 	);
 };
@@ -351,7 +385,7 @@ export const query_role_grant_offer_history_for_account = async (
 	offset = 0
 ): Promise<Array<RoleGrantOffer>> => {
 	return deps.db.query<RoleGrantOffer>(
-		`SELECT ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'o')} FROM role_grant_offer o
+		`SELECT ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'o', role_grant_offer_expr('o'))} FROM role_grant_offer o
 		 LEFT JOIN actor a ON a.id = o.from_actor_id
 		 WHERE o.to_account_id = $1 OR a.account_id = $1
 		 ORDER BY o.created_at DESC
@@ -361,46 +395,72 @@ export const query_role_grant_offer_history_for_account = async (
 };
 
 /**
- * Look up a pending offer by id. Returns `null` if the offer is terminal,
- * expired (server-side filter), or missing.
- */
-export const query_role_grant_offer_find_pending = async (
-	deps: QueryDeps,
-	offer_id: string
-): Promise<RoleGrantOffer | null> => {
-	const row = await deps.db.query_one<RoleGrantOffer>(
-		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)} FROM role_grant_offer
-		 WHERE id = $1
-		   AND accepted_at IS NULL
-		   AND declined_at IS NULL
-		   AND retracted_at IS NULL
-		   AND superseded_at IS NULL
-		   AND expires_at > NOW()`,
-		[offer_id]
-	);
-	return row ?? null;
-};
-
-/**
- * Return pending offers whose `expires_at` has passed.
+ * Claim the pending offers whose `expires_at` has passed and whose expiry has
+ * not been audited yet, stamping `expire_audited_at` on each, and return them
+ * soonest-expiry first.
  *
- * Callers fire `role_grant_offer_expire` audit events for each row. The schema
- * does not tombstone the row, so callers are responsible for their own
- * idempotency (e.g. check whether a `role_grant_offer_expire` audit event
- * already exists for the offer id).
+ * The stamp is the sweep's idempotency: a claimed row never matches again, so
+ * each expiry is audited exactly once. It must share a transaction with the
+ * caller's `role_grant_offer_expire` audit inserts — committed together, or
+ * rolled back together so the next sweep retries. Concurrent sweeps claim
+ * disjoint rows: a row another sweep has stamped but not committed blocks on
+ * its row lock, then fails the re-checked `expire_audited_at IS NULL`.
+ * `cleanup_expired_role_grant_offers` is the caller.
+ *
+ * @mutates `role_grant_offer` rows - stamps `expire_audited_at` on each claimed row
  */
 export const query_role_grant_offer_sweep_expired = async (
 	deps: QueryDeps
 ): Promise<Array<RoleGrantOffer>> => {
 	return deps.db.query<RoleGrantOffer>(
-		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)} FROM role_grant_offer
-		 WHERE accepted_at IS NULL
-		   AND declined_at IS NULL
-		   AND retracted_at IS NULL
-		   AND superseded_at IS NULL
-		   AND expires_at <= NOW()
-		 ORDER BY expires_at ASC`
+		`WITH claimed AS (
+			UPDATE role_grant_offer
+			SET expire_audited_at = NOW()
+			WHERE ${offer_pending_predicate('')}
+			  AND expires_at <= NOW()
+			  AND expire_audited_at IS NULL
+			-- raw columns; the outer select formats them
+			RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}
+		)
+		SELECT ${qualify_columns(ROLE_GRANT_OFFER_COLUMNS, 'c', role_grant_offer_expr('c'))}
+		FROM claimed c
+		ORDER BY c.expires_at ASC, c.id ASC`
 	);
+};
+
+/**
+ * Whether `grantor_actor_id` holds an active **global** `admin` on an active
+ * actor of an active account — the authority a builtin-role offer needs at the
+ * moment its grant is minted.
+ *
+ * A locking read: `FOR SHARE OF rg` takes a share lock on the grant row that
+ * admits, so a concurrent revoke (an `UPDATE` of that row) is strictly ordered
+ * against this accept — it either commits first, and the recheck of the locked
+ * row sees `revoked_at` set and excludes it, or it waits for this transaction
+ * to commit the grant it authorized. A plain `EXISTS` could read the grant as
+ * active while a revoke commits in between. The actor and account tombstones
+ * are read but not locked — ordering a delete racing an accept isn't worth
+ * locking two more tables. Twin of the Rust `grantor_holds_global_admin`.
+ */
+const query_grantor_holds_global_admin = async (
+	deps: QueryDeps,
+	grantor_actor_id: Uuid
+): Promise<boolean> => {
+	const row = await deps.db.query_one<{ held: number }>(
+		`SELECT 1 AS held FROM role_grant rg
+		 JOIN actor act ON act.id = rg.actor_id
+		 JOIN account a ON a.id = act.account_id
+		 WHERE rg.actor_id = $1
+		   AND rg.role = $2
+		   AND rg.scope_id IS NULL
+		   AND ${role_grant_active_sql('rg')}
+		   AND act.deleted_at IS NULL
+		   AND a.deleted_at IS NULL
+		 LIMIT 1
+		 FOR SHARE OF rg`,
+		[grantor_actor_id, ROLE_ADMIN]
+	);
+	return row != null;
 };
 
 /** Input for `query_accept_offer`. */
@@ -428,7 +488,7 @@ export interface AcceptOfferInput {
 export interface AcceptOfferResult {
 	role_grant: RoleGrant;
 	offer: RoleGrantOffer;
-	/** `true` if this call is the one that accepted the offer (new role_grant inserted); `false` on a race returning the already-created role_grant. */
+	/** `true` if this call is the one that accepted the offer (new role_grant inserted); `false` on a replay (or a race loser) returning the already-created, still-held role_grant — the caller then audits and notifies nothing. */
 	created: boolean;
 	/**
 	 * Sibling offers superseded by this accept — empty on the race-loser path.
@@ -449,16 +509,23 @@ export interface AcceptOfferResult {
  * inside a transaction — the caller's route spec should declare
  * `transaction: true` (or wrap explicitly).
  *
- * Idempotent on race: if a second concurrent call observes the offer
- * already accepted, returns the existing role_grant rather than creating a
- * duplicate or throwing.
+ * Idempotent on replay and on race: a call that observes the offer already
+ * accepted returns the existing role_grant (`created: false`) rather than
+ * creating a duplicate or throwing — while that grant is still held. A grant
+ * revoked since the accept, or gone, makes the offer terminal.
  *
  * Error map:
  * - `RoleGrantOfferNotFoundError` — offer does not exist, or belongs to a
  *   different recipient (IDOR guard). The offer row is untouched.
  * - `RoleGrantOfferAlreadyTerminalError` — offer is declined, retracted, or
- *   superseded.
+ *   superseded; or accepted, and its grant revoked, gone, or bound to another
+ *   actor.
  * - `RoleGrantOfferExpiredError` — offer is pending but past `expires_at`.
+ * - `RoleGrantOfferActorMismatchError` — actor-targeted offer, different actor.
+ * - `RoleGrantOfferBuiltinRefusedError` — a builtin-role offer that must not
+ *   mint: `keeper` at all, a builtin bound to a scope, or one whose grantor no
+ *   longer holds an active global `admin` (read under `FOR SHARE`). The offer
+ *   stays pending.
  *
  * Sibling supersede is what closes the "accept a pre-revoke sibling offer
  * to bypass a revoke" path: once A is accepted, B/C/... can no longer be
@@ -469,8 +536,10 @@ export interface AcceptOfferResult {
  * @mutates `role_grant_offer` siblings - stamps `superseded_at` on every other pending offer for the tuple
  * @mutates `audit_log` table - emits `role_grant_offer_accept` + `role_grant_create` + one `role_grant_offer_supersede` per sibling
  * @throws RoleGrantOfferNotFoundError if the offer is missing or belongs to another recipient
- * @throws RoleGrantOfferAlreadyTerminalError if the offer is declined, retracted, or superseded
+ * @throws RoleGrantOfferAlreadyTerminalError if the offer is declined, retracted, or superseded, or accepted with its grant revoked, gone, or bound to another actor
  * @throws RoleGrantOfferExpiredError if the offer is pending but past `expires_at`
+ * @throws RoleGrantOfferActorMismatchError if the offer is actor-targeted to a different actor
+ * @throws RoleGrantOfferBuiltinRefusedError if a builtin-role offer must not mint (see `BuiltinOfferRefusal`)
  * @throws Error if the accepting `actor_id` does not belong to `to_account_id`, or invariant assertions fail
  */
 export const query_accept_offer = async (
@@ -485,30 +554,45 @@ export const query_accept_offer = async (
 	// We defer writing `accepted_at` until the role_grant row exists — the
 	// `role_grant_offer_role_grant_iff_accepted` CHECK constraint demands both be set
 	// (or neither) at row-visibility time.
-	const locked = await deps.db.query_one<RoleGrantOffer>(
-		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)} FROM role_grant_offer
+	//
+	// Trailing `expires_at > NOW() AS still_valid` rides on the FOR UPDATE row
+	// so the expiry branch below compares the **raw** column on Postgres' clock
+	// — the projected `expires_at` is floored to the second, so comparing it in
+	// JS would report expiry up to a second early. Twin of the Rust
+	// `query_accept_offer`'s `o.expires_at > NOW() AS still_valid`.
+	const locked_row = await deps.db.query_one<RoleGrantOffer & { still_valid: boolean }>(
+		`SELECT ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))},
+		        role_grant_offer.expires_at > NOW() AS still_valid
+		 FROM role_grant_offer
 		 WHERE id = $1 AND to_account_id = $2
 		 FOR UPDATE`,
 		[offer_id, to_account_id]
 	);
 
-	if (!locked) {
+	if (!locked_row) {
 		throw new RoleGrantOfferNotFoundError(offer_id);
 	}
 
+	// `still_valid` is the comparison result, not a column of the offer — split
+	// it off so `locked` stays exactly `ROLE_GRANT_OFFER_COLUMNS`.
+	const { still_valid, ...locked } = locked_row;
+
 	if (locked.accepted_at) {
-		// Race winner already committed; return the pre-existing role_grant.
+		// Already accepted (a replay, or a race winner already committed);
+		// return the pre-existing role_grant.
 		// `role_grant_offer_role_grant_iff_accepted` CHECK guarantees resulting_role_grant_id is non-null.
-		const role_grant = assert_row(
-			await query_role_grant_by_id(deps, locked.resulting_role_grant_id!),
-			'resulting_role_grant lookup'
-		);
+		const role_grant = await query_role_grant_by_id(deps, locked.resulting_role_grant_id!);
+		// The idempotent answer stands only while the grant it names does. A
+		// grant revoked since the accept (or gone) makes a replay terminal:
+		// answering OK with the revoked grant's id would tell the caller "you
+		// hold this role" when they don't.
+		//
 		// Multi-actor guard: two actors on the same recipient account may
 		// both race an account-grain offer — the loser must not silently
 		// receive the winner's role_grant (which would tell them "you got it"
 		// while the actor on the role_grant is someone else). Treat the offer
 		// as terminal for the loser.
-		if (role_grant.actor_id !== actor_id) {
+		if (!role_grant || role_grant.revoked_at !== null || role_grant.actor_id !== actor_id) {
 			throw new RoleGrantOfferAlreadyTerminalError(offer_id);
 		}
 		return {
@@ -526,8 +610,9 @@ export const query_accept_offer = async (
 
 	// Expiry check AFTER the accepted-path: a validly-accepted offer past its
 	// expires_at still returns the role_grant idempotently. Only pending offers
-	// past expiry reach this branch.
-	if (new Date(locked.expires_at) <= new Date()) {
+	// past expiry reach this branch. `still_valid` rode on the FOR UPDATE row
+	// above, so the comparison stays on the raw column and Postgres' clock.
+	if (!still_valid) {
 		throw new RoleGrantOfferExpiredError(offer_id);
 	}
 
@@ -549,6 +634,28 @@ export const query_accept_offer = async (
 	// under the FK invariant but stays as defense-in-depth).
 	if (locked.to_actor_id != null && locked.to_actor_id !== actor_id) {
 		throw new RoleGrantOfferActorMismatchError(offer_id);
+	}
+
+	// Builtin-role offers — checked here, the chokepoint where an offer turns
+	// into a `role_grant`, so a direct caller of this query can't skip them. No
+	// current grant path creates a refused shape, but a pending row can still
+	// carry one (a direct `query_role_grant_offer_create`, or an offer made under
+	// a since-closed path).
+	if (is_builtin_role(locked.role)) {
+		let refusal: BuiltinOfferRefusal | null = null;
+		if (locked.role === ROLE_KEEPER) {
+			// `keeper` is bootstrap-only — never conferred through an offer, even
+			// from a global admin.
+			refusal = 'bootstrap_only';
+		} else if (locked.scope_id !== null) {
+			// Builtin roles are global-only.
+			refusal = 'scoped';
+		} else if (!(await query_grantor_holds_global_admin(deps, locked.from_actor_id))) {
+			refusal = 'grantor_not_authorized';
+		}
+		if (refusal !== null) {
+			throw new RoleGrantOfferBuiltinRefusedError(locked, refusal);
+		}
 	}
 
 	// Verify the accepting actor belongs to the recipient account.
@@ -583,7 +690,7 @@ export const query_accept_offer = async (
 		`UPDATE role_grant_offer
 		 SET accepted_at = NOW(), resulting_role_grant_id = $2
 		 WHERE id = $1
-		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}`,
+		 RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS, role_grant_offer_expr(''))}`,
 		[locked.id, role_grant.id]
 	);
 	const offer = assert_row(offer_accepted, 'mark offer accepted');
@@ -601,10 +708,8 @@ export const query_accept_offer = async (
 			  AND role = $2
 			  AND scope_id IS NOT DISTINCT FROM $3
 			  AND id <> $4
-			  AND accepted_at IS NULL
-			  AND declined_at IS NULL
-			  AND retracted_at IS NULL
-			  AND superseded_at IS NULL
+			  AND ${offer_pending_predicate('')}
+			-- raw columns; the outer grantor select formats them
 			RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}
 		)
 		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
@@ -680,4 +785,42 @@ export const query_accept_offer = async (
 		superseded_offers: superseded,
 		audit_events: [offer_accept_event, role_grant_create_event, ...supersede_events]
 	};
+};
+
+/**
+ * Supersede every pending offer **made by** one of `from_actor_ids` — the
+ * grantor-side cascade.
+ *
+ * An offer carries no record of the authority it was made under, so one
+ * outliving that authority would still confer its role on accept. Revoking a
+ * grant (`role_grant_revoke`, the revokee's actor) and removing an account
+ * (`account_delete` / `account_purge`, every actor of the account) end the
+ * grantor's outgoing pending offers in the same transaction. Each row carries
+ * the grantor's `from_account_id`, as every supersede cascade's does; the
+ * caller emits a `role_grant_offer_supersede` audit event per entry, and the
+ * revoke caller also sends the supersede notification. Twin of the Rust
+ * `query_role_grant_offer_supersede_outgoing`.
+ *
+ * @param deps - query dependencies
+ * @param from_actor_ids - the grantors whose pending offers end
+ * @returns the superseded offers, each with its grantor's account
+ * @mutates `role_grant_offer` rows - stamps `superseded_at` on every pending offer from `from_actor_ids`
+ */
+export const query_role_grant_offer_supersede_outgoing = async (
+	deps: QueryDeps,
+	from_actor_ids: ReadonlyArray<Uuid>
+): Promise<Array<SupersededOffer>> => {
+	if (from_actor_ids.length === 0) return [];
+	return deps.db.query<SupersededOffer>(
+		`WITH updated AS (
+			UPDATE role_grant_offer
+			SET superseded_at = NOW()
+			WHERE from_actor_id = ANY($1)
+			  AND ${offer_pending_predicate('')}
+			-- raw columns; the outer grantor select formats them
+			RETURNING ${columns_sql(ROLE_GRANT_OFFER_COLUMNS)}
+		)
+		${ROLE_GRANT_OFFER_WITH_GRANTOR_SELECT}`,
+		[from_actor_ids]
+	);
 };

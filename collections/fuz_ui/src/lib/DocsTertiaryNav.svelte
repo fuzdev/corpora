@@ -3,7 +3,7 @@
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
 	import DocsPageLinks from './DocsPageLinks.svelte';
-	import { tome_to_pathname, Tome } from './tome.ts';
+	import { tome_to_pathname, type Tome } from './tome.ts';
 	import { docs_links_context } from './docs_helpers.svelte.ts';
 	import { library_context } from './library.svelte.ts';
 	import TomeLink from './TomeLink.svelte';

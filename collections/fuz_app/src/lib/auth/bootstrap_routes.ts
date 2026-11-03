@@ -13,12 +13,21 @@ import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import type { SessionOptions } from './session_cookie.ts';
 import { create_session_and_set_cookie } from './session_middleware.ts';
-import { bootstrap_account, type BootstrapAccountSuccess } from './bootstrap_account.ts';
+import {
+	bootstrap_account,
+	read_bootstrap_token,
+	type BootstrapAccountSuccess
+} from './bootstrap_account.ts';
 import { bootstrap_route_shape, type BootstrapInput } from './bootstrap_route_schema.ts';
 import type { Db } from '../db/db.ts';
 import { get_route_input, type RouteSpec } from '../http/route_spec.ts';
 import { get_client_ip } from '../http/client_ip.ts';
-import { rate_limit_exceeded_response, type RateLimiter } from '../rate_limiter.ts';
+import { rate_limit_ip_key } from '../http/ip_canonical.ts';
+import {
+	rate_limit_exceeded_response,
+	reserve_optional,
+	type RateLimiter
+} from '../rate_limiter.ts';
 import type { RouteFactoryDeps } from './deps.ts';
 import { ERROR_ALREADY_BOOTSTRAPPED, ERROR_TOKEN_FILE_MISSING } from '../http/error_schemas.ts';
 
@@ -76,10 +85,11 @@ export interface CheckBootstrapStatusDeps {
  * Bootstrap is available when:
  * 1. A token path is configured
  * 2. The token file passes the secure read (exists, not a symlink, mode
- *    `0600`/`0400`, within the size cap)
+ *    `0600`/`0400`, within the size cap) and holds at least
+ *    `BOOTSTRAP_TOKEN_MIN_BYTES` (a shorter one logs an error)
  * 3. The `bootstrap_lock` table shows `bootstrapped = false`
  *
- * The probe **reads through the same `read_secure_file` the request-time
+ * The probe **reads through the same `read_bootstrap_token` the request-time
  * read uses**, so "bootstrap is available" and "the token file can actually
  * be read" can't drift apart — an availability check laxer than the read it
  * gates is the misconfiguration that reports green at boot and fails at
@@ -101,7 +111,7 @@ export const check_bootstrap_status = async (
 	}
 
 	try {
-		await read_secure_file(token_path);
+		await read_bootstrap_token({ read_secure_file, log }, token_path);
 	} catch (err) {
 		log.info(`Bootstrap unavailable: ${to_error_message(err)}`);
 		return { available: false, token_path };
@@ -146,101 +156,108 @@ export const create_bootstrap_route_specs = (
 					return c.json({ error: ERROR_ALREADY_BOOTSTRAPPED }, 403);
 				}
 
-				// Per-IP rate limit check (before any token/DB work)
-				const ip = bootstrap_ip_rate_limiter ? get_client_ip(c) : null;
-				if (bootstrap_ip_rate_limiter && ip) {
-					const check = bootstrap_ip_rate_limiter.check(ip);
-					if (!check.allowed) {
-						return rate_limit_exceeded_response(c, check.retry_after);
-					}
-				}
-
-				const input = get_route_input<BootstrapInput>(c);
-
-				// `transaction: false` makes `route.db` the pool. `bootstrap_account`
-				// manages its own transaction internally.
-				const result = await bootstrap_account(
-					{
-						db: route.db,
-						token_path,
-						read_secure_file: deps.read_secure_file,
-						delete_file: deps.delete_file,
-						password: deps.password,
-						log: deps.log
-					},
-					input.token,
-					input
-				);
-				if (!result.ok) {
-					// An unreadable token file closes the window. Bootstrap cannot
-					// succeed without one, and `check_bootstrap_status` already reads
-					// an unreadable file as unavailable at startup — so leaving the
-					// flag set means the two disagree, and every later request takes
-					// this leg and writes another audit row. The limiter would bound
-					// that channel; closing it ends it, and stops `/status`
-					// advertising a window that can't be walked through. Twin of the
-					// Rust spine's `bootstrap_handler`, which does the same.
-					if (result.error === ERROR_TOKEN_FILE_MISSING) bootstrap_status.available = false;
-					if (bootstrap_ip_rate_limiter && ip) bootstrap_ip_rate_limiter.record(ip);
-					deps.audit.emit(route, {
-						event_type: 'bootstrap',
-						outcome: 'failure',
-						ip: get_client_ip(c),
-						metadata: { error: result.error }
-					});
-					return c.json({ error: result.error }, result.status);
-				}
-
-				// Successful bootstrap — update state immediately. Nothing is
-				// reset: bootstrap has no account-grain bucket to forgive (it
-				// predates any account), and the IP bucket is never refunded on
-				// success (see `RateLimiter.reset`). So this is the one auth
-				// surface where a success clears nothing at all. Bootstrap is
-				// one-shot, so at most `max_attempts - 1` residual entries
-				// survive — and they sit on this route's own limiter, not
-				// login's, so a fumbled token can't spend the operator's login
-				// budget on a deployment where their account is the only one.
-				bootstrap_status.available = false;
-
-				await create_session_and_set_cookie({
-					keyring,
-					deps: { db: route.db },
-					c,
-					account_id: result.account.id,
-					session_options
+				// Per-IP rate limit (before any token/DB work). Reserved, not
+				// checked: the attempt counts against the cap until it settles, so
+				// a concurrent burst of token guesses can't all pass before any of
+				// it records. The `finally` releases it unless a failure recorded it.
+				// keyed by the address's rate-limit key (an IPv6 client's /64)
+				const ip_key = bootstrap_ip_rate_limiter ? rate_limit_ip_key(get_client_ip(c)) : null;
+				const ip_reserved = await reserve_optional(bootstrap_ip_rate_limiter, ip_key, {
+					signal: c.req.raw.signal
 				});
-
-				if (on_bootstrap) {
-					try {
-						await on_bootstrap(result, c);
-					} catch (err) {
-						deps.log.error(`on_bootstrap callback failed: ${to_error_message(err)}`);
-					}
+				if (!ip_reserved.ok) {
+					return rate_limit_exceeded_response(c, ip_reserved.retry_after);
 				}
+				try {
+					const input = get_route_input<BootstrapInput>(c);
 
-				deps.audit.emit(route, {
-					event_type: 'bootstrap',
-					actor_id: result.actor.id,
-					account_id: result.account.id,
-					ip: get_client_ip(c)
-				});
-
-				// CRITICAL: If token file deletion failed, throw to force operator attention.
-				// All success work (session, on_bootstrap, audit) has completed above.
-				// The error response alerts the operator to delete the token file manually.
-				if (!result.token_file_deleted) {
-					throw new Error(
-						`Bootstrap succeeded but token file was not deleted at ${
-							token_path
-						}. Delete it manually and log in.`
+					// `transaction: false` makes `route.db` the pool. `bootstrap_account`
+					// manages its own transaction internally.
+					const result = await bootstrap_account(
+						{
+							db: route.db,
+							token_path,
+							read_secure_file: deps.read_secure_file,
+							delete_file: deps.delete_file,
+							password: deps.password,
+							log: deps.log
+						},
+						input.token,
+						input
 					);
-				}
+					if (!result.ok) {
+						// An unreadable token file closes the window. Bootstrap cannot
+						// succeed without one, and `check_bootstrap_status` already reads
+						// an unreadable file as unavailable at startup — so leaving the
+						// flag set means the two disagree, and every later request takes
+						// this leg and writes another audit row. The limiter would bound
+						// that channel; closing it ends it, and stops `/status`
+						// advertising a window that can't be walked through. Twin of the
+						// Rust spine's `bootstrap_handler`, which does the same.
+						if (result.error === ERROR_TOKEN_FILE_MISSING) bootstrap_status.available = false;
+						ip_reserved.reservation.record();
+						await deps.audit.emit(route, {
+							event_type: 'bootstrap',
+							outcome: 'failure',
+							ip: get_client_ip(c),
+							metadata: { error: result.error }
+						});
+						return c.json({ error: result.error }, result.status);
+					}
 
-				return c.json({
-					ok: true,
-					account: { id: result.account.id, username: result.account.username },
-					actor: { id: result.actor.id }
-				});
+					// Successful bootstrap — update state immediately. Nothing is
+					// reset: bootstrap has no account-grain bucket to forgive (it
+					// predates any account), and the IP bucket is never refunded on
+					// success (see `RateLimiter.reset`). So this is the one auth
+					// surface where a success clears nothing at all. Bootstrap is
+					// one-shot, so at most `max_attempts - 1` residual entries
+					// survive — and they sit on this route's own limiter, not
+					// login's, so a fumbled token can't spend the operator's login
+					// budget on a deployment where their account is the only one.
+					bootstrap_status.available = false;
+
+					await create_session_and_set_cookie({
+						keyring,
+						deps: { db: route.db },
+						c,
+						account_id: result.account.id,
+						session_options
+					});
+
+					if (on_bootstrap) {
+						try {
+							await on_bootstrap(result, c);
+						} catch (err) {
+							deps.log.error(`on_bootstrap callback failed: ${to_error_message(err)}`);
+						}
+					}
+
+					await deps.audit.emit(route, {
+						event_type: 'bootstrap',
+						actor_id: result.actor.id,
+						account_id: result.account.id,
+						ip: get_client_ip(c)
+					});
+
+					// CRITICAL: If token file deletion failed, throw to force operator attention.
+					// All success work (session, on_bootstrap, audit) has completed above.
+					// The error response alerts the operator to delete the token file manually.
+					if (!result.token_file_deleted) {
+						throw new Error(
+							`Bootstrap succeeded but token file was not deleted at ${
+								token_path
+							}. Delete it manually and log in.`
+						);
+					}
+
+					return c.json({
+						ok: true,
+						account: { id: result.account.id, username: result.account.username },
+						actor: { id: result.actor.id }
+					});
+				} finally {
+					ip_reserved.reservation.release();
+				}
 			}
 		}
 	];

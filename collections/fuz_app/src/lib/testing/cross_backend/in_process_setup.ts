@@ -17,7 +17,7 @@ import '../assert_dev_env.ts';
  * @module
  */
 
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../../primitive_schemas.ts';
 
 import type { RouteSpec } from '../../http/route_spec.ts';
 import type { AppSurfaceSpec } from '../../http/surface.ts';
@@ -25,13 +25,14 @@ import type { BootstrapServerOptions } from '../../server/app_server.ts';
 import type { AppServerContext } from '../../server/app_server_context.ts';
 import type { SessionOptions } from '../../auth/session_cookie.ts';
 import { ROLE_KEEPER } from '../../auth/role_schema.ts';
-import { query_create_actor } from '../../auth/account_queries.ts';
+import { create_test_extra_actor } from '../db_entities.ts';
 import {
 	create_test_app,
 	create_test_account_with_credentials,
 	mint_test_session,
 	type CreateTestAppOptions,
-	type SuiteAppOptions
+	type SuiteAppOptions,
+	type TestAccount
 } from '../app_server.ts';
 import { create_test_app_surface_spec } from '../stubs.ts';
 import {
@@ -42,16 +43,15 @@ import {
 import { in_process_capabilities, type BackendCapabilities } from './capabilities.ts';
 import type { FetchTransport } from '../transports/fetch_transport.ts';
 import {
-	build_extra_account_fixture,
 	EXPIRED_SESSION_OFFSET_SECONDS,
+	to_test_account,
 	type SetupTest,
-	type ExtraAccountFixture,
 	type ExtraAccountSpec
 } from './setup.ts';
 
 /**
  * Wrap a Hono-style app into a `FetchTransport`-shaped object so the
- * shared `TestFixtureBase.transport` type holds for both in-process and
+ * shared `TestFixture.transport` type holds for both in-process and
  * cross-process setups. In-process has no real cookie jar — the no-op
  * `cookies()` returns `[]`; in-process tests build cookies via
  * `fixture.create_session_headers()` instead.
@@ -59,7 +59,7 @@ import {
 const in_process_fetch_transport = (app: Parameters<typeof http_transport>[0]): FetchTransport => {
 	const call = http_transport(app);
 	const transport = ((url: string, init: RequestInit) => call(url, init)) as RpcTestTransport;
-	return Object.assign(transport, { cookies: (): ReadonlyArray<string> => [] }) as FetchTransport;
+	return Object.assign(transport, { cookies: (): ReadonlyArray<string> => [] });
 };
 
 /**
@@ -79,10 +79,15 @@ export interface InProcessSetupOptions extends CreateTestAppOptions {
 	/**
 	 * Additional actor names to seed on the bootstrapped keeper — exposed on
 	 * `fixture.extra_actors`. See `CrossProcessSetupOptions.extra_actors` /
-	 * `TestFixtureBase.extra_actors`. Seeded directly against the live backend
+	 * `TestFixture.extra_actors`. Seeded directly against the live backend
 	 * DB (in-process has no wire hop).
 	 */
 	readonly extra_actors?: ReadonlyArray<string>;
+	/**
+	 * Refuse undeclared audit metadata keys in the fixture's audit reads — see
+	 * `CrossProcessSetupOptions.reject_unknown_audit_metadata_keys`.
+	 */
+	readonly reject_unknown_audit_metadata_keys?: boolean;
 }
 
 /**
@@ -99,8 +104,8 @@ export interface InProcessSetupOptions extends CreateTestAppOptions {
  * `_testing_reset` cradle so suite bodies read
  * `fixture.extra_accounts[username]` uniformly regardless of transport.
  *
- * The describe-level `auth_integration_truncate_tables` / pglite WASM
- * cache lifecycle stays in `create_pglite_factory` / `create_describe_db`
+ * The describe-level `auth_integration_truncate_tables` / WASM database
+ * cache lifecycle stays in `create_default_db_factory` / `create_describe_db`
  * (`testing/db.ts`) — `default_in_process_setup` doesn't manage db state
  * beyond what `create_test_app` already does.
  */
@@ -108,7 +113,7 @@ export const default_in_process_setup =
 	(options: InProcessSetupOptions): SetupTest =>
 	async () => {
 		// Per-test fresh db. When `options.migration_namespaces` is set,
-		// `create_test_app` provisions an auth+extras PGlite (e.g. the cell
+		// `create_test_app` provisions an auth+extras database (e.g. the cell
 		// layer); otherwise the auth-only default. Either way the factory
 		// resets + re-migrates on each `create`, so the per-test keeper
 		// bootstrap below lands on a clean DB.
@@ -118,7 +123,7 @@ export const default_in_process_setup =
 		// just landed on. Direct-insert is the only path for roles whose
 		// `grant_paths` excludes `'admin'` (e.g. `ROLE_KEEPER`) — see
 		// `ExtraAccountSpec` for why this bypass is bootstrap-cradle-only.
-		const extra_accounts: Record<string, ExtraAccountFixture> = {};
+		const extra_accounts: Record<string, TestAccount> = {};
 		const { cookie_name } = options.session_options;
 		for (const spec of options.extra_accounts ?? []) {
 			const seeded = await create_test_account_with_credentials({
@@ -130,17 +135,18 @@ export const default_in_process_setup =
 				password_value: spec.password_value,
 				roles: [...spec.roles]
 			});
-			extra_accounts[spec.username] = build_extra_account_fixture(seeded, cookie_name);
+			extra_accounts[spec.username] = to_test_account(seeded, cookie_name);
 		}
 
 		// Seed additional keeper actors directly against the same DB. Mirrors
 		// the cross-process `_testing_reset` `extra_actors` path; no production
 		// wire mints a second actor, so this bootstrap-cradle insert is the
-		// only way into a multi-actor keeper state.
+		// only way into a multi-actor keeper state. Seeded at the wall clock,
+		// like the reset, so they sort after the bootstrap actor.
 		const extra_actors: Array<{ id: Uuid; name: string }> = [];
 		for (const name of options.extra_actors ?? []) {
-			const seeded_actor = await query_create_actor(
-				{ db: test_app.backend.deps.db },
+			const seeded_actor = await create_test_extra_actor(
+				test_app.backend.deps.db,
 				test_app.backend.account.id,
 				name
 			);
@@ -161,6 +167,7 @@ export const default_in_process_setup =
 			create_account: test_app.create_account,
 			extra_accounts,
 			extra_actors,
+			reject_unknown_audit_metadata_keys: options.reject_unknown_audit_metadata_keys ?? false,
 			// Forge directly against the live backend's DB + keyring — no wire
 			// hop needed in-process.
 			mint_expired_session: async () => {
@@ -216,9 +223,14 @@ export interface DefaultInProcessSuiteOptions {
 	extra_accounts?: ReadonlyArray<ExtraAccountSpec>;
 	/**
 	 * Additional actor names to seed on the bootstrapped keeper — exposed on
-	 * `fixture.extra_actors`. See `TestFixtureBase.extra_actors`.
+	 * `fixture.extra_actors`. See `TestFixture.extra_actors`.
 	 */
 	extra_actors?: ReadonlyArray<string>;
+	/**
+	 * Refuse undeclared audit metadata keys in the fixture's audit reads — see
+	 * `CrossProcessSetupOptions.reject_unknown_audit_metadata_keys`.
+	 */
+	reject_unknown_audit_metadata_keys?: boolean;
 	/**
 	 * Pre-built `AppSurfaceSpec` — overrides the default which calls
 	 * `create_test_app_surface_spec` against the same factory inputs.
@@ -286,7 +298,8 @@ export const default_in_process_suite_options = <const O extends DefaultInProces
 		app_options: options.app_options,
 		roles: [ROLE_KEEPER, ...(options.extra_keeper_roles ?? [])],
 		extra_accounts: options.extra_accounts,
-		extra_actors: options.extra_actors
+		extra_actors: options.extra_actors,
+		reject_unknown_audit_metadata_keys: options.reject_unknown_audit_metadata_keys
 	}),
 	surface_source:
 		options.surface_source ??
@@ -297,7 +310,10 @@ export const default_in_process_suite_options = <const O extends DefaultInProces
 			// Mirror what `create_test_app` → `create_app_server` will mount.
 			// Both helpers read from the top-level `bootstrap` slot so surface
 			// and live app stay in sync by construction.
-			bootstrap: options.bootstrap
+			bootstrap: options.bootstrap,
+			surface_route: options.app_options?.surface_route,
+			// `create_test_app` always passes a `daemon_token_state`
+			daemon_token: true
 		}),
 	capabilities: in_process_capabilities,
 	session_options: options.session_options,

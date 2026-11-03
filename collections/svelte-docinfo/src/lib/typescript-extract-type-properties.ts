@@ -12,6 +12,8 @@
  * @see `typescript-extract-shared.ts` for shared helpers
  * @see `typescript-extract-type.ts` for the dispatcher
  *
+ * @internal
+ *
  * @module
  */
 
@@ -19,9 +21,14 @@ import ts from 'typescript';
 
 import type { DeclarationModifier } from './types.ts';
 import type { DeclarationJsonBuild, MemberJsonBuild } from './declaration-build.ts';
-import { to_error_message } from './error.ts';
+import { toErrorMessage } from './error.ts';
 import { parseComment } from './tsdoc.ts';
-import { resolveTypeInfo } from './typescript-extract-type-json.ts';
+import {
+	resolveTypeInfo,
+	typeAliasTypeNode,
+	writtenTypeAnnotation,
+	type TypeAliasLike
+} from './typescript-extract-type-json.ts';
 import { type IsExternalFile } from './typescript-program.ts';
 import {
 	emitCallOrConstructSignature,
@@ -112,7 +119,7 @@ const extractLocalIndexInfo = (
 /**
  * Resolve, emit, and diagnose a local index signature for a type alias.
  *
- * Wraps `extractLocalIndexType` with the boilerplate shared by string and
+ * Wraps `extractLocalIndexInfo` with the boilerplate shared by string and
  * number kinds: push a `[key: string]` / `[key: number]` member when found,
  * flip `partial: true` and add a `type_extraction_failed` diagnostic on
  * checker errors. Pulled out of the call site to avoid copy-paste drift
@@ -124,7 +131,7 @@ const extractLocalIndexInfo = (
 const emitLocalIndexSignature = (
 	declaration: DeclarationJsonBuild,
 	nodeType: ts.Type,
-	node: ts.TypeAliasDeclaration,
+	node: TypeAliasLike,
 	ctx: ExtractContext,
 	kind: 'string' | 'number'
 ): void => {
@@ -155,7 +162,7 @@ const emitLocalIndexSignature = (
 			file: loc.file,
 			line: loc.line,
 			column: loc.column,
-			message: `Failed to extract ${kind} index signature for type "${declaration.name ?? '<default export>'}": ${to_error_message(err)}`,
+			message: `Failed to extract ${kind} index signature for type "${declaration.name ?? '<default export>'}": ${toErrorMessage(err)}`,
 			severity: 'warning',
 			symbolName: declaration.name ?? '<default export>'
 		});
@@ -176,10 +183,9 @@ const isReadonlyProperty = (prop: ts.Symbol, mappedReadonly: boolean): boolean =
 	const decls = prop.getDeclarations();
 	if (decls) {
 		for (const decl of decls) {
-			if (ts.canHaveModifiers(decl)) {
-				const mods = ts.getModifiers(decl);
-				if (mods?.some((m) => m.kind === ts.SyntaxKind.ReadonlyKeyword)) return true;
-			}
+			// a JS class's `@readonly` field or `this.x` too, as on the class itself
+			// (`extractModifiers`)
+			if (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Readonly) return true;
 		}
 	}
 	return mappedReadonly;
@@ -195,10 +201,16 @@ const isReadonlyProperty = (prop: ts.Symbol, mappedReadonly: boolean): boolean =
  * - Call signatures (`(call)`)
  * - Construct signatures (`(construct)`)
  *
+ * A JSDoc typedef reads the same way: a `@typedef {object}` builds its
+ * properties from `@property` tags (each tag's description is the member's
+ * `docComment`, and a bracketed `[x]` or `{T=}` makes it optional), and a
+ * `@callback` is a function type, so it gets a `(call)` member whose
+ * parameters and return carry the callback's `@param`/`@returns` text.
+ *
  * @mutates declaration - adds members
  */
 export const extractTypeAliasProperties = (
-	node: ts.TypeAliasDeclaration,
+	node: TypeAliasLike,
 	nodeType: ts.Type,
 	declaration: DeclarationJsonBuild,
 	ctx: ExtractContext
@@ -212,9 +224,10 @@ export const extractTypeAliasProperties = (
 	// intersections, bare references, indexed-access. Unions are gated out here
 	// (the Svelte prop path calls `filterDocumentedProperties` directly, so unions
 	// still surface `externalTypes` there, just not for plain type aliases).
+	const typeNode = typeAliasTypeNode(node);
 	const { properties: filteredProperties, externalTypes } = filterDocumentedProperties(
 		nodeType,
-		node.type,
+		typeNode ?? node,
 		checker,
 		isExternalFile
 	);
@@ -270,8 +283,11 @@ export const extractTypeAliasProperties = (
 		const propTsdoc = propDecl ? parseComment(propDecl, propDecl.getSourceFile()) : undefined;
 
 		const annotation =
-			propDecl && (ts.isPropertySignature(propDecl) || ts.isPropertyDeclaration(propDecl))
-				? propDecl.type
+			propDecl &&
+			(ts.isPropertySignature(propDecl) ||
+				ts.isPropertyDeclaration(propDecl) ||
+				ts.isJSDocPropertyTag(propDecl))
+				? writtenTypeAnnotation(propDecl)
 				: undefined;
 		// owns the TSDoc application too — `@default` gates on the settled kind
 		populatePropertyMember(

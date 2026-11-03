@@ -3,29 +3,32 @@
 	Adds SVG text labels based on features in the data or a custom GeoJSON Feature Collection.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, width, height } = getContext('LayerCake');
+	/** @type {import('layercake').LayerCakeContext<any, { features: Array<any> }>} */
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
 	 * @property {Function} projection - A D3 projection function. Pass this in as an uncalled function, e.g. `projection={geoAlbersUsa}`.
-	 * @property {Function} getLabel - An accessor function to get the field to display.
-	 * @property {number|undefined} [fixedAspectRatio] - By default, the map fills to fit the $width and $height. If instead you want a fixed-aspect ratio, like for a server-side rendered map, set that here.
-	 * @property {Function} getCoordinates - An accessor function to get the `[x, y]` coordinate field. Defaults to a GeoJSON feature format.
-	 * @property {Array<Object>|undefined} [features] - A list of labels as GeoJSON features. If unset, the plotted features will default to those in `$data.features`, assuming this field is a list of GeoJSON features.
+	 * @property {(d: any) => string} getLabel - Returns the label text for a feature.
+	 * @property {(d: any) => [number, number]} getCoordinates - Returns the `[x, y]` coordinate pair to project for a feature, e.g. `d => d.geometry.coordinates`.
+	 * @property {number|undefined} [fixedAspectRatio] - By default, the map fills to fit the k.width and k.height. If instead you want a fixed-aspect ratio, like for a server-side rendered map, set that here.
+	 * @property {Array<Object>|undefined} [features] - A list of labels as GeoJSON features. If unset, the plotted features will default to those in `k.data.features`, assuming this field is a list of GeoJSON features.
 	 */
 
 	/** @type {Props} */
-	let { projection, getLabel, fixedAspectRatio, getCoordinates, features } = $props();
+	let { projection, getLabel, getCoordinates, fixedAspectRatio, features } = $props();
 
-	let fitSizeRange = $derived(fixedAspectRatio ? [100, 100 / fixedAspectRatio] : [$width, $height]);
+	let fitSizeRange = $derived(
+		fixedAspectRatio ? [100, 100 / fixedAspectRatio] : [k.width, k.height]
+	);
 
-	let projectionFn = $derived(projection().fitSize(fitSizeRange, $data));
+	let projectionFn = $derived(projection().fitSize(fitSizeRange, k.data));
 </script>
 
 <g class="map-labels">
-	{#each features || $data.features as d}
+	{#each features || k.data.features as d}
 		{@const coords = projectionFn(getCoordinates(d))}
 		<text class="map-label" x={coords[0]} y={coords[1]}>{getLabel(d)}</text>
 	{/each}
@@ -36,11 +39,8 @@
 		pointer-events: none;
 	}
 	.map-label {
-		color: #333;
-		/**
-		 * If you render this in an ScaledSvg layout component, you'll
-		 * want to make this like 1px bc it's actually being zoomed by about 10x
-		 */
+		fill: #333;
+		/* Inside a ScaledSvg layout, which scales everything up about 10x, use about 1px */
 		font-size: 8px;
 		text-anchor: middle;
 	}

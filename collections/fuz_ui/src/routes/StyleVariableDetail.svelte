@@ -7,7 +7,7 @@
 		variable: StyleVariable | null;
 	} = $props();
 
-	// TODO @many add to $lib?
+	// TODO @many add to `src/lib`?
 
 	// TODO needs a lot of work - for example, enable editing the values directly, and certain values like colors could be rendered
 </script>
@@ -17,8 +17,8 @@
 		<div class="name"><code>--{variable.name}</code></div>
 		{#if variable.summary}<blockquote>{variable.summary}</blockquote>{/if}
 		<label>
-			<div class="title">light</div>
-			<input disabled value={variable.light ?? ''} />
+			<div class="title">base</div>
+			<input disabled value={variable.base ?? ''} />
 		</label>
 		<label>
 			<div class="title">dark</div>

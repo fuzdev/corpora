@@ -3,57 +3,46 @@
 	Generates a canvas map using the `geoPath` function from [d3-geo](https://github.com/d3/d3-geo).
  -->
 <script>
-	import { getContext } from 'svelte';
-	import { scaleCanvas } from 'layercake';
+	import { getLayerCakeContext, getCanvasContext } from 'layercake';
 	import { geoPath } from 'd3-geo';
 
-	const { data, width, height, zGet } = getContext('LayerCake');
-
-	const { ctx } = getContext('canvas');
+	/** @type {import('layercake').LayerCakeContext<any, { features: Array<any> }>} */
+	const k = getLayerCakeContext();
+	const canvas = getCanvasContext();
 
 	/**
 	 * @typedef {Object} Props
 	 * @property {Function} projection - A D3 projection function. Pass this in as an uncalled function, e.g. `projection={geoAlbersUsa}`.
 	 * @property {string} [stroke='#ccc'] - The shape's stroke color.
 	 * @property {number} [strokeWidth=1] - The shape's stroke width.
-	 * @property {string|undefined} [fill] - The shape's fill color. By default, the fill will be determined by the z-scale, unless this prop is set.
-	 * @property {Array<GeoJSON>|undefined} [features] - A list of GeoJSON features. Use this if you want to draw a subset of the features in `$data` while keeping the zoom on the whole GeoJSON feature set. By default, it plots everything in `$data.features` if left unset.
+	 * @property {string|undefined} [fill] - The shape's fill color. By default, the fill will be determined by the c-scale, unless this prop is set.
+	 * @property {Array<Object>|undefined} [features] - A list of GeoJSON features. Use this if you want to draw a subset of the features in `k.data` while keeping the zoom on the whole GeoJSON feature set. By default, it plots everything in `k.data.features` if left unset.
 	 */
 
 	/** @type {Props} */
 	let { projection, stroke = '#ccc', strokeWidth = 1, fill, features } = $props();
 
-	let projectionFn = $derived(projection().fitSize([$width, $height], $data));
+	let projectionFn = $derived(projection().fitSize([k.width, k.height], k.data));
 
 	let geoPathFn = $derived(geoPath(projectionFn));
 
-	let featuresToDraw = $derived(features || $data.features);
+	let featuresToDraw = $derived(features || k.data.features);
 
-	$effect(() => {
-		if (!$width || !$height || !$ctx) return;
+	// Layer Cake runs this on every repaint: resize, new data or a prop change
+	canvas.draw(ctx => {
+		// geoPath draws into whichever context it was given last, so hand it this one first
+		geoPathFn.context(ctx);
+		featuresToDraw.forEach(feature => {
+			ctx.beginPath();
+			geoPathFn(feature);
 
-		// Assign to a local variable: setting properties on `$ctx` directly
-		// would re-notify the store and re-trigger this effect
-		const context = $ctx;
-		const zGetFn = $zGet;
+			// Fall back to a neutral fill when the chart has no c dimension
+			ctx.fillStyle = fill ?? k.cGet?.(feature.properties) ?? '#ccc';
+			ctx.fill();
 
-		scaleCanvas(context, $width, $height);
-		context.clearRect(0, 0, $width, $height);
-
-		featuresToDraw.forEach(
-			/** @param {any} feature */ feature => {
-				context.beginPath();
-				// Set the context here since setting it in `geoPath` is a circular reference
-				geoPathFn.context(context);
-				geoPathFn(feature);
-
-				context.fillStyle = fill || zGetFn(feature.properties);
-				context.fill();
-
-				context.lineWidth = strokeWidth;
-				context.strokeStyle = stroke;
-				context.stroke();
-			}
-		);
+			ctx.lineWidth = strokeWidth;
+			ctx.strokeStyle = stroke;
+			ctx.stroke();
+		});
 	});
 </script>

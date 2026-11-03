@@ -1,11 +1,14 @@
 /**
  * Spec-level gate check for the `_testing_*` backdoor actions.
  *
- * The seven test-binary actions (`_testing_reset`, `_testing_mint_session`,
- * `_testing_put_fact`, `_testing_drain_effects`, `_testing_schema_snapshot`,
- * `_testing_migration_tracker`, `_testing_action_manifest`) are privileged:
- * they run direct DB writes or
- * dump internal state the production wire never exposes. Their only structural
+ * The test-binary actions (`_testing_reset`, `_testing_mint_session`,
+ * `_testing_put_fact`, `_testing_drain_effects`, `_testing_flood_notifications`,
+ * `_testing_schema_snapshot`, `_testing_migration_tracker`,
+ * `_testing_action_manifest`, `_testing_origin_check`,
+ * `_testing_shorten_credential_expiry`) are privileged: they run
+ * direct DB writes, dump internal state, drive a connection past its limits, or
+ * answer probes of the server's own configuration — nothing the
+ * production wire exposes. Their only structural
  * fence is the daemon-token credential gate
  * on every spec's `auth` axis. This test pins that wiring directly — the
  * dispatcher's *enforcement* of the gate is covered behaviorally
@@ -26,20 +29,29 @@ import {
 	testing_mint_session_action_spec,
 	testing_put_fact_action_spec,
 	testing_drain_effects_action_spec,
+	testing_flood_notifications_action_spec,
 	testing_schema_snapshot_action_spec,
 	testing_migration_tracker_action_spec,
-	testing_action_manifest_action_spec
-} from '$lib/testing/cross_backend/testing_reset_actions.ts';
-import type { RequestResponseActionSpec } from '$lib/actions/action_spec.ts';
+	testing_action_manifest_action_spec,
+	testing_shorten_credential_expiry_action_spec
+} from '#lib/testing/cross_backend/testing_reset_actions.ts';
+import { testing_origin_check_action_spec } from '#lib/testing/cross_backend/testing_origin_check.ts';
+import type { RequestResponseActionSpec } from '#lib/actions/action_spec.ts';
 
 const testing_action_specs: ReadonlyArray<{ name: string; spec: RequestResponseActionSpec }> = [
 	{ name: '_testing_reset', spec: testing_reset_action_spec },
 	{ name: '_testing_mint_session', spec: testing_mint_session_action_spec },
 	{ name: '_testing_put_fact', spec: testing_put_fact_action_spec },
 	{ name: '_testing_drain_effects', spec: testing_drain_effects_action_spec },
+	{ name: '_testing_flood_notifications', spec: testing_flood_notifications_action_spec },
 	{ name: '_testing_schema_snapshot', spec: testing_schema_snapshot_action_spec },
 	{ name: '_testing_migration_tracker', spec: testing_migration_tracker_action_spec },
-	{ name: '_testing_action_manifest', spec: testing_action_manifest_action_spec }
+	{ name: '_testing_action_manifest', spec: testing_action_manifest_action_spec },
+	{ name: '_testing_origin_check', spec: testing_origin_check_action_spec },
+	{
+		name: '_testing_shorten_credential_expiry',
+		spec: testing_shorten_credential_expiry_action_spec
+	}
 ];
 
 describe('_testing_* backdoor action specs carry the daemon-token gate', () => {

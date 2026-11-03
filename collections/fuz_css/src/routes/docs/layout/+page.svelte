@@ -6,14 +6,12 @@
 	import StyleVariableButton from '@fuzdev/fuz_ui/StyleVariableButton.svelte';
 	import { resolve } from '$app/paths';
 
-	import { space_variants, distance_variants } from '$lib/variable_data.ts';
+	import { space_variants, distance_variants } from '#lib/variable_data.ts';
+	import ResolvedLength from '#routes/docs/ResolvedLength.svelte';
 
 	const LIBRARY_ITEM_NAME = 'layout';
 
 	const tome = tome_get_by_slug(LIBRARY_ITEM_NAME);
-
-	const computed_styles =
-		typeof window === 'undefined' ? null : window.getComputedStyle(document.documentElement);
 
 	// TODO width/height classes
 </script>
@@ -35,14 +33,14 @@
 					<div class="fill" style:width="var(--{name})"></div>
 					<div class="variable_wrapper"><StyleVariableButton {name} /></div>
 					<span class="pr_sm">=</span>
-					<div class="computed_value">{computed_styles?.getPropertyValue('--' + name)}</div>
+					<div class="computed_value"><ResolvedLength {name} /></div>
 				</li>
 			{/each}
 		</ul>
 		<p>
 			Space variants are used in <a href={resolve('/docs/classes')}>classes</a> like
-			<code>.p_md</code>
-			for padding, margin, other forms of spacing like gap, positioning, dimensions, etc.
+			<code>.p_md</code> for padding, margin, other forms of spacing like gap, positioning,
+			dimensions, etc.
 		</p>
 	</TomeSection>
 	<TomeSection>
@@ -54,14 +52,13 @@
 					<div class="fill" style:width="var(--{name})"></div>
 					<div class="variable_wrapper"><StyleVariableButton {name} /></div>
 					<span class="pr_sm">=</span>
-					<div class="computed_value">{computed_styles?.getPropertyValue('--' + name)}</div>
+					<div class="computed_value"><ResolvedLength {name} /></div>
 				</li>
 			{/each}
 		</ul>
 		<p>
 			Distance variants have <a href={resolve('/docs/classes')}>classes</a> like
-			<code>.width_atmost_sm</code>
-			and <code>.width_atleast_md</code>.
+			<code>.width_atmost_sm</code> and <code>.width_atleast_md</code>.
 		</p>
 	</TomeSection>
 </TomeContent>

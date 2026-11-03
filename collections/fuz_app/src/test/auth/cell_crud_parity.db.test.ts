@@ -3,7 +3,7 @@
  *
  * Runs `describe_cell_crud_cross_tests` against the in-process Hono app (no
  * process boundary), so the cell wire contract + authz matrix are verified
- * under a plain `gro test` — the cross-process legs (`cell.cross.test.ts`)
+ * under a plain `gro test` — the cross-process legs (`spine_suites.cross.test.ts`)
  * additionally drive the TS spine binary + Rust `testing_spine_stub` over real
  * HTTP behind `FUZ_TEST_CROSS_BACKEND=1`.
  *
@@ -15,8 +15,8 @@
  * @module
  */
 
-import { in_process_capabilities } from '$lib/testing/cross_backend/capabilities.ts';
-import { describe_cell_crud_cross_tests } from '$lib/testing/cross_backend/cell_crud.ts';
+import { in_process_capabilities } from '#lib/testing/cross_backend/capabilities.ts';
+import { describe_cell_crud_cross_tests } from '#lib/testing/cross_backend/cell_crud.ts';
 
 import { create_cell_parity_setup } from './cell_parity_helpers.ts';
 

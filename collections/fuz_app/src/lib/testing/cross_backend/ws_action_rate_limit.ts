@@ -1,0 +1,468 @@
+import '../assert_dev_env.ts';
+
+/**
+ * Cross-backend parity suite for **action rate limiting over a real
+ * WebSocket**, and its budget shared with HTTP RPC.
+ *
+ * An action spec's `rate_limit` class (`'ip'` / `'account'` / `'both'`) is
+ * charged by the dispatcher on both transports, and a server holds one
+ * limiter per axis, so an action's budget is per caller, not per transport.
+ * The in-process tests pin that through an assembled app; this suite pins it
+ * over the wire, against backends spawned with small shared limiters (the
+ * action rate-limit toggles — `ACTION_RATE_LIMIT_ENABLED_ENV` and
+ * `ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV` — see `global_setup_login_security.ts`):
+ *
+ * - **account axis over WS** — `account_token_create` (`rate_limit:
+ *   'account'` on both spines) with malformed params: the first `max_attempts`
+ *   calls each answer `invalid_params` (the throttle runs before params
+ *   validation, so a malformed call still charges), and the next answers
+ *   `rate_limited` with a `retry_after`.
+ * - **one account bucket across transports** — calls split between HTTP RPC and
+ *   WS exhaust one budget: the call past the cap is refused on WS and on HTTP
+ *   (`429`).
+ * - **IP axis, keyed by the resolved client IP** — `peer/ping` (`rate_limit:
+ *   'ip'`, public) with malformed params, from one `X-Forwarded-For` address
+ *   over anonymous HTTP and over a WS whose upgrade carried the same header:
+ *   the call past the cap is refused on both, while a second address keeps its
+ *   own budget on both. Over HTTP, IPv6 addresses bucket by their `/64`:
+ *   another address in the same `/64` is refused once one has spent the
+ *   budget, while one in the next `/64` keeps its own.
+ * - **account axis at the dispatchers** — `cell_create` (`rate_limit:
+ *   'account'`, on both spines' RPC and WS mounts) with malformed params: the
+ *   call past the cap answers `429` over HTTP and `rate_limited` over WS, calls
+ *   split between the two transports exhaust one budget, and a budget split
+ *   between `cell_create` and `account_token_create` is one bucket.
+ *
+ * - **the throttle precedes the dispatcher's own params checks** —
+ *   `account_token_create` with a malformed `acting` selector, which each
+ *   spine refuses in its dispatcher (TS's input schema, Rust's
+ *   `check_acting_selector`) rather than in the handler: the call past the cap
+ *   still answers `rate_limited`, so the refusals charged.
+ *
+ * **Charge site.** Both spines charge every classed action — the auth
+ * families included — in the shared dispatch core (`perform_action`), after
+ * authorization and ahead of params validation. `account_token_create` pins
+ * the auth families' class, `peer/ping` the IP axis, and `cell_create` the
+ * account axis of a consumer-shaped spec, over RPC and WS.
+ *
+ * **Isolation.** Limiter state is in-memory and `_testing_reset` wipes only
+ * the database, so every case reads a bucket no other case touched: the
+ * account cases each run on the fresh keeper the reset seeds (a new account
+ * id), and the IP case uses addresses no other case sends. Login limiters are
+ * also on in this project; nothing here logs in.
+ *
+ * Cross-process only: the composition under test is the spawned binary's
+ * (`create_app_server` threading one limiter pair to both mounts on TS; the
+ * stub's dispatcher states on Rust).
+ *
+ * @module
+ */
+
+import { assert, describe, test } from 'vitest';
+
+import { create_jsonrpc_request } from '../../http/jsonrpc_helpers.ts';
+import {
+	is_response_for,
+	type JsonrpcErrorResponseFrame,
+	type JsonrpcSuccessResponseFrame,
+	type WsClient
+} from '../transports/ws_client.ts';
+import type { SetupTest } from './setup.ts';
+import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
+import { open_session_ws, type WsEndpointTarget } from './ws_endpoint.ts';
+
+// Wire literals are deliberate independent copies of the producers'
+// constants (`JSONRPC_ERROR_CODES` on TS, the `JsonrpcError` taxonomy on
+// Rust) — parity by test, so a renamed or renumbered code fails here.
+
+/** JSON-RPC `invalid_params`. */
+const CODE_INVALID_PARAMS = -32602;
+/** JSON-RPC `rate_limited` — the spines' server-side throttle code. */
+const CODE_RATE_LIMITED = -32006;
+
+/** An `account`-classed action on both spines (session-only, side-effecting). */
+const ACCOUNT_LIMITED_METHOD = 'account_token_create';
+/** Unknown key — refused by both spines' strict params decode, after the throttle. */
+const ACCOUNT_LIMITED_BAD_PARAMS = { not_a_param: true };
+/**
+ * A malformed `acting` selector — refused by both spines' dispatchers ahead of
+ * the handler (TS's input schema, Rust's `check_acting_selector`), after the
+ * throttle.
+ */
+const ACCOUNT_LIMITED_BAD_ACTING = { acting: 'not-a-uuid' };
+
+/**
+ * An `account`-classed consumer-shaped action (not an auth family, unlike
+ * `ACCOUNT_LIMITED_METHOD`), mounted on both spines' RPC and WS. Actor-grain,
+ * so the keeper's actor resolves before the throttle; the same unknown-key
+ * params are refused by both spines' strict decode, after it.
+ */
+const DISPATCHER_ACCOUNT_LIMITED_METHOD = 'cell_create';
+
+/** The `ip`-classed public protocol action on both spines. */
+const IP_LIMITED_METHOD = 'peer/ping';
+/** Wrong-typed `nonce` — refused by both spines' params decode, after the throttle. */
+const IP_LIMITED_BAD_PARAMS = { nonce: 'not_a_number' };
+
+/**
+ * RFC 5737 TEST-NET-2 (`198.51.100.0/24`) documentation addresses, spoofed
+ * via `X-Forwarded-For` (both spines trust the loopback peer in this project).
+ * Distinct from `login_security.ts`'s TEST-NET-3 addresses, though the login
+ * and action limiters keep separate buckets anyway.
+ */
+const XFF_IP_EXHAUSTED = '198.51.100.1';
+const XFF_IP_FRESH = '198.51.100.2';
+/**
+ * RFC 3849 documentation addresses: two in one `/64` — the second differs past
+ * bit 64 only — and one in the next `/64`. Distinct from `login_security.ts`'s.
+ */
+const XFF_V6_EXHAUSTED = '2001:db8:e3a:1::1';
+const XFF_V6_SAME_64 = '2001:db8:e3a:1:8000::2';
+const XFF_V6_OTHER_64 = '2001:db8:e3a:2::1';
+
+/** Generous per-response wait — the cases assert the server's answer, not a timeout. */
+const RESPONSE_TIMEOUT_MS = 5000;
+
+/** Options for `describe_ws_action_rate_limit_cross_tests`. */
+export interface WsActionRateLimitCrossTestOptions extends WsEndpointTarget {
+	/** Per-test fixture producer (cross-process only — see the module doc). */
+	readonly setup_test: SetupTest;
+	/** JSON-RPC endpoint path. Default `/api/rpc` (the spine convention). */
+	readonly rpc_path?: string;
+	/**
+	 * The `max_attempts` both action limiters were started with
+	 * (`action_rate_limit_max_attempts` on the backend config). At least 2 —
+	 * the shared-bucket case splits the budget across the two transports.
+	 */
+	readonly max_attempts: number;
+}
+
+/** A JSON-RPC outcome reduced to what the cases assert: the HTTP status (HTTP only) and the error. */
+interface RpcOutcome {
+	readonly status: number | null;
+	readonly code: number | null;
+	readonly retry_after: unknown;
+}
+
+const outcome_from_frame = (
+	status: number | null,
+	frame: Partial<JsonrpcSuccessResponseFrame & JsonrpcErrorResponseFrame> | undefined
+): RpcOutcome => ({
+	status,
+	code: frame?.error?.code ?? null,
+	retry_after: (frame?.error?.data as { retry_after?: unknown } | undefined)?.retry_after
+});
+
+/**
+ * Register the action rate-limit suite: the account axis over WS, one account
+ * bucket across HTTP RPC and WS, the per-IP axis keyed by `X-Forwarded-For`
+ * across both transports, and the account axis at the RPC and WS dispatchers.
+ */
+export const describe_ws_action_rate_limit_cross_tests = (
+	options: WsActionRateLimitCrossTestOptions
+): void => {
+	const { setup_test, max_attempts } = options;
+	const rpc_path = options.rpc_path ?? SPINE_RPC_PATH;
+	assert(
+		Number.isInteger(max_attempts) && max_attempts >= 2,
+		'ws_action_rate_limit needs max_attempts >= 2 to split a budget across transports'
+	);
+
+	type Fixture = Awaited<ReturnType<typeof setup_test>>;
+
+	let next_id = 1;
+
+	/** POST one JSON-RPC call on a fresh (cookie-jar-free) transport. */
+	const call_http = async (
+		fixture: Fixture,
+		method: string,
+		params: unknown,
+		headers: Record<string, string>
+	): Promise<RpcOutcome> => {
+		const res = await fixture.fresh_transport()(rpc_path, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', ...headers },
+			body: JSON.stringify(create_jsonrpc_request(method, params as never, next_id++))
+		});
+		const body = (await res.json().catch(() => undefined)) as
+			Partial<JsonrpcSuccessResponseFrame & JsonrpcErrorResponseFrame> | undefined;
+		return outcome_from_frame(res.status, body);
+	};
+
+	/** Send one JSON-RPC call over an open socket and read its response. */
+	const call_ws = async (ws: WsClient, method: string, params: unknown): Promise<RpcOutcome> => {
+		const id = next_id++;
+		await ws.send(create_jsonrpc_request(method, params as never, id));
+		const frame = await ws.wait_for<JsonrpcSuccessResponseFrame | JsonrpcErrorResponseFrame>(
+			is_response_for(id),
+			RESPONSE_TIMEOUT_MS
+		);
+		return outcome_from_frame(null, frame);
+	};
+
+	/** Open a socket on the keeper's session, optionally behind a forwarded IP. */
+	const open_ws = (fixture: Fixture, forwarded_for?: string): Promise<WsClient> =>
+		open_session_ws(options, fixture, {
+			admitted: false,
+			headers: forwarded_for ? { 'x-forwarded-for': forwarded_for } : undefined
+		});
+
+	const assert_charged_not_limited = (outcome: RpcOutcome, label: string): void => {
+		assert.strictEqual(
+			outcome.code,
+			CODE_INVALID_PARAMS,
+			`${label}: expected invalid_params (charged, under the cap), got ${JSON.stringify(outcome)}`
+		);
+		if (outcome.status !== null) assert.strictEqual(outcome.status, 400, `${label}: HTTP status`);
+	};
+
+	const assert_rate_limited = (outcome: RpcOutcome, label: string): void => {
+		assert.strictEqual(
+			outcome.code,
+			CODE_RATE_LIMITED,
+			`${label}: expected rate_limited, got ${JSON.stringify(outcome)}`
+		);
+		assert.ok(
+			typeof outcome.retry_after === 'number' && outcome.retry_after > 0,
+			`${label}: rate_limited carries a positive data.retry_after, got ${String(outcome.retry_after)}`
+		);
+		if (outcome.status !== null) assert.strictEqual(outcome.status, 429, `${label}: HTTP status`);
+	};
+
+	describe('action rate limiting (cross-process, real socket)', () => {
+		test(`an account-limited action is refused on the WS call past the cap`, async () => {
+			const fixture = await setup_test();
+			const ws = await open_ws(fixture);
+			try {
+				for (let i = 1; i <= max_attempts; i++) {
+					assert_charged_not_limited(
+						await call_ws(ws, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+						`WS call ${i}`
+					);
+				}
+				assert_rate_limited(
+					await call_ws(ws, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+					`WS call ${max_attempts + 1}`
+				);
+			} finally {
+				await ws.close();
+			}
+		});
+
+		test('a malformed acting selector is charged: the throttle precedes params validation', async () => {
+			const fixture = await setup_test();
+			const session = fixture.create_session_headers();
+			for (let i = 1; i <= max_attempts; i++) {
+				assert_charged_not_limited(
+					await call_http(fixture, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_ACTING, session),
+					`HTTP call ${i}`
+				);
+			}
+			assert_rate_limited(
+				await call_http(fixture, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_ACTING, session),
+				`HTTP call ${max_attempts + 1}`
+			);
+		});
+
+		test('HTTP RPC and WS calls draw one account budget', async () => {
+			const fixture = await setup_test();
+			const session = fixture.create_session_headers();
+			const http_calls = Math.floor(max_attempts / 2);
+			for (let i = 1; i <= http_calls; i++) {
+				assert_charged_not_limited(
+					await call_http(fixture, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS, session),
+					`HTTP call ${i}`
+				);
+			}
+			const ws = await open_ws(fixture);
+			try {
+				for (let i = http_calls + 1; i <= max_attempts; i++) {
+					assert_charged_not_limited(
+						await call_ws(ws, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+						`WS call ${i}`
+					);
+				}
+				assert_rate_limited(
+					await call_ws(ws, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+					'WS call past the shared cap'
+				);
+			} finally {
+				await ws.close();
+			}
+			assert_rate_limited(
+				await call_http(fixture, ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS, session),
+				'HTTP call past the shared cap'
+			);
+		});
+
+		test('an account-limited action is refused at the RPC dispatcher past the cap', async () => {
+			const fixture = await setup_test();
+			const session = fixture.create_session_headers();
+			for (let i = 1; i <= max_attempts; i++) {
+				assert_charged_not_limited(
+					await call_http(
+						fixture,
+						DISPATCHER_ACCOUNT_LIMITED_METHOD,
+						ACCOUNT_LIMITED_BAD_PARAMS,
+						session
+					),
+					`HTTP call ${i}`
+				);
+			}
+			assert_rate_limited(
+				await call_http(
+					fixture,
+					DISPATCHER_ACCOUNT_LIMITED_METHOD,
+					ACCOUNT_LIMITED_BAD_PARAMS,
+					session
+				),
+				`HTTP call ${max_attempts + 1}`
+			);
+		});
+
+		test('an account-limited action is refused at the WS dispatcher past the cap', async () => {
+			const fixture = await setup_test();
+			const ws = await open_ws(fixture);
+			try {
+				for (let i = 1; i <= max_attempts; i++) {
+					assert_charged_not_limited(
+						await call_ws(ws, DISPATCHER_ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+						`WS call ${i}`
+					);
+				}
+				assert_rate_limited(
+					await call_ws(ws, DISPATCHER_ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+					`WS call ${max_attempts + 1}`
+				);
+			} finally {
+				await ws.close();
+			}
+		});
+
+		test('the dispatchers draw one account budget across HTTP RPC and WS', async () => {
+			const fixture = await setup_test();
+			const session = fixture.create_session_headers();
+			const http_calls = Math.floor(max_attempts / 2);
+			for (let i = 1; i <= http_calls; i++) {
+				assert_charged_not_limited(
+					await call_http(
+						fixture,
+						DISPATCHER_ACCOUNT_LIMITED_METHOD,
+						ACCOUNT_LIMITED_BAD_PARAMS,
+						session
+					),
+					`HTTP call ${i}`
+				);
+			}
+			const ws = await open_ws(fixture);
+			try {
+				for (let i = http_calls + 1; i <= max_attempts; i++) {
+					assert_charged_not_limited(
+						await call_ws(ws, DISPATCHER_ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+						`WS call ${i}`
+					);
+				}
+				assert_rate_limited(
+					await call_ws(ws, DISPATCHER_ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_BAD_PARAMS),
+					'WS call past the shared cap'
+				);
+			} finally {
+				await ws.close();
+			}
+			assert_rate_limited(
+				await call_http(
+					fixture,
+					DISPATCHER_ACCOUNT_LIMITED_METHOD,
+					ACCOUNT_LIMITED_BAD_PARAMS,
+					session
+				),
+				'HTTP call past the shared cap'
+			);
+		});
+
+		test('two account-limited actions draw one account budget', async () => {
+			const fixture = await setup_test();
+			const session = fixture.create_session_headers();
+			const first_calls = Math.floor(max_attempts / 2);
+			for (let i = 1; i <= max_attempts; i++) {
+				const method =
+					i <= first_calls ? DISPATCHER_ACCOUNT_LIMITED_METHOD : ACCOUNT_LIMITED_METHOD;
+				assert_charged_not_limited(
+					await call_http(fixture, method, ACCOUNT_LIMITED_BAD_PARAMS, session),
+					`HTTP ${method} call ${i}`
+				);
+			}
+			for (const method of [DISPATCHER_ACCOUNT_LIMITED_METHOD, ACCOUNT_LIMITED_METHOD]) {
+				assert_rate_limited(
+					await call_http(fixture, method, ACCOUNT_LIMITED_BAD_PARAMS, session),
+					`HTTP ${method} call past the shared cap`
+				);
+			}
+		});
+
+		test('an IP-limited action is keyed by the forwarded client IP on both transports', async () => {
+			// the addresses are fixed per process and their bucket outlives
+			// `_testing_reset`, so a vitest retry of this case would start
+			// exhausted and fail
+			const fixture = await setup_test();
+			const exhausted = { 'x-forwarded-for': XFF_IP_EXHAUSTED };
+			// anonymous HTTP — `peer/ping` is public, so only the IP axis applies
+			for (let i = 1; i < max_attempts; i++) {
+				assert_charged_not_limited(
+					await call_http(fixture, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS, exhausted),
+					`HTTP call ${i} from ${XFF_IP_EXHAUSTED}`
+				);
+			}
+			const ws_exhausted = await open_ws(fixture, XFF_IP_EXHAUSTED);
+			const ws_fresh = await open_ws(fixture, XFF_IP_FRESH);
+			try {
+				assert_charged_not_limited(
+					await call_ws(ws_exhausted, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS),
+					`WS call ${max_attempts} from ${XFF_IP_EXHAUSTED}`
+				);
+				assert_rate_limited(
+					await call_ws(ws_exhausted, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS),
+					`WS call past the cap from ${XFF_IP_EXHAUSTED}`
+				);
+				assert_rate_limited(
+					await call_http(fixture, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS, exhausted),
+					`HTTP call past the cap from ${XFF_IP_EXHAUSTED}`
+				);
+				// a second address has its own bucket, on both transports, even on
+				// the same account's session
+				assert_charged_not_limited(
+					await call_ws(ws_fresh, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS),
+					`WS call from ${XFF_IP_FRESH}`
+				);
+				assert_charged_not_limited(
+					await call_http(fixture, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS, {
+						'x-forwarded-for': XFF_IP_FRESH
+					}),
+					`HTTP call from ${XFF_IP_FRESH}`
+				);
+			} finally {
+				await ws_exhausted.close();
+				await ws_fresh.close();
+			}
+		});
+
+		test('an IP-limited action buckets IPv6 clients by /64', async () => {
+			const fixture = await setup_test();
+			const call = (forwarded_for: string): Promise<RpcOutcome> =>
+				call_http(fixture, IP_LIMITED_METHOD, IP_LIMITED_BAD_PARAMS, {
+					'x-forwarded-for': forwarded_for
+				});
+			for (let i = 1; i <= max_attempts; i++) {
+				assert_charged_not_limited(
+					await call(XFF_V6_EXHAUSTED),
+					`call ${i} from ${XFF_V6_EXHAUSTED}`
+				);
+			}
+			assert_rate_limited(await call(XFF_V6_SAME_64), `a call from ${XFF_V6_SAME_64}, same /64`);
+			assert_charged_not_limited(
+				await call(XFF_V6_OTHER_64),
+				`a call from ${XFF_V6_OTHER_64}, the next /64`
+			);
+		});
+	});
+};

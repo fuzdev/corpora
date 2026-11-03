@@ -30,6 +30,13 @@ export const ERROR_INVALID_ROUTE_PARAMS = 'invalid_route_params' as const;
 /** URL query params failed Zod validation. */
 export const ERROR_INVALID_QUERY_PARAMS = 'invalid_query_params' as const;
 
+/**
+ * An RPC call's `params` hold an own `__proto__` key, at any depth — refused
+ * by the dispatcher (`invalid_params`) before the input schema runs. See
+ * `json_has_own_proto_key`.
+ */
+export const ERROR_PARAMS_PROTO_KEY = 'params_proto_key' as const;
+
 // --- Core: Authentication & authorization (auto-derived by auth middleware) ---
 
 /** No valid session or bearer token. */
@@ -71,10 +78,27 @@ export const ERROR_INVALID_CREDENTIALS = 'invalid_credentials' as const;
 /** Request body exceeds the maximum allowed size. */
 export const ERROR_PAYLOAD_TOO_LARGE = 'payload_too_large' as const;
 
+/**
+ * A pool checkout failed — the database is unavailable (503). The flat REST
+ * reason of the JSON-RPC `service_unavailable` a `DbCheckoutError` maps to;
+ * the Rust spine's `fuz_http::SERVICE_UNAVAILABLE_REASON`.
+ */
+export const ERROR_SERVICE_UNAVAILABLE = 'service_unavailable' as const;
+
+/** Request `Content-Length` header is not a plain run of ASCII digits. */
+export const ERROR_INVALID_CONTENT_LENGTH = 'invalid_content_length' as const;
+
 // --- Origin & bearer token verification ---
 
 /** Request origin not in allowlist. */
 export const ERROR_FORBIDDEN_ORIGIN = 'forbidden_origin' as const;
+
+/**
+ * A `POST` whose `Content-Type` the route refuses: anything but
+ * `application/json` on a JSON route, a CORS-safelisted type or none on a
+ * `raw_body` one. See `http/simple_request.ts`.
+ */
+export const ERROR_UNSUPPORTED_CONTENT_TYPE = 'unsupported_content_type' as const;
 
 /** Bearer token failed validation (missing, malformed, or revoked). */
 export const ERROR_INVALID_TOKEN = 'invalid_token' as const;
@@ -162,6 +186,23 @@ export const ERROR_ROLE_GRANT_NOT_FOUND = 'role_grant_not_found' as const;
 
 /** Query parameter `event_type` is not a valid audit event type. */
 export const ERROR_INVALID_EVENT_TYPE = 'invalid_event_type' as const;
+
+// --- Declared input reasons (paged reads) ---
+// each is a field's `invalid_reason` (`schema_meta.ts`): every refusal of the
+// field carries it, whatever the fault — a wrong type or an unsafe integer
+// included; each is named `<field>_invalid`
+
+/** `limit` on a paged read refused — out of `[1, max]`, or not an integer. */
+export const ERROR_LIMIT_INVALID = 'limit_invalid' as const;
+
+/** `offset` on a paged read refused — negative, or not a safe integer. */
+export const ERROR_OFFSET_INVALID = 'offset_invalid' as const;
+
+/** `audit_log_list`'s `since_seq` cursor refused — negative, or not a safe integer. */
+export const ERROR_SINCE_SEQ_INVALID = 'since_seq_invalid' as const;
+
+/** `audit_log_list`'s `outcome` filter refused — not `'success'` or `'failure'`. */
+export const ERROR_OUTCOME_INVALID = 'outcome_invalid' as const;
 
 // --- DB table browser ---
 
@@ -271,8 +312,7 @@ export type CredentialTypeRequiredError = z.infer<typeof CredentialTypeRequiredE
  * `docs/security.md` §Token scoping.
  *
  * `required_scope` carries the capability string the route demands, verbatim
- * from its `auth.required_scope` — `surface:audit_stream` for a non-RPC
- * surface, `rpc:<method>` for a bridged action — matching the Rust
+ * from its `auth.required_scope` (`surface:audit_stream`, …) — matching the Rust
  * `token_scope_surface_denied_response` and the dispatcher's own per-method
  * denial. Third in the family with `PermissionError` and
  * `CredentialTypeRequiredError` — each names what the route demanded rather
@@ -296,6 +336,12 @@ export const PayloadTooLargeError = z.looseObject({
 	error: z.literal(ERROR_PAYLOAD_TOO_LARGE)
 });
 export type PayloadTooLargeError = z.infer<typeof PayloadTooLargeError>;
+
+/** Unsupported content type error — returned when a `POST` route refuses the request's `Content-Type`. */
+export const UnsupportedContentTypeError = z.looseObject({
+	error: z.literal(ERROR_UNSUPPORTED_CONTENT_TYPE)
+});
+export type UnsupportedContentTypeError = z.infer<typeof UnsupportedContentTypeError>;
 
 /** Foreign key violation error — returned when a delete is blocked by references. */
 export const ForeignKeyError = z.looseObject({
@@ -387,6 +433,9 @@ export type RateLimitKey = z.infer<typeof RateLimitKey>;
  *   of `NoActorsOnAccountError` / `AccountVanishedError`. The dispatcher's
  *   authorization phase emits these whenever it tries to resolve an actor.
  * - **rate_limit**: 429 (`RateLimitError` with `retry_after`).
+ * - **checks_content_type**: 415 (`UnsupportedContentTypeError`) —
+ *   every `POST` route (see `is_post_content_type_refused` in
+ *   `http/simple_request.ts`).
  */
 export interface DeriveErrorSchemasOptions {
 	auth: RouteAuth;
@@ -394,6 +443,7 @@ export interface DeriveErrorSchemasOptions {
 	has_params?: boolean;
 	has_query?: boolean;
 	rate_limit?: RateLimitKey;
+	checks_content_type?: boolean;
 }
 
 export const derive_error_schemas = ({
@@ -401,7 +451,8 @@ export const derive_error_schemas = ({
 	has_input = false,
 	has_params = false,
 	has_query = false,
-	rate_limit
+	rate_limit,
+	checks_content_type = false
 }: DeriveErrorSchemasOptions): RouteErrorSchemas => {
 	const errors: RouteErrorSchemas = {};
 
@@ -441,6 +492,10 @@ export const derive_error_schemas = ({
 
 	if (rate_limit) {
 		errors[429] = RateLimitError;
+	}
+
+	if (checks_content_type) {
+		errors[415] = UnsupportedContentTypeError;
 	}
 
 	return errors;

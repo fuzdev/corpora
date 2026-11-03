@@ -19,6 +19,7 @@ import {
 	PALETTE_CHROMA_KNOBS,
 	PALETTE_CHROMA_CAPS,
 	NEUTRAL_CHROMA,
+	SHADE_CHROMA_00,
 	ramp_lightness,
 	ramp_chroma,
 	ramp_chroma_shape,
@@ -29,20 +30,26 @@ import {
 	render_chroma_shape_css,
 	render_chroma_stop_css,
 	render_neutral_stop_css,
+	neutral_color_oklch,
+	neutral_ground_chroma_weight,
+	SHADE_GROUND_CHROMA_REACH,
 	render_ramp_color_css,
 	render_border_color_stop_css,
 	render_shadow_tint_css,
 	border_color_oklch,
 	BORDER_COLOR_ALPHAS,
+	to_chroma_shape_name,
+	to_lightness_stop_name,
+	to_palette_chroma_name,
 	type RampFamily
-} from '$lib/ramps.ts';
+} from '#lib/ramps.ts';
 import {
 	numeric_scale_variants,
 	palette_variants,
 	color_scheme_variants,
 	type ColorSchemeVariant,
 	type NumericScaleVariant
-} from '$lib/variable_data.ts';
+} from '#lib/variable_data.ts';
 
 // the emitters round ramp positions to 1e-6, so allow a hair over that
 const TOLERANCE = 1e-5;
@@ -119,7 +126,7 @@ const evaluate_css_number = (expr: string, vars: Record<string, number>): number
 			}
 			if (name === 'var') {
 				skip_ws();
-				const m = /^--([a-z][a-z0-9_]*)/.exec(s.slice(i));
+				const m = /^--(_?[a-z][a-z0-9_]*)/.exec(s.slice(i));
 				if (!m) throw new Error(`expected a custom property name at ${i} in ${expr}`);
 				i += m[0].length;
 				skip_ws();
@@ -182,6 +189,7 @@ const knob_vars = (scheme: ColorSchemeVariant): Record<string, number> => {
 	const vars: Record<string, number> = {
 		chroma_scale: 1,
 		neutral_chroma: NEUTRAL_CHROMA[scheme],
+		shade_chroma_00: SHADE_CHROMA_00,
 		border_color_lightness: border_color_oklch(scheme)[0],
 		border_color_chroma: border_color_oklch(scheme)[1],
 		hue_neutral: PALETTE_HUES.f,
@@ -202,14 +210,17 @@ const knob_vars = (scheme: ColorSchemeVariant): Record<string, number> => {
 		vars[`palette_${letter}_chroma_scale`] = PALETTE_CHROMA_MULTIPLIERS[letter];
 	}
 	for (const stop of numeric_scale_variants) {
-		vars[`chroma_shape_${stop}`] = ramp_chroma_shape(stop, PALETTE_CHROMA_KNOBS[scheme].curve);
-		vars[`palette_chroma_${stop}`] = ramp_chroma(
+		vars[to_chroma_shape_name(stop)] = ramp_chroma_shape(stop, PALETTE_CHROMA_KNOBS[scheme].curve);
+		vars[to_palette_chroma_name(stop)] = ramp_chroma(
 			stop,
 			PALETTE_CHROMA_KNOBS[scheme],
 			PALETTE_CHROMA_CAPS[scheme][stop]
 		);
 		for (const family of ['palette', 'shade', 'text'] as const) {
-			vars[`${family}_lightness_${stop}`] = ramp_lightness(LIGHTNESS_KNOBS[family][scheme], stop);
+			vars[to_lightness_stop_name(family, stop)] = ramp_lightness(
+				LIGHTNESS_KNOBS[family][scheme],
+				stop
+			);
 		}
 	}
 	return vars;
@@ -277,7 +288,7 @@ describe('chroma stop emitter', () => {
 
 	test('an explicit cap overrides the baked one', () => {
 		const vars = knob_vars('light');
-		const css = render_chroma_stop_css('50', 'light', 0.01);
+		const css = render_chroma_stop_css('50', 0.01);
 		assert.closeTo(evaluate_css_number(css, vars), 0.01, TOLERANCE);
 	});
 });
@@ -323,6 +334,50 @@ describe('neutral stop emitter', () => {
 					assert.closeTo(evaluate_css_number(h_css, vars), h, TOLERANCE, `${family} ${stop} H`);
 				}
 			}
+		}
+	});
+});
+
+describe('the ground tint', () => {
+	test('the emitter and the twin add each stop its share of it', () => {
+		const vars = { ...knob_vars('light'), shade_chroma_00: 0.015 };
+		for (const stop of numeric_scale_variants) {
+			for (const family of ['shade', 'text'] as const) {
+				const [l_css, c_css, h_css] = parse_oklch_args(render_neutral_stop_css(family, stop));
+				const ground = 0.015 * neutral_ground_chroma_weight(family, stop);
+				const [l, c, h] = neutral_color_oklch(
+					evaluate_css_number(l_css, vars),
+					NEUTRAL_CHROMA.light,
+					ramp_chroma_shape(stop, PALETTE_CHROMA_KNOBS.light.curve),
+					PALETTE_HUES.f,
+					ground
+				);
+				assert.closeTo(evaluate_css_number(c_css, vars), c, TOLERANCE, `${family} ${stop} C`);
+				assert.closeTo(evaluate_css_number(l_css, vars), l, TOLERANCE, `${family} ${stop} L`);
+				assert.closeTo(evaluate_css_number(h_css, vars), h, TOLERANCE, `${family} ${stop} H`);
+			}
+		}
+		assert.include(render_neutral_stop_css('shade', '00'), 'var(--shade_chroma_00))');
+		assert.include(render_neutral_stop_css('shade', '10'), 'var(--shade_chroma_00) *');
+		assert.notInclude(render_neutral_stop_css('shade', '50'), 'var(--shade_chroma_00)');
+		assert.notInclude(render_neutral_stop_css('text', '00'), 'var(--shade_chroma_00)');
+	});
+
+	test('the weight is whole at the ground and fades out by the reach', () => {
+		assert.strictEqual(neutral_ground_chroma_weight('shade', '00'), 1);
+		// quadratic: a fifth of the way to the reach keeps (1 - 0.2)^2 of the tint
+		assert.strictEqual(neutral_ground_chroma_weight('shade', '10'), 0.64);
+		let previous = 1;
+		for (const stop of numeric_scale_variants) {
+			const weight = neutral_ground_chroma_weight('shade', stop);
+			assert.isAtMost(weight, previous, `shade ${stop} rises`);
+			if (Number(stop) / 100 >= SHADE_GROUND_CHROMA_REACH) {
+				assert.strictEqual(weight, 0, `shade ${stop} past the reach`);
+			} else {
+				assert.isAbove(weight, 0, `shade ${stop} inside the reach`);
+			}
+			assert.strictEqual(neutral_ground_chroma_weight('text', stop), 0, `text ${stop}`);
+			previous = weight;
 		}
 	});
 });

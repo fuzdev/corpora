@@ -9,7 +9,7 @@
 
 import type { QueryDeps } from '../db/query_deps.ts';
 import { assert_row } from '../db/assert_row.ts';
-import { columns_sql, qualify_columns } from '../db/sql_columns.ts';
+import { columns_sql, iso8601_timestamp_expr, qualify_columns } from '../db/sql_columns.ts';
 import type { Invite, CreateInviteInput, InviteWithUsernamesJson } from './invite_schema.ts';
 
 /**
@@ -31,6 +31,9 @@ export const INVITE_COLUMNS = [
 	'created_by'
 ] as const satisfies ReadonlyArray<keyof Invite>;
 
+/** The `invite` timestamp override, by row qualifier (`''` bare, `i` for the username JOIN). */
+const invite_expr = iso8601_timestamp_expr(INVITE_COLUMNS, ['claimed_at', 'created_at']);
+
 /**
  * Create a new invite.
  *
@@ -46,36 +49,10 @@ export const query_create_invite = async (
 	const row = await deps.db.query_one<Invite>(
 		`INSERT INTO invite (email, username, created_by)
 		 VALUES ($1, $2, $3)
-		 RETURNING ${columns_sql(INVITE_COLUMNS)}`,
+		 RETURNING ${columns_sql(INVITE_COLUMNS, invite_expr(''))}`,
 		[input.email ?? null, input.username ?? null, input.created_by]
 	);
 	return assert_row(row, 'INSERT INTO invite');
-};
-
-/**
- * Find an unclaimed invite by email (case-insensitive).
- */
-export const query_invite_find_unclaimed_by_email = async (
-	deps: QueryDeps,
-	email: string
-): Promise<Invite | undefined> => {
-	return deps.db.query_one<Invite>(
-		`SELECT ${columns_sql(INVITE_COLUMNS)} FROM invite WHERE LOWER(email) = LOWER($1) AND claimed_at IS NULL`,
-		[email]
-	);
-};
-
-/**
- * Find an unclaimed invite by username (case-insensitive).
- */
-export const query_invite_find_unclaimed_by_username = async (
-	deps: QueryDeps,
-	username: string
-): Promise<Invite | undefined> => {
-	return deps.db.query_one<Invite>(
-		`SELECT ${columns_sql(INVITE_COLUMNS)} FROM invite WHERE LOWER(username) = LOWER($1) AND claimed_at IS NULL`,
-		[username]
-	);
 };
 
 /**
@@ -106,7 +83,7 @@ export const query_invite_find_unclaimed_match_for_update = async (
 	username: string
 ): Promise<Invite | undefined> => {
 	return deps.db.query_one<Invite>(
-		`SELECT ${columns_sql(INVITE_COLUMNS)} FROM invite WHERE claimed_at IS NULL AND (
+		`SELECT ${columns_sql(INVITE_COLUMNS, invite_expr(''))} FROM invite WHERE claimed_at IS NULL AND (
 			(email IS NOT NULL AND username IS NULL
 			 AND $1::text IS NOT NULL AND LOWER(email) = LOWER($1::text))
 			OR
@@ -116,7 +93,7 @@ export const query_invite_find_unclaimed_match_for_update = async (
 			(email IS NOT NULL AND username IS NOT NULL
 			 AND $1::text IS NOT NULL AND LOWER(email) = LOWER($1::text)
 			 AND LOWER(username) = LOWER($2))
-		) ORDER BY created_at ASC, id ASC LIMIT 1
+		) ORDER BY invite.created_at ASC, invite.id ASC LIMIT 1
 		FOR UPDATE`,
 		[email, username]
 	);
@@ -128,9 +105,9 @@ export const query_invite_find_unclaimed_match_for_update = async (
  * The `_unscoped` suffix is the safety signal — the SQL only checks the
  * row state (`claimed_at IS NULL`), not whether the claiming account's
  * email or username matches the invite. Callers must scope the lookup
- * upstream via one of the `_find_unclaimed_match*` siblings (production
- * uses `_for_update` to make find + claim atomic). Skipping the find
- * step lets a caller claim any unclaimed invite by id.
+ * upstream through `query_invite_find_unclaimed_match_for_update`, which
+ * also makes find + claim atomic. Skipping the find step lets a caller
+ * claim any unclaimed invite by id.
  *
  * Mirrors the `query_session_revoke_by_hash_unscoped` precedent — there
  * is no scoped sibling because the scoping is provided by a separate
@@ -157,15 +134,6 @@ export const query_invite_claim_unscoped = async (
 };
 
 /**
- * List all invites, newest first.
- */
-export const query_invite_list_all = async (deps: QueryDeps): Promise<Array<Invite>> => {
-	return deps.db.query<Invite>(
-		`SELECT ${columns_sql(INVITE_COLUMNS)} FROM invite ORDER BY created_at DESC`
-	);
-};
-
-/**
  * List all invites with resolved creator/claimer usernames, newest first.
  *
  * @param deps - query dependencies
@@ -175,7 +143,7 @@ export const query_invite_list_all_with_usernames = async (
 	deps: QueryDeps
 ): Promise<Array<InviteWithUsernamesJson>> => {
 	return deps.db.query<InviteWithUsernamesJson>(
-		`SELECT ${qualify_columns(INVITE_COLUMNS, 'i')},
+		`SELECT ${qualify_columns(INVITE_COLUMNS, 'i', invite_expr('i'))},
 			act.name AS created_by_username,
 			a.username AS claimed_by_username
 		 FROM invite i

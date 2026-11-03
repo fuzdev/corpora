@@ -1,10 +1,8 @@
 // @slop Claude Opus 4
 
-import { z } from 'zod';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import { Domain } from './domain.svelte.ts';
 import type { Projects } from './projects.svelte.ts';
@@ -104,7 +102,7 @@ export class DomainViewmodel {
 			this.projects.add_domain(this.project_id, domain);
 		}
 
-		void goto(resolve(`/projects/${this.project_id}/domains`));
+		void goto(resolve('/projects/[project_id]/domains', { project_id: this.project_id }));
 	}
 
 	/**
@@ -116,9 +114,7 @@ export class DomainViewmodel {
 		// eslint-disable-next-line no-alert
 		if (confirm('Are you sure you want to remove this domain? This action cannot be undone.')) {
 			this.projects.delete_domain(this.project_id, this.domain_id);
-			void goto(resolve(`/projects/${this.project_id}/domains`));
+			void goto(resolve('/projects/[project_id]/domains', { project_id: this.project_id }));
 		}
 	}
 }
-
-export const DomainViewmodelSchema = z.instanceof(DomainViewmodel);

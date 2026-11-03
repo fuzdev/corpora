@@ -5,132 +5,103 @@
  * variables used by auth, http, server, and testing modules.
  *
  * Auto-loaded by `server/app_server.ts` (side-effect import) and
- * transitively by auth middleware modules that import `CREDENTIAL_TYPE_KEY`.
+ * transitively by auth middleware modules that import `RESOLVED_AUTH_KEY`.
  * Consumers don't need a manual import unless bypassing the standard server assembly.
  *
  * @module
  */
 
-import { z } from 'zod';
-
-import type { TokenScope } from './auth/token_scope.ts';
+import type { Context } from 'hono';
 
 import type { RequestContext } from './auth/request_context.ts';
-import {
-	CREDENTIAL_TYPE_API_TOKEN,
-	CREDENTIAL_TYPE_DAEMON_TOKEN,
-	CREDENTIAL_TYPE_SESSION
-} from './auth/credential_type_schema.ts';
+import type { ResolvedAuth } from './auth/resolved_auth.ts';
 
 /**
- * The credential types that can authenticate a request — the closed set
- * of fuz_app builtins. The open registry on top
- * (`create_credential_type_schema(consumer_types)`) is consulted at
- * registry time by `create_role_schema` for `RoleSpec.required_credential_types`
- * validation; the wire-validated `CredentialType` enum here stays
- * narrow because middleware only ever sets one of the three builtins.
+ * Hono context variable name for the request's resolved credential
+ * (`ResolvedAuth`) — the one value every auth middleware leg writes, read
+ * through `get_resolved_auth`.
+ *
+ * The daemon-token, session, and bearer legs run in that order, and the first
+ * that authenticates sets it; the legs after it see it set and skip. Unset
+ * (read as `null`) for an unauthenticated request.
  */
-export const CREDENTIAL_TYPES = [
-	CREDENTIAL_TYPE_SESSION,
-	CREDENTIAL_TYPE_API_TOKEN,
-	CREDENTIAL_TYPE_DAEMON_TOKEN
-] as const;
-
-/** Credential type — how a request was authenticated. */
-export const CredentialType = z.enum(CREDENTIAL_TYPES);
-export type CredentialType = z.infer<typeof CredentialType>;
-
-/** Hono context variable name for the credential type. */
-export const CREDENTIAL_TYPE_KEY = 'credential_type';
-
-/** Hono context variable name for the authenticated API token id. */
-export const AUTH_API_TOKEN_ID_KEY = 'auth_api_token_id';
+export const RESOLVED_AUTH_KEY = 'resolved_auth';
 
 /**
- * Hono context variable name for the credential's `TokenScope`.
- *
- * Set by every auth middleware that resolves a credential — bearer reads it
- * from the token row; session and daemon-token set `full`, because a browser
- * session *is* full account authority (narrowing it is what role grants are
- * for) and the daemon token is singular, filesystem-proved, and keeper-bound.
- *
- * Unset only for the anonymous caller, who holds no credential to narrow.
- * Downstream must not read an unset value as permissive for an *authenticated*
- * caller — that absent case is exactly the permissive default this design
- * removes.
+ * Hono context variable name for the session token — set by the session
+ * middleware (`create_session_middleware`) to the token a verified, unexpired
+ * session cookie carries, `null` otherwise, and read by the session leg of the
+ * auth middleware (`create_request_context_middleware`), which hashes it to
+ * find the `auth_session` row. Fixed rather than configurable: the session
+ * middleware and the session leg must agree on it, and no other spine key may
+ * share it.
  */
-export const TOKEN_SCOPE_KEY = 'token_scope';
+export const SESSION_TOKEN_KEY = 'auth_session_id';
 
 /**
- * Hono context variable name for the authenticated account id.
- *
- * Set by the auth middleware (session, bearer, or daemon token) on a valid
- * credential. `null` for unauthenticated requests. The route-spec wrapper /
- * RPC dispatcher's authorization phase reads this when resolving the acting
- * actor; account-grain auth guards (`require_auth`) and account-grain handlers
- * read it directly.
+ * Hono context variable name for the session cookie's signed expiry, in
+ * seconds since the Unix epoch — set by the session middleware on a cookie
+ * that verified and has not expired, `null` otherwise. The request-context
+ * middleware folds it into the session's `ResolvedAuth.credential_deadline`.
  */
-export const ACCOUNT_ID_KEY = 'auth_account_id';
+export const SESSION_COOKIE_EXPIRES_AT_KEY = 'auth_session_cookie_expires_at';
 
 /**
  * Hono context variable name for the test-harness pre-baked context flag.
  *
  * Test harnesses (`create_test_app_from_specs`, `create_fake_hono_context`,
  * the WS round-trip `connect()` helper, plus per-test middleware that
- * pre-populates `REQUEST_CONTEXT_KEY`) set this to `true` so
+ * pre-populates `REQUEST_CONTEXT_KEY`) set it to `TEST_CONTEXT_PRESET` so
  * `apply_authorization_phase` skips its DB-backed actor resolution and
  * trusts the supplied `RequestContext`. Production middleware never sets
  * this key — only test code does. The flag is the explicit escape hatch
  * that replaced the implicit "is `REQUEST_CONTEXT_KEY` already set?" probe,
  * so that future production code consulting `REQUEST_CONTEXT_KEY` cannot
- * silently bypass the live build.
+ * silently bypass the live build. Read it with `has_test_context_preset`.
  */
 export const TEST_CONTEXT_PRESET_KEY = 'test_context_preset';
+
+/**
+ * The one value that sets the test-harness preset (`TEST_CONTEXT_PRESET_KEY`).
+ * A symbol, so only code that imports it can set the flag: a string, a
+ * `true`, or any other value a misconfiguration or a request could put under
+ * the key reads as unset. Testing only — no module outside `testing/` writes
+ * it.
+ */
+export const TEST_CONTEXT_PRESET: unique symbol = Symbol('test_context_preset');
+
+/**
+ * Whether a test harness pre-baked this request's context — the key holds
+ * `TEST_CONTEXT_PRESET` itself. The skip every transport makes of the live
+ * authorization phase and the admission re-reads.
+ *
+ * @param c - the Hono context
+ * @returns `true` only when the key holds the `TEST_CONTEXT_PRESET` symbol
+ */
+export const has_test_context_preset = (c: Context): boolean =>
+	c.get(TEST_CONTEXT_PRESET_KEY) === TEST_CONTEXT_PRESET;
 
 declare module 'hono' {
 	interface ContextVariableMap {
 		/** Resolved client IP, set by the trusted proxy middleware. */
 		client_ip: string;
+		/** The session token (`SESSION_TOKEN_KEY`), set by the session middleware. */
 		auth_session_id: string | null;
 		request_context: RequestContext | null;
 		validated_input: unknown;
 		validated_params: unknown;
 		validated_query: unknown;
-		/** How the request was authenticated (`'session'`, `'api_token'`, or `'daemon_token'`). */
-		credential_type: CredentialType | null;
 		/**
-		 * The credential's authority narrowing. Set by every auth middleware that
-		 * resolves a credential — bearer reads it off the token row; session and
-		 * daemon-token set `full`. Absent only for the anonymous caller, who holds
-		 * no credential to narrow; downstream must not read absent as permissive
-		 * for an authenticated one.
+		 * The credential the auth middleware resolved (`RESOLVED_AUTH_KEY`);
+		 * `null` or unset for an unauthenticated request. Read it with
+		 * `get_resolved_auth`.
 		 */
-		token_scope: TokenScope | undefined;
-		/**
-		 * Authenticated account id. Set by the session / bearer / daemon-token
-		 * middleware on a valid credential; `null` for unauthenticated requests.
-		 * The dispatcher's authorization phase resolves the acting actor against
-		 * this id; `require_auth` 401s when it is `null`.
-		 */
-		auth_account_id: string | null;
-		/**
-		 * blake3 hash of the authenticated session token, or `null` for non-session
-		 * credentials. Set by `create_request_context_middleware`. Used to scope
-		 * per-session resources (e.g., SSE stream identity for `session_revoke`
-		 * disconnection) without re-hashing the cookie in every handler.
-		 */
-		auth_session_token_hash: string | null;
-		/**
-		 * `api_token.id` when the request authenticated via `Authorization: Bearer`,
-		 * or `null` for session/daemon-token/unauthenticated requests. Set by
-		 * `create_bearer_auth_middleware`. Used to scope per-token resources
-		 * (e.g., WS connection revocation on `token_revoke`) without re-looking
-		 * up the token.
-		 */
-		auth_api_token_id: string | null;
+		resolved_auth: ResolvedAuth | null;
+		/** The session cookie's signed expiry, epoch seconds (`SESSION_COOKIE_EXPIRES_AT_KEY`). */
+		auth_session_cookie_expires_at: number | null;
 		/**
 		 * Eager fire-and-forget pool writes for this request — audit emits,
-		 * session-touch UPDATE, api-token usage tracking. Producers push the
+		 * api-token usage tracking. Producers push the
 		 * in-flight `Promise<void>` directly. The flush middleware drains via
 		 * `flush_pending_effects` after the handler returns. Initialized by
 		 * `create_app_server`. In test mode (`await_pending_effects: true`),
@@ -152,10 +123,11 @@ declare module 'hono' {
 		 */
 		post_commit_effects: Array<() => void | Promise<void>>;
 		/**
-		 * Set to `true` by test harnesses that pre-populate `request_context`
-		 * to bypass the dispatcher's DB-backed actor resolution. Read by
-		 * `apply_authorization_phase`. Production middleware never sets this.
+		 * Set to `TEST_CONTEXT_PRESET` by test harnesses that pre-populate
+		 * `request_context` to bypass the dispatcher's DB-backed actor
+		 * resolution. Read with `has_test_context_preset`. Production
+		 * middleware never sets this.
 		 */
-		test_context_preset: boolean;
+		test_context_preset: typeof TEST_CONTEXT_PRESET;
 	}
 }

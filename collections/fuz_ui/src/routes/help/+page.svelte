@@ -1,6 +1,6 @@
 <script lang="ts">
-	import Alert from '$lib/Alert.svelte';
-	import GithubLink from '$lib/GithubLink.svelte';
+	import Alert from '#lib/Alert.svelte';
+	import GithubLink from '#lib/GithubLink.svelte';
 </script>
 
 <div class="width_atmost_md m_auto">

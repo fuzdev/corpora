@@ -10,18 +10,20 @@ import AxisXTop from './_components/AxisXTop.svelte';
 import AxisY from './_components/AxisY.svelte';
 import AxisYRight from './_components/AxisYRight.svelte';
 import Bar from './_components/Bar.svelte';
+import BarGrouped from './_components/BarGrouped.svelte';
 import BarStacked from './_components/BarStacked.svelte';
 import Beeswarm from './_components/Beeswarm.svelte';
 import BeeswarmHtml from './_components/Beeswarm.html.svelte';
 import BeeswarmForce from './_components/BeeswarmForce.svelte';
 import BeeswarmForceHtml from './_components/BeeswarmForce.html.svelte';
-import Brush from './_components/Brush.svelte';
-import Calendar from './_components/Calendar.svelte';
-import CirclePack from './_components/CirclePack.svelte';
+import Brush from './_components/Brush.html.svelte';
+import Calendar from './_components/CalendarMonth.svelte';
+import CirclePack from './_components/CirclePack.html.svelte';
 import CirclePackForce from './_components/CirclePackForce.svelte';
 import ClevelandDotPlot from './_components/ClevelandDotPlot.svelte';
-import ClevelandDotPlotHtml from './_components/ClevelandDotPlot.html.svelte';
+import ClevelandDotPlotHtml from './_components_ssr/ClevelandDotPlot.percent-range.html.svelte';
 import Column from './_components/Column.svelte';
+import ColumnGrouped from './_components/ColumnGrouped.svelte';
 import ColumnStacked from './_components/ColumnStacked.svelte';
 import Line from './_components/Line.svelte';
 import LineD3 from './_components/Line-D3.svelte';
@@ -30,25 +32,30 @@ import MapCanvas from './_components/Map.canvas.svelte';
 import MapPoints from './_components/MapPoints.svelte';
 import MapPointsHtml from './_components/MapPoints.html.svelte';
 import MapPointsCanvas from './_components/MapPoints.canvas.svelte';
-import MapLabels from './_components/MapLabels.svelte';
+import MapLabels from './_components/MapLabels.svg.svelte';
 import MapLabelsHtml from './_components/MapLabels.html.svelte';
 import MultiLine from './_components/MultiLine.svelte';
 import Radar from './_components/Radar.svelte';
 import Sankey from './_components/Sankey.svelte';
 import ScatterCanvas from './_components/Scatter.canvas.svelte';
 import ScatterSvg from './_components/Scatter.svg.svelte';
-import ScatterWebgl from './_components/ScatterWebgl.svelte';
+import ScatterWebgl from './_components/Scatter.webgl.svelte';
 import Voronoi from './_components/Voronoi.svelte';
 import Labels from './_components/Labels.html.svelte';
 import GroupLabels from './_components/GroupLabels.html.svelte';
 import Tooltip from './_components/Tooltip.html.svelte';
 import SharedTooltip from './_components/SharedTooltip.html.svelte';
 import SharedTooltipPercentRange from './_components_ssr/SharedTooltip.percent-range.html.svelte';
-import AxisXHtml from './_components_ssr/AxisX.html.svelte';
-import AxisXTopHtml from './_components_ssr/AxisXTop.html.svelte';
-import AxisYHtml from './_components_ssr/AxisY.html.svelte';
-import AxisYRightHtml from './_components_ssr/AxisYRight.html.svelte';
-import ScatterHtml from './_components_ssr/Scatter.html.svelte';
+import AxisXHtml from './_components_ssr/AxisX.percent-range.html.svelte';
+import AxisXTopHtml from './_components_ssr/AxisXTop.percent-range.html.svelte';
+import AxisYHtml from './_components_ssr/AxisY.percent-range.html.svelte';
+import AxisYRightHtml from './_components_ssr/AxisYRight.percent-range.html.svelte';
+import ScatterHtml from './_components_ssr/Scatter.percent-range.html.svelte';
+import SmallMultipleWrapper from './_components/SmallMultipleWrapper.svelte';
+import SmallMultipleWrapperPercentRange from './_components_ssr/SmallMultipleWrapper.percent-range.svelte';
+import SyncedBrushWrapper from './_components/SyncedBrushWrapper.svelte';
+import SyncedBrushWrapperPercentRange from './_components_ssr/SyncedBrushWrapper.percent-range.svelte';
+import ArrowheadMarker from './_components/ArrowheadMarker.svelte';
 import Key from './_components_ssr/Key.html.svelte';
 import QuadTree from './_components/QuadTree.html.svelte';
 import QuadTreePercentRange from './_components_ssr/QuadTree.percent-range.html.svelte';
@@ -75,6 +82,7 @@ export default [
 			{ slug: 'Area-D3.svelte', component: AreaD3 },
 			{ slug: 'AreaStacked.svelte', component: AreaStacked },
 			{ slug: 'Bar.svelte', component: Bar },
+			{ slug: 'BarGrouped.svelte', component: BarGrouped },
 			{ slug: 'BarStacked.svelte', component: BarStacked },
 			{ slug: 'Beeswarm.svelte', component: Beeswarm },
 			{ slug: 'Beeswarm.html.svelte', component: BeeswarmHtml },
@@ -86,6 +94,7 @@ export default [
 			{ slug: 'ClevelandDotPlot.svelte', component: ClevelandDotPlot },
 			{ slug: 'ClevelandDotPlot.percent-range.html.svelte', component: ClevelandDotPlotHtml },
 			{ slug: 'Column.svelte', component: Column },
+			{ slug: 'ColumnGrouped.svelte', component: ColumnGrouped },
 			{ slug: 'ColumnStacked.svelte', component: ColumnStacked },
 			{ slug: 'Line.svelte', component: Line },
 			{ slug: 'Line-D3.svelte', component: LineD3 },
@@ -95,7 +104,12 @@ export default [
 			{ slug: 'Scatter.canvas.svelte', component: ScatterCanvas },
 			{ slug: 'Scatter.svg.svelte', component: ScatterSvg },
 			{ slug: 'Scatter.webgl.svelte', component: ScatterWebgl },
-			{ slug: 'Scatter.html.svelte', component: ScatterHtml }
+			{ slug: 'Scatter.percent-range.html.svelte', component: ScatterHtml },
+			{ slug: 'SmallMultipleWrapper.svelte', component: SmallMultipleWrapper },
+			{
+				slug: 'SmallMultipleWrapper.percent-range.svelte',
+				component: SmallMultipleWrapperPercentRange
+			}
 		]
 	},
 	{
@@ -119,7 +133,9 @@ export default [
 			{ slug: 'QuadTree.percent-range.html.svelte', component: QuadTreePercentRange },
 			{ slug: 'Tooltip.html.svelte', component: Tooltip },
 			{ slug: 'SharedTooltip.html.svelte', component: SharedTooltip },
-			{ slug: 'SharedTooltip.percent-range.html.svelte', component: SharedTooltipPercentRange }
+			{ slug: 'SharedTooltip.percent-range.html.svelte', component: SharedTooltipPercentRange },
+			{ slug: 'SyncedBrushWrapper.svelte', component: SyncedBrushWrapper },
+			{ slug: 'SyncedBrushWrapper.percent-range.svelte', component: SyncedBrushWrapperPercentRange }
 		]
 	},
 	{
@@ -128,6 +144,7 @@ export default [
 			{ slug: 'Annotations.html.svelte', component: Annotations },
 			{ slug: 'AnnotationsData.html.svelte', component: AnnotationsData },
 			{ slug: 'Arrows.svelte', component: Arrows },
+			{ slug: 'ArrowheadMarker.svelte', component: ArrowheadMarker },
 			{ slug: 'Key.html.svelte', component: Key },
 			{ slug: 'Labels.html.svelte', component: Labels },
 			{ slug: 'GroupLabels.html.svelte', component: GroupLabels }

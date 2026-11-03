@@ -5,18 +5,17 @@
  * The TS analog of the Rust `testing_spine_stub`: mounts ONLY the standard
  * fuz_app spine surface (auth / account / admin / audit + signup +
  * bootstrap) over a real HTTP socket, with `_testing_reset` and a WS
- * endpoint, and no consumer domain layer. It exists so the
+ * endpoint (auto-mounted from `ws_endpoints`), and no consumer domain layer. It exists so the
  * `describe_standard_cross_process_tests` bundle can run against fuz_app's
  * own TS impl over the wire — making drift in fuz_app's real HTTP path a
  * fuz_app failure rather than only surfacing through a downstream consumer.
  *
- * **`#lib`, not `$lib`, by contract.** This module + the Node/Deno/Bun
- * entries that wrap it are spawned as raw processes (Gro's loader, `deno
- * run`, `bun run`) — none of which resolve the Vite-only `$lib` SvelteKit
- * alias. They reach `src/lib` through the `#lib/*` package.json subpath
- * import (`"imports": {"#lib/*": "./src/lib/*"}`), which Node, Bun, Deno,
- * and Gro's loader all resolve uniformly. A `$lib` import anywhere in this
- * spawn graph would still typecheck under vitest but break the spawn.
+ * **`#lib` by contract.** This module + the Node/Deno/Bun entries that wrap
+ * it are spawned as raw processes (Gro's loader, `deno run`, `bun run`), so
+ * they can't rely on anything Vite resolves. They reach `src/lib` through
+ * the `#lib/*` package.json subpath import
+ * (`"imports": {"#lib/*": "./src/lib/*"}`), which Node, Bun, Deno, and Gro's
+ * loader all resolve uniformly.
  *
  * **NEVER ships in a release.** Lives under `src/test/` (excluded from the
  * `dist` package build) and uses `stub_password_deps` — a deterministic
@@ -27,16 +26,13 @@
 
 import { dirname, join } from 'node:path';
 import type { Context } from 'hono';
-import type { UpgradeWebSocket } from 'hono/ws';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
+import { z } from 'zod';
 
-import { protocol_actions } from '#lib/actions/protocol.ts';
-import { register_ws_endpoint } from '#lib/actions/register_ws_endpoint.ts';
-import { BackendWebsocketTransport } from '#lib/actions/transports_ws_backend.ts';
-import {
-	create_ws_auth_guard,
-	create_ws_logout_closer
-} from '#lib/actions/transports_ws_auth_guard.ts';
+import { DEFAULT_WS_MAX_MESSAGE_BYTES } from '#lib/actions/transports.ts';
+import { WS_RECEIVE_TIMEOUT_MAX } from '#lib/actions/register_action_ws.ts';
+import { ConnectionRegistry } from '#lib/actions/connection_registry.ts';
+import type { AppSurface } from '#lib/http/surface.ts';
 import { start_daemon_token_rotation } from '#lib/testing/daemon_token_rotation.ts';
 import { load_env } from '#lib/env/load.ts';
 import type { RuntimeDeps } from '#lib/runtime/deps.ts';
@@ -44,7 +40,7 @@ import { cell_audit_events } from '#lib/auth/cell_audit_events.ts';
 import { create_audit_emitter } from '#lib/auth/audit_emitter.ts';
 import { create_audit_log_config } from '#lib/auth/audit_log_schema.ts';
 import { CELL_MIGRATION_NS } from '#lib/db/cell_ddl.ts';
-import { CELL_HISTORY_MIGRATION_NS } from '#lib/db/cell_history_ddl.ts';
+import { SSE_KEEP_ALIVE_INTERVAL_MS_MAX } from '#lib/realtime/sse_constants.ts';
 import { FACT_MIGRATION_NS } from '#lib/db/fact_ddl.ts';
 import {
 	create_serve_cell_fact_route_spec,
@@ -54,8 +50,11 @@ import { create_app_backend, type AuditFactory } from '#lib/server/app_backend.t
 import { create_app_server } from '#lib/server/app_server.ts';
 import {
 	RateLimiter,
+	default_action_account_rate_limit,
+	default_action_ip_rate_limit,
 	default_login_account_rate_limit,
-	default_login_ip_rate_limit
+	default_login_ip_rate_limit,
+	type RateLimiterOptions
 } from '#lib/rate_limiter.ts';
 import { BaseServerEnv, validate_server_env } from '#lib/server/env.ts';
 import { stub_password_deps } from '#lib/testing/app_server.ts';
@@ -64,8 +63,22 @@ import {
 	create_spine_route_specs,
 	spine_session_options
 } from '#lib/testing/cross_backend/default_spine_surface.ts';
-import { full_spine_rpc_endpoints } from '#lib/testing/cross_backend/full_spine_mount.ts';
-import type { BuiltTestingApp } from '#lib/testing/cross_backend/testing_server_core.ts';
+import { build_full_spine_mount } from '#lib/testing/cross_backend/full_spine_mount.ts';
+import {
+	ACTION_RATE_LIMIT_ENABLED_ENV,
+	ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV,
+	AUDIT_SSE_KEEP_ALIVE_MS_ENV,
+	LOGIN_RATE_LIMIT_ENABLED_ENV,
+	SPINE_ROLE_GATED_WS_PATH,
+	SPINE_ROLE_GATED_WS_ROLES,
+	SPINE_RPC_PATH,
+	SPINE_WS_PATH,
+	WS_RECEIVE_TIMEOUT_MS_ENV
+} from '#lib/testing/cross_backend/spine_surface_constants.ts';
+import type {
+	BuildTestingAppContext,
+	BuiltTestingApp
+} from '#lib/testing/cross_backend/testing_server_core.ts';
 
 /** Resolved bind config the entry passes to `start_testing_server`. */
 export interface SpineServerConfig {
@@ -73,7 +86,7 @@ export interface SpineServerConfig {
 	readonly port: number;
 }
 
-/** Options for {@link build_spine_app}. */
+/** Options for `build_spine_app`. */
 export interface BuildSpineAppOptions {
 	/** `RuntimeDeps` from the runtime adapter (env + fs capabilities). */
 	readonly runtime: RuntimeDeps;
@@ -85,12 +98,121 @@ export interface BuildSpineAppOptions {
 	 * `BackendConfig.bootstrap.daemon_token_path` (`{root}/run/daemon_token`).
 	 */
 	readonly daemon_token_path: string;
+	/**
+	 * The core's WS preparation (`BuildTestingAppContext.prepare_websocket`) —
+	 * its factory becomes `create_app_server`'s `create_upgrade_websocket`.
+	 */
+	readonly prepare_websocket: BuildTestingAppContext['prepare_websocket'];
 	/** WS mount path. Default `/api/ws`. */
 	readonly ws_path?: string;
 }
 
-const WS_PATH_DEFAULT = '/api/ws';
+/** The spine app plus its generated surface (for the surface-invariant test). */
+export interface BuiltSpineApp extends BuiltTestingApp {
+	readonly surface: AppSurface;
+}
+
 const HEALTH_PATH = '/health';
+
+/**
+ * The WS endpoint's inbound message cap — passed to both the endpoint spec and
+ * the adapter's preparation, so Node's `ws` frame cap is set from it.
+ */
+const WS_MAX_MESSAGE_BYTES = DEFAULT_WS_MAX_MESSAGE_BYTES;
+
+/** Zod's `stringbool` — the env boolean contract the Rust stub's `parse_stringbool` mirrors. */
+const EnvStringbool = z.stringbool();
+
+/**
+ * Parse an optional boolean env toggle the way the Rust stub's
+ * `parse_stringbool_env` does: unset is `false`; otherwise a case-insensitive
+ * `true`/`1`/`yes`/`on`/`y`/`enabled` or `false`/`0`/`no`/`off`/`n`/`disabled`,
+ * untrimmed. Anything else (the empty string included) throws, so a typo
+ * can't silently leave a limiter off while a suite asserts its throttle.
+ *
+ * @param name - the env var, for the error
+ * @param raw - its value, `undefined` when unset
+ * @throws Error on a value outside the recognized set
+ */
+export const parse_stringbool_env = (name: string, raw: string | undefined): boolean => {
+	if (raw === undefined) return false;
+	const parsed = EnvStringbool.safeParse(raw);
+	if (!parsed.success) {
+		throw new Error(
+			`testing_spine_server: ${name}: expected a boolean string (true/false, 1/0, yes/no, on/off, y/n, enabled/disabled), got ${JSON.stringify(raw)}`
+		);
+	}
+	return parsed.data;
+};
+
+/** `u32::MAX` — the largest cap the Rust stub's `u32` parse accepts. */
+const U32_MAX = 0xffff_ffff;
+
+/**
+ * Parse `FUZ_ACTION_RATE_LIMIT_MAX_ATTEMPTS` against the enable flag — a
+ * positive integer, refused when set without `FUZ_ACTION_RATE_LIMIT_ENABLED`
+ * (a cap that silently does nothing would leave a suite asserting a throttle
+ * the binary never built). Mirrors the Rust stub's
+ * `parse_action_rate_limit_max_attempts` (`raw.trim().parse::<u32>()`, then
+ * `> 0`): surrounding Unicode whitespace is trimmed, one leading `+` and leading zeros
+ * are accepted, and a value above `u32::MAX` is refused.
+ *
+ * @param raw - the env value, `undefined` when unset
+ * @param enabled - the parsed enable flag
+ * @returns the cap, or `undefined` when unset
+ * @throws Error on a malformed or out-of-range cap, or a cap without the flag
+ */
+export const parse_action_rate_limit_max_attempts = (
+	raw: string | undefined,
+	enabled: boolean
+): number | undefined => {
+	if (raw === undefined) return undefined;
+	const trimmed = raw.trim();
+	const max_attempts = /^\+?[0-9]+$/.test(trimmed) ? Number(trimmed) : NaN;
+	if (!(max_attempts > 0 && max_attempts <= U32_MAX)) {
+		throw new Error(
+			`testing_spine_server: ${ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV}: expected a positive integer, got ${JSON.stringify(raw)}`
+		);
+	}
+	if (!enabled) {
+		throw new Error(
+			`testing_spine_server: ${ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV} is set but ${ACTION_RATE_LIMIT_ENABLED_ENV} is not`
+		);
+	}
+	return max_attempts;
+};
+
+/**
+ * Parse a timing env var (`FUZ_AUDIT_SSE_KEEP_ALIVE_MS`,
+ * `FUZ_WS_RECEIVE_TIMEOUT_MS`) — a positive integer of ms up to the knob's
+ * cap, 2³¹ − 1 for both, the longest interval a JS timer honors.
+ * Mirrors the Rust stub's `parse_timing_ms` (`raw.trim_ascii()`, then a
+ * `u32` parse in range): surrounding ASCII whitespace (space, tab, line feed,
+ * form feed, carriage return) is trimmed — not `String.prototype.trim`'s set,
+ * which differs from Rust's `trim` — and one leading `+` and leading zeros are
+ * accepted.
+ *
+ * @param name - the env var, for the error
+ * @param raw - the env value, `undefined` when unset
+ * @param max - the knob's cap (`SSE_KEEP_ALIVE_INTERVAL_MS_MAX`, `WS_RECEIVE_TIMEOUT_MAX`)
+ * @returns the interval in ms, or `undefined` when unset
+ * @throws Error on a malformed or out-of-range value
+ */
+export const parse_timing_ms_env = (
+	name: string,
+	raw: string | undefined,
+	max: number
+): number | undefined => {
+	if (raw === undefined) return undefined;
+	const digits = /^[\t\n\f\r ]*(\+?[0-9]+)[\t\n\f\r ]*$/.exec(raw)?.[1];
+	const ms = digits === undefined ? NaN : Number(digits);
+	if (!(ms > 0 && ms <= max)) {
+		throw new Error(
+			`testing_spine_server: ${name}: expected a positive integer of ms up to ${max}, got ${JSON.stringify(raw)}`
+		);
+	}
+	return ms;
+};
 
 /**
  * Audit factory registering the cell event types so the live-mounted cell
@@ -98,12 +220,17 @@ const HEALTH_PATH = '/health';
  * (and `cell_audit_list` reads them back) instead of tripping the
  * unknown-event drift counter. Models a real consumer that spreads
  * `cell_audit_events` into its `create_audit_log_config`.
+ *
+ * Tracks in-flight writes so `_testing_drain_effects` is a real barrier — a
+ * WS mutation is answered before its audit write settles. The Rust stub
+ * builds its emitter the same way (`new_with_inflight_tracking`).
  */
-const cell_audit_factory: AuditFactory = ({ db, log }) =>
+export const cell_audit_factory: AuditFactory = ({ db, log }) =>
 	create_audit_emitter({
 		db,
 		log,
-		audit_log_config: create_audit_log_config({ extra_events: cell_audit_events })
+		audit_log_config: create_audit_log_config({ extra_events: cell_audit_events }),
+		track_inflight: true
 	});
 
 /** Resolve `{host, port}` from the runtime's env via `BaseServerEnv`. */
@@ -113,16 +240,24 @@ export const resolve_spine_server_config = (runtime: RuntimeDeps): SpineServerCo
 };
 
 /**
- * Build the no-domain spine Hono app + close + WS mount hook.
+ * Build the no-domain spine Hono app + close.
  *
- * Uses `stub_password_deps` (fast deterministic hasher), in-memory PGlite
- * by default (`DATABASE_URL=memory://`), every rate limiter disabled, and
+ * Uses `stub_password_deps` (fast deterministic hasher), in-memory pglet
+ * by default (`DATABASE_URL=memory://`), every rate limiter disabled
+ * (`rate_limiters: 'disabled_for_testing'`) unless an env toggle opts the
+ * login or action limiters in, and
  * appends `_testing_reset` to the standard RPC endpoint so the cross-process
  * fixture protocol can reset per test. Bootstrap runs live (the harness
  * consumes it once in `globalSetup`).
  */
-export const build_spine_app = async (options: BuildSpineAppOptions): Promise<BuiltTestingApp> => {
-	const { runtime, get_connection_ip, daemon_token_path, ws_path = WS_PATH_DEFAULT } = options;
+export const build_spine_app = async (options: BuildSpineAppOptions): Promise<BuiltSpineApp> => {
+	const {
+		runtime,
+		get_connection_ip,
+		daemon_token_path,
+		prepare_websocket,
+		ws_path = SPINE_WS_PATH
+	} = options;
 	const log = new Logger('[testing_spine_server]');
 
 	const env = load_env(BaseServerEnv, runtime.env_get);
@@ -133,7 +268,7 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 			`testing_spine_server: invalid ${env_config.field}: ${env_config.errors.join('; ')}`
 		);
 	}
-	const { keyring, allowed_origins, bootstrap_token_path } = env_config;
+	const { keyring, allowed_origins, allow_origin_wildcards, bootstrap_token_path } = env_config;
 
 	const app_backend = await create_app_backend({
 		database_url: env.DATABASE_URL,
@@ -146,11 +281,11 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 		// namespace so the cell verbs + the fact-serving routes below have their
 		// tables. Both stay off the standard declared surface
 		// (`create_spine_surface_spec`) — driven only by the dedicated cell /
-		// fact-serving cross suites, ws/sse-style. `CELL_HISTORY_MIGRATION_NS`
-		// stages the dormant `cell_history` table (the Rust `fuz_cell` migration
-		// bundles it; TS isolates it in its own namespace) so the schema-parity
-		// gate sees the same full spine schema on both backends.
-		migration_namespaces: [CELL_MIGRATION_NS, CELL_HISTORY_MIGRATION_NS, FACT_MIGRATION_NS]
+		// fact-serving cross suites, ws/sse-style.
+		migration_namespaces: [CELL_MIGRATION_NS, FACT_MIGRATION_NS],
+		// the pool checkout bounds, as a production server passes them
+		db_checkout_timeout_ms: env.FUZ_DB_CHECKOUT_TIMEOUT_MS,
+		db_audit_checkout_timeout_ms: env.FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS
 	});
 
 	// Facts dir for the disk-stream / X-Accel serving paths. The cross suite
@@ -163,39 +298,40 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 	// writer lands the token in.
 	await runtime.mkdir(dirname(daemon_token_path), { recursive: true });
 
-	// Daemon-token rotation is required — `_testing_reset` gates on the
-	// daemon-token credential, and the harness reads the rotated token to
-	// authenticate the keeper channel.
+	// The daemon token is required — `_testing_reset` gates on the
+	// daemon-token credential, and the harness reads the token file to
+	// authenticate the keeper channel. It reads it once at spawn, and only one
+	// previous token stays valid, so the token is held static for the run with
+	// a long interval, as the Rust stub does by never rotating
+	// (≤ `setInterval`'s ~24.8-day max).
 	const daemon_token_rotation = await start_daemon_token_rotation(
 		runtime,
 		{ db: app_backend.deps.db },
-		{ token_path: daemon_token_path },
+		{ token_path: daemon_token_path, rotation_interval_ms: 24 * 60 * 60 * 1000 },
 		log
 	);
 
-	// Created up front so the audit-revocation guards AND the role-grant-offer
-	// `notification_sender` bind to the SAME transport the WS endpoint registers
-	// connections against (the transport is the connection registry — a separate
-	// instance would fan out to an empty registry and reach nobody). Threaded
-	// into `spine_rpc_endpoints({notification_sender})` below and into
-	// `register_ws_endpoint` in `mount_websocket`.
-	const ws_transport = new BackendWebsocketTransport();
+	// Created up front so the role-grant-offer `notification_sender` binds to the
+	// SAME registry the WS endpoint registers connections against — a separate
+	// instance would fan out to an empty registry and reach nobody. Threaded into
+	// `build_full_spine_mount({notification_sender})` and the `ws_endpoints` spec
+	// below; `create_app_server` adds it to the backend's connection closer and
+	// wires its audit-revocation guard.
+	const connection_registry = new ConnectionRegistry();
 
 	// Login rate limiting is OFF by default — the standard cross suites fire
 	// many login/signup round-trips per backend lifetime from one host (loopback),
-	// which a live limiter would 429. The dedicated login-security cross project
-	// spawns a backend with `FUZ_LOGIN_RATE_LIMIT_ENABLED=true` to exercise the
+	// which a live limiter would 429. The dedicated security cross project
+	// spawns a backend with `FUZ_LOGIN_RATE_LIMIT_ENABLED=true` (any stringbool
+	// truthy value; garbage refuses to boot) to exercise the
 	// 429 + `Retry-After` path and XFF-keyed bucketing over the wire (see
 	// `testing/cross_backend/login_security.ts`). `trusted_proxies` is always
 	// wired below, so the resolved client IP keys the limiter; the security suite
 	// spoofs per-case `X-Forwarded-For` IPs so each case is its own fresh bucket.
-	// Read the raw flag directly — it's a test-binary-only toggle, not part of the
-	// production `BaseServerEnv` schema. The literal is the canonical
-	// `LOGIN_RATE_LIMIT_ENABLED_ENV` (in `default_backend_configs.ts`, where the
-	// backend configs set it for both impls), re-declared here because that module
-	// transitively pulls `vitest` and can't be imported into the spawned binary —
-	// the same local-redeclare `testing_spine_server_node.ts` does for `TS_SPINE_DIR_ENV`.
-	const login_rate_limit_enabled = runtime.env_get('FUZ_LOGIN_RATE_LIMIT_ENABLED') === 'true';
+	const login_rate_limit_enabled = parse_stringbool_env(
+		LOGIN_RATE_LIMIT_ENABLED_ENV,
+		runtime.env_get(LOGIN_RATE_LIMIT_ENABLED_ENV)
+	);
 	const login_ip_rate_limiter = login_rate_limit_enabled
 		? new RateLimiter(default_login_ip_rate_limit)
 		: null;
@@ -203,35 +339,86 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 		? new RateLimiter(default_login_account_rate_limit)
 		: null;
 
+	// Action rate limiting is OFF by default for the same reason. The security
+	// project's `FUZ_ACTION_RATE_LIMIT_ENABLED=true` builds one IP + one account
+	// limiter (the action defaults' windows, `FUZ_ACTION_RATE_LIMIT_MAX_ATTEMPTS`
+	// replacing both caps) that `create_app_server` threads to the RPC endpoint
+	// and the WS endpoint alike — one budget per axis across both transports,
+	// which `testing/cross_backend/ws_action_rate_limit.ts` drives. The Rust stub
+	// reads the same two env vars.
+	const action_rate_limit_enabled = parse_stringbool_env(
+		ACTION_RATE_LIMIT_ENABLED_ENV,
+		runtime.env_get(ACTION_RATE_LIMIT_ENABLED_ENV)
+	);
+	const action_rate_limit_max_attempts = parse_action_rate_limit_max_attempts(
+		runtime.env_get(ACTION_RATE_LIMIT_MAX_ATTEMPTS_ENV),
+		action_rate_limit_enabled
+	);
+	const with_action_cap = (defaults: RateLimiterOptions): RateLimiterOptions => ({
+		...defaults,
+		max_attempts: action_rate_limit_max_attempts ?? defaults.max_attempts
+	});
+	const action_ip_rate_limiter = action_rate_limit_enabled
+		? new RateLimiter(with_action_cap(default_action_ip_rate_limit))
+		: null;
+	const action_account_rate_limiter = action_rate_limit_enabled
+		? new RateLimiter(with_action_cap(default_action_account_rate_limit))
+		: null;
+
+	// The timing overrides, unset outside the timing cross project: the audit
+	// stream's keep-alive interval and the WS endpoints' receive timeout, so
+	// `sse_keep_alive.cross.test.ts` and `ws_receive_timeout.cross.test.ts`
+	// see both within seconds. The Rust stub reads the same two env vars.
+	const audit_sse_keep_alive_ms = parse_timing_ms_env(
+		AUDIT_SSE_KEEP_ALIVE_MS_ENV,
+		runtime.env_get(AUDIT_SSE_KEEP_ALIVE_MS_ENV),
+		SSE_KEEP_ALIVE_INTERVAL_MS_MAX
+	);
+	const ws_receive_timeout_ms = parse_timing_ms_env(
+		WS_RECEIVE_TIMEOUT_MS_ENV,
+		runtime.env_get(WS_RECEIVE_TIMEOUT_MS_ENV),
+		WS_RECEIVE_TIMEOUT_MAX
+	);
+
+	// The full live mount, built once for both endpoints: the RPC list and the
+	// WS list serving the same actions behind the protocol actions (see
+	// `build_full_spine_mount`). Single-sourced in `full_spine_mount.ts` so the
+	// binary, the in-process parity setup, and the `spine_method_coverage`
+	// reconciliation test all build the same list — a method can't be mounted
+	// here and forgotten elsewhere. The shared `connection_registry` is threaded as the
+	// role-grant-offer `notification_sender` so the spine emits the WS
+	// notification family — driving `describe_role_grant_offer_notification_ws_tests`.
+	const full_mount = build_full_spine_mount(app_backend.deps, {
+		notification_sender: connection_registry,
+		daemon_token_state: daemon_token_rotation.state
+	});
+
 	const app_server = await create_app_server({
 		backend: app_backend,
 		session_options: spine_session_options,
 		allowed_origins,
+		allow_origin_wildcards,
 		proxy: { trusted_proxies: ['127.0.0.1', '::1'], get_connection_ip },
-		// Login limiters: null unless `FUZ_LOGIN_RATE_LIMIT_ENABLED` is set (above).
-		// `create_spine_route_specs` reads these off `AppServerContext` and wires
-		// them onto `POST /api/account/login`. Every other limiter stays disabled
-		// for the same many-round-trips-from-one-host reason — including the
-		// sibling per-surface IP limiters, which now default to live instances
-		// (`create_app_server` builds one per surface when the field is omitted),
-		// so an omission here would 429 the bootstrap + signup round trips the
-		// standard cross suites fire from loopback.
+		// Every limiter not passed below stays off. The explicit ones win over
+		// the mode: each is null unless its env toggle (above) built it.
+		// `create_spine_route_specs` reads the login pair off `AppServerContext`
+		// and wires them onto `POST /api/account/login`; the action pair is
+		// threaded to the RPC + WS endpoints.
+		rate_limiters: 'disabled_for_testing',
 		login_ip_rate_limiter,
-		signup_ip_rate_limiter: null,
-		bootstrap_ip_rate_limiter: null,
 		login_account_rate_limiter,
-		signup_account_rate_limiter: null,
-		action_ip_rate_limiter: null,
-		action_account_rate_limiter: null,
+		action_ip_rate_limiter,
+		action_account_rate_limiter,
 		daemon_token_state: daemon_token_rotation.state,
 		bootstrap: bootstrap_token_path
 			? { mode: 'live', token_path: bootstrap_token_path }
 			: { mode: 'disabled' },
-		// Auto-wires the SSE registry + auth guard + broadcaster and sets
+		// Auto-wires the SSE registry + broadcaster (and the revocation guard) and sets
 		// `ctx.audit_sse`, which `create_spine_route_specs` reads to mount
 		// `GET /api/admin/audit/stream` (`audit_log_event_specs` join the
 		// surface automatically). Drives the cross-process SSE self-test.
-		audit_log_sse: true,
+		audit_log_sse:
+			audit_sse_keep_alive_ms === undefined ? true : { keep_alive_ms: audit_sse_keep_alive_ms },
 		// Standard spine REST routes + the cell-gated fact-serving routes
 		// (cell-scoped per-reference + admin-only bare-hash), twinning the Rust
 		// `testing_spine_stub`'s `fact_routers`. The serve routes carry full
@@ -246,37 +433,61 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 			// driven by the dedicated `describe_ready_cross_tests` suite, not the
 			// generic round-trip.
 			create_spine_ready_route_spec(log),
-			create_serve_cell_fact_route_spec({ deps: ctx.deps, facts_dir, log }),
-			create_serve_fact_route_spec({ deps: ctx.deps, facts_dir, log })
+			create_serve_cell_fact_route_spec({ facts_dir, log }),
+			create_serve_fact_route_spec({ facts_dir, log })
 		],
 		// The full live RPC mount: the standard bundle plus the off-declared-surface
 		// families (`_testing_*` backdoors, the full cell verb set, the opt-in
-		// `actor_lookup` / `actor_search` resolvers). Single-sourced in
-		// `full_spine_mount.ts` so the binary, the in-process parity setup, and the
-		// `spine_method_coverage` reconciliation test all build the same list — a
-		// method can't be mounted here and forgotten elsewhere. Cells / actors stay
-		// off `create_spine_surface_spec`, so the standard cross suite's generic
+		// `actor_lookup` / `actor_search` resolvers). Cells / actors stay off
+		// `create_spine_surface_spec`, so the standard cross suite's generic
 		// round-trip never drives them (they're covered by the dedicated cell /
-		// actor cross suites). The shared `ws_transport` is threaded as the
-		// role-grant-offer `notification_sender` so the spine emits the WS
-		// notification family — driving `describe_role_grant_offer_notification_ws_tests`.
-		rpc_endpoints: (ctx) =>
-			full_spine_rpc_endpoints(ctx, {
-				notification_sender: ws_transport,
-				daemon_token_state: daemon_token_rotation.state
-			}),
+		// actor cross suites).
+		rpc_endpoints: [{ path: SPINE_RPC_PATH, actions: full_mount.rpc_actions }],
+		// The WS endpoint serves the same actions behind the protocol actions,
+		// as the Rust stub serves one registry on RPC and WS — so a socket can
+		// revoke the session it is running on (`capabilities.ws_account_actions`)
+		// and the cell verbs' dispatcher-charged rate limit is reachable over WS
+		// on both spines (`describe_ws_action_rate_limit_cross_tests`). No
+		// `required_roles` — the stub's WS state carries none either.
+		//
+		// A second endpoint serves the same actions behind a role gate
+		// (`SPINE_ROLE_GATED_WS_ROLES`), sharing the registry — as the Rust
+		// stub's gated mount shares its connection registry — so a revoked role
+		// must close the gated registrations of one registry and leave the
+		// ungated ones open (`describe_ws_role_gated_cross_tests`).
+		create_upgrade_websocket: prepare_websocket({ max_message_bytes: WS_MAX_MESSAGE_BYTES }),
+		ws_endpoints: [
+			{
+				path: ws_path,
+				actions: full_mount.ws_actions,
+				registry: connection_registry,
+				max_message_bytes: WS_MAX_MESSAGE_BYTES,
+				receive_timeout: ws_receive_timeout_ms
+			},
+			{
+				path: SPINE_ROLE_GATED_WS_PATH,
+				actions: full_mount.ws_actions,
+				registry: connection_registry,
+				max_message_bytes: WS_MAX_MESSAGE_BYTES,
+				receive_timeout: ws_receive_timeout_ms,
+				required_roles: SPINE_ROLE_GATED_WS_ROLES
+			}
+		],
 		env_schema: BaseServerEnv,
 		env_values: env,
-		// Await fire-and-forget effects before each response returns, so a
-		// mutation's audit emits are durable by response time. Makes the
-		// `_testing_drain_effects` barrier satisfied by construction on the TS
-		// spine (the Rust stub, whose audit writes are detached tasks, does the
-		// real await in `AuditEmitter::drain_inflight`). Matches the in-process
-		// `create_test_app` default.
+		// Await fire-and-forget effects before each HTTP response returns, so
+		// an HTTP mutation's audit emits are durable by response time. WS
+		// replies before its effects flush; `_testing_drain_effects` awaits
+		// the tracked emitter for those (`cell_audit_factory`). Matches the
+		// in-process `create_test_app` default.
 		await_pending_effects: true,
 		on_effect_error: (error, ctx) => {
 			log.error(`Pending effect failed (${ctx.method} ${ctx.path}):`, error);
 		}
+		// `auth_cleanup` stays off (its default): a background pass would delete
+		// rows and write audit rows under a running suite. The Rust
+		// `testing_spine_stub` this binary is compared against leaves its twin
+		// unscheduled too.
 	});
 
 	// Health probe endpoint — the spawn harness polls this for readiness.
@@ -285,28 +496,14 @@ export const build_spine_app = async (options: BuildSpineAppOptions): Promise<Bu
 
 	const close = async (): Promise<void> => {
 		await daemon_token_rotation.stop();
+		// closes the WS + SSE connections, then the DB
+		await app_server.close();
+		// caller-injected limiters are the caller's to dispose
 		login_ip_rate_limiter?.dispose();
 		login_account_rate_limiter?.dispose();
-		await app_server.close();
+		action_ip_rate_limiter?.dispose();
+		action_account_rate_limiter?.dispose();
 	};
 
-	// WS is mounted after the app exists (Node's `createNodeWebSocket` needs
-	// the app) — see `testing_server_core.ts`. Protocol actions only; the
-	// no-domain spine carries no domain WS surface.
-	const mount_websocket = (upgrade_websocket: UpgradeWebSocket): void => {
-		register_ws_endpoint({
-			app: app_server.app,
-			path: ws_path,
-			allowed_origins,
-			db: app_backend.deps.db,
-			upgradeWebSocket: upgrade_websocket,
-			actions: protocol_actions,
-			transport: ws_transport,
-			log
-		});
-		app_backend.deps.audit.add_listener(create_ws_auth_guard(ws_transport, log));
-		app_backend.deps.audit.add_listener(create_ws_logout_closer(ws_transport, log));
-	};
-
-	return { app: app_server.app, close, mount_websocket };
+	return { app: app_server.app, close, surface: app_server.surface_spec.surface };
 };

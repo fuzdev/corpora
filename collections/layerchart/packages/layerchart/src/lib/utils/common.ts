@@ -19,7 +19,12 @@ export function accessor<TData = any>(prop: Accessor<TData>): (d: TData) => any 
     // function
     return prop;
   } else if (typeof prop === 'string' || typeof prop === 'number') {
-    // path string or number (array index)
+    // A plain key needs no path resolution, and `get` re-parses the string on every call — which
+    // is once per row per channel, so a 5,000-point chart parses `"date"` 5,000 times per pass
+    if (typeof prop === 'number' || (!prop.includes('.') && !prop.includes('['))) {
+      return (d: TData) => (d == null ? undefined : (d as any)[prop]);
+    }
+    // path string (dot / bracket notation)
     return (d: TData) => get(d, prop);
   } else {
     // return full object
@@ -68,17 +73,34 @@ export function defaultChartPadding<TData>(
 }
 
 /**
+ * Compare two scale/domain values, treating boxed values such as `Date` as equal when they
+ * represent the same instant.  `null` and `undefined` are equal to each other.
+ *
+ * Uses `valueOf()` rather than d3's `+a === +b` idiom: numeric coercion turns the string values
+ * of a band/point scale into `NaN`, so identical categories would never compare equal.
+ */
+export function isEqualValue(a: any, b: any) {
+  return a?.valueOf() === b?.valueOf();
+}
+
+/**
  * Find the first instance within `data` with the same value as `original` using prop accessor.
  * Handles complex objects such as `Date` by invoking `.valueOf()`
+ *
+ * `within` narrows the candidates — a facet panel's `has`, where the same value recurs per panel.
  */
-export function findRelatedData(data: any[], original: any, accessor: Function) {
+export function findRelatedData(
+  data: any[],
+  original: any,
+  accessor: Function,
+  within?: (d: any) => boolean
+) {
   if (data.includes(original)) {
     return original;
   }
 
-  return data.find((d) => {
-    return accessor(d)?.valueOf() === accessor(original)?.valueOf();
-  });
+  const value = accessor(original);
+  return data.find((d) => isEqualValue(accessor(d), value) && (!within || within(d)));
 }
 
 /**

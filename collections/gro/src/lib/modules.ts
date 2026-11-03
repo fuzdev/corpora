@@ -2,8 +2,8 @@ import type { Timings } from '@fuzdev/fuz_util/timings.ts';
 import { UnreachableError } from '@fuzdev/fuz_util/error.ts';
 import type { Result } from '@fuzdev/fuz_util/result.ts';
 import { print_error } from '@fuzdev/fuz_util/print.ts';
-import { pathToFileURL } from 'node:url';
 import type { PathId } from '@fuzdev/fuz_util/path.ts';
+import { pathToFileURL } from 'node:url';
 
 import type { ResolvedInputFile } from './input_path.ts';
 import { print_path } from './paths.ts';
@@ -26,18 +26,12 @@ export type LoadModuleFailure =
 
 export const load_module = async <TModule extends Record<string, any>>(
 	id: PathId,
-	validate?: (mod: Record<string, any>) => mod is TModule,
-	bust_cache?: boolean
+	validate?: (mod: Record<string, any>) => mod is TModule
 ): Promise<LoadModuleResult<TModule>> => {
 	let mod;
 	try {
-		let import_path = id;
-		if (bust_cache) {
-			const url = pathToFileURL(id);
-			url.searchParams.set('t', Date.now().toString());
-			import_path = url.href;
-		}
-		mod = await import(import_path);
+		// as a URL, so a `#`, `?`, or `%` in the path is escaped, not read as URL syntax
+		mod = await import(pathToFileURL(id).href);
 	} catch (error) {
 		return { ok: false, type: 'failed_import', id, error };
 	}

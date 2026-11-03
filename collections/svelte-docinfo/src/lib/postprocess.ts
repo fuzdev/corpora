@@ -3,16 +3,20 @@
  *
  * These functions transform analysis results after module-level analysis is complete:
  *
- * 1. **Validation** — `findDuplicates` checks flat namespace constraints
+ * 1. **Validation** — `findDuplicates` checks the opt-in flat-namespace constraint
  * 2. **Transformation** — `mergeReExports` resolves re-export relationships,
+ *    `resolveComponentAliases` fills component aliases from their canonicals,
  *    `computeDependents` builds bidirectional dependency graphs
- * 3. **Output** — `sortModules` prepares deterministic output
+ * 3. **Output** — `sortModules` prepares deterministic output (`compareStrings`
+ *    is the one comparator for all output ordering)
+ * 4. **Queries** — `resolveExportSurface` combines a module's declarations and
+ *    re-export facts into its full export surface
  *
  * Every function here is pure — transformation passes return new arrays with
  * structural sharing (unchanged objects flow through `===`-equal) and never
  * mutate their input.
  *
- * @see `analyze.ts` for the main analysis entry point
+ * @see `analyze-core.ts` for the phase-2 pipeline that runs these
  *
  * @module
  */
@@ -124,22 +128,14 @@ const resolveCanonicalIdentity = (
  * (`export {default as Foo} from './Foo.svelte'`) therefore doesn't flag.
  * When a name does flag, all occurrences are reported, aliases included.
  *
- * Callers can decide how to handle duplicates (throw, warn, ignore).
+ * The analysis entry points run this only under the opt-in `onDuplicates`.
  *
  * @returns `Map` of declaration names to their `DuplicateDeclaration` occurrences (only includes duplicates)
  *
  * @example
  * ```ts
  * const duplicates = findDuplicates(modules);
- * if (duplicates.size > 0) {
- *   for (const [name, occurrences] of duplicates) {
- *     console.error(`"${name}" found in:`);
- *     for (const {declaration, module} of occurrences) {
- *       console.error(`  - ${module}:${declaration.sourceLine} (${declaration.kind})`);
- *     }
- *   }
- *   throw new Error(`Found ${duplicates.size} duplicate declaration names`);
- * }
+ * duplicates.get('parse'); // [{declaration, module: 'a.ts'}, {declaration, module: 'b.ts'}]
  * ```
  */
 export const findDuplicates = (
@@ -315,6 +311,9 @@ export const mergeReExports = (modules: Array<ModuleJson>): Array<ModuleJson> =>
  * are shared by reference, not cloned); everything else flows through
  * `===`-equal.
  *
+ * Doc-comment fields fill gaps only: local doc fields applied to the alias
+ * before phase 2 (from JSDoc on the re-export statement) stick.
+ *
  * @param modules - the analyzed modules (parsed `ModuleJson`s)
  * @param contextModules - canonical-lookup-only modules that never appear in
  *   output — gated component canonicals (the `internal/` convention) analyzed
@@ -352,6 +351,7 @@ export const resolveComponentAliases = (
 				...decl,
 				props: canonical.props,
 				acceptsChildren: canonical.acceptsChildren,
+				cssCustomProperties: canonical.cssCustomProperties,
 				externalTypes: canonical.externalTypes,
 				genericParams: canonical.genericParams
 			};
@@ -392,10 +392,10 @@ export const resolveComponentAliases = (
 /**
  * Compute bidirectional dependencies from source files.
  *
- * This function ensures that if file A has file B in its `dependencies`,
- * then file B will have file A in its `dependents`. This provides consistent
- * output regardless of whether callers provide one-directional or bidirectional
- * dependency information.
+ * If file A has file B in its `dependencies`, file B gets file A in its
+ * `dependents`. Dependents are derived solely from the forward `dependencies`
+ * edges within `files` (`SourceFileInfo` carries no `dependents` field);
+ * edges to files outside the set are ignored.
  *
  * Returns new `SourceFileInfo` objects when computed dependents exist or when
  * paths needed posixification; otherwise the original input objects flow
@@ -510,8 +510,11 @@ export interface ExportSurface {
 	/** Surface entries, sorted by `name` (case-insensitive order, `compareStrings`). */
 	entries: Array<ExportSurfaceEntry>;
 	/**
-	 * Star targets (own or transitive) absent from the analyzed set — their
-	 * projected names are unknown, so the surface is incomplete.
+	 * Star targets (own or transitive) whose projected names are unknown, so
+	 * the surface is incomplete: ones absent from `modules` (a filtered list,
+	 * modules assembled by hand — a whole analysis result's `starExports` only
+	 * name modules it contains), and `partial` placeholders, such as a
+	 * component that failed to transform.
 	 */
 	unresolvedStarExports: Array<string>;
 	/**
@@ -560,8 +563,9 @@ interface InternalSurface {
  * (an approximation of ES fixpoint resolution — fine in practice). Surfaces
  * resolved inside a cycle are path-relative and not memoized, so sibling
  * star paths resolve independently rather than inheriting them. Star
- * targets missing from `modules` are reported in `unresolvedStarExports`
- * rather than guessed at; `externalStarExports` aggregates external star
+ * targets missing from `modules` or `partial` (a placeholder whose bindings
+ * are unknown) are reported in `unresolvedStarExports` rather than guessed
+ * at; `externalStarExports` aggregates external star
  * specifiers reachable from the module, whose names are unknowable.
  *
  * @param modules - the analyzed modules (parsed `ModuleJson`s — run wire
@@ -670,7 +674,8 @@ export const resolveExportSurface = (
 		// 5. Star projection, with ES shadowing and ambiguity rules
 		const excluded = new Set<string>();
 		for (const target of mod.starExports) {
-			if (!byPath.has(target)) {
+			// a `partial` placeholder's bindings are unknown, like an absent module's
+			if (!byPath.has(target) || byPath.get(target)!.partial) {
 				surface.unresolvedStars.add(target);
 				continue;
 			}

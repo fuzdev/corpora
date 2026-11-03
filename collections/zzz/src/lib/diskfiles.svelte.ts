@@ -1,23 +1,40 @@
 import { z } from 'zod';
-import { strip_start } from '@fuzdev/fuz_util/string.ts';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { untrack } from 'svelte';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import { get_datetime_now, Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
+import type { Result } from '@fuzdev/fuz_util/result.ts';
+import type { JsonrpcErrorObject } from '@fuzdev/fuz_app/http/jsonrpc.ts';
+import { jsonrpc_error_messages } from '@fuzdev/fuz_app/http/jsonrpc_errors.ts';
 
 import { Diskfile } from './diskfile.svelte.ts';
 import {
 	DiskfileJson,
 	DiskfilePath,
+	type DiskfileDirectoryPath,
 	type DiskfileJsonInput,
+	type DisknodeMetadata,
 	type SerializableDisknode
 } from './diskfile_types.ts';
-import { disknode_to_diskfile_json, to_relative_path } from './diskfile_helpers.ts';
+import {
+	DISKFILE_CONTENT_NOT_LOADED_MESSAGE,
+	ERROR_CONTENT_NOT_LOADED,
+	disknode_to_diskfile_json,
+	normalize_path,
+	parse_new_diskfile_name,
+	to_file_directories,
+	to_relative_path
+} from './diskfile_helpers.ts';
+import { to_diskfile_content_kind } from './diskfile_content_kind.ts';
+import type { MarkdownLinkIndex } from './markdown_links.ts';
 import { Cell, type CellOptions } from './cell.svelte.ts';
-import { HANDLED } from './cell_helpers.ts';
+import { create_collection_decoder } from './cell_helpers.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
-import { create_single_index, create_multi_index } from './indexed_collection_helpers.svelte.ts';
+import { create_single_index } from './indexed_collection_helpers.svelte.ts';
 import { DiskfilesEditor } from './diskfiles_editor.svelte.ts';
+import { DiskfileEditorState } from './diskfile_editor_state.svelte.ts';
+import { create_detached } from './reactive_helpers.svelte.ts';
 import { CellJson } from './cell_types.ts';
-import type { ActionInputs } from './action_collections.ts';
+import type { ActionInputs, ActionOutputs } from './action_collections.ts';
 
 export const DiskfilesJson = CellJson.extend({
 	diskfiles: z.array(DiskfileJson).default(() => []),
@@ -28,22 +45,50 @@ export type DiskfilesJsonInput = z.input<typeof DiskfilesJson>;
 
 export interface DiskfilesOptions extends CellOptions<typeof DiskfilesJson> {}
 
+/**
+ * What `filer_change` reported while a file-tree snapshot was in flight —
+ * see `Diskfiles.track_changes` for how a snapshot is applied around it.
+ */
+export interface DiskfileSnapshotChanges {
+	/**
+	 * Paths an `add`, `change`, or `delete` reported. The snapshot's entries
+	 * for them are skipped.
+	 */
+	readonly paths: ReadonlySet<string>;
+	/**
+	 * The latest `touch` reported per path. A touch never makes the snapshot
+	 * yield; its metadata is applied again after the snapshot.
+	 */
+	readonly touches: ReadonlyMap<string, DisknodeMetadata>;
+}
+
+/** Records what `filer_change` reports while a file-tree snapshot is in flight. */
+export interface DiskfileChangeTracker extends DiskfileSnapshotChanges {
+	/** Stops recording. */
+	stop: () => void;
+}
+
 export class Diskfiles extends Cell<typeof DiskfilesJson> {
+	// TODO bound memory across files: every file opened keeps its state and history
+	// (each capped) until the diskfile goes away — maybe drop clean ones when their
+	// last view and tab close, or keep an app-wide history budget
+	/** The files' app-level editing states, by diskfile id — see `get_editor_state`. */
+	readonly #editor_states: SvelteMap<Uuid, DiskfileEditorState> = new SvelteMap();
+
 	readonly items: IndexedCollection<Diskfile> = new IndexedCollection({
+		dispose_item: (diskfile) => {
+			// every way out of the collection passes here - `remove`, `remove_many`, and `clear`
+			this.#sync_directories(diskfile);
+			this.#remove_editor_state(diskfile.id);
+			diskfile.dispose();
+		},
 		indexes: [
 			create_single_index({
 				key: 'by_path',
 				extractor: (file) => file.path,
-				query_schema: z.string()
-			}),
-
-			create_multi_index({
-				key: 'by_extension',
-				extractor: (file) => {
-					const match = /\.([^.]+)$/.exec(file.path);
-					return match ? match[1]!.toLowerCase() : 'no_extension'; // guaranteed by ternary check
-				},
-				query_schema: z.string()
+				// a diskfile's path is its disk identity — `upsert` updates in place by path,
+				// and renames arrive as a delete plus an add
+				immutable_key: true
 			})
 		]
 	});
@@ -54,6 +99,34 @@ export class Diskfiles extends Cell<typeof DiskfilesJson> {
 		this.selected_file_id ? (this.items.by_id.get(this.selected_file_id) ?? null) : null
 	);
 
+	/** Diskfiles that exist on disk — excludes ones kept only for unsaved edits. */
+	readonly on_disk: Array<Diskfile> = $derived(
+		this.items.values.filter((diskfile) => !diskfile.deleted_on_disk)
+	);
+
+	/**
+	 * The diskfiles the explorer lists: those on disk, plus ones deleted on disk
+	 * but kept for a draft, so every draft stays reachable.
+	 */
+	readonly listed: Array<Diskfile> = $derived(
+		this.items.values.filter(
+			(diskfile) =>
+				!diskfile.deleted_on_disk || !!this.#editor_states.get(diskfile.id)?.has_unsaved_edits
+		)
+	);
+
+	/**
+	 * Whether any file is `dirty` (see `DiskfileEditorState.dirty`: it has a
+	 * draft, or its editor shows other content than the disk's) — edits that
+	 * live only in memory, lost on a reload.
+	 */
+	readonly has_unsaved_changes: boolean = $derived.by(() => {
+		for (const editor_state of this.#editor_states.values()) {
+			if (editor_state.dirty) return true;
+		}
+		return false;
+	});
+
 	/** The editor for managing diskfiles editing state. */
 	readonly editor: DiskfilesEditor;
 
@@ -63,108 +136,605 @@ export class Diskfiles extends Cell<typeof DiskfilesJson> {
 		this.editor = new DiskfilesEditor({ app: this.app });
 
 		this.decoders = {
-			diskfiles: (diskfiles) => {
-				if (Array.isArray(diskfiles)) {
-					this.items.clear();
-					for (const diskfile_json of diskfiles) {
-						this.add(diskfile_json);
-					}
-				}
-				return HANDLED;
-			}
+			diskfiles: create_collection_decoder(
+				() => this.items.clear(),
+				(json) => this.add(json)
+			)
 		};
 
 		this.init();
 	}
 
+	// not reactive — bookkeeping for snapshot requests in flight
+	readonly #change_trackers: Set<{
+		paths: Set<string>;
+		touches: Map<string, DisknodeMetadata>;
+	}> = new Set();
+
+	/**
+	 * Starts recording what `handle_change` is given. Start it before
+	 * requesting a file-tree snapshot and pass it to `add_initial` or
+	 * `reconcile` with the snapshot, which is then applied around what
+	 * `filer_change` reported while the request was in flight:
+	 *
+	 * - A path an `add`, `change`, or `delete` reported keeps what the
+	 *   notification left: the snapshot's entry for it is skipped, and it isn't
+	 *   pruned. So a file deleted meanwhile isn't resurrected and newer content
+	 *   isn't reverted.
+	 * - A `touch` never makes the snapshot yield, because it carries no
+	 *   contents: a client that missed a `change` while disconnected holds old
+	 *   text, and only the snapshot can replace it. The snapshot's entry is
+	 *   applied (or the file pruned, if the snapshot lacks it), and then the
+	 *   path's latest touch is applied again — unless an `add`, `change`, or
+	 *   `delete` was also reported for the path, whose result already stands.
+	 *
+	 * The touch's metadata wins over the snapshot's whichever `mtime` is
+	 * higher. The two can't be ordered from here — a notification that arrives
+	 * during the request may have been sent before or after the backend read
+	 * its index for the snapshot, and a file's `mtime` can move backwards — but
+	 * the backend queues a notification for every change to its index, so its
+	 * notifications converge on the index: if the snapshot was the newer of the
+	 * two, whatever moved the file past the touch has its own notification
+	 * still to come, and that one settles it. Preferring the snapshot would
+	 * have no such correction when the touch was the newer.
+	 */
+	track_changes(): DiskfileChangeTracker {
+		const tracker = { paths: new Set<string>(), touches: new Map<string, DisknodeMetadata>() };
+		this.#change_trackers.add(tracker);
+		return {
+			paths: tracker.paths,
+			touches: tracker.touches,
+			stop: () => this.#change_trackers.delete(tracker)
+		};
+	}
+
+	/**
+	 * Applies a `filer_change` notification. `add` and `change` both upsert by
+	 * path — the backend's add/change split is advisory, and a re-seed or a
+	 * missed delete must never leave two diskfiles for one path. A `touch`
+	 * carries no contents (see `touch`).
+	 */
 	handle_change(params: ActionInputs['filer_change']): void {
-		const validated_disknode = params.disknode;
-
-		switch (params.change.type) {
-			case 'add': {
-				this.add(disknode_to_diskfile_json(validated_disknode));
-				break;
-			}
-			case 'change': {
-				const existing_diskfile = this.items.by_optional('by_path', validated_disknode.id);
-
-				if (existing_diskfile) {
-					const diskfile_json = disknode_to_diskfile_json(validated_disknode, existing_diskfile.id);
-
-					existing_diskfile.set_json({
-						...diskfile_json,
-						// TODO hacky, should be handled more cleanly elsewhere
-						created: existing_diskfile.created, // Preserve original creation date
-						updated: get_datetime_now() // TODO @many probably rely on the db to bump `updated`
-					});
-				} else {
-					// If it doesn't exist yet, create a new one
-					this.add(disknode_to_diskfile_json(validated_disknode));
-				}
-				break;
-			}
-			case 'delete': {
-				const existing_diskfile = this.items.by_optional('by_path', validated_disknode.id);
-				if (existing_diskfile) {
-					this.items.remove(existing_diskfile.id);
-				}
-				break;
-			}
+		const { disknode } = params;
+		if (!('contents' in disknode)) {
+			// recorded apart from the changes a snapshot in flight yields to
+			// (see `track_changes`), whether or not there's a diskfile to update
+			for (const tracker of this.#change_trackers) tracker.touches.set(disknode.id, disknode);
+			this.touch(disknode);
+			return;
+		}
+		for (const tracker of this.#change_trackers) tracker.paths.add(disknode.id);
+		if (params.change.type === 'delete') {
+			this.remove_by_path(disknode.id);
+		} else {
+			this.upsert(disknode);
 		}
 	}
 
-	add(json: DiskfileJsonInput, auto_select: boolean = true): Diskfile {
+	/**
+	 * Applies a `touch`: the file's metadata changed on disk and the contents
+	 * the backend holds for it did not, so the diskfile keeps the content it
+	 * has — loaded or not — and takes the new `mtime`. For a file whose
+	 * content isn't loaded the backend holds none, so every change to it
+	 * arrives this way. Nothing else changes: no editor state is notified,
+	 * since there's no new content to weigh against a draft.
+	 *
+	 * A path this client doesn't hold is left alone (there are no contents to
+	 * add it with — the next snapshot brings it), as is a diskfile kept after
+	 * its file was deleted, whose content is no longer the file's.
+	 *
+	 * @returns whether a diskfile was updated
+	 */
+	touch(metadata: DisknodeMetadata): boolean {
+		const existing = this.items.by_optional('by_path', metadata.id);
+		if (!existing || existing.deleted_on_disk) return false;
+		if (existing.mtime !== metadata.mtime) existing.mtime = metadata.mtime;
+		return true;
+	}
+
+	/**
+	 * Adds a diskfile. It isn't selected: a file appearing on disk — seeded by
+	 * a snapshot, or created by another tool — never moves the selection or
+	 * opens a tab. Only `create_file` selects the file it creates.
+	 */
+	add(json: DiskfileJsonInput): Diskfile {
 		const diskfile = new Diskfile({ app: this.app, json });
 		this.items.add(diskfile);
-
-		if (auto_select && this.selected_file_id === null) {
-			this.select(diskfile.id);
+		this.#sync_directories(diskfile);
+		if (diskfile.path === this.#select_on_arrival) {
+			this.#select_on_arrival = null;
+			this.select(diskfile.id, true);
 		}
-
 		return diskfile;
 	}
 
-	/** Seed diskfiles from an initial file tree (e.g. session load or workspace open). */
-	add_initial(files: Array<SerializableDisknode>): void {
+	/**
+	 * The file `create_file` created whose `filer_change` hasn't arrived yet,
+	 * selected when it does. Not reactive. Dropped when it's selected, when
+	 * the user selects anything else (`select`, or a tab change through
+	 * `DiskfilesEditor` — `follow_selected_tab`), when its workspace is removed
+	 * (`handle_workspace_removed`), or by the next `create_file` — so a file the
+	 * filer never reports (say under `node_modules/`) can't take the selection
+	 * later.
+	 */
+	#select_on_arrival: DiskfilePath | null = null;
+
+	/**
+	 * The app-level editing state of `diskfile` (its draft, history, and save
+	 * state), created on first use and kept until the diskfile is removed —
+	 * views read it, they don't own it. Safe to call from component init or a
+	 * `$derived`: it's created detached from the calling effect, and reading it
+	 * doesn't track the lookup. A diskfile no longer in the collection gets a
+	 * throwaway state.
+	 */
+	get_editor_state(diskfile: Diskfile): DiskfileEditorState {
+		const existing = untrack(() => this.#editor_states.get(diskfile.id));
+		if (existing) return existing;
+		return create_detached(() => {
+			const editor_state = new DiskfileEditorState({ app: this.app, diskfile });
+			if (this.items.by_id.get(diskfile.id) === diskfile) {
+				this.#editor_states.set(diskfile.id, editor_state);
+			} else {
+				// unmanaged, so nothing would dispose it — keep it out of the cell registry
+				editor_state.dispose();
+			}
+			return editor_state;
+		});
+	}
+
+	/** The editing state of diskfile `id` if one was created — see `get_editor_state`. */
+	find_editor_state(id: Uuid): DiskfileEditorState | undefined {
+		return this.#editor_states.get(id);
+	}
+
+	#remove_editor_state(id: Uuid): void {
+		const editor_state = this.#editor_states.get(id);
+		if (!editor_state) return;
+		this.#editor_states.delete(id);
+		editor_state.dispose();
+	}
+
+	/**
+	 * Adds a diskfile for `disknode`, or updates the existing one at the same
+	 * path in place — keeping its id, so tabs, selection, and parts stay attached.
+	 * A diskfile kept after a delete (see `remove_by_path`) is reattached this
+	 * way when its path reappears on disk. An existing diskfile whose content
+	 * and dependency data already match is left untouched but for its `mtime`,
+	 * so a resync that re-sends every file doesn't churn the unchanged ones. A content change is
+	 * recorded in the file's editing state, if it has one
+	 * (`DiskfileEditorState.check_disk_changes`).
+	 */
+	upsert(disknode: SerializableDisknode): Diskfile {
+		const existing = this.items.by_optional('by_path', disknode.id);
+		if (!existing) {
+			return this.add(disknode_to_diskfile_json(disknode));
+		}
+		if (!existing.deleted_on_disk && diskfile_matches(existing, disknode)) {
+			// the one thing a rewrite to the same content changes — and the only
+			// sign of a change to a file whose content isn't loaded
+			if (existing.mtime !== disknode.mtime) existing.mtime = disknode.mtime;
+			return existing;
+		}
+		existing.deleted_on_disk = false;
+		existing.set_json({
+			...disknode_to_diskfile_json(disknode, existing.id),
+			// TODO hacky, should be handled more cleanly elsewhere
+			created: existing.created, // Preserve original creation date
+			updated: get_datetime_now() // TODO @many probably rely on the db to bump `updated`
+		});
+		// back on disk, and its root may have changed with a snapshot from another filer
+		this.#sync_directories(existing);
+		untrack(() => this.#editor_states.get(existing.id))?.check_disk_changes();
+		return existing;
+	}
+
+	/**
+	 * Seed diskfiles from an initial file tree (e.g. session load or workspace open).
+	 * Upserts by path, so overlapping seeds don't duplicate.
+	 *
+	 * @param files - the snapshot's file tree
+	 * @param changes - what `filer_change` reported while the snapshot was in
+	 * flight (see `track_changes`)
+	 */
+	add_initial(files: Array<SerializableDisknode>, changes?: DiskfileSnapshotChanges): void {
+		this.#upsert_snapshot(files, changes?.paths);
+		this.#apply_touches(changes);
+	}
+
+	#upsert_snapshot(files: Array<SerializableDisknode>, skip_paths?: ReadonlySet<string>): void {
 		for (const disknode of files) {
-			this.add(disknode_to_diskfile_json(disknode));
+			if (skip_paths?.has(disknode.id)) continue;
+			this.upsert(disknode);
 		}
 	}
 
-	async update(path: DiskfilePath, content: string): Promise<void> {
-		const result = await this.app.api.diskfile_update({ path, content });
-		// Handler already updated state on error
-		if (!result.ok) return;
+	/**
+	 * Applies the touches reported while a snapshot was in flight again, now
+	 * that the snapshot is in — except for a path a full change was reported
+	 * for (see `track_changes`).
+	 */
+	#apply_touches(changes: DiskfileSnapshotChanges | undefined): void {
+		if (!changes) return;
+		for (const [path, metadata] of changes.touches) {
+			if (!changes.paths.has(path)) this.touch(metadata);
+		}
 	}
 
+	/**
+	 * Replaces the file tree under `roots` with a session snapshot's: upserts
+	 * every snapshot file (like `add_initial`), and removes each known file under
+	 * a root that the snapshot lacks, via `remove_by_path` — so a file open with
+	 * unsaved edits is kept, flagged `deleted_on_disk`. Files outside every root
+	 * are left alone, since the snapshot says nothing about them.
+	 *
+	 * @param files - the snapshot's file tree
+	 * @param roots - the directories (trailing `/`) whose complete trees `files` holds
+	 * @param options.changes - what `filer_change` reported while the snapshot
+	 *   was in flight (see `track_changes`): a path with a full change is
+	 *   neither upserted nor removed
+	 * @param options.skip_dirs - directories (trailing `/`) whose files aren't
+	 *   removed, e.g. workspaces opened while the snapshot was in flight
+	 */
+	reconcile(
+		files: Array<SerializableDisknode>,
+		roots: ReadonlyArray<string>,
+		options?: { changes?: DiskfileSnapshotChanges; skip_dirs?: ReadonlyArray<string> }
+	): void {
+		const changes = options?.changes;
+		const skip_paths = changes?.paths;
+		const skip_dirs = options?.skip_dirs ?? [];
+		this.#upsert_snapshot(files, skip_paths);
+		this.#prune_unlisted(files, roots, skip_paths, skip_dirs);
+		this.#apply_touches(changes);
+	}
+
+	#prune_unlisted(
+		files: Array<SerializableDisknode>,
+		roots: ReadonlyArray<string>,
+		skip_paths: ReadonlySet<string> | undefined,
+		skip_dirs: ReadonlyArray<string>
+	): void {
+		if (!roots.length) return;
+		const snapshot_paths: Set<string> = new Set(files.map((disknode) => disknode.id));
+		for (const diskfile of this.items.values) {
+			const { path } = diskfile;
+			if (snapshot_paths.has(path) || skip_paths?.has(path)) continue;
+			if (!is_under_any(path, roots) || is_under_any(path, skip_dirs)) continue;
+			this.remove_by_path(path);
+		}
+	}
+
+	/**
+	 * Handles the diskfile at `path` being gone from disk.
+	 *
+	 * If it has a draft — edited in a tab, a file part, anywhere — it's kept,
+	 * flagged `deleted_on_disk` with its tabs and editing state intact, so the
+	 * user can save it back (recreating the file) or discard the draft (see
+	 * `release_if_unneeded`). Otherwise it's removed along with its tabs and
+	 * editing state.
+	 */
+	remove_by_path(path: string): void {
+		const diskfile = this.items.by_optional('by_path', path);
+		if (!diskfile) return;
+
+		if (this.#editor_states.get(diskfile.id)?.has_unsaved_edits) {
+			this.set_deleted_on_disk(diskfile, true);
+			return;
+		}
+
+		this.#forget(diskfile);
+	}
+
+	/**
+	 * Forgets diskfile `id` if it's deleted on disk and nothing holds it anymore
+	 * — no draft and no tab. Called when its draft is discarded and when its
+	 * last tab closes.
+	 */
+	release_if_unneeded(id: Uuid): void {
+		const diskfile = this.items.by_id.get(id);
+		if (
+			diskfile?.deleted_on_disk &&
+			!this.#editor_states.get(id)?.has_unsaved_edits &&
+			!this.editor.tabs.by_diskfile_id.has(id)
+		) {
+			this.#forget(diskfile);
+		}
+	}
+
+	/**
+	 * Called when a diskfile's last tab closes. A diskfile deleted on disk with
+	 * no draft left is forgotten now (see `release_if_unneeded`). Otherwise its
+	 * editing state resets what it shows (`DiskfileEditorState.reset_view`), so
+	 * a reopen shows the draft if there is one, else the disk content.
+	 */
+	handle_diskfile_detached(diskfile_id: Uuid): void {
+		this.release_if_unneeded(diskfile_id);
+		this.#editor_states.get(diskfile_id)?.reset_view();
+	}
+
+	/**
+	 * Removes a diskfile with its editor tabs and editing state (disposed with
+	 * the diskfile). If it was selected, selection follows the editor's newly
+	 * selected tab, or clears.
+	 */
+	#forget(diskfile: Diskfile): void {
+		// remove first, so closing its tabs re-entering `handle_diskfile_detached` is a no-op
+		this.items.remove(diskfile.id);
+		this.editor.remove_diskfile(diskfile.id);
+
+		if (this.selected_file_id === diskfile.id) {
+			this.selected_file_id = this.editor.tabs.selected_diskfile_id;
+		}
+	}
+
+	/**
+	 * Writes `content` to the file at `path`. The local `Diskfile` changes only
+	 * when the resulting `filer_change` broadcast arrives, not from the response.
+	 *
+	 * Refuses, without sending, to write over a known file whose content wasn't
+	 * loaded (`Diskfile.content_loaded` — over 4 MiB, not UTF-8 text, or
+	 * unreadable): nobody has seen what it would overwrite. Fails with
+	 * `conflict` (`data.reason` `content_not_loaded`).
+	 *
+	 * @returns the RPC result — on failure, callers surface `error` themselves
+	 */
+	update(
+		path: DiskfilePath,
+		content: string
+	): Promise<Result<{ value: ActionOutputs['diskfile_update'] }, { error: JsonrpcErrorObject }>> {
+		const existing = this.get_by_path(path);
+		if (existing && !existing.content_loaded) {
+			return Promise.resolve({
+				ok: false,
+				error: jsonrpc_error_messages.conflict(
+					`refusing to overwrite ${path}: ${DISKFILE_CONTENT_NOT_LOADED_MESSAGE}`,
+					{ reason: ERROR_CONTENT_NOT_LOADED }
+				)
+			});
+		}
+		return this.app.api.diskfile_update({ path, content });
+	}
+
+	/**
+	 * Deletes the file at `path` on disk. The file leaves the index when its
+	 * `filer_change` arrives.
+	 *
+	 * @throws Error with the backend's message when the delete fails
+	 */
 	async delete(path: DiskfilePath): Promise<void> {
 		const result = await this.app.api.diskfile_delete({ path });
-		// Handler already updated state on error
-		if (!result.ok) return;
+		if (!result.ok) throw new Error(result.error.message);
 	}
 
+	/**
+	 * The directory new files and folders are created in: the active
+	 * workspace's, `null` when no workspace is open.
+	 */
+	readonly new_files_dir: DiskfileDirectoryPath | null = $derived(
+		this.app.workspaces.active?.path ?? null
+	);
+
+	/**
+	 * The directories the file index covers, each with a trailing `/`: the app
+	 * directory, the scoped dirs, and the open workspaces.
+	 */
+	readonly indexed_roots: ReadonlyArray<DiskfileDirectoryPath> = $derived.by(() => {
+		const { zzz_dir, scoped_dirs, workspaces } = this.app;
+		const roots: Array<DiskfileDirectoryPath> = zzz_dir ? [zzz_dir] : [];
+		roots.push(...scoped_dirs);
+		for (const workspace of workspaces.items.values) roots.push(workspace.path);
+		return roots;
+	});
+
+	/**
+	 * How many files on disk each directory holds, at any depth, by its path
+	 * with a trailing `/` — every ancestor of each file up to its root (see
+	 * `to_file_directories`). Kept in step as files come and go
+	 * (`#sync_directories`), never rebuilt. Not reactive: `directory_paths` is.
+	 */
+	readonly #directory_counts: Map<string, number> = new Map();
+
+	/** What each counted diskfile contributed to `#directory_counts`, by id. Not reactive. */
+	readonly #counted_files: Map<Uuid, { path: string; source_dir: string }> = new Map();
+
+	readonly #directory_paths: SvelteSet<string> = new SvelteSet();
+
+	/**
+	 * The directories holding a file on disk, each with a trailing `/` —
+	 * changing only as a directory gains its first file or loses its last.
+	 */
+	readonly directory_paths: ReadonlySet<string> = this.#directory_paths;
+
+	/**
+	 * Marks `diskfile` gone from disk, or back — the one writer of
+	 * `Diskfile.deleted_on_disk` besides `upsert`, so `directory_paths` stays
+	 * in step.
+	 */
+	set_deleted_on_disk(diskfile: Diskfile, deleted_on_disk: boolean): void {
+		if (diskfile.deleted_on_disk === deleted_on_disk) return;
+		diskfile.deleted_on_disk = deleted_on_disk;
+		this.#sync_directories(diskfile);
+	}
+
+	/**
+	 * Brings `#directory_counts` in step with the file `diskfile`'s id names:
+	 * it counts while it's in the collection and on disk, under its current
+	 * path and root. Called after every change to any of those. Reads the
+	 * collection's own object for the id when there is one, so a stale or
+	 * rejected object (an `add` of an id already present) can't uncount the
+	 * file that's there.
+	 */
+	#sync_directories(diskfile: Diskfile): void {
+		untrack(() => {
+			const counted = this.#counted_files.get(diskfile.id);
+			const live = this.items.by_id.get(diskfile.id);
+			const counts = !!live && !live.deleted_on_disk;
+			const { path, source_dir } = live ?? diskfile;
+			if (counted && counts && counted.path === path && counted.source_dir === source_dir) return;
+			if (counted) {
+				this.#counted_files.delete(diskfile.id);
+				for (const dir of to_file_directories(counted.path, counted.source_dir)) {
+					const count = this.#directory_counts.get(dir)! - 1;
+					if (count > 0) {
+						this.#directory_counts.set(dir, count);
+					} else {
+						this.#directory_counts.delete(dir);
+						this.#directory_paths.delete(dir);
+					}
+				}
+			}
+			if (counts) {
+				this.#counted_files.set(diskfile.id, { path, source_dir });
+				for (const dir of to_file_directories(path, source_dir)) {
+					const count = this.#directory_counts.get(dir) ?? 0;
+					this.#directory_counts.set(dir, count + 1);
+					if (count === 0) this.#directory_paths.add(dir);
+				}
+			}
+		});
+	}
+
+	/**
+	 * The file index as markdown links see it, for telling a link's target
+	 * exists — reactive, so a check in a `$derived` follows the index.
+	 */
+	readonly link_index: MarkdownLinkIndex = this.#create_link_index();
+
+	#create_link_index(): MarkdownLinkIndex {
+		const get_roots = () => this.indexed_roots;
+		return {
+			has_file: (path) => {
+				const diskfile = this.get_by_path(path as DiskfilePath);
+				return !!diskfile && !diskfile.deleted_on_disk;
+			},
+			has_directory: (path) => this.#directory_paths.has(path),
+			get roots() {
+				return get_roots();
+			}
+		};
+	}
+
+	/**
+	 * Opens the file at `path` in a tab, as a preview unless `open_not_preview`
+	 * (see `select`) — only a file on disk in the index. A markdown file's
+	 * markdown view then reveals the heading `fragment` names (see
+	 * `DiskfileEditorState.markdown_pending_fragment`).
+	 *
+	 * @returns whether a file was opened
+	 */
+	open_path(
+		path: string,
+		options?: { fragment?: string | null; open_not_preview?: boolean }
+	): boolean {
+		const diskfile = this.get_by_path(path as DiskfilePath);
+		if (!diskfile || diskfile.deleted_on_disk) return false;
+		const fragment = options?.fragment;
+		if (fragment && to_diskfile_content_kind(diskfile.path) === 'markdown') {
+			this.get_editor_state(diskfile).markdown_pending_fragment = fragment;
+		}
+		this.select(diskfile.id, options?.open_not_preview);
+		return true;
+	}
+
+	/**
+	 * Creates a new file in `new_files_dir` — never overwriting one: the
+	 * backend's `diskfile_create` creates the final name exclusively, so an
+	 * existing file (indexed or not) is left untouched. The new file is
+	 * selected and opened in a permanent tab, like VS Code's new file — now if
+	 * its `filer_change` already arrived, else when it does.
+	 *
+	 * @param filename - the file's path relative to `new_files_dir`, parsed by
+	 * `parse_new_diskfile_name`: trimmed, with leading slashes dropped; refused
+	 * when blank, naming the directory itself, with a whitespace-only segment,
+	 * climbing out with `..`, or ending in an empty, `.`, or `..` segment
+	 * @param content - the new file's content
+	 * @throws Error when no workspace is open, the name is refused, the file
+	 * already exists, or the write fails
+	 */
 	async create_file(filename: string, content: string = ''): Promise<void> {
-		if (!this.app.zzz_dir) {
-			throw new Error('cannot create file: zzz_dir is not set');
+		const dir = this.new_files_dir;
+		if (!dir) {
+			throw new Error('cannot create file: no workspace is open');
 		}
+		const parsed = parse_new_diskfile_name(filename, 'file');
+		if (!parsed.ok) throw new Error(parsed.message);
 
-		// zzz_dir already has trailing slash (DiskfileDirectoryPath), strip any leading slash from filename
-		const path = DiskfilePath.parse(`${this.app.zzz_dir}${strip_start(filename, '/')}`);
-
-		// Reuse `update` which creates or updates files
-		await this.update(path, content);
+		// `dir` has a trailing slash (`DiskfileDirectoryPath`), and the parsed name has no leading one
+		await this.create_file_at(DiskfilePath.parse(`${dir}${parsed.value}`), content);
 	}
 
-	async create_directory(dirname: string): Promise<void> {
-		if (!this.app.zzz_dir) {
-			throw new Error('cannot create directory: zzz_dir is not set');
+	/**
+	 * Creates a new file at an absolute path — never overwriting one, like
+	 * `create_file` — and selects it, opened in a permanent tab, now or when
+	 * its `filer_change` arrives.
+	 *
+	 * @param path - the new file's absolute path
+	 * @param content - the new file's content
+	 * @throws Error when the file already exists or the write fails
+	 */
+	async create_file_at(path: DiskfilePath, content: string = ''): Promise<void> {
+		this.#select_on_arrival = null;
+
+		const result = await this.app.api.diskfile_create({ path, content });
+		if (!result.ok) {
+			const { reason } = (result.error.data ?? {}) as { reason?: unknown };
+			throw new Error(reason === 'already_exists' ? 'already exists' : result.error.message);
 		}
 
-		const path = DiskfilePath.parse(`${this.app.zzz_dir}${dirname}`);
+		// the backend normalizes the path, and the filer reports it that way
+		const created_path = DiskfilePath.parse(normalize_path(path));
+		const created = this.get_by_path(created_path);
+		if (created) {
+			this.select(created.id, true);
+		} else {
+			this.#select_on_arrival = created_path;
+		}
+	}
+
+	/**
+	 * Makes the selected file the editor's selected tab's (or none) after a
+	 * user-driven tab change — selecting, opening, closing the selected tab,
+	 * reopening, or navigating back/forward (the `DiskfilesEditor` methods) —
+	 * and drops a pending `create_file` selection, since the user has moved on.
+	 */
+	follow_selected_tab(): void {
+		this.#select_on_arrival = null;
+		this.selected_file_id = this.editor.tabs.selected_diskfile_id;
+	}
+
+	/**
+	 * Called when the workspace at `path` is removed: a file created there that
+	 * hasn't arrived won't be selected if it arrives later.
+	 */
+	handle_workspace_removed(path: DiskfileDirectoryPath): void {
+		if (this.#select_on_arrival?.startsWith(path)) this.#select_on_arrival = null;
+	}
+
+	/**
+	 * Creates a new directory in `new_files_dir`.
+	 *
+	 * @param dirname - the directory's path relative to `new_files_dir`, parsed
+	 * by `parse_new_diskfile_name` as for `create_file`, except that its last
+	 * segment may be empty, `.`, or `..` (`src/`, `a/b/..`)
+	 * @throws Error when no workspace is open, the name is refused or already
+	 * taken, or the backend refuses
+	 */
+	async create_directory(dirname: string): Promise<void> {
+		const dir = this.new_files_dir;
+		if (!dir) {
+			throw new Error('cannot create folder: no workspace is open');
+		}
+
+		const parsed = parse_new_diskfile_name(dirname, 'folder');
+		if (!parsed.ok) throw new Error(parsed.message);
+
+		const path = DiskfilePath.parse(`${dir}${parsed.value}`);
 
 		const result = await this.app.api.directory_create({ path });
-		// Handler already updated state on error
-		if (!result.ok) return;
+		if (!result.ok) {
+			const { reason } = (result.error.data ?? {}) as { reason?: unknown };
+			throw new Error(reason === 'already_exists' ? 'already exists' : result.error.message);
+		}
 	}
 
 	get_by_path(path: DiskfilePath): Diskfile | undefined {
@@ -185,6 +755,7 @@ export class Diskfiles extends Cell<typeof DiskfilesJson> {
 	 * If `open_not_preview` is `true`, opens as a permanent tab, otherwise previews.
 	 */
 	select(id: Uuid | null | undefined, open_not_preview: boolean = false): void {
+		this.#select_on_arrival = null;
 		if (id === undefined) {
 			this.select_next();
 		} else {
@@ -202,8 +773,22 @@ export class Diskfiles extends Cell<typeof DiskfilesJson> {
 	}
 
 	select_next(): void {
-		const { by_id } = this.items;
-		const next = by_id.values().next();
-		this.select(next.value?.id ?? null);
+		this.select(this.on_disk[0]?.id ?? null);
 	}
 }
+
+/** Whether `path` is inside one of `dirs` (each with a trailing `/`). */
+const is_under_any = (path: string, dirs: ReadonlyArray<string>): boolean =>
+	dirs.some((dir) => path.startsWith(dir));
+
+/** Whether `diskfile` already holds everything `upsert` would take from `disknode`. */
+const diskfile_matches = (diskfile: Diskfile, disknode: SerializableDisknode): boolean =>
+	diskfile.content === disknode.contents &&
+	diskfile.source_dir === disknode.source_dir &&
+	dependency_lists_match(diskfile.dependents, disknode.dependents) &&
+	dependency_lists_match(diskfile.dependencies, disknode.dependencies);
+
+const dependency_lists_match = (
+	a: ReadonlyArray<readonly [string, unknown]>,
+	b: ReadonlyArray<readonly [string, unknown]>
+): boolean => a.length === b.length && (a.length === 0 || JSON.stringify(a) === JSON.stringify(b));

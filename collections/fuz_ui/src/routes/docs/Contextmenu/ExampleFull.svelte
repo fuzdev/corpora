@@ -5,23 +5,23 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import Contextmenu from '$lib/Contextmenu.svelte';
-	import Details from '$lib/Details.svelte';
-	import GithubLink from '$lib/GithubLink.svelte';
-	import ContextmenuTextEntry from '$lib/ContextmenuTextEntry.svelte';
+	import Contextmenu from '#lib/Contextmenu.svelte';
+	import Details from '#lib/Details.svelte';
+	import GithubLink from '#lib/GithubLink.svelte';
+	import ContextmenuTextEntry from '#lib/ContextmenuTextEntry.svelte';
 	import CatContextmenu from './CatContextmenu.svelte';
 	import AppContextmenu from './AppContextmenu.svelte';
 	import HomeContextmenu from './HomeContextmenu.svelte';
 	import AdventureContextmenu from './AdventureContextmenu.svelte';
 	import CatView from './CatView.svelte';
 	import type { Cat, CatPosition, HistoryItem } from './helpers.ts';
-	import ColorSchemeInput from '$lib/ColorSchemeInput.svelte';
-	import ThemeInput from '$lib/ThemeInput.svelte';
-	import Dialog from '$lib/Dialog.svelte';
-	import DialogContent from '$lib/DialogContent.svelte';
+	import ColorSchemeInput from '#lib/ColorSchemeInput.svelte';
+	import ThemeInput from '#lib/ThemeInput.svelte';
+	import Dialog from '#lib/Dialog.svelte';
+	import DialogContent from '#lib/DialogContent.svelte';
 	import file_contents from './ExampleFull.svelte?raw';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 	import { selected_contextmenu_root_component_context } from './selected_root_component.svelte.ts';
 
 	const selected = selected_contextmenu_root_component_context.get();
@@ -232,7 +232,7 @@
 	<Dialog onclose={() => (show_about_dialog = false)}>
 		<DialogContent>
 			<h1>About Fuz</h1>
-			<blockquote>Svelte UI library</blockquote>
+			<blockquote>Svelte component library and frontend helpers</blockquote>
 			<blockquote>
 				free and open source at<br /><GithubLink path="fuzdev/fuz_ui" />
 			</blockquote>

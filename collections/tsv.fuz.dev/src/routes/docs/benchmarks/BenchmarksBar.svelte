@@ -1,10 +1,6 @@
 <script lang="ts">
-	import {
-		category_color,
-		format_label,
-		type FormattedUnit,
-		type ImplementationCategory
-	} from './benchmark_data.ts';
+	import type { ImplementationCategory } from './benchmark_data.ts';
+	import { category_color, format_row_label, type FormattedUnit } from './benchmark_display.ts';
 
 	const {
 		label,
@@ -15,9 +11,9 @@
 		ratio_color,
 		annotation,
 		disabled = false,
-		coverage_only = false,
-		on_enter,
-		on_leave
+		placeholder = 'no API',
+		baseline_key,
+		anchor = false
 	}: {
 		label: string;
 		bar_fraction: number;
@@ -25,50 +21,35 @@
 		value: FormattedUnit;
 		ratio_text: string;
 		ratio_color: string | undefined;
-		// optional extra context shown between value and ratio (corpus coverage in
-		// benchmark groups, gzipped size in binary-size groups); omitted when absent
+		// optional extra context shown between value and ratio (gzipped size in the
+		// binary-size groups); omitted when absent
 		annotation?: string | undefined;
 		// a grayed-out, inert placeholder (a tool that doesn't run in this group) —
 		// no bar, no value, no ratio, just the label held in its shared slot
 		disabled?: boolean;
-		// inert for a different reason: the tool DID run over the whole corpus but
-		// was deliberately never timed (no in-process API, so a per-file row would
-		// have measured process spawn). Reads `not timed` rather than `n/a`, since
-		// "we chose not to measure this" and "this tool wasn't here" are different
-		// claims and the gray alone can't tell them apart
-		coverage_only?: boolean;
-		// hover-to-rebaseline: fired when the pointer enters/leaves the row so the
-		// group can adopt this row as its ratio anchor; omitted on inert placeholders
-		on_enter?: (() => void) | undefined;
-		on_leave?: (() => void) | undefined;
+		// what a `disabled` row reads in its value cell: why the tool is absent
+		// (a parse slot's tool has no parser API; the size table's slot, no wasm
+		// build) or, on a coverage-only row, why it ran but went untimed
+		placeholder?: string;
+		// hover-to-rebaseline: the key the group's delegated `pointerover` reads off
+		// this row to adopt it as the ratio anchor. Omitted on inert placeholders,
+		// which publish no key and so can never become the anchor.
+		baseline_key?: string | undefined;
+		// the row every ratio in the group is currently taken against
+		anchor?: boolean;
 	} = $props();
 
-	// the parenthesized binding suffix (`(wasm)`/`(node napi)`) describes how the
-	// tool actually ran in this (Node) report - meaningless for the disabled
-	// placeholders of single-variant tools (biome and dprint each ship only a wasm
-	// build here, so there's no ambiguity to lose). oxc-parser keeps its suffix even
-	// when disabled since it has two placeholder rows (napi and wasm) that would
-	// otherwise become indistinguishable.
-	const display_label = $derived(
-		disabled && (category === 'biome' || category === 'dprint')
-			? format_label(label).replace(/ \([^)]*\)$/, '')
-			: format_label(label)
-	);
+	const display_label = $derived(format_row_label(label, disabled));
 </script>
 
-<!-- the hover handlers only re-baseline the group's ratios — a non-essential
-	visual aid over data that's fully visible regardless, with the default anchor
-	serving keyboard and no-hover users — so the row stays presentational -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	class="bar-row"
-	class:has-annotation={annotation != null}
-	class:disabled
-	onmouseenter={on_enter}
-	onmouseleave={on_leave}
->
-	<span class="bar-label">{display_label}</span>
-	<div class="bar-track">
+<!-- the grid is a table to assistive tech (its parent is the `role="table"`):
+	each row is one tool, its cells the label, measurement, annotation, and ratio;
+	the bar itself only repeats the measurement visually, so it is hidden. Hover is
+	handled by the group, which reads `data-baseline-key` off whichever row the
+	pointer is over — see `BenchmarksBaselineGroup` -->
+<div class="bar-row" class:disabled class:anchor role="row" data-baseline-key={baseline_key}>
+	<span class="bar-label" role="rowheader">{display_label}</span>
+	<div class="bar-track" role="cell" aria-hidden="true">
 		{#if !disabled}
 			<div
 				class="bar-fill"
@@ -77,58 +58,58 @@
 			></div>
 		{/if}
 	</div>
-	<span class="bar-value">
+	<span class="bar-value" role="cell">
 		{#if disabled}
-			<span class="text_40">{coverage_only ? 'not timed' : 'n/a'}</span>
+			{placeholder}
 		{:else}
-			{value.value} <span class="text_50">{value.unit}</span>
+			{value.value} {value.unit}
 		{/if}
 	</span>
 	{#if annotation != null}
-		<span class="bar-annotation text_50">{annotation}</span>
+		<small class="bar-annotation" role="cell">{annotation}</small>
 	{/if}
-	<span class="bar-ratio" style:color={ratio_color}>
+	<span class="bar-ratio" role="cell" style:color={ratio_color}>
 		{#if !disabled}{ratio_text}{/if}
 	</span>
 </div>
 
 <style>
+	/* a row borrows its columns from the group's grid (`BenchmarksBaselineGroup`), so
+	 * every row's cells line up and size to the group's content */
 	.bar-row {
 		display: grid;
-		grid-template-columns: 16rem 1fr 5.6rem 3.4rem;
+		grid-template-columns: subgrid;
+		grid-column: 1 / -1;
 		align-items: center;
-		gap: var(--space_sm);
-		/* rows sit flush (no inter-row gap) with a little padding, so the hover
+		/* rows sit flush (no inter-row gap) with a little padding, so the anchor
 		 * highlight reads as one contiguous, full-height band per row */
-		padding-block: var(--space_xs);
-		border-radius: var(--border_radius_xs);
-	}
-	.bar-row.has-annotation {
-		grid-template-columns: 16rem 1fr 5.6rem 6rem 3.4rem;
+		padding: var(--space_xs);
 	}
 	.bar-row.disabled {
 		opacity: 0.6;
 	}
-	/* hovering an enabled row makes it the group's ratio anchor (driven in JS); the
-	 * highlight marks which row every ratio in the group is now measured against */
-	.bar-row:not(.disabled):hover {
-		background-color: var(--fg_10);
+	/* the row every ratio in the group is currently taken against — the default, or
+	 * whichever enabled row is hovered (driven in JS) — marked as the CLI tables mark
+	 * theirs */
+	.bar-row.anchor {
+		background-color: var(--ink_05);
+		box-shadow: inset var(--border_width_3) 0 0 var(--ink_50);
 	}
-	.bar-annotation {
-		font-size: var(--font_size_xs);
+	.bar-label,
+	.bar-value,
+	.bar-annotation,
+	.bar-ratio {
 		text-align: right;
 		white-space: nowrap;
 	}
 	.bar-label {
-		font-size: var(--font_size_sm);
-		text-align: right;
-		white-space: nowrap;
-		/* these may overflow slightly/harmlessly, just need to visually check */
+		grid-column: label;
 	}
 	.bar-track {
+		grid-column: track;
 		height: 1.2rem;
 		border-radius: var(--border_radius_xs);
-		background: var(--fg_05);
+		background: var(--ink_05);
 	}
 	.bar-fill {
 		height: 100%;
@@ -137,13 +118,23 @@
 		transition: width 0.3s ease;
 	}
 	.bar-value {
-		font-size: var(--font_size_sm);
-		text-align: right;
-		white-space: nowrap;
+		grid-column: value;
+	}
+	.bar-annotation {
+		grid-column: annotation;
 	}
 	.bar-ratio {
-		font-size: var(--font_size_sm);
+		grid-column: ratio;
 		font-weight: 700;
-		text-align: right;
+		font-variant-numeric: tabular-nums;
+	}
+	/* too narrow for a bar beside its label: the label takes a line of its own */
+	@container benchmarks-bars (max-width: 36rem) {
+		.bar-label {
+			grid-column: 1 / -1;
+			/* clear of the anchor's edge, which the right-aligned label never met */
+			padding-left: var(--space_xs);
+			text-align: left;
+		}
 	}
 </style>

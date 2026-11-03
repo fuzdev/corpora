@@ -5,7 +5,7 @@
 	import { DEV } from 'esm-env';
 
 	import type { SvgData } from '@fuzdev/fuz_ui/svg.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 
 	import type { Model } from './model.svelte.ts';
 	import ProviderLogo from './ProviderLogo.svelte';
@@ -33,19 +33,24 @@
 		});
 	}
 
-	const selected = $derived(page.url.pathname === resolve(`/models/${model.name}`));
+	const selected = $derived(page.url.pathname === resolve('/models/[slug]', { slug: model.name }));
 </script>
 
 <!-- TODO this contextmenu appears as a duplicate, I think a de-duped key is the best fix, not manually disabling it -->
 <ModelContextmenu {model}>
-	<a {...rest} href={resolve(`/models/${model.name}`)} class="selected-plain" class:selected>
+	<a
+		{...rest}
+		href={resolve('/models/[slug]', { slug: model.name })}
+		class="selected-plain"
+		class:selected
+	>
 		{#if children}
 			{@render children()}
 		{:else}
 			{#if icon === 'logo'}
 				<ProviderLogo name={model.provider_name} />&nbsp;
 			{:else if icon}
-				<Svg data={icon} inline />&nbsp;
+				<Icon data={icon} />&nbsp;
 			{/if}{model.name}
 		{/if}
 	</a>

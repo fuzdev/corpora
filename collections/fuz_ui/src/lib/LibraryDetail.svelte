@@ -6,6 +6,7 @@ with file-type coloring. Uses svelte-docinfo's file type predicates for module c
 
 @see `library.svelte.ts` for the `Library` wrapper class
 @see {@link https://github.com/ryanatkn/svelte-docinfo svelte-docinfo} for the analysis library
+@cssprop --max_width - maximum width of the detail
 -->
 <script lang="ts">
 	import { page } from '$app/state';

@@ -5,9 +5,8 @@
  * idempotent (`ON CONFLICT DO NOTHING`) so the same hash can be written by
  * two callers without the second observing an error.
  *
- * Higher-level lifecycle (verify-on-read, JSON ref auto-extraction,
- * embedded-vs-referenced selection) lives in `db/fact_store.ts`. Queries
- * here are deliberately mechanical.
+ * Higher-level lifecycle (verify-on-read, embedded-vs-referenced selection)
+ * lives in `db/fact_store.ts`. Queries here are deliberately mechanical.
  *
  * @module
  */
@@ -15,7 +14,7 @@
 import type { QueryDeps } from './query_deps.ts';
 
 import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
-import { columns_sql, omit_columns } from './sql_columns.ts';
+import { columns_sql, iso8601_timestamp_column, omit_columns } from './sql_columns.ts';
 
 /** Row shape for `SELECT … FROM fact`. */
 export interface FactRow {
@@ -46,6 +45,13 @@ export const FACT_COLUMNS = [
 	'created_at'
 ] as const satisfies ReadonlyArray<keyof FactRow>;
 
+// `created_at` is deliberately *not* projected through
+// `iso8601_timestamp_column` here, unlike every other table: these rows feed
+// `PgFactStore`, whose `FactMeta.created_at` is a `Date` in the
+// `@fuzdev/fuz_util` `FactStore` contract, and nothing serializes them. The
+// one fact timestamp that does reach the wire — the orphan-sweep sample in
+// `query_orphan_facts_list` — projects the ISO-8601 wire string.
+
 /** `FACT_COLUMNS` minus the payload — the `FactMetaRow` projection. */
 const FACT_META_COLUMNS = omit_columns(FACT_COLUMNS, 'bytes');
 
@@ -59,6 +65,15 @@ export interface FactMetaRow {
 	created_at: Date;
 }
 
+/** Input for `query_put_fact` — one `fact` row. Twin of the Rust `PutFactInput`. */
+export interface PutFactInput {
+	hash: FactHash;
+	bytes: Uint8Array | null;
+	external_url: string | null;
+	content_type: string | null;
+	size: number;
+}
+
 /**
  * Idempotently insert a fact row.
  *
@@ -68,16 +83,7 @@ export interface FactMetaRow {
  * inserted, `false` when a row already existed (caller can use this to
  * decide whether to also write `fact_ref`).
  */
-export const query_put_fact = async (
-	deps: QueryDeps,
-	input: {
-		hash: FactHash;
-		bytes: Uint8Array | null;
-		external_url: string | null;
-		content_type: string | null;
-		size: number;
-	}
-): Promise<boolean> => {
+export const query_put_fact = async (deps: QueryDeps, input: PutFactInput): Promise<boolean> => {
 	const row = await deps.db.query_one<{ hash: FactHash }>(
 		`INSERT INTO fact (hash, bytes, external_url, content_type, size)
 		 VALUES ($1, $2, $3, $4, $5)
@@ -187,6 +193,22 @@ export const query_delete_fact = async (
 };
 
 /**
+ * The grace-window half of the orphan cutoff: no `fact_holder` row was
+ * recorded (or refreshed) at or after `$1`. A dedup put adds no `fact` row,
+ * so `fact.created_at` stays at the first insert — without this, an old
+ * orphan an actor re-uploads looks stale, and a sweep between the upload and
+ * the cell write that references it deletes the fact (and, by cascade, the
+ * possession the write needs). A fact counts as recent when its own
+ * `created_at` or any holder's is within the window. Served by
+ * `idx_fact_holder_hash`. Twin of the Rust `ORPHAN_FACT_NOT_RECENTLY_HELD`.
+ */
+const ORPHAN_FACT_NOT_RECENTLY_HELD = `NOT EXISTS (
+		   SELECT 1 FROM fact_holder h
+		   WHERE h.hash = f.hash
+		     AND h.created_at >= $1::timestamptz
+		 )`;
+
+/**
  * Summary + sample shape returned by `query_orphan_facts_list`. The sample
  * is a small page (default 20 rows) shown in the admin panel so the
  * operator has *some* visibility into what they're about to delete.
@@ -215,14 +237,15 @@ export interface OrphanFactsListResult {
  * outputs? external fact mirrors?) the predicate moves to a generic
  * `fact_consumers` registry; today the cell layer is the only consumer.
  *
- * The `older_than` filter applies to `fact.created_at`. Pass `null`
- * to skip the filter (used by the list-summary preview); the delete
- * handler always passes a non-null cutoff (default 0, meaning "any
- * orphan").
+ * The `older_than` filter is the grace cutoff: a fact passes it when both
+ * its `created_at` and every `fact_holder` row's are older (a re-put
+ * refreshes the holder row). Pass `null` to skip the filter (used by the
+ * list-summary preview); the delete handler always passes a non-null
+ * cutoff (default 0, meaning "any orphan").
  *
  * @param deps - query deps
- * @param older_than - filter to facts created before this Date (or null
- *   to skip)
+ * @param older_than - filter to facts created, and last put by any holder,
+ *   before this Date (or null to skip)
  * @param sample_limit - row cap for the returned `sample`
  */
 export const query_orphan_facts_list = async (
@@ -241,23 +264,25 @@ export const query_orphan_facts_list = async (
 		   WHERE c.refs @> ARRAY[f.hash]::text[]
 		     AND c.deleted_at IS NULL
 		 )
-		 AND ($1::timestamptz IS NULL OR f.created_at < $1::timestamptz)`,
+		 AND ($1::timestamptz IS NULL
+		      OR (f.created_at < $1::timestamptz AND ${ORPHAN_FACT_NOT_RECENTLY_HELD}))`,
 		[older_than]
 	);
 	const sample_rows = await deps.db.query<{
 		hash: FactHash;
 		size: number | string;
-		created_at: Date | string;
+		created_at: string;
 		external_url: string | null;
 	}>(
-		`SELECT hash, size, created_at, external_url
+		`SELECT hash, size, ${iso8601_timestamp_column('f', 'created_at')} AS created_at, external_url
 		 FROM fact f
 		 WHERE NOT EXISTS (
 		   SELECT 1 FROM cell c
 		   WHERE c.refs @> ARRAY[f.hash]::text[]
 		     AND c.deleted_at IS NULL
 		 )
-		 AND ($1::timestamptz IS NULL OR f.created_at < $1::timestamptz)
+		 AND ($1::timestamptz IS NULL
+		      OR (f.created_at < $1::timestamptz AND ${ORPHAN_FACT_NOT_RECENTLY_HELD}))
 		 ORDER BY f.created_at ASC
 		 LIMIT $2`,
 		[older_than, sample_limit]
@@ -268,7 +293,7 @@ export const query_orphan_facts_list = async (
 		sample: sample_rows.map((r) => ({
 			hash: r.hash,
 			size: Number(r.size),
-			created_at: typeof r.created_at === 'string' ? r.created_at : r.created_at.toISOString(),
+			created_at: r.created_at,
 			external_url: r.external_url
 		}))
 	};
@@ -279,7 +304,9 @@ export const query_orphan_facts_list = async (
  * (no row-count limit) — callers iterate to unlink disk files. The
  * `older_than` cutoff is required (non-null) here: bulk delete should
  * always be operator-scoped to a time window. A "delete all" sweep
- * passes a far-future cutoff, not `null`.
+ * passes a far-future cutoff, not `null`. It is the same grace cutoff as
+ * `query_orphan_facts_list`: a fact put — or re-put, deduplicated — by an
+ * actor within the window is kept, whatever its own `created_at`.
  */
 export const query_orphan_facts_select_for_delete = async (
 	deps: QueryDeps,
@@ -297,7 +324,8 @@ export const query_orphan_facts_select_for_delete = async (
 		   WHERE c.refs @> ARRAY[f.hash]::text[]
 		     AND c.deleted_at IS NULL
 		 )
-		 AND f.created_at < $1::timestamptz`,
+		 AND f.created_at < $1::timestamptz
+		 AND ${ORPHAN_FACT_NOT_RECENTLY_HELD}`,
 		[older_than]
 	);
 	return rows.map((r) => ({ hash: r.hash, size: Number(r.size), external_url: r.external_url }));

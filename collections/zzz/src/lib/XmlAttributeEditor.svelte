@@ -4,7 +4,7 @@
 
 	import type { XmlAttributeWithDefaults } from './xml.ts';
 	import { icon_remove } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 
 	const {
 		attribute,
@@ -23,14 +23,14 @@
 
 <div class="display:flex gap_xs2 align-items:center" class:dormant_wrapper={!attribute.key}>
 	<input
-		class="plain sm"
+		class="plain sized_sm"
 		class:dormant
 		placeholder="key"
 		value={attribute.key}
 		oninput={(e) => onupdate({ key: e.currentTarget.value })}
 	/>
 	<input
-		class="plain sm"
+		class="plain sized_sm"
 		class:dormant
 		placeholder="value"
 		value={attribute.value}
@@ -39,8 +39,8 @@
 	<ConfirmButton
 		onconfirm={onremove}
 		title="remove attribute {attribute.key || ''}"
-		class="plain sm"
+		class="plain sized_sm"
 	>
-		<Svg data={icon_remove} />
+		<Icon data={icon_remove} />
 	</ConfirmButton>
 </div>

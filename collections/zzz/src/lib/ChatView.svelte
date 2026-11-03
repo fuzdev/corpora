@@ -6,7 +6,7 @@
 	import { Chat } from './chat.svelte.ts';
 	import { frontend_context } from './frontend.svelte.ts';
 	import { icon_chat, icon_delete, icon_thread, icon_view } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 	import ThreadList from './ThreadList.svelte';
 	import ChatViewSimple from './ChatViewSimple.svelte';
 	import ChatViewMulti from './ChatViewMulti.svelte';
@@ -38,9 +38,14 @@
 		{#if chat}
 			<section class="column-section" transition:slide>
 				<!-- TODO needs work -->
-				<div class="font_size_lg display:flex align-items:center">
-					<Svg data={icon_chat} />
-					<EditableText bind:value={chat.name} />
+				<div
+					class="font_size_lg display:flex align-items:center"
+					title={chat.autoname && chat.init_name_error
+						? `auto-naming failed: ${chat.init_name_error}`
+						: undefined}
+				>
+					<Icon data={icon_chat} />
+					<EditableText bind:value={() => chat.name, (name) => chat.rename(name)} />
 				</div>
 				<div class="row">
 					<small class="flex:1" title={chat.created_formatted_datetime}>
@@ -55,10 +60,10 @@
 								}
 								active_content="simple"
 								inactive_content="multi"
-								class="plain sm"
-								title="toggle chat to ${chat.view_mode === 'multi' ? 'simple' : 'multi'} view"
+								class="plain sized_sm"
+								title="toggle chat to {chat.view_mode === 'multi' ? 'simple' : 'multi'} view"
 							>
-								<Svg data={icon_view} class="mr_xs" />
+								<Icon data={icon_view} class="mr_xs" />
 							</ToggleButton>
 						{/if}
 						<ConfirmButton
@@ -66,8 +71,8 @@
 							title="delete chat {'"' + chat.name + '"'}"
 							class="plain icon-button"
 						>
-							<Svg data={icon_delete} />
-							{#snippet popover_button_content()}<Svg data={icon_delete} />{/snippet}
+							<Icon data={icon_delete} />
+							{#snippet popover_button_content()}<Icon data={icon_delete} />{/snippet}
 						</ConfirmButton>
 					</div>
 				</div>
@@ -80,7 +85,7 @@
 					class="mt_0 mb_lg font_size_lg display:flex justify-content:space-between"
 					title="threads are the individual threads of conversation in a chat -- each chat can have many threads, comprising its history"
 				>
-					<span><Svg data={icon_thread} /> threads</span><span>{thread_count}</span>
+					<span><Icon data={icon_thread} /> threads</span><span>{thread_count}</span>
 				</header>
 				<ThreadList {chat} />
 			</section>

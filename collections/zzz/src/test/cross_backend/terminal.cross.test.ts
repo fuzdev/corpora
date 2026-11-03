@@ -4,25 +4,152 @@
  * Each test mints a fresh per-test account via
  * `default_cross_process_setup` and exercises the terminal RPC +
  * WebSocket data/exit notification path against the spawned test
- * binary.
+ * binary. The ownership test mints a second account to check that a
+ * terminal's notifications and controls stay with the account that
+ * created it, and that another account's terminal gets the same reply as
+ * an unknown id (`not_found` for input and resize).
  *
  * @module
  */
 
-import { describe, test, inject, assert } from 'vitest';
-import {
-	default_cross_process_setup,
-	reconstruct_bootstrapped_handle
-} from '@fuzdev/fuz_app/testing/cross_backend/setup.ts';
+import { readFile } from 'node:fs/promises';
+import { describe, test, assert } from 'vitest';
+import { inject_backend_handle } from '@fuzdev/fuz_app/testing/cross_backend/provided_context.ts';
+import { default_cross_process_setup } from '@fuzdev/fuz_app/testing/cross_backend/setup.ts';
 import { rpc_call } from '@fuzdev/fuz_app/testing/rpc_helpers.ts';
 import { create_ws_transport } from '@fuzdev/fuz_app/testing/transports/ws_transport.ts';
 
-import './cross_test_types.ts';
+import {
+	ERROR_TERMINAL_COMMAND_NOT_FOUND,
+	TERMINAL_ACK_THRESHOLD_BYTES
+} from '#lib/terminal_helpers.ts';
 
-const handle = reconstruct_bootstrapped_handle(inject('backend_handle'));
+const handle = inject_backend_handle();
 const setup_test = default_cross_process_setup(handle);
 
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+/** The reply to `terminal_data_send` / `terminal_resize` for a terminal the caller doesn't own. */
+const TERMINAL_NOT_FOUND = { code: -32003, message: 'terminal not found' };
+
+type WsClient = Awaited<ReturnType<typeof create_ws_transport>>;
+
+/** `value` as its JSON round-trip — `undefined` fields dropped, for deep comparison. */
+const to_json = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+
+/** An `rpc_call` reply without its headers — for comparing replies. */
+const reply_of = (res: object): unknown => to_json({ ...res, headers: undefined });
+
+/** The `terminal_ids` of a `session_load` result. */
+const session_terminal_ids = (result: unknown): Array<string> =>
+	((result as Record<string, unknown>).data as Record<string, unknown>)
+		.terminal_ids as Array<string>;
+
+const open_ws = async (): Promise<WsClient> => {
+	const fixture = await setup_test();
+	const ws = await create_ws_transport({
+		base_url: handle.config.base_url,
+		ws_path: handle.config.ws_path,
+		cookies: fixture.transport.cookies()
+	});
+	await ws.request('_warmup', 'ping', undefined);
+	return ws;
+};
+
+const is_notification = (msg: unknown, method: string, terminal_id: string): boolean => {
+	if (!msg || typeof msg !== 'object') return false;
+	const m = msg as Record<string, unknown>;
+	if (m.method !== method) return false;
+	const params = m.params as Record<string, unknown> | undefined;
+	return params?.terminal_id === terminal_id;
+};
+
+/** Concatenate every `terminal_data` payload received so far for `terminal_id`, in order. */
+const terminal_output = (ws: WsClient, terminal_id: string): string =>
+	ws.messages
+		.filter((msg) => is_notification(msg, 'terminal_data', terminal_id))
+		.map((msg) => String(((msg as Record<string, unknown>).params as Record<string, unknown>).data))
+		.join('');
+
+/** Wait until the accumulated output of `terminal_id` satisfies `done`. */
+const wait_for_output = async (
+	ws: WsClient,
+	terminal_id: string,
+	done: (output: string) => boolean,
+	timeout_ms = 10_000
+): Promise<string> => {
+	await ws.wait_for(
+		(msg) =>
+			is_notification(msg, 'terminal_data', terminal_id) && done(terminal_output(ws, terminal_id)),
+		timeout_ms
+	);
+	return terminal_output(ws, terminal_id);
+};
+
+/** The `sent_bytes` of the newest `terminal_data` received for `terminal_id` (0 before any). */
+const terminal_sent_bytes = (ws: WsClient, terminal_id: string): number => {
+	for (let i = ws.messages.length - 1; i >= 0; i--) {
+		const msg = ws.messages[i];
+		if (is_notification(msg, 'terminal_data', terminal_id)) {
+			return Number(
+				((msg as Record<string, unknown>).params as Record<string, unknown>).sent_bytes
+			);
+		}
+	}
+	return 0;
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The backend's `OUTPUT_WINDOW_HIGH_BYTES` (`pty_manager.rs`): the
+ * unacknowledged output past which a paced terminal stops reading its PTY.
+ */
+const OUTPUT_WINDOW_HIGH_BYTES = 1024 * 1024;
+
+/** The most one PTY read can add to `sent_bytes` — the backend's `READ_BUFFER_SIZE`. */
+const OUTPUT_READ_MAX_BYTES = 8192;
+
+/** Prints several times the output window, then a marker. */
+const SEVERAL_WINDOWS_COMMAND = {
+	command: 'sh',
+	args: ['-c', 'head -c 4500000 /dev/zero | base64; echo ZZZ_OUTPUT_DONE']
+};
+
+/** A lower bound on what `SEVERAL_WINDOWS_COMMAND` prints. */
+const SEVERAL_WINDOWS_MIN_BYTES = 6_000_000;
+
+const wait_for_exited = async (
+	ws: WsClient,
+	terminal_id: string,
+	timeout_ms = 10_000
+): Promise<Record<string, unknown>> => {
+	const msg = await ws.wait_for(
+		(m) => is_notification(m, 'terminal_exited', terminal_id),
+		timeout_ms
+	);
+	return (msg as Record<string, unknown>).params as Record<string, unknown>;
+};
+
+const create_terminal = async (
+	ws: WsClient,
+	id: string,
+	params: Record<string, unknown>
+): Promise<string> => {
+	const result = await ws.request<Record<string, unknown>>(id, 'terminal_create', params);
+	const terminal_id = result.terminal_id as string;
+	assert.equal(typeof terminal_id, 'string');
+	return terminal_id;
+};
+
+const process_exists = async (pid: number): Promise<boolean> => {
+	try {
+		await readFile(`/proc/${pid}/stat`, 'utf8');
+		return true; // running or a zombie — either way not reaped
+	} catch {
+		return false;
+	}
+};
 
 describe('terminal cross-backend', () => {
 	test('terminal_create_echo', async () => {
@@ -196,55 +323,26 @@ describe('terminal cross-backend', () => {
 
 	test('terminal_create_nonexistent_command', async () => {
 		const fixture = await setup_test();
-		const ws = await create_ws_transport({
-			base_url: handle.config.base_url,
-			ws_path: handle.config.ws_path,
-			cookies: fixture.transport.cookies()
+		const res = await rpc_call({
+			app: fixture.transport,
+			path: handle.config.rpc_path,
+			method: 'terminal_create',
+			params: { command: '/nonexistent/binary_zzz_test' },
+			headers: fixture.create_session_headers()
 		});
-		try {
-			await ws.request('_warmup', 'ping', undefined);
-
-			// Two valid behaviors across backends — either an error response
-			// from the create call, or a successful create followed by an
-			// exited notification with exit_code 127. Catch the error path
-			// from `ws.request` (it throws on error frames) and fall through
-			// to the success-path branch.
-			let terminal_id: string | undefined;
-			let create_error: Error | undefined;
-			try {
-				const create_result = await ws.request<Record<string, unknown>>(
-					'tcne-1',
-					'terminal_create',
-					{
-						command: '/nonexistent/binary_zzz_test',
-						args: []
-					}
-				);
-				terminal_id = create_result.terminal_id as string;
-				assert.equal(typeof terminal_id, 'string');
-			} catch (e) {
-				create_error = e as Error;
-			}
-
-			if (create_error) {
-				// Spawn failed at the create call — message includes the code.
-				assert.match(create_error.message, /-32603/);
-			} else {
-				// Forkpty path: child exits 127. Wait for the terminal_exited
-				// notification matching the just-created terminal_id.
-				const exited = await ws.wait_for<Record<string, unknown>>((msg) => {
-					if (!msg || typeof msg !== 'object') return false;
-					const m = msg as Record<string, unknown>;
-					if (m.method !== 'terminal_exited') return false;
-					const params = m.params as Record<string, unknown> | undefined;
-					return params?.terminal_id === terminal_id;
-				}, 5_000);
-				const exit_params = exited.params as Record<string, unknown>;
-				assert.equal(exit_params.exit_code, 127, 'exit_code is 127');
-			}
-		} finally {
-			await ws.close();
-		}
+		assert.ok(!res.ok, 'a missing command should be refused');
+		assert.equal(res.status, 400);
+		assert.equal(res.error.code, -32602);
+		assert.deepEqual(res.error.data, { reason: ERROR_TERMINAL_COMMAND_NOT_FOUND });
+		// refused before any terminal is registered
+		const session = await rpc_call({
+			app: fixture.transport,
+			path: handle.config.rpc_path,
+			method: 'session_load',
+			headers: fixture.create_session_headers()
+		});
+		assert.ok(session.ok, JSON.stringify(session));
+		assert.deepEqual(session_terminal_ids(session.result), []);
 	});
 
 	test('terminal_data_send_missing', async () => {
@@ -256,8 +354,8 @@ describe('terminal cross-backend', () => {
 			params: { terminal_id: NIL_UUID, data: 'hello' },
 			headers: fixture.create_session_headers()
 		});
-		assert.ok(res.ok);
-		assert.equal(res.result, null, 'silent null for missing terminal');
+		assert.ok(!res.ok, 'a missing terminal is an error, not a silent success');
+		assert.deepEqual(to_json(res.error), TERMINAL_NOT_FOUND);
 	});
 
 	test('terminal_close_missing', async () => {
@@ -269,8 +367,39 @@ describe('terminal cross-backend', () => {
 			params: { terminal_id: NIL_UUID },
 			headers: fixture.create_session_headers()
 		});
-		assert.ok(res.ok);
-		assert.deepEqual(res.result, { exit_code: null }, 'result is {exit_code: null}');
+		assert.ok(!res.ok, 'a missing terminal is an error, like data_send and resize');
+		assert.deepEqual(to_json(res.error), TERMINAL_NOT_FOUND);
+	});
+
+	test('terminal_close_rejects_unsupported_signals', async () => {
+		const fixture = await setup_test();
+		for (const signal of ['SIGINT', 'sigkill', '9', '']) {
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_close',
+				params: { terminal_id: NIL_UUID, signal },
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(!res.ok, `signal ${JSON.stringify(signal)} should be refused`);
+			assert.equal(res.error.code, -32602, JSON.stringify(signal));
+		}
+	});
+
+	test('terminal_create_rejects_relative_cwd', async () => {
+		const fixture = await setup_test();
+		for (const cwd of ['', '.', 'tmp', '~/dev']) {
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_create',
+				params: { command: 'pwd', cwd },
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(!res.ok, `cwd ${JSON.stringify(cwd)} should be refused`);
+			assert.equal(res.error.code, -32602, JSON.stringify(cwd));
+			assert.deepEqual(res.error.data, { reason: 'invalid_path' }, JSON.stringify(cwd));
+		}
 	});
 
 	test('terminal_resize_missing', async () => {
@@ -282,7 +411,482 @@ describe('terminal cross-backend', () => {
 			params: { terminal_id: NIL_UUID, cols: 80, rows: 24 },
 			headers: fixture.create_session_headers()
 		});
-		assert.ok(res.ok);
-		assert.equal(res.result, null, 'silent null for missing terminal');
+		assert.ok(!res.ok);
+		assert.deepEqual(to_json(res.error), TERMINAL_NOT_FOUND);
+	});
+
+	test('terminal_create_bad_cwd_fails', async () => {
+		const ws = await open_ws();
+		try {
+			let create_error: Error | undefined;
+			try {
+				await ws.request('tbc-1', 'terminal_create', {
+					command: 'pwd',
+					args: [],
+					cwd: '/nonexistent/zzz_cross_test_cwd'
+				});
+			} catch (e) {
+				create_error = e as Error;
+			}
+			// a bad cwd must fail the spawn, not run the command in the daemon's cwd
+			assert.ok(create_error, 'terminal_create should fail for a nonexistent cwd');
+			assert.match(create_error.message, /-32603/);
+			assert.match(create_error.message, /cwd/);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_large_paste_roundtrip', async () => {
+		const ws = await open_ws();
+		try {
+			// echo off so the output is cat's copy alone
+			const terminal_id = await create_terminal(ws, 'tlp-1', {
+				command: 'sh',
+				args: ['-c', 'stty -echo; echo READY; exec cat']
+			});
+			await wait_for_output(ws, terminal_id, (out) => out.includes('READY'));
+
+			// ~22KB in one send — far past the PTY input buffer, so it only
+			// arrives intact if partial writes are continued
+			const lines = Array.from(
+				{ length: 2000 },
+				(_, i) => `line-${String(i + 1).padStart(5, '0')}`
+			);
+			await ws.request('tlp-2', 'terminal_data_send', {
+				terminal_id,
+				data: lines.join('\n') + '\n'
+			});
+
+			const output = await wait_for_output(ws, terminal_id, (out) =>
+				out.includes(lines[lines.length - 1]!)
+			);
+			const echoed = output
+				.split(/\r?\n/)
+				.map((line) => line.trim())
+				.filter((line) => line.startsWith('line-'));
+			assert.deepEqual(echoed, lines, 'every pasted line arrives once, in order');
+
+			await ws.request('tlp-3', 'terminal_close', { terminal_id }).catch(() => undefined);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_multibyte_output_split_across_reads', async () => {
+		const ws = await open_ws();
+		try {
+			// 20000 3-byte characters: 60KB of output, so PTY reads split
+			// characters at their boundaries
+			const count = 20_000;
+			const terminal_id = await create_terminal(ws, 'tmb-1', {
+				command: 'awk',
+				args: [`BEGIN { for (i = 0; i < ${count}; i++) printf "€" }`]
+			});
+			const exited = await wait_for_exited(ws, terminal_id);
+			assert.equal(exited.exit_code, 0);
+			const output = terminal_output(ws, terminal_id);
+			assert.notInclude(output, '\uFFFD', 'no character mangled by a read boundary');
+			assert.equal(output, '€'.repeat(count));
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_env_scrubs_daemon_secrets', async () => {
+		const ws = await open_ws();
+		try {
+			const terminal_id = await create_terminal(ws, 'tes-1', { command: 'env', args: [] });
+			await wait_for_exited(ws, terminal_id);
+			const names = terminal_output(ws, terminal_id)
+				.split(/\r?\n/)
+				.map((line) => line.split('=')[0]!)
+				.filter(Boolean);
+			assert.include(names, 'PATH', 'the user environment passes through');
+			const leaked = names.filter(
+				(name) =>
+					/^(SECRET_|FUZ_|ZZZ_|PUBLIC_ZZZ_)/.test(name) ||
+					name === 'DATABASE_URL' ||
+					name === 'PORT'
+			);
+			assert.deepEqual(leaked, [], 'daemon secrets and config are withheld');
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_close_reaps_child_ignoring_term_and_hup', async () => {
+		const ws = await open_ws();
+		try {
+			// `exec` keeps the pid; the ignored dispositions survive it, so
+			// neither the SIGTERM nor the hangup from closing ends the process
+			const terminal_id = await create_terminal(ws, 'trp-1', {
+				command: 'sh',
+				args: ['-c', `trap '' TERM HUP; echo PID=$$; exec sleep 30`]
+			});
+			const output = await wait_for_output(ws, terminal_id, (out) => /PID=\d+/.test(out));
+			const pid = Number(/PID=(\d+)/.exec(output)![1]);
+			assert.ok(await process_exists(pid), 'child is running');
+
+			const close_result = await ws.request<Record<string, unknown>>('trp-2', 'terminal_close', {
+				terminal_id
+			});
+			assert.equal(close_result.exit_code, null, 'still running when close returns');
+
+			// escalated to SIGKILL and reaped in the background — no zombie left
+			const deadline = Date.now() + 10_000;
+			while ((await process_exists(pid)) && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			assert.ok(!(await process_exists(pid)), `pid ${pid} reaped (not running, not a zombie)`);
+		} finally {
+			await ws.close();
+		}
+	}, 20_000);
+
+	test('terminal_ack_paces_output_to_what_the_client_acknowledges', async () => {
+		const ws = await open_ws();
+		try {
+			const terminal_id = await create_terminal(ws, 'tak-1', SEVERAL_WINDOWS_COMMAND);
+
+			// the first ack makes this connection one the terminal is paced
+			// against; acknowledging nothing leaves the whole window to fill
+			await ws.request('tak-2', 'terminal_ack', { terminal_id, bytes: 0 });
+
+			// with no further acks the output stops just past the window —
+			// wait until it has been still for a while
+			let stalled = terminal_sent_bytes(ws, terminal_id);
+			for (let still_ms = 0; still_ms < 1000;) {
+				await sleep(50);
+				const sent = terminal_sent_bytes(ws, terminal_id);
+				still_ms = sent === stalled ? still_ms + 50 : 0;
+				stalled = sent;
+			}
+			assert.isAbove(stalled, OUTPUT_WINDOW_HIGH_BYTES, 'the window filled');
+			assert.isAtMost(
+				stalled,
+				OUTPUT_WINDOW_HIGH_BYTES + OUTPUT_READ_MAX_BYTES,
+				'at most one read past the window'
+			);
+			assert.notInclude(
+				terminal_output(ws, terminal_id),
+				'ZZZ_OUTPUT_DONE',
+				'the process is blocked, not finished'
+			);
+
+			// a paused terminal still answers a resize
+			assert.isNull(
+				await ws.request('tak-3', 'terminal_resize', { terminal_id, cols: 100, rows: 30 })
+			);
+
+			// the frontend acks at once only when its threshold is waiting, so a
+			// paused terminal has to read again as soon as less than that is
+			// unacked — else a client that had consumed everything could leave
+			// the process blocked until its ack delay ran out
+			await ws.request('tak-4', 'terminal_ack', {
+				terminal_id,
+				bytes: stalled - TERMINAL_ACK_THRESHOLD_BYTES + 1
+			});
+			for (let waited_ms = 0; terminal_sent_bytes(ws, terminal_id) === stalled; waited_ms += 50) {
+				assert.isBelow(waited_ms, 5000, 'an ack inside the threshold did not resume the output');
+				await sleep(50);
+			}
+
+			// acknowledging what arrives lets the rest through, and an ack past
+			// what was sent counts as all of it
+			let acks = 0;
+			while (!terminal_output(ws, terminal_id).includes('ZZZ_OUTPUT_DONE')) {
+				assert.isBelow(acks, 2000, 'the output never finished');
+				// the last ack can find the terminal already gone — the loop
+				// condition tells that apart from one refused mid-stream
+				await ws
+					.request(`tak-ack-${acks++}`, 'terminal_ack', {
+						terminal_id,
+						bytes: Number.MAX_SAFE_INTEGER
+					})
+					.catch(() => undefined);
+				await sleep(10);
+			}
+			assert.isAbove(terminal_sent_bytes(ws, terminal_id), SEVERAL_WINDOWS_MIN_BYTES);
+			assert.equal((await wait_for_exited(ws, terminal_id)).exit_code, 0);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_output_nobody_acknowledges_is_not_paced', async () => {
+		const ws = await open_ws();
+		try {
+			// several windows of output, and never an ack: a client that doesn't
+			// know about acks gets all of it
+			const terminal_id = await create_terminal(ws, 'tna-1', SEVERAL_WINDOWS_COMMAND);
+			assert.equal((await wait_for_exited(ws, terminal_id, 30_000)).exit_code, 0);
+			assert.include(terminal_output(ws, terminal_id), 'ZZZ_OUTPUT_DONE');
+			assert.isAbove(terminal_sent_bytes(ws, terminal_id), SEVERAL_WINDOWS_MIN_BYTES);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_ack_over_http_is_accepted_and_paces_nothing', async () => {
+		const fixture = await setup_test();
+		const ws = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: fixture.transport.cookies()
+		});
+		try {
+			await ws.request('_warmup', 'ping', undefined);
+			const terminal_id = await create_terminal(ws, 'tah-1', SEVERAL_WINDOWS_COMMAND);
+			// an HTTP request has no connection receiving output to pace against
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_ack',
+				params: { terminal_id, bytes: 0 },
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(res.ok);
+			assert.isNull(res.result);
+			assert.equal((await wait_for_exited(ws, terminal_id, 30_000)).exit_code, 0);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_ack_missing', async () => {
+		const fixture = await setup_test();
+		const ack = (params: Record<string, unknown>) =>
+			rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_ack',
+				params,
+				headers: fixture.create_session_headers()
+			});
+		const res = await ack({ terminal_id: NIL_UUID, bytes: 0 });
+		assert.ok(!res.ok, 'a missing terminal is an error, not a silent success');
+		assert.deepEqual(to_json(res.error), TERMINAL_NOT_FOUND);
+		for (const params of [
+			{ terminal_id: NIL_UUID },
+			{ terminal_id: NIL_UUID, bytes: -1 },
+			{ terminal_id: NIL_UUID, bytes: 1.5 },
+			{ terminal_id: NIL_UUID, bytes: 0, extra: true }
+		]) {
+			const invalid = await ack(params);
+			assert.ok(!invalid.ok, JSON.stringify(params));
+			assert.equal(invalid.error.code, -32602, JSON.stringify(params));
+		}
+	});
+
+	test('terminal_output_and_control_are_scoped_to_the_owner', async () => {
+		const fixture = await setup_test();
+		const owner_ws = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: fixture.transport.cookies()
+		});
+		// the owner's second socket, e.g. another tab
+		const owner_ws_2 = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: fixture.transport.cookies()
+		});
+		const other = await fixture.create_account();
+		const other_ws = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: [`${handle.config.cookie_name}=${other.session_cookie}`]
+		});
+		try {
+			await owner_ws.request('_warmup', 'ping', undefined);
+			await owner_ws_2.request('_warmup', 'ping', undefined);
+			await other_ws.request('_warmup', 'ping', undefined);
+
+			const terminal_id = await create_terminal(owner_ws, 'own-1', { command: 'cat', args: [] });
+			await owner_ws.request('own-2', 'terminal_data_send', { terminal_id, data: 'mine\n' });
+			await wait_for_output(owner_ws, terminal_id, (out) => out.includes('mine'));
+			// every socket of the owning account gets the output
+			await wait_for_output(owner_ws_2, terminal_id, (out) => out.includes('mine'));
+
+			// another account can't drive it: each call gets exactly the reply for an unknown id
+			const as_other = (method: string, params: Record<string, unknown>) =>
+				rpc_call({
+					app: fixture.fresh_transport(),
+					path: handle.config.rpc_path,
+					method,
+					params,
+					headers: other.create_session_headers()
+				});
+			for (const [method, params] of [
+				['terminal_data_send', { data: 'theirs\n' }],
+				['terminal_resize', { cols: 100, rows: 30 }],
+				['terminal_ack', { bytes: 1 }],
+				['terminal_close', {}]
+			] as const) {
+				const foreign = await as_other(method, { terminal_id, ...params });
+				const unknown = await as_other(method, { terminal_id: NIL_UUID, ...params });
+				assert.deepEqual(
+					reply_of(foreign),
+					reply_of(unknown),
+					`${method}: a foreign terminal is indistinguishable from an unknown one`
+				);
+				assert.ok(!foreign.ok);
+				assert.deepEqual(to_json(foreign.error), TERMINAL_NOT_FOUND);
+			}
+			// and doesn't see it in its session snapshot
+			const other_session = await rpc_call({
+				app: fixture.fresh_transport(),
+				path: handle.config.rpc_path,
+				method: 'session_load',
+				headers: other.create_session_headers()
+			});
+			assert.ok(other_session.ok);
+			assert.deepEqual(session_terminal_ids(other_session.result), []);
+
+			// still running for its owner, and the other account's input never reached it
+			await owner_ws.request('own-3', 'terminal_data_send', { terminal_id, data: 'still\n' });
+			const output = await wait_for_output(owner_ws, terminal_id, (out) => out.includes('still'));
+			assert.ok(!output.includes('theirs'), 'other account input not written');
+
+			// an exit notification reaches the owner only
+			const exiting_id = await create_terminal(owner_ws, 'own-4', {
+				command: 'echo',
+				args: ['bye']
+			});
+			assert.equal((await wait_for_exited(owner_ws, exiting_id)).exit_code, 0);
+
+			// a round-trip on the other socket flushes anything queued to it before
+			await other_ws.request('oth-4', 'ping', undefined);
+			const leaked = other_ws.messages.filter(
+				(msg) =>
+					is_notification(msg, 'terminal_data', terminal_id) ||
+					is_notification(msg, 'terminal_data', exiting_id) ||
+					is_notification(msg, 'terminal_exited', exiting_id)
+			);
+			assert.deepEqual(leaked, [], 'no terminal notifications reach another account');
+
+			const close = await owner_ws.request<Record<string, unknown>>('own-5', 'terminal_close', {
+				terminal_id
+			});
+			assert.ok(close.exit_code === null || typeof close.exit_code === 'number');
+		} finally {
+			await owner_ws.close();
+			await owner_ws_2.close();
+			await other_ws.close();
+		}
+	});
+
+	test('terminal_processes_end_when_their_account_is_deleted', async () => {
+		const fixture = await setup_test();
+		const doomed = await fixture.create_account();
+		const ws = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: [`${handle.config.cookie_name}=${doomed.session_cookie}`]
+		});
+		let pid: number;
+		try {
+			await ws.request('_warmup', 'ping', undefined);
+			const terminal_id = await create_terminal(ws, 'del-1', {
+				command: 'sh',
+				args: ['-c', 'echo PID=$$; exec sleep 60']
+			});
+			const output = await wait_for_output(ws, terminal_id, (out) => /PID=\d+/.test(out));
+			pid = Number(/PID=(\d+)/.exec(output)![1]);
+			assert.ok(await process_exists(pid), 'terminal process running');
+		} finally {
+			// the delete below closes this socket server-side
+			await ws.close();
+		}
+
+		// self-delete — the spine revokes the account's sessions and sockets,
+		// and zzz's audit listener closes its terminals
+		const res = await rpc_call({
+			app: fixture.fresh_transport(),
+			path: handle.config.rpc_path,
+			method: 'account_delete',
+			params: {},
+			headers: doomed.create_session_headers()
+		});
+		assert.ok(res.ok, JSON.stringify(res));
+
+		const deadline = Date.now() + 10_000;
+		while ((await process_exists(pid)) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		assert.ok(!(await process_exists(pid)), `pid ${pid} reaped after the account was deleted`);
+	}, 20_000);
+
+	test('session_load lists the live terminals of the caller', async () => {
+		const fixture = await setup_test();
+		const ws = await create_ws_transport({
+			base_url: handle.config.base_url,
+			ws_path: handle.config.ws_path,
+			cookies: fixture.transport.cookies()
+		});
+		const session_ids = async (): Promise<Array<string>> => {
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'session_load',
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(res.ok, JSON.stringify(res));
+			return session_terminal_ids(res.result);
+		};
+		try {
+			await ws.request('_warmup', 'ping', undefined);
+			const baseline = await session_ids();
+
+			const cat_id = await create_terminal(ws, 'sl-1', { command: 'cat', args: [] });
+			const echo_id = await create_terminal(ws, 'sl-2', { command: 'echo', args: ['bye'] });
+			await wait_for_exited(ws, echo_id);
+			// the exit notification can beat the entry's removal by the reap
+			let ids = await session_ids();
+			const deadline = Date.now() + 5_000;
+			while (ids.includes(echo_id) && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				ids = await session_ids();
+			}
+			assert.include(ids, cat_id, 'a running terminal is listed');
+			assert.notInclude(ids, echo_id, 'an exited terminal is not');
+
+			await ws.request('sl-3', 'terminal_close', { terminal_id: cat_id });
+			assert.deepEqual(await session_ids(), baseline, 'a closed terminal is not');
+
+			// and its id is now not_found, like any unknown one
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_data_send',
+				params: { terminal_id: cat_id, data: 'late\n' },
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(!res.ok);
+			assert.deepEqual(to_json(res.error), TERMINAL_NOT_FOUND);
+		} finally {
+			await ws.close();
+		}
+	});
+
+	test('terminal_resize_rejects_out_of_range', async () => {
+		const fixture = await setup_test();
+		for (const [cols, rows] of [
+			[0, 24],
+			[80, 0],
+			[65_536, 24],
+			[80, 65_536]
+		] as const) {
+			const res = await rpc_call({
+				app: fixture.transport,
+				path: handle.config.rpc_path,
+				method: 'terminal_resize',
+				params: { terminal_id: NIL_UUID, cols, rows },
+				headers: fixture.create_session_headers()
+			});
+			assert.ok(!res.ok, `cols=${cols} rows=${rows} rejected`);
+			assert.equal(res.error.code, -32602);
+		}
 	});
 });

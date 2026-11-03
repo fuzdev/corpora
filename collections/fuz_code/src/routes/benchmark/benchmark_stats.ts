@@ -19,7 +19,7 @@ import type {
  */
 export const analyze_results = (data: MeasurementData): BrowserBenchmarkStats => {
 	// Convert milliseconds to nanoseconds for BenchmarkStats. `core` is the work
-	// time (the highlighter's compute cost); `paint` adds the frames until pixels
+	// time (the styler's compute cost); `paint` adds the frames until pixels
 	// settle. Both series are index-aligned, so failed iterations drop out of each.
 	const core = new BenchmarkStats(data.work_ms.map((ms) => ms * TIME_NS_PER_MS));
 	const paint = new BenchmarkStats(data.paint_ms.map((ms) => ms * TIME_NS_PER_MS));
@@ -37,48 +37,45 @@ export const analyze_results = (data: MeasurementData): BrowserBenchmarkStats =>
 	};
 };
 
+const geomean = (values: Array<number>): number =>
+	Math.exp(values.reduce((sum, v) => sum + Math.log(v), 0) / values.length);
+
 /**
- * Calculate summary statistics across all test results.
+ * Calculate summary statistics across all test results. Times and rates are
+ * geometric means across languages, so each language weighs the same however
+ * long its sample takes.
  */
 export const calculate_summary = (
 	results: Array<BenchmarkResult>
 ): Record<string, SummaryStats> => {
 	const by_impl: Record<string, Array<BenchmarkResult>> = {};
 
-	// Group results by implementation
 	for (const result of results) {
-		if (!(by_impl as Record<string, Array<BenchmarkResult> | undefined>)[result.implementation]) {
-			by_impl[result.implementation] = [];
-		}
-		by_impl[result.implementation]!.push(result);
+		(by_impl[result.implementation] ??= []).push(result);
 	}
 
 	const summary: Record<string, SummaryStats> = {};
 
-	// Calculate averages for each implementation (convert ns to ms for display)
 	for (const [impl, impl_results] of Object.entries(by_impl)) {
-		const mean_times_ms = impl_results.map((r) => r.stats.core.mean_ns / TIME_NS_PER_MS);
-		const avg_mean = mean_times_ms.reduce((a, b) => a + b, 0) / mean_times_ms.length;
-		const avg_ops =
-			impl_results.map((r) => r.stats.core.ops_per_second).reduce((a, b) => a + b, 0) /
-			impl_results.length;
+		const geomean_ms = geomean(impl_results.map((r) => r.stats.core.mean_ns / TIME_NS_PER_MS));
+		const geomean_ops = geomean(impl_results.map((r) => r.stats.core.ops_per_second));
 		const avg_cv =
 			impl_results.map((r) => r.stats.core.cv).reduce((a, b) => a + b, 0) / impl_results.length;
 
 		summary[impl] = {
-			avg_mean,
-			avg_ops,
+			geomean_ms,
+			geomean_ops,
 			avg_cv,
 			languages: impl_results.length
 		};
 	}
 
 	// Calculate relative performance (only if baseline exists)
-	const baseline_mean = summary.html?.avg_mean;
-	if (baseline_mean !== undefined) {
+	const baseline_ms = summary.html?.geomean_ms;
+	if (baseline_ms !== undefined) {
 		for (const impl of Object.keys(summary)) {
 			const impl_summary = summary[impl]!;
-			impl_summary.relative_speed = baseline_mean / impl_summary.avg_mean;
+			impl_summary.relative_speed = baseline_ms / impl_summary.geomean_ms;
 			impl_summary.improvement = (impl_summary.relative_speed - 1) * 100;
 		}
 	}

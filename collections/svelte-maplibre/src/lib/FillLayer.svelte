@@ -3,10 +3,11 @@
   import Layer from './Layer.svelte';
   import type { Feature } from 'geojson';
   import type { CommonLayerProps } from './types.js';
+  import type { FillLayerSpecification } from 'maplibre-gl';
 
   interface Props extends CommonLayerProps<FEATURE> {
-    paint: maplibregl.FillLayerSpecification['paint'];
-    layout?: maplibregl.FillLayerSpecification['layout'] | undefined;
+    paint: FillLayerSpecification['paint'];
+    layout?: FillLayerSpecification['layout'] | undefined;
   }
 
   let {
@@ -35,6 +36,14 @@
     onmouseleave = undefined,
   }: Props = $props();
 </script>
+
+<!-- @component
+Add a MapLibre `fill` layer to the map. It shows polygon features as filled areas.
+
+This is a thin wrapper around `Layer` with `type` set to `fill`. Place it inside a source component such as `GeoJSON`, or set the `source` prop.
+
+Set `manageHoverState` to set the `hover` feature state on the feature under the mouse. Bind to `hovered` to get that feature.
+-->
 
 <Layer
   {id}

@@ -1,8 +1,5 @@
 <script lang="ts" module>
-  export type {
-    CircleProps,
-    CirclePropsWithoutHTML,
-  } from './Circle.shared.svelte.js';
+  export type { CircleProps, CirclePropsWithoutHTML } from './Circle.shared.svelte.js';
 </script>
 
 <script lang="ts">
@@ -11,11 +8,7 @@
   import { renderCircle, type ComputedStylesOptions } from '$lib/utils/canvas.js';
   import { resolveColorProp, resolveStyleProp } from '$lib/utils/dataProp.js';
   import { createKey } from '$lib/utils/key.svelte.js';
-  import {
-    CircleState,
-    circleMarkInfo,
-    type CircleProps,
-  } from './Circle.shared.svelte.js';
+  import { CircleState, circleMarkInfo, type CircleProps } from './Circle.shared.svelte.js';
 
   let { ...rest }: CircleProps = $props();
 
@@ -79,15 +72,33 @@
           resolvedOpacity,
           resolvedClass
         );
-        renderCircle(ctx, item, styleOpts);
+        const m = c.viewportMatrix;
+        if (m) {
+          // `viewport`: cancel the isometric view about the circle, so it draws round
+          ctx.save();
+          ctx.translate(item.cx, item.cy);
+          ctx.transform(m.a, m.b, m.c, m.d, 0, 0);
+          ctx.translate(-item.cx, -item.cy);
+          renderCircle(ctx, item, styleOpts);
+          ctx.restore();
+        } else {
+          renderCircle(ctx, item, styleOpts);
+        }
       }
     } else {
       const styleOpts = getStyleOptions(styleOverrides);
-      renderCircle(
-        ctx,
-        { cx: c.motionCx, cy: c.motionCy, r: c.motionR },
-        styleOpts
-      );
+      const pixel = { cx: c.motionCx, cy: c.motionCy, r: c.motionR };
+      const m = c.viewportMatrix;
+      if (m) {
+        ctx.save();
+        ctx.translate(pixel.cx, pixel.cy);
+        ctx.transform(m.a, m.b, m.c, m.d, 0, 0);
+        ctx.translate(-pixel.cx, -pixel.cy);
+        renderCircle(ctx, pixel, styleOpts);
+        ctx.restore();
+      } else {
+        renderCircle(ctx, pixel, styleOpts);
+      }
     }
   }
 
@@ -109,6 +120,7 @@
         pointerleave: (rest as any).onpointerleave,
       },
       deps: () => [
+        c.viewportMatrix,
         c.dataMode,
         c.dataMode ? c.resolvedItems : null,
         c.motionCx,

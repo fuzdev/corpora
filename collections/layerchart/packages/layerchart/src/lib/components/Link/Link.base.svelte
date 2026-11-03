@@ -18,6 +18,9 @@
     getLinkRadialPresetPath,
   } from '$lib/utils/linkUtils.js';
   import { getChartContext } from '$lib/contexts/chart.js';
+  import { getMarkData } from '$lib/contexts/facet.js';
+  import { getLayerIsometric } from '$lib/contexts/isometric.js';
+  import { resolveDataProp, type DataProp } from '$lib/utils/dataProp.js';
   import { accessor, type Accessor } from '$lib/utils/common.js';
   import { cls } from '@layerstack/tailwind';
   import {
@@ -29,6 +32,8 @@
   import { LINK_FALLBACK_COORDS, isAccessorAccessor } from './Link.shared.svelte.js';
 
   const ctx = getChartContext();
+  const markData = getMarkData();
+  const layerIsometric = getLayerIsometric();
 
   let {
     Path,
@@ -36,6 +41,8 @@
     y1,
     x2,
     y2,
+    z1,
+    z2,
     data,
     sankey = false,
     source: sourceProp,
@@ -177,6 +184,18 @@
     }
   });
 
+  /** Where raising an end one pixel moves it on the flat plot, when either end has a height */
+  const lift = $derived(
+    (z1 == null && z2 == null) || radial || !layerIsometric() ? null : ctx.isometricLift
+  );
+
+  /** `point` raised by the height `z` gives row `d`, in pixels */
+  function raise(point: { x: number; y: number }, z: DataProp | undefined, d: any) {
+    if (!lift || z == null) return point;
+    const height = typeof z === 'number' ? z : resolveDataProp(z, d, ctx.zScale, 0);
+    return { x: point.x + lift.x * height, y: point.y + lift.y * height };
+  }
+
   function buildPath(source: { x: number; y: number }, target: { x: number; y: number }) {
     if (pathDataProp) return pathDataProp;
     if (radial) {
@@ -191,7 +210,9 @@
   }
 
   const singlePathData = $derived(
-    isArrayMode ? '' : buildPath(singleSourceCoords, singleTargetCoords)
+    isArrayMode
+      ? ''
+      : buildPath(raise(singleSourceCoords, z1, data), raise(singleTargetCoords, z2, data))
   );
 
   const extractedTween = extractTweenConfig(motion);
@@ -217,7 +238,7 @@
   // inside `<Path>`'s own template — the parent stays stable.
   const getPathData = () => motionPath.current;
 
-  const arrayRows = $derived(isArrayMode ? data ?? ctx.data ?? [] : []);
+  const arrayRows = $derived(isArrayMode ? markData(data) : []);
 
   function resolvePerDatum<T>(value: T | ((d: any) => T) | undefined, d: any): T | undefined {
     return typeof value === 'function' ? (value as (d: any) => T)(d) : (value as T | undefined);
@@ -240,7 +261,7 @@
     {@const resolvedStroke =
       resolvePerDatum(strokeProp, d) ?? (ctx.config.c ? ctx.cGet(d) : undefined)}
     <Path
-      pathData={buildPath(source, target)}
+      pathData={buildPath(raise(source, z1, d), raise(target, z2, d))}
       {marker}
       {markerStart}
       {markerMid}

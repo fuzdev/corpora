@@ -14,7 +14,12 @@ export type GeoStateProps = {
    */
   fixedAspectRatio?: number;
   clipAngle?: number;
-  clipExtent?: [[number, number], [number, number]];
+  /**
+   * Clip rendered geometry to a pixel rectangle. Pass `[[x0, y0], [x1, y1]]`, or `true`
+   * to clip to the chart dimensions (`[[0, 0], [width, height]]`) — e.g. to trim the
+   * `Sphere` overflow under `geoMercator`.
+   */
+  clipExtent?: [[number, number], [number, number]] | boolean;
   rotate?: {
     /** Lambda (Center Meridian) */
     yaw: number;
@@ -45,8 +50,19 @@ export class GeoState {
   transformApply = $state({ rotation: false, scale: true, translate: true });
 
   // The actual projection instance — derived so it works during SSR
-  projection: GeoProjection | undefined = $derived.by(() => {
+  projection: GeoProjection | undefined = $derived.by(() => this.#build(true));
+
+  /**
+   * The projection as its props set it, before any `projection` transform — what that transform
+   * starts from, so a chart opens where its `scale`, `translate`, `rotate`, or fit put it rather than
+   * jumping once the transform loads.  Only made when read.
+   */
+  untransformedProjection: GeoProjection | undefined = $derived.by(() => this.#build(false));
+
+  /** The projection from its props, and with `transformed` the `projection` transform on top */
+  #build(transformed: boolean) {
     if (!this.props.projection) return undefined;
+    const transform = transformed && this.transformState?.mode === 'projection';
 
     const _projection = this.props.projection();
 
@@ -61,8 +77,8 @@ export class GeoState {
         _projection.scale(this.props.scale);
       }
 
-      if (this.transformState?.mode === 'projection' && this.transformApply.scale) {
-        _projection.scale(this.transformState.scale);
+      if (transform && this.transformApply.scale) {
+        _projection.scale(this.transformState!.scale);
       }
     }
 
@@ -76,10 +92,12 @@ export class GeoState {
         ]);
       }
 
-      if (this.transformState?.mode === 'projection' && this.transformApply.rotation) {
+      if (transform && this.transformApply.rotation) {
         _projection.rotate([
-          this.transformState.translate.x, // yaw
-          this.transformState.translate.y, // pitch
+          this.transformState!.translate.x, // yaw
+          this.transformState!.translate.y, // pitch
+          // Dragging turns yaw and pitch, leaving `rotate`'s roll as it was
+          this.props.rotate?.roll ?? 0,
         ]);
       }
     }
@@ -97,8 +115,8 @@ export class GeoState {
         ]);
       }
 
-      if (this.transformState?.mode === 'projection' && this.transformApply.translate) {
-        _projection.translate([this.transformState.translate.x, this.transformState.translate.y]);
+      if (transform && this.transformApply.translate) {
+        _projection.translate([this.transformState!.translate.x, this.transformState!.translate.y]);
       }
     }
 
@@ -122,13 +140,17 @@ export class GeoState {
       _projection.clipAngle(this.props.clipAngle);
     }
 
-    // Apply clipExtent
+    // Apply clipExtent (`true` -> clip to chart dimensions, matching `fitSize` range)
     if (this.props.clipExtent && 'clipExtent' in _projection) {
-      _projection.clipExtent(this.props.clipExtent);
+      const clipExtent =
+        this.props.clipExtent === true
+          ? ([[0, 0], this.fitSizeRange] as [[number, number], [number, number]])
+          : this.props.clipExtent;
+      _projection.clipExtent(clipExtent);
     }
 
     return _projection;
-  });
+  }
 
   constructor(
     propsGetter: () => GeoStateProps,

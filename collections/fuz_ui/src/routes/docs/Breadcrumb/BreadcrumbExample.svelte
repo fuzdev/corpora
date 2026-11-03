@@ -2,7 +2,7 @@
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 	import { resolve } from '$app/paths';
 
-	import Breadcrumb from '$lib/Breadcrumb.svelte';
+	import Breadcrumb from '#lib/Breadcrumb.svelte';
 
 	const {
 		selected_path

@@ -1,40 +1,33 @@
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { fs_exists, fs_search } from '@fuzdev/fuz_util/fs.ts';
-import { strip_start } from '@fuzdev/fuz_util/string.ts';
-import { z } from 'zod';
-import type { Flavored } from '@fuzdev/fuz_util/types.ts';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import type { Flavored } from '@fuzdev/fuz_schema/schema.ts';
 import type { PathInfo, PathId, ResolvedPath } from '@fuzdev/fuz_util/path.ts';
 
-import { GRO_PACKAGE_DIR, GRO_DIST_DIR } from './paths.ts';
-import { TASK_FILE_SUFFIX_JS } from './task.ts';
+// TODO Flavored doesn't work when used in schemas, `flavor` from fuz_schema could carry it
+export const InputPath = s.string;
+export type InputPath = Flavored<s.Infer<typeof InputPath>, 'InputPath'>;
 
-// TODO Flavored doesn't work when used in schemas, use Zod brand instead? problem is ergonomics
-export const InputPath = z.string();
-export type InputPath = Flavored<z.infer<typeof InputPath>, 'InputPath'>;
-
-export const RawInputPath = z.string();
-export type RawInputPath = Flavored<z.infer<typeof RawInputPath>, 'RawInputPath'>;
+export const RawInputPath = s.string;
+export type RawInputPath = Flavored<s.Infer<typeof RawInputPath>, 'RawInputPath'>;
 
 /**
- * Raw input paths are paths that users provide to Gro to reference files for tasks and gen.
+ * Raw input paths are paths that users provide to Gro to reference files for gen.
  *
  * A raw input path can be to a file or directory in the following forms:
  *
  * - an absolute path, preserved
  * - an explicit relative path, e.g. `./src/foo`, resolved to `root_path` which defaults to the cwd
  * - an implicit relative path, e.g. `src/foo`, preserved
- * - an implicit relative path prefixed with `gro/`, transformed to absolute in the Gro directory
  *
  * Thus, input paths are either absolute or implicitly relative.
  */
 export const to_input_path = (
 	raw_input_path: RawInputPath,
-	root_path = process.cwd() // TODO @many isn't passed in anywhere, maybe hoist to `invoke_task` and others
+	root_path = process.cwd()
 ): InputPath => {
-	if (raw_input_path.startsWith(GRO_PACKAGE_DIR)) {
-		return GRO_DIST_DIR + strip_start(raw_input_path, GRO_PACKAGE_DIR);
-	} else if (raw_input_path[0] === '.') {
+	if (raw_input_path[0] === '.') {
 		return resolve(root_path, raw_input_path);
 	}
 	return raw_input_path as InputPath;
@@ -42,7 +35,7 @@ export const to_input_path = (
 
 export const to_input_paths = (
 	raw_input_paths: Array<RawInputPath>,
-	root_path?: string // TODO @many isn't passed in anywhere, maybe hoist to `invoke_task` and others
+	root_path?: string
 ): Array<InputPath> => raw_input_paths.map((p) => to_input_path(p, root_path));
 
 export interface PossiblePath {
@@ -63,22 +56,10 @@ export const get_possible_paths = async (
 	const possible_paths: Set<PossiblePath> = new Set();
 
 	const add_possible_paths = (path: string, root_dir: PathId) => {
-		// Specifically for paths to the Gro package dist, optimize by only looking for `.task.js`.
-		if (path.startsWith(GRO_DIST_DIR)) {
-			possible_paths.add({
-				id:
-					path.endsWith('/') || path.endsWith(TASK_FILE_SUFFIX_JS)
-						? path
-						: path + TASK_FILE_SUFFIX_JS,
-				input_path,
-				root_dir
-			});
-		} else {
-			possible_paths.add({ id: path, input_path, root_dir });
-			if (!path.endsWith('/') && !extensions.some((e) => path.endsWith(e))) {
-				for (const extension of extensions) {
-					possible_paths.add({ id: path + extension, input_path, root_dir });
-				}
+		possible_paths.add({ id: path, input_path, root_dir });
+		if (!path.endsWith('/') && !extensions.some((e) => path.endsWith(e))) {
+			for (const extension of extensions) {
+				possible_paths.add({ id: path + extension, input_path, root_dir });
 			}
 		}
 	};
@@ -110,7 +91,6 @@ export interface ResolvedInputFile {
 
 export interface ResolvedInputPaths {
 	resolved_input_paths: Array<ResolvedInputPath>;
-	possible_paths_by_input_path: Map<InputPath, Array<PossiblePath>>;
 	unmapped_input_paths: Array<InputPath>;
 }
 
@@ -125,14 +105,12 @@ export const resolve_input_paths = async (
 	extensions: Array<string>
 ): Promise<ResolvedInputPaths> => {
 	const resolved_input_paths: Array<ResolvedInputPath> = [];
-	const possible_paths_by_input_path: Map<InputPath, Array<PossiblePath>> = new Map();
 	const unmapped_input_paths: Array<InputPath> = [];
 	for (const input_path of input_paths) {
 		let found_file: [PathInfo, PossiblePath] | null = null;
 		let found_dirs: Array<[PathInfo, PossiblePath]> | null = null;
 
 		const possible_paths = await get_possible_paths(input_path, root_dirs, extensions);
-		possible_paths_by_input_path.set(input_path, possible_paths);
 
 		// Find the first existing file path or fallback to the first directory path.
 		for (const possible_path of possible_paths) {
@@ -170,16 +148,11 @@ export const resolve_input_paths = async (
 			unmapped_input_paths.push(input_path);
 		}
 	}
-	return {
-		resolved_input_paths,
-		possible_paths_by_input_path,
-		unmapped_input_paths
-	};
+	return { resolved_input_paths, unmapped_input_paths };
 };
 
 export interface ResolvedInputFiles {
 	resolved_input_files: Array<ResolvedInputFile>;
-	resolved_input_files_by_root_dir: Map<PathId, Array<ResolvedInputFile>>;
 	input_directories_with_no_files: Array<InputPath>;
 }
 
@@ -243,15 +216,6 @@ export const resolve_input_files = async (
 	}
 	return {
 		resolved_input_files,
-		resolved_input_files_by_root_dir: resolved_input_files.reduce((map, resolved_input_file) => {
-			const { root_dir } = resolved_input_file.resolved_input_path;
-			if (map.has(root_dir)) {
-				map.get(root_dir)!.push(resolved_input_file);
-			} else {
-				map.set(root_dir, [resolved_input_file]);
-			}
-			return map;
-		}, new Map<PathId, Array<ResolvedInputFile>>()),
 		input_directories_with_no_files: remaining.map((r) => r.input_path)
 	};
 };

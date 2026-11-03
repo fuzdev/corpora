@@ -5,20 +5,23 @@
  *
  * - `GET /api/cells/:cell_id/facts/:hash` — the **per-reference read**.
  *   The request names the referencing cell. Authz is scoped to that one
- *   reference: `can_view_cell(caller, cell) AND cell.refs includes hash`.
- *   This is the path non-admin callers use, and the only path for
+ *   reference: `(can_view_cell(caller, cell) OR the steward arm) AND
+ *   cell.refs includes hash`, the steward arm being the governing root's
+ *   manager reading a pending or rejected contribution
+ *   (`auth/cell_steward.ts`). This is the path non-admin callers use, and the only path for
  *   confidential content.
  * - `GET /api/facts/:hash` — the **bare-hash read**, restricted to admins.
  *
  * Embedded facts stream from the `fact.bytes` PG column; external facts
  * (filesystem-backed `file:<shard>/<rest>` URLs) either return an
  * `X-Accel-Redirect` header pointing into nginx's internal facts location
- * (production) or stream from disk via the filesystem `FactExternalFetcher`
- * (dev / tests). The runtime mode is selected by the optional `x_accel`
- * factory option — a validated `XAccelConfig` (built via
+ * (production) or stream from disk (dev / tests). The runtime mode is
+ * selected by the optional `x_accel` factory option — a validated
+ * `XAccelConfig` (built via
  * `create_x_accel_config` in `server/x_accel.ts`) set in prod, unset in dev.
  * The handle can only be obtained by proving the facts nginx location is
- * `internal;`, so X-Accel serving can't be enabled against a public location.
+ * `internal;` and carries the fact hardening headers, so X-Accel serving can't
+ * be enabled against a public or header-less location.
  *
  * REST, not RPC: binary responses don't fit the JSON-RPC envelope.
  *
@@ -39,6 +42,25 @@
  * hash. B publishing identical bytes from B's public cell makes them
  * readable *via B's cell* — it never touches A's private reference.
  *
+ * The edge is only as safe as what may create it. A cell's `refs` derive
+ * from its `data`, and any account that can write a cell writes its `data` —
+ * so this route alone would make a known hash a read capability: name it in
+ * a cell you own, flip the cell public, and the bytes serve to the world,
+ * while a 200 against a 404 says whether the fact exists. What closes that is
+ * **possession-gated ref admission** on the cell verbs
+ * (`auth/cell_ref_admission.ts`): a non-admin `cell_create` / `cell_update` /
+ * `cell_clone` may introduce a ref only to a fact its acting actor holds —
+ * one it put the bytes of, recorded in `fact_holder` on every put, a
+ * deduplicated put included — and is refused `403 cell_ref_not_held`
+ * otherwise, the same answer whether or not a fact is stored. Refs a cell
+ * already carries stay admitted through updates and clones, so a viewer who
+ * clones a cell carries its refs: what a viewer can read through a cell, it
+ * can republish — no more than downloading the bytes and uploading them
+ * again. A serve is a snapshot of the edge at read time; revoking someone's
+ * access to a cell does not withdraw refs they already wrote elsewhere.
+ * Writers that bypass the verbs (seeds, raw inserts) are trusted and not
+ * admitted.
+ *
  * The bare-hash route is **admin-only**: an admin's reach already spans
  * every cell, so serving by bare hash grants no escalation. Non-admin
  * callers are rejected at the auth phase and never reach the handler.
@@ -48,23 +70,32 @@
  *
  * Auth shape on the cell-scoped route is `{account: 'none', actor: 'none'}`
  * — the dispatcher's authorization phase is skipped for pure-public routes,
- * so the handler builds the `RequestContext` itself from `c.var.account_id`
- * (populated by the `/api/*` session middleware) by resolving the caller's
- * single actor and loading their role_grants. Unauthed callers pass through
- * with `req_ctx: null` and are admitted only by a `cell.visibility ===
- * 'public'` cell. Multi-actor accounts fall through with `req_ctx: null`
+ * so the handler builds the `RequestContext` itself from the resolved account
+ * id (`get_public_account_id`, over what the `/api/*` auth middleware set) by
+ * resolving the caller's single actor and loading their role_grants.
+ * Unauthed callers pass through with `req_ctx: null` and are admitted only by
+ * a `cell.visibility === 'public'` cell whose `moderation` admits an audience (unmoderated or
+ * `'approved'`). Multi-actor accounts fall through with `req_ctx: null`
  * — there's no `acting?` slot on a pure-public route, so multi-actor
- * callers are treated as anonymous.
+ * callers are treated as anonymous. A scope-narrowed API token is treated as
+ * anonymous too, not refused (`get_public_account_id`): a narrowed token
+ * reaches no non-RPC surface, but on a route that admits anonymous callers
+ * a 403 would enforce nothing — the holder drops the `Authorization` header and
+ * re-reads every public cell anyway.
  *
  * 404 is the universal "not viewable" response: missing fact, missing or
  * unviewable cell, or the cell doesn't reference the hash. We deliberately
  * don't distinguish 403 from 404 — neither the existence of a fact nor the
- * existence of a cell→fact edge should leak through the public surface.
+ * existence of a cell→fact edge should leak through the public surface. The
+ * view check runs before the edge check, so an unviewable cell does the same
+ * work whether or not it references the hash — its refs don't leak through
+ * response timing either.
  *
- * Content-addressed serving of inline `blake3:` images (a markdown doc cell
- * with embedded image refs) works through this model: the referencing cell
- * is the doc cell, so serving goes view-doc-cell → doc-cell-refs-include-hash
- * → serve.
+ * A ref is a `data` string value that is exactly a fact hash
+ * (`derive_cell_refs`) — a hash inside prose or markup is not one. So a doc
+ * cell that shows images stores each image's hash as its own string value
+ * (an attachment list, say) beside the text that places them; serving then
+ * goes view-doc-cell → doc-cell-refs-include-hash → serve.
  *
  * ## Untrusted-content hardening
  *
@@ -73,80 +104,63 @@
  * from executing as stored XSS for any reader of a referencing cell, **every**
  * served-fact response carries `X-Content-Type-Options: nosniff` +
  * `Content-Security-Policy: default-src 'none'; sandbox` (the
- * `FACT_SECURITY_HEADERS` set, applied in all three serve branches). The same
- * pair, byte-identical, is set by the Rust twin (`fuz_fact_serving::serve`).
+ * `FACT_SECURITY_HEADERS` set from `server/fact_security_headers.ts`,
+ * byte-identical with the Rust twin `fuz_fact_serving`). The embedded and
+ * disk-stream branches set them on the response. On the `X-Accel-Redirect`
+ * branch nginx serves the bytes, and the headers the client sees come from the
+ * internal facts location, not this response — that location must carry the
+ * lines `fact_security_header_directives` renders, which `create_x_accel_config`
+ * enforces.
  * `Content-Disposition: attachment` is deliberately **not** added — it would
  * force-download and break legitimate inline image rendering.
  *
  * ## Defense-in-depth
  *
- * The `external_url` regex is re-validated before issuing
- * `X-Accel-Redirect` even though `PgFactStore.put_ref` only writes
- * `file:<shard>/<rest>`-shaped URLs. A future row-injection bug
- * upstream would otherwise hand nginx an attacker-controlled path.
+ * `external_url` is re-validated before it addresses the filesystem or an
+ * `X-Accel-Redirect`: it must have the `file:<shard>/<rest>` shape, and it must
+ * be the requested hash's own address (`file_fact_url_addresses`). `PgFactStore`
+ * writes only such URLs, but the column is free text and `query_put_fact`
+ * inserts what it is given, so a row written past the store — or a
+ * row-injection bug upstream — would otherwise hand nginx an
+ * attacker-controlled path, or serve another fact's bytes under this hash,
+ * behind this hash's admission. The serve path never re-hashes what it
+ * streams, so this binding is what ties the bytes to the name. Either refusal
+ * is a logged error and the masked 404, the same unavailable that
+ * `PgFactStore.get` reports as `null`. Twin of the Rust `fuz_fact_serving`.
  *
  * @module
  */
 
-import { createReadStream } from 'node:fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import type { Context } from 'hono';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
-import { FactHashSchema, type FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { FactHash } from '@fuzdev/fuz_util/hash_schemas.ts';
+import { FactHashSchema, Uuid } from '../primitive_schemas.ts';
 import { z } from 'zod';
 
 import {
 	build_request_context,
+	get_public_account_id,
 	get_request_context,
-	has_role,
+	has_scoped_role,
 	type RequestContext
 } from '../auth/request_context.ts';
 import { ROLE_ADMIN } from '../auth/role_schema.ts';
 import { ActingActor } from '../http/auth_shape.ts';
-import { ACCOUNT_ID_KEY } from '../hono_context.ts';
 import { query_active_actors_by_account } from '../auth/account_queries.ts';
 import { get_route_params, type RouteContext, type RouteSpec } from '../http/route_spec.ts';
 import { ERROR_INVALID_ROUTE_PARAMS } from '../http/error_schemas.ts';
-import type { AppDeps } from '../auth/deps.ts';
 import { query_get_fact, query_get_fact_meta } from '../db/fact_queries.ts';
+import { to_uint8 } from '../db/fact_store.ts';
 import { query_cell_get } from '../db/cell_queries.ts';
 import { query_cell_grant_list_for_cell } from '../db/cell_grant_queries.ts';
 import { can_view_cell } from '../auth/cell_authorize.ts';
-import { parse_file_fact_url } from '../db/file_fact_url.ts';
+import { cell_steward_admits } from '../auth/cell_steward.ts';
+import { file_fact_url_addresses, parse_file_fact_url } from '../db/file_fact_url.ts';
 import type { XAccelConfig } from './x_accel.ts';
-
-/** `Cache-Control` for fact responses — 5 min revocation window. */
-const CACHE_CONTROL = 'private, max-age=300';
-
-/**
- * `X-Content-Type-Options` for fact responses — block MIME sniffing so an
- * `application/octet-stream` fact can't be sniffed into executable HTML.
- */
-const X_CONTENT_TYPE_OPTIONS = 'nosniff';
-
-/**
- * `Content-Security-Policy` for fact responses. Fact bytes carry a
- * producer-supplied `content_type` served verbatim inline, so a fact stored as
- * (or sniffable to) `text/html` would otherwise execute as stored XSS for any
- * reader of a referencing cell. `default-src 'none'; sandbox` neutralizes
- * script execution and sub-resource loads even when a fact is rendered inline;
- * harmless for directly-served images (they load no sub-resources). The same
- * pair, byte-identical, is set by the Rust twin (`fuz_fact_serving::serve`).
- */
-const CONTENT_SECURITY_POLICY = "default-src 'none'; sandbox";
-
-/**
- * The untrusted-content hardening headers applied to every served-fact
- * response across all three branches (embedded, `X-Accel-Redirect`,
- * disk-stream). `Content-Disposition: attachment` is deliberately omitted — it
- * would force-download and break legitimate inline image rendering.
- */
-const FACT_SECURITY_HEADERS = {
-	'X-Content-Type-Options': X_CONTENT_TYPE_OPTIONS,
-	'Content-Security-Policy': CONTENT_SECURITY_POLICY
-} as const;
+import { FACT_CACHE_CONTROL, FACT_SECURITY_HEADERS } from './fact_security_headers.ts';
 
 /**
  * Path-param schema for the bare-hash route. Matching the canonical
@@ -168,23 +182,20 @@ const cell_fact_params_schema = z.strictObject({
 	hash: FactHashSchema
 });
 
-/** Shared error-schema entry: tighten the auto-derived 400 to the literal emitted by params validation. */
+/**
+ * Shared error-schema entry: tighten the auto-derived 400 to the literal
+ * emitted by params validation. `issues` is optional because the framework
+ * emits it through `dev_only` — a production body carries the `error`
+ * literal alone.
+ */
 const params_400_error = {
 	400: z.looseObject({
 		error: z.literal(ERROR_INVALID_ROUTE_PARAMS),
-		issues: z.array(z.unknown())
+		issues: z.array(z.unknown()).optional()
 	})
 } as const;
 
 export interface CreateServeFactRouteSpecOptions {
-	/**
-	 * App deps reference. Currently unused at handler time (cell + fact
-	 * tables are read via `RouteContext.db`); kept on the factory
-	 * signature for symmetry with sibling route factories and to give
-	 * future role_grant-scoped viewer extensions somewhere to read other
-	 * deps without changing the public shape.
-	 */
-	deps: AppDeps;
 	/** Absolute path of the facts directory. Used for the dev/test streaming path. */
 	facts_dir: string;
 	/**
@@ -214,9 +225,12 @@ interface ServeFactConfig {
  * bare-hash route, viewable referencing cell on the cell-scoped route).
  * Reuses the embedded-stream / `X-Accel-Redirect` / disk-stream logic.
  *
- * Returns 404 when the fact's metadata is missing or its embedded bytes
- * have vanished (a race), so the response shape is identical whether the
- * fact is genuinely absent or merely unviewable.
+ * Returns 404 when the fact's metadata is missing, its embedded bytes have
+ * vanished (a race), or its disk file is missing, so the response shape is
+ * identical whether the fact is genuinely absent or merely unviewable; any
+ * other failure to open the disk file answers a logged 500. HEAD on a disk
+ * fact opens the file (so it answers the same statuses) and closes it again,
+ * sending headers only.
  */
 const serve_fact_bytes = async (
 	c: Context,
@@ -250,59 +264,90 @@ const serve_fact_bytes = async (
 		return c.body(bytes as unknown as ArrayBuffer, 200, {
 			'Content-Type': content_type,
 			'Content-Length': size,
-			'Cache-Control': CACHE_CONTROL,
+			'Cache-Control': FACT_CACHE_CONTROL,
 			...FACT_SECURITY_HEADERS
 		});
 	}
 
 	// External — defense-in-depth re-validate the URL before trusting it
-	// to address the filesystem.
+	// to address the filesystem: its shape, then that it is this hash's file
 	const parsed = parse_file_fact_url(meta.external_url);
 	if (!parsed) {
-		log.error(`serve_fact: rejecting malformed external_url for ${hash}: ${meta.external_url}`);
+		log.error(
+			`serve_fact: external_url for ${hash} is not a file:<shard>/<rest> URL; answering 404`
+		);
+		return c.body(null, 404);
+	}
+	if (!file_fact_url_addresses(parsed, hash)) {
+		log.error(`serve_fact: external_url for ${hash} addresses another fact's file; answering 404`);
 		return c.body(null, 404);
 	}
 	const { shard, rest } = parsed;
 
 	if (x_accel !== undefined) {
 		// Production: hand off to nginx via the validated `internal;` facts location.
+		// nginx answers with that location's own `add_header` set, not these
+		// headers, which is why the validator requires the fact pair there.
 		return c.body(null, 200, {
 			'Content-Type': content_type,
 			'Content-Length': size,
-			'Cache-Control': CACHE_CONTROL,
+			'Cache-Control': FACT_CACHE_CONTROL,
 			'X-Accel-Redirect': `${x_accel.redirect_prefix}${shard}/${rest}`,
 			...FACT_SECURITY_HEADERS
 		});
 	}
 
-	// Dev / tests: stream from disk. `createReadStream` errors land on the
-	// returned ReadableStream, which Hono surfaces as a 500 to the client.
+	// Dev / tests: stream from disk. Open before committing the 200 so a
+	// missing file answers 404 and any other open failure a logged 500, as the
+	// Rust twin does — a lazy stream would send the headers, then truncate.
 	const file_path = join(facts_dir, shard, rest);
-	const node_stream = createReadStream(file_path);
-	const web_stream = Readable.toWeb(node_stream) as ReadableStream<Uint8Array>;
-	return c.body(web_stream, 200, {
+	let handle: FileHandle;
+	try {
+		handle = await open(file_path, 'r');
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+			log.warn(`serve_fact: disk file for ${hash} is missing; answering 404`);
+			return c.body(null, 404);
+		}
+		log.error(`serve_fact: disk open for ${hash} failed`, err);
+		return c.json({ error: 'internal_error' }, 500);
+	}
+	const headers = {
 		'Content-Type': content_type,
 		'Content-Length': size,
-		'Cache-Control': CACHE_CONTROL,
+		'Cache-Control': FACT_CACHE_CONTROL,
 		...FACT_SECURITY_HEADERS
-	});
+	};
+	// Hono answers HEAD by running this GET handler and discarding the body
+	// unread, so a stream built here would hold the handle open until GC
+	if (c.req.method === 'HEAD') {
+		await handle.close();
+		return c.body(null, 200, headers);
+	}
+	const web_stream = Readable.toWeb(handle.createReadStream()) as ReadableStream<Uint8Array>;
+	return c.body(web_stream, 200, headers);
 };
 
 /**
  * Resolve the caller's `RequestContext` on a pure-public route from the
- * session-middleware-set account id. Multi-actor accounts return `null`
- * (no `acting?` slot on a public route to disambiguate); single active-actor
- * accounts resolve their actor and role_grants for owner / grant / admin
- * admission paths. Unauthenticated callers return `null`. Soft-deleted
- * (tombstoned) actors are excluded from the count
- * (`query_active_actors_by_account`), matching the acting-actor resolution
- * path — a tombstoned actor is never resolvable here.
+ * session-middleware-set account id, read through `get_public_account_id`, so
+ * a scope-narrowed API token returns `null` — downgraded to anonymous, not
+ * refused (see the module doc). Twin of the Rust
+ * `AuthGate::public_request_context`.
+ *
+ * Multi-actor accounts return `null` (no `acting?` slot on a public route to
+ * disambiguate); single active-actor accounts resolve their actor and
+ * role_grants for owner / grant / admin admission paths. Unauthenticated
+ * callers return `null`. Soft-deleted (tombstoned) actors are excluded from the
+ * count (`query_active_actors_by_account`), matching the acting-actor
+ * resolution path — a tombstoned actor is never resolvable here.
  */
 const build_public_request_context = async (
 	c: Context,
 	route: RouteContext
 ): Promise<RequestContext | null> => {
-	const account_id = c.get(ACCOUNT_ID_KEY);
+	// a narrowed token is the anonymous caller here, never a refusal
+	const account_id = get_public_account_id(c);
 	if (!account_id) return null;
 	const actors = await query_active_actors_by_account({ db: route.db }, account_id);
 	if (actors.length !== 1) return null;
@@ -314,12 +359,16 @@ const build_public_request_context = async (
  * — the per-reference read.
  *
  * Resolves the named cell (404 if missing / soft-deleted), requires
- * `can_view_cell(caller, cell)` AND `cell.refs` to include the hash
- * (else 404, masked), then serves the bytes. Authz is scoped to this one
- * `(cell, hash)` edge — never unioned across the fact's other referrers.
+ * `can_view_cell(caller, cell)` — or the steward arm,
+ * `cell_steward_admits` — and then `cell.refs` to include the hash
+ * (else 404, masked), then serves the bytes. The view check runs first, so a
+ * caller that can't view the cell learns nothing about its refs. Authz is
+ * scoped to this one `(cell, hash)` edge — never unioned across the fact's
+ * other referrers.
  *
  * Pure-public auth — the handler builds the per-request `RequestContext`
- * from `c.var.account_id` and enforces visibility per-reference.
+ * from the resolved account id (`get_public_account_id`) and enforces
+ * visibility per-reference.
  */
 export const create_serve_cell_fact_route_spec = (
 	options: CreateServeFactRouteSpecOptions
@@ -330,8 +379,9 @@ export const create_serve_cell_fact_route_spec = (
 		method: 'GET',
 		path: '/api/cells/:cell_id/facts/:hash',
 		auth: { account: 'none', actor: 'none' },
+		reads_credential: true,
 		description:
-			'Serve content-addressed fact bytes through a named referencing cell. 404 unless the cell admits the caller via can_view_cell AND references the hash (per-reference, never union-of-referrers).',
+			"Serve content-addressed fact bytes through a named referencing cell. 404 unless the cell admits the caller via can_view_cell (or the steward arm: the governing root's manager reading a pending or rejected contribution) AND references the hash (per-reference, never union-of-referrers).",
 		params: cell_fact_params_schema,
 		input: z.null(),
 		// The body is a binary stream; no JSON output schema applies.
@@ -346,15 +396,10 @@ export const create_serve_cell_fact_route_spec = (
 				return c.body(null, 404);
 			}
 
-			// The cell→fact edge: the cell must actually reference the hash.
-			// `cell.refs` is auto-derived from `data` on every write, so this is
-			// the authoritative "does this cell reference these bytes" check.
-			// Missing edge → 404 (masked), never "exists elsewhere".
-			if (!cell.refs?.includes(hash)) {
-				return c.body(null, 404);
-			}
-
-			// Per-reference view check — scoped to *this* cell only.
+			// Per-reference view check — scoped to *this* cell only. It runs
+			// before the edge check, so a cell the caller can't view does the
+			// same work, and answers the same 404, whether or not it references
+			// the hash — the edge stays unobservable to a non-viewer.
 			const req_ctx = await build_public_request_context(c, route);
 			// Unauthenticated callers skip the grant fetch entirely — no grant
 			// can admit a null req_ctx (the only admit path is the
@@ -363,8 +408,22 @@ export const create_serve_cell_fact_route_spec = (
 			const grants = req_ctx
 				? await query_cell_grant_list_for_cell({ db: route.db }, cell.id)
 				: null;
-			if (!can_view_cell(req_ctx, cell, grants)) {
+			// The governing root's manager also reads a pending or rejected
+			// contribution's facts (the steward arm, `auth/cell_steward.ts`),
+			// checked only once the view check denies.
+			if (
+				!can_view_cell(req_ctx, cell, grants) &&
+				!(await cell_steward_admits({ db: route.db }, req_ctx, cell))
+			) {
 				// 404 (not 403) so an unviewable cell→fact edge doesn't leak.
+				return c.body(null, 404);
+			}
+
+			// The cell→fact edge: the cell must actually reference the hash.
+			// `cell.refs` is auto-derived from `data` on every write, so this is
+			// the authoritative "does this cell reference these bytes" check.
+			// Missing edge → 404 (masked), never "exists elsewhere".
+			if (!cell.refs?.includes(hash)) {
 				return c.body(null, 404);
 			}
 
@@ -385,9 +444,11 @@ export const create_serve_cell_fact_route_spec = (
  * Auth is `{account: 'required', actor: 'required', roles: ['admin']}` —
  * the dispatcher's authorization phase resolves the acting actor and the
  * post-authorization guard enforces the admin role before the handler runs.
- * The handler re-checks `has_role(_, admin)` as defense-in-depth so a future
- * mounting/auth-shape regression fails closed rather than serving by bare
- * hash to a non-admin.
+ * The handler re-checks the **global** admin grant
+ * (`has_scoped_role(_, admin, null)`, the auth phase's own reading) as
+ * defense-in-depth so a future mounting/auth-shape regression fails closed —
+ * a masked 404, logged at error — rather than serving by bare hash to a
+ * non-admin.
  */
 export const create_serve_fact_route_spec = (
 	options: CreateServeFactRouteSpecOptions
@@ -425,8 +486,13 @@ export const create_serve_fact_route_spec = (
 
 			// Defense-in-depth: the auth phase already gated this on the admin
 			// role, but re-check the resolved context so a mounting/auth-shape
-			// regression fails closed instead of serving by bare hash.
-			if (!has_role(get_request_context(c), ROLE_ADMIN)) {
+			// regression fails closed instead of serving by bare hash. Global
+			// grant only — a scoped `admin` row must not read every fact. It
+			// fires only on such a regression, so it fails loud as well.
+			if (!has_scoped_role(get_request_context(c), ROLE_ADMIN, null)) {
+				log.error(
+					'bare-hash fact read reached the handler without a global admin grant — the auth gate did not run'
+				);
 				return c.body(null, 404);
 			}
 
@@ -434,13 +500,3 @@ export const create_serve_fact_route_spec = (
 		}
 	};
 };
-
-/**
- * Coerce whatever the driver returns for BYTEA into a `Uint8Array`. Same
- * shape as the helper in `PgFactStore.get` — `pg` returns a `Buffer`
- * (`Uint8Array` subclass), `pglite` already returns `Uint8Array`.
- */
-const to_uint8 = (value: Uint8Array): Uint8Array =>
-	value instanceof Uint8Array && value.constructor === Uint8Array
-		? value
-		: new Uint8Array(value.buffer, value.byteOffset, value.byteLength);

@@ -1,5 +1,4 @@
 import { readFile, writeFile } from 'node:fs/promises';
-import { z } from 'zod';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 import type { FetchValueCache } from '@fuzdev/fuz_util/fetch.ts';
 
@@ -10,11 +9,13 @@ import { github_fetch_commit_prs } from './github.ts';
  * It's similar to `@changesets/changelog-github` but doesn't require a token for light usage.
  * This may be better implemented as a standalone dependency
  * as an alternative to `@changesets/changelog-git`.
+ * @param fetch - the `fetch` the GitHub API requests go through, handed in by the caller
  * @returns boolean indicating if the changelog changed
  */
 export const update_changelog = async (
 	owner: string,
 	repo: string,
+	fetch: typeof globalThis.fetch,
 	path = 'CHANGELOG.md',
 	token?: string,
 	log?: Logger,
@@ -22,7 +23,7 @@ export const update_changelog = async (
 ): Promise<boolean> => {
 	const contents = await readFile(path, 'utf8');
 	const parsed = parse_changelog(contents);
-	const mapped = await map_changelog(parsed, owner, repo, token, log, cache);
+	const mapped = await map_changelog(parsed, owner, repo, fetch, token, log, cache);
 	const updated = serialize_changelog(mapped);
 	if (contents === updated) {
 		return false;
@@ -32,8 +33,7 @@ export const update_changelog = async (
 };
 
 // keeping this really simple for now, no need to parse further for our current usecases
-const ParsedChangelog = z.array(z.string());
-type ParsedChangelog = z.infer<typeof ParsedChangelog>;
+type ParsedChangelog = Array<string>;
 const parse_changelog = (contents: string): ParsedChangelog => contents.split('\n');
 const serialize_changelog = (parsed: ParsedChangelog): string => parsed.join('\n');
 
@@ -43,6 +43,7 @@ const map_changelog = async (
 	parsed: ParsedChangelog,
 	owner: string,
 	repo: string,
+	fetch: typeof globalThis.fetch,
 	token?: string,
 	log?: Logger,
 	cache?: FetchValueCache
@@ -53,7 +54,7 @@ const map_changelog = async (
 		if (matches) {
 			const commit_sha = matches[1]!;
 			const l = '- ' + line.substring(commit_sha.length + 4);
-			const prs = await github_fetch_commit_prs(owner, repo, commit_sha, token, log, cache);
+			const prs = await github_fetch_commit_prs(owner, repo, commit_sha, fetch, token, log, cache);
 			if (prs?.length) {
 				mapped.push(`${l} (${prs.map((p) => `[#${p.number}](${p.html_url})`).join(', ')})`);
 			} else {

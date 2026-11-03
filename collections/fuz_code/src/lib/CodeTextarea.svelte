@@ -7,6 +7,9 @@
 	 * the highlight ranges. The two share identical box metrics so characters line
 	 * up exactly, and the backdrop is scroll-synced to the textarea.
 	 *
+	 * Drops in for a plain `<textarea>` under fuz_css: the wrapper carries the
+	 * same flow margin a bare textarea gets, so spacing below it is unchanged.
+	 *
 	 * **Minimal by design**: this is a highlighted input, not a full editor. It
 	 * does not provide line numbers, tab-to-indent, auto-resize, or undo handling
 	 * — compose those on top via the spread `...rest` props and `bind:value`.
@@ -32,7 +35,7 @@
 		value?: string;
 		/**
 		 * Language identifier (e.g. 'ts', 'css', 'svelte'). `null` disables
-		 * highlighting; `undefined` falls back to the default ('svelte').
+		 * styling; `undefined` falls back to the default ('svelte').
 		 */
 		lang?: string | null;
 		/** Custom `SyntaxStyler` instance (defaults to the global one). */
@@ -92,6 +95,15 @@
 <style>
 	.code_textarea {
 		position: relative;
+	}
+
+	/* The wrapper stands in for a bare textarea in flow, so it takes fuz_css's flow
+	   margin. The inner textarea never gets it — it always follows the backdrop, so
+	   it's always the last child — and margin belongs on the wrapper anyway: the
+	   backdrop fills the wrapper with `inset: 0`, so a child margin would misalign
+	   the highlights. */
+	.code_textarea:not(:last-child) {
+		margin-bottom: var(--flow_margin, var(--space_lg));
 	}
 
 	/* The textarea keeps fuz_css's native textarea styling — padding, border (with

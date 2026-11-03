@@ -1,3 +1,19 @@
+<!--
+@component
+
+The menu surface shared by `ContextmenuRoot.svelte` and
+`ContextmenuRootForSafariCompatibility.svelte`. Owns everything that happens while
+the menu is open - positioning, keyboard navigation, dismissal on outside presses,
+popover top-layer promotion, and entry rendering - while the roots own gesture
+detection, i.e. how the menu opens. Holds no gesture state of its own; the
+`open_guard` it consults is owned and armed by the root.
+
+@cssprop --contextmenu_z_index - stacking order of the menu in browsers without the Popover API
+@cssprop --contextmenu_border_width - width of the menu's border
+@cssprop --contextmenu_border_style - style of the menu's border
+@cssprop --contextmenu_border_color - color of the menu's border
+@cssprop --contextmenu_border_radius - corner radius of the menu
+-->
 <script module lang="ts">
 	// The default entry snippets are shared by `ContextmenuRoot.svelte`
 	// and `ContextmenuRootForSafariCompatibility.svelte`.
@@ -5,14 +21,6 @@
 </script>
 
 <script lang="ts">
-	/**
-	 * The menu surface shared by `ContextmenuRoot.svelte` and
-	 * `ContextmenuRootForSafariCompatibility.svelte`. Owns everything that happens
-	 * while the menu is open - positioning, keyboard navigation, dismissal on
-	 * outside presses, popover top-layer promotion, and entry rendering - while
-	 * the roots own gesture detection, i.e. how the menu opens. Holds no gesture
-	 * state of its own; the `open_guard` it consults is owned and armed by the root.
-	 */
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
 	import type { ComponentProps, Snippet } from 'svelte';
 

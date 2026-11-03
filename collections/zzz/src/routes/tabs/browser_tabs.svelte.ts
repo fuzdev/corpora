@@ -1,19 +1,18 @@
 // @slop Claude Opus 4
 
 import { z } from 'zod';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Cell, type CellOptions } from '$lib/cell.svelte.ts';
-import { IndexedCollection } from '$lib/indexed_collection.svelte.ts';
+import { Cell, type CellOptions } from '#lib/cell.svelte.ts';
+import { IndexedCollection } from '#lib/indexed_collection.svelte.ts';
 import {
 	create_single_index,
 	create_derived_index
-} from '$lib/indexed_collection_helpers.svelte.ts';
-import { CellJson } from '$lib/cell_types.ts';
+} from '#lib/indexed_collection_helpers.svelte.ts';
+import { CellJson } from '#lib/cell_types.ts';
 import { BrowserTab, BrowserTabJson } from './browser_tab.svelte.ts';
-import { HANDLED } from '$lib/cell_helpers.ts';
-import { to_reordered_list } from '$lib/list_helpers.ts';
+import { create_collection_decoder, HANDLED } from '#lib/cell_helpers.ts';
+import { to_reordered_list } from '#lib/list_helpers.ts';
 import { fake_sites } from './sample_tabs.ts';
 
 export const BrowserTabsJson = CellJson.extend({
@@ -24,13 +23,16 @@ export type BrowserTabsJsonInput = z.input<typeof BrowserTabsJson>;
 
 export type BrowserTabsOptions = CellOptions<typeof BrowserTabsJson>;
 
+/** How many closed tabs `BrowserTabs` keeps for reopening — the oldest are forgotten first. */
+export const BROWSER_TABS_CLOSED_MAX = 50;
+
 export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 	items: IndexedCollection<BrowserTab> = new IndexedCollection({
+		dispose_item: (tab) => tab.dispose(),
 		indexes: [
 			create_single_index({
 				key: 'url',
-				extractor: (tab) => tab.url,
-				query_schema: z.string()
+				extractor: (tab) => tab.url
 			}),
 			create_derived_index({
 				key: 'manual_order',
@@ -42,7 +44,12 @@ export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 	/** Ordered array of tabs derived from the `manual_order` index. */
 	readonly ordered_tabs: Array<BrowserTab> = $derived(this.items.derived_index('manual_order'));
 
-	recently_closed_tabs: Array<BrowserTab> = $state([]);
+	/**
+	 * Snapshots of closed tabs for reopening, oldest first, at most
+	 * `BROWSER_TABS_CLOSED_MAX`. Kept as JSON, not cells: a closed tab's cell
+	 * is disposed, so a reopen creates a fresh one.
+	 */
+	recently_closed_tabs: Array<BrowserTabJson> = $state.raw([]);
 
 	readonly selected_tab: BrowserTab | undefined = $derived(
 		this.ordered_tabs.find((t) => t.selected)
@@ -54,31 +61,15 @@ export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 		super(BrowserTabsJson, options);
 
 		this.decoders = {
-			tabs: (tabs) => {
-				if (Array.isArray(tabs)) {
-					// Clear existing tabs
-					this.items.clear();
-
-					// Add tabs from JSON
-					for (const tab_json of tabs) {
-						const tab = new BrowserTab({
-							app: this.app,
-							json: tab_json
-						});
-						this.items.add(tab);
-					}
-				}
-				return HANDLED;
-			},
+			tabs: create_collection_decoder(
+				() => this.items.clear(),
+				(json) => this.items.add(new BrowserTab({ app: this.app, json }))
+			),
 			recently_closed_tabs: (tabs) => {
 				if (Array.isArray(tabs)) {
-					this.recently_closed_tabs = tabs.map(
-						(tab_json) =>
-							new BrowserTab({
-								app: this.app,
-								json: tab_json
-							})
-					);
+					this.recently_closed_tabs = tabs
+						.map((tab_json) => BrowserTabJson.parse(tab_json))
+						.slice(-BROWSER_TABS_CLOSED_MAX);
 				}
 				return HANDLED;
 			}
@@ -125,8 +116,11 @@ export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 
 			const was_selected = tab_to_close.selected;
 
-			// Store a copy of the tab before removing it
-			this.recently_closed_tabs.push(tab_to_close);
+			// snapshot the tab before removing it, since removing disposes it
+			this.recently_closed_tabs = [
+				...this.recently_closed_tabs.slice(1 - BROWSER_TABS_CLOSED_MAX),
+				tab_to_close.to_json()
+			];
 
 			this.items.remove(tab_to_close.id);
 
@@ -143,19 +137,21 @@ export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 		}
 	}
 
+	/**
+	 * Reopens the most recently closed tab as a new cell from its snapshot,
+	 * selected if it was selected when closed.
+	 */
 	reopen_last_closed_tab(): void {
-		if (this.recently_closed_tabs.length > 0) {
-			const tab_to_reopen = this.recently_closed_tabs.pop();
-			if (tab_to_reopen) {
-				// If the tab was previously selected, deselect all current tabs
-				if (tab_to_reopen.selected) {
-					for (const tab of this.items.by_id.values()) {
-						tab.selected = false;
-					}
-				}
-				this.items.add(tab_to_reopen);
+		const tab_to_reopen = this.recently_closed_tabs.at(-1);
+		if (!tab_to_reopen) return;
+		this.recently_closed_tabs = this.recently_closed_tabs.slice(0, -1);
+		// If the tab was previously selected, deselect all current tabs
+		if (tab_to_reopen.selected) {
+			for (const tab of this.items.by_id.values()) {
+				tab.selected = false;
 			}
 		}
+		this.add(tab_to_reopen);
 	}
 
 	select(index: number): void {
@@ -199,5 +195,3 @@ export class BrowserTabs extends Cell<typeof BrowserTabsJson> {
 		this.items.indexes.manual_order = to_reordered_list(this.ordered_tabs, from_index, to_index);
 	}
 }
-
-export const BrowserTabsSchema = z.instanceof(BrowserTabs);

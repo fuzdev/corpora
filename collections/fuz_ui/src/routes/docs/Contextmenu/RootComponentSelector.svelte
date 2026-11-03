@@ -1,5 +1,5 @@
 <script lang="ts">
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
 	import { selected_contextmenu_root_component_context } from './selected_root_component.svelte.ts';
 
 	const selected_root_component = selected_contextmenu_root_component_context.get();

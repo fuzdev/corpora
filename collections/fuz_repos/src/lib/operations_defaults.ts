@@ -1,47 +1,25 @@
 /**
  * Production implementations of operations interfaces.
  *
- * Provides real git, npm, fs, and build operations for production use.
+ * Provides real git, npm, fs, and `repos` operations for production use.
  * For interface definitions and dependency injection pattern, see `operations.ts`.
  *
  * @module
  */
 
-import { spawn_out } from '@fuzdev/fuz_util/process.ts';
+import { spawn_out, spawn_result_to_message } from '@fuzdev/fuz_util/process.ts';
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
-import { git_checkout, type GitBranch, type GitOrigin } from '@fuzdev/fuz_util/git.ts';
 import { fs_classify_error } from '@fuzdev/fuz_util/fs.ts';
-import { EMPTY_OBJECT } from '@fuzdev/fuz_util/object.ts';
 
 import { has_changesets, read_changesets, predict_next_version } from './changeset_reader.ts';
 import { wait_for_package } from './npm_registry.ts';
-import { run_preflight_checks } from './preflight_checks.ts';
-import {
-	git_add,
-	git_commit,
-	git_add_and_commit,
-	git_tag,
-	git_push_tag,
-	git_has_changes,
-	git_list_uncommitted_files,
-	git_has_file_changed,
-	git_stash,
-	git_stash_pop,
-	git_switch_branch,
-	git_current_branch_name_required,
-	git_current_commit_hash_required,
-	git_check_clean_workspace_as_boolean,
-	git_has_remote
-} from './git_operations.ts';
+import { git_add, git_commit } from './git_operations.ts';
 import type {
 	ChangesetOperations,
 	GitOperations,
-	ProcessOperations,
 	NpmOperations,
-	PreflightOperations,
 	FsOperations,
-	BuildOperations,
-	GitopsOperations
+	ReposOperations
 } from './operations.ts';
 
 /** Wrap an async function that returns a value */
@@ -94,197 +72,80 @@ export const default_changeset_operations: ChangesetOperations = {
 };
 
 export const default_git_operations: GitOperations = {
-	// Core git info
-	current_branch_name: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() => git_current_branch_name_required(cwd ? { cwd } : undefined));
-	},
-
-	current_commit_hash: async (options) => {
-		const { branch, cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() =>
-			git_current_commit_hash_required(branch, cwd ? { cwd } : undefined)
-		);
-	},
-
-	check_clean_workspace: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() => git_check_clean_workspace_as_boolean(cwd ? { cwd } : undefined));
-	},
-
-	// Branch operations
-	checkout: async (options) => {
-		const { branch, cwd } = options;
-		return wrap_void(() => git_checkout(branch, cwd ? { cwd } : undefined));
-	},
-
-	pull: async (options) => {
-		const { origin, branch, cwd } = options ?? EMPTY_OBJECT;
-		try {
-			// Omit the branch arg when absent: a trailing `''` makes git pull the remote's
-			// default branch (origin/HEAD) instead of the current branch's upstream.
-			const spawned = await spawn_out(
-				'git',
-				['pull', origin || 'origin', ...(branch ? [branch] : [])],
-				cwd ? { cwd } : undefined
-			);
-			if (spawned.result.ok) {
-				return { ok: true };
-			} else {
-				return { ok: false, message: spawned.stderr || 'Pull failed' };
-			}
-		} catch (error) {
-			return { ok: false, message: String(error) };
-		}
-	},
-
-	switch_branch: async (options) => {
-		const { branch, pull, cwd } = options;
-		return wrap_void(() => git_switch_branch(branch as GitBranch, pull, cwd ? { cwd } : undefined));
-	},
-
-	has_remote: async (options) => {
-		const { remote, cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() => git_has_remote(remote, cwd ? { cwd } : undefined));
-	},
-
-	// Staging and committing
 	add: async (options) => {
 		const { files, cwd } = options;
 		return wrap_void(() => git_add(files, cwd ? { cwd } : undefined));
 	},
 
 	commit: async (options) => {
-		const { message, cwd } = options;
-		return wrap_void(() => git_commit(message, cwd ? { cwd } : undefined));
-	},
-
-	add_and_commit: async (options) => {
-		const { files, message, cwd } = options;
-		return wrap_void(() => git_add_and_commit(files, message, cwd ? { cwd } : undefined));
-	},
-
-	has_changes: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() => git_has_changes(cwd ? { cwd } : undefined));
-	},
-
-	list_uncommitted_files: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		return wrap_with_value(() => git_list_uncommitted_files(cwd ? { cwd } : undefined));
-	},
-
-	// Tagging
-	tag: async (options) => {
-		const { tag_name, message, cwd } = options;
-		return wrap_void(() => git_tag(tag_name, message, cwd ? { cwd } : undefined));
-	},
-
-	push_tag: async (options) => {
-		const { tag_name, origin, cwd } = options;
-		return wrap_void(() => git_push_tag(tag_name, origin as GitOrigin, cwd ? { cwd } : undefined));
-	},
-
-	// Stashing
-	stash: async (options) => {
-		const { message, cwd } = options ?? EMPTY_OBJECT;
-		return wrap_void(() => git_stash(message, cwd ? { cwd } : undefined));
-	},
-
-	stash_pop: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		return wrap_void(() => git_stash_pop(cwd ? { cwd } : undefined));
-	},
-
-	// File change detection
-	has_file_changed: async (options) => {
-		const { from_commit, to_commit, file_path, cwd } = options;
-		return wrap_with_value(() =>
-			git_has_file_changed(from_commit, to_commit, file_path, cwd ? { cwd } : undefined)
-		);
+		const { message, files, cwd } = options;
+		return wrap_void(() => git_commit(message, files, cwd ? { cwd } : undefined));
 	}
 };
 
-export const default_process_operations: ProcessOperations = {
-	spawn: async (options) => {
-		const { cmd, args, cwd } = options;
-		try {
-			const spawned = await spawn_out(cmd, args, cwd ? { cwd } : undefined);
-			if (spawned.result.ok) {
-				return {
-					ok: true,
-					stdout: spawned.stdout || undefined,
-					stderr: spawned.stderr || undefined
-				};
-			} else {
-				return {
-					ok: false,
-					message: 'Command failed',
-					stderr: spawned.stderr || undefined
-				};
-			}
-		} catch (error) {
-			return { ok: false, message: String(error) };
+export const default_repos_operations: ReposOperations = {
+	status: async (options) => {
+		const { keys, registry, fetch } = options;
+		const args = [...(registry === undefined ? [] : ['--registry', registry]), 'status'];
+		if (fetch) args.push('--fetch');
+		// `--` so a key can never read as a flag
+		args.push('--json', '--', ...keys);
+		const spawned = await spawn_out('repos', args);
+		const { result } = spawned;
+		if (result.kind === 'error') {
+			const not_found = (result.error as NodeJS.ErrnoException).code === 'ENOENT';
+			return {
+				ok: false,
+				kind: not_found ? 'not_found' : 'failed',
+				message: result.error.message
+			};
 		}
+		if (result.kind === 'signaled') {
+			return { ok: false, kind: 'failed', message: `repos was killed by ${result.signal}` };
+		}
+		return {
+			ok: true,
+			output: {
+				stdout: spawned.stdout ?? '',
+				stderr: spawned.stderr ?? '',
+				exit_code: result.code
+			}
+		};
 	}
 };
 
 export const default_npm_operations: NpmOperations = {
+	view_version: async (options) => {
+		const { pkg, version } = options;
+		try {
+			const spawned = await spawn_out('npm', ['view', `${pkg}@${version}`, 'version']);
+			if (spawned.result.ok) {
+				// an existing package without the version prints nothing
+				const listed = (spawned.stdout ?? '').trim() === version;
+				return { ok: true, value: listed ? 'listed' : 'unlisted' };
+			}
+			// a package the registry doesn't know was never published
+			if (spawned.stderr?.includes('E404')) return { ok: true, value: 'unknown' };
+			const stderr = spawned.stderr?.trim();
+			return {
+				ok: false,
+				message:
+					`\`npm view ${pkg}@${version}\` failed (${spawn_result_to_message(spawned.result)})` +
+					(stderr ? `: ${stderr.split('\n', 1)[0]}` : '')
+			};
+		} catch (error) {
+			return { ok: false, message: String(error) };
+		}
+	},
+
 	wait_for_package: async (options) => {
 		const { pkg, version, wait_options, log } = options;
 		try {
 			await wait_for_package(pkg, version, { ...wait_options, log });
 			return { ok: true };
 		} catch (error) {
-			return { ok: false, message: String(error), timeout: true };
-		}
-	},
-
-	check_auth: async () => {
-		try {
-			const result = await spawn_out('npm', ['whoami']);
-			if (result.stdout) {
-				const username = result.stdout.trim();
-				if (username) {
-					return { ok: true, username };
-				}
-			}
-			return { ok: false, message: 'Not logged in to npm' };
-		} catch (error) {
 			return { ok: false, message: String(error) };
 		}
-	},
-
-	check_registry: async () => {
-		try {
-			const result = await spawn_out('npm', ['ping']);
-			if (result.stdout) {
-				return { ok: true };
-			}
-			return { ok: false, message: 'Failed to ping npm registry' };
-		} catch (error) {
-			return { ok: false, message: String(error) };
-		}
-	},
-
-	install: async (options) => {
-		const { cwd } = options ?? EMPTY_OBJECT;
-		try {
-			const spawned = await spawn_out('npm', ['install'], cwd ? { cwd } : undefined);
-			if (spawned.result.ok) {
-				return { ok: true };
-			} else {
-				return { ok: false, message: 'Install failed', stderr: spawned.stderr || undefined };
-			}
-		} catch (error) {
-			return { ok: false, message: String(error) };
-		}
-	}
-};
-
-export const default_preflight_operations: PreflightOperations = {
-	run_preflight_checks: async (options) => {
-		return run_preflight_checks(options);
 	}
 };
 
@@ -327,38 +188,4 @@ export const default_fs_operations: FsOperations = {
 			return false;
 		}
 	}
-};
-
-export const default_build_operations: BuildOperations = {
-	build_package: async (options) => {
-		const { repo, log } = options;
-		try {
-			log?.info(`  Building ${repo.library.name}...`);
-			const spawned = await spawn_out('gro', ['build'], { cwd: repo.repo_dir });
-			if (spawned.result.ok) {
-				return { ok: true };
-			} else {
-				return {
-					ok: false,
-					message: 'Build failed',
-					output: spawned.stderr || spawned.stdout || 'Build failed'
-				};
-			}
-		} catch (error) {
-			return { ok: false, message: String(error) };
-		}
-	}
-};
-
-/**
- * Combined default operations for all gitops functionality.
- */
-export const default_gitops_operations: GitopsOperations = {
-	changeset: default_changeset_operations,
-	git: default_git_operations,
-	process: default_process_operations,
-	npm: default_npm_operations,
-	preflight: default_preflight_operations,
-	fs: default_fs_operations,
-	build: default_build_operations
 };

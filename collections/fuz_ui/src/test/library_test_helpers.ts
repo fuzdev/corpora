@@ -1,4 +1,4 @@
-import type { Library } from '$lib/library.svelte.ts';
+import type { Library } from '#lib/library.svelte.ts';
 
 /**
  * A minimal fake `Library` for mounting docs components in tests:

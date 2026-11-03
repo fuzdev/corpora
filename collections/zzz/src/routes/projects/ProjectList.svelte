@@ -3,7 +3,7 @@
 
 	import { projects_context } from './projects.svelte.ts';
 	import { icon_add } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from '#lib/Icon.svelte';
 
 	const projects = projects_context.get();
 </script>
@@ -19,7 +19,7 @@
 		<div class="projects-grid">
 			{#each projects.projects as project (project.id)}
 				<a
-					href={resolve(`/projects/${project.id}`)}
+					href={resolve('/projects/[project_id]', { project_id: project.id })}
 					class="project-card panel p_md font-weight:400"
 				>
 					<h3 class="mt_0 mb_sm">{project.name}</h3>
@@ -46,16 +46,18 @@
 							{project.pages.length}
 							{project.pages.length === 1 ? 'page' : 'pages'}
 						</small>
-						<small class="chip">updated {new Date(project.updated).toLocaleDateString()}</small>
+						<small class="chip">
+							updated {new Date(project.updated).toLocaleDateString()}
+						</small>
 					</div>
 				</a>
 			{/each}
 		</div>
 	{/if}
 
-	<div class="display:flex justify_content_between mt_lg">
+	<div class="display:flex justify-content:space-between mt_lg">
 		<button type="button" class="palette_a" onclick={() => projects.create_new_project()}>
-			<Svg data={icon_add} />&nbsp; new project
+			<Icon data={icon_add} />&nbsp; new project
 		</button>
 	</div>
 </section>

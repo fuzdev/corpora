@@ -1,5 +1,5 @@
-import type { Channel } from '$lib/channel.ts';
-import type { VideoJson } from '$lib/video.ts';
+import type { Channel } from '#lib/channel.ts';
+import type { VideoJson } from '#lib/video.ts';
 
 const webdevladder_videos: Array<VideoJson> = [
 	// {
@@ -28,18 +28,6 @@ const webdevladder_vods_videos: Array<VideoJson> = [
 		url: 'https://www.youtube.com/watch?v=bE-BYtepFr8',
 		duration: 1367000,
 		playlists: ['Earbetter']
-	},
-	{
-		title: 'Moderating Mastodon comments on my websites without running a server',
-		url: 'https://www.youtube.com/watch?v=5w9iUZ5TesE',
-		duration: 6537000,
-		playlists: ['fuz_mastodon']
-	},
-	{
-		title: 'Refactoring my messy Mastodon library',
-		url: 'https://www.youtube.com/watch?v=QET2GbcW9ww',
-		duration: 5392000,
-		playlists: ['fuz_mastodon']
 	},
 	{
 		title: "Programming my channel's website using Svelte, adding videos with reactive durations",
@@ -139,11 +127,6 @@ export const webdevladder_vods_channel: Channel = {
 			name: 'fuz_blog',
 			url: 'https://www.youtube.com/playlist?list=PLio_5jgyVNVm0nMXojbEP7vQOEakA8n4X',
 			summary: 'coding blog software from scratch'
-		},
-		{
-			name: 'fuz_mastodon',
-			url: 'https://www.youtube.com/playlist?list=PLio_5jgyVNVlxnUGhFTSzcs8p6YB_bj67',
-			summary: 'Mastodon library programming'
 		},
 		{
 			name: 'Earbetter',

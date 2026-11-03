@@ -3,7 +3,7 @@
 	import { tick } from 'svelte';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
-	import { estimate_token_count, format_placeholder } from './helpers.ts';
+	import { format_placeholder } from './helpers.ts';
 	import type { Thread } from './thread.svelte.ts';
 	import ModelPickerDialog from './ModelPickerDialog.svelte';
 	import TurnList from './TurnList.svelte';
@@ -12,7 +12,7 @@
 	import ModelContextmenu from './ModelContextmenu.svelte';
 	import ContentEditor from './ContentEditor.svelte';
 	import { icon_error, icon_send, icon_stop } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
 
 	// TODO no longer uses `Chat`, maybe rename to `ThreadView` or similar?
 
@@ -25,7 +25,7 @@
 		attrs
 	}: {
 		thread: Thread;
-		onsend: (input: string) => Promise<void>;
+		onsend: (input: string) => Promise<unknown>;
 		// TODO @many think about how these two could be refactored, like a single class instance
 		focus_key?: string | number | null | undefined;
 		pending_element_to_focus_key?: string | number | null | undefined;
@@ -33,17 +33,17 @@
 		attrs?: SvelteHTMLElements['div'] | undefined;
 	} = $props();
 
-	let input = $state.raw('');
-	const input_token_count = $derived(estimate_token_count(input));
+	// the draft lives on the thread so it stays with it across chat/thread switches
+	// (this component instance is reused when the displayed thread changes)
 	let content_input: { focus: () => void } | undefined;
 
 	const send = async () => {
-		const parsed = input.trim();
+		const parsed = thread.main_input.trim();
 		if (!parsed) {
 			content_input?.focus();
 			return;
 		}
-		input = '';
+		thread.main_input = '';
 		void tick().then(() => content_input?.focus()); // timeout is maybe unnecessary, lets the input clear first to maybe avoid a frame of jank
 		await onsend(parsed);
 	};
@@ -55,14 +55,23 @@
 	let show_model_picker = $state.raw(false);
 
 	const provider = $derived(thread.model?.provider);
+	// why the thread can't send, beyond a send in flight — the same checks as
+	// `Thread.can_send`, which also drives the chat's "to N" count
 	const provider_error = $derived(
-		provider?.available
-			? null
+		!thread.model
+			? `model ${thread.model_name} not found`
 			: provider?.status && !provider.status.available
 				? provider.status.error
-				: 'provider unavailable'
+				: null
 	);
-	const send_disabled = $derived(thread.pending || !!provider_error);
+	const send_disabled = $derived(!thread.can_send);
+
+	// the count is an estimate of the message alone — the request also carries the history
+	const send_title = $derived(
+		thread.main_input.trim()
+			? `send ≈${thread.main_input_token_count} token${thread.main_input_token_count === 1 ? '' : 's'} to ${thread.model_name}`
+			: `type a message to send to ${thread.model_name}`
+	);
 </script>
 
 <ModelContextmenu model={thread.model}>
@@ -77,7 +86,7 @@
 				<header>
 					<button
 						type="button"
-						class="plain sm font_size_lg text-align:left font-weight:400"
+						class="plain sized_sm font_size_lg text-align:left font-weight:400"
 						onclick={() => (show_model_picker = true)}
 					>
 						{thread.model?.name ?? thread.model_name}
@@ -89,7 +98,7 @@
 							icon_props={{ size: 'var(--font_size_sm)' }}
 							label="name"
 						/>{#if provider_error}
-							<span class="color_c_50 ml_sm"><Svg data={icon_error} /> {provider_error}</span>
+							<span class="color_c_60 ml_sm"><Icon data={icon_error} /> {provider_error}</span>
 						{/if}
 					</small>
 				</header>
@@ -103,8 +112,8 @@
 			<div>
 				<ContentEditor
 					bind:this={content_input}
-					bind:content={input}
-					token_count={input_token_count}
+					bind:content={thread.main_input}
+					token_count={thread.main_input_token_count}
 					placeholder={format_placeholder()}
 					show_stats
 					show_actions
@@ -118,7 +127,7 @@
 							onclick={() => thread.cancel_pending()}
 							title="stop generating"
 						>
-							<Svg data={icon_stop} />
+							<Icon data={icon_stop} />
 						</button>
 					{:else}
 						<PendingButton
@@ -126,11 +135,9 @@
 							disabled={send_disabled}
 							onclick={send}
 							class="plain {provider_error ? ' color_c_50' : ''}"
-							title={provider?.available
-								? `send ${input_token_count} tokens to ${thread.model_name}`
-								: (provider_error ?? undefined)}
+							title={provider_error ?? send_title}
 						>
-							<Svg data={icon_send} />
+							<Icon data={icon_send} />
 						</PendingButton>
 					{/if}
 				</ContentEditor>

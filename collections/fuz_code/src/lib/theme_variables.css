@@ -1,20 +1,25 @@
 /*
 
-CSS variables for syntax highlighting when not using fuz_css.
-Import this alongside theme.css if you're not using fuz_css.
+CSS variables for the fuz_code themes when not using fuz_css.
+Import this alongside theme.css or theme_highlight.css.
+
+Values are sRGB snapshots of fuz_css's derived OKLCH palette at stop 50
+(`--palette_X_50`) and the neutral text scale (`--text_50`), per scheme.
+
+TODO: hand-snapshotted from fuz_css's evaluators, regenerate when fuz_css's palette changes.
 
 */
 
 :root {
-	--text_color_5: light-dark(#8e7e71, #8e7e71);
-	--color_a_5: light-dark(#397fc6, #88b2dd);
-	--color_b_5: light-dark(#298e29, #66c266);
-	--color_c_5: light-dark(#d22d2d, #dd4040);
-	--color_d_5: light-dark(#6a40bf, #a68cd9);
-	--color_e_5: light-dark(#ad9625, #e2cb5a);
-	--color_f_5: light-dark(#6a3e1b, #b08b6d);
-	--color_g_5: light-dark(#e03e81, #ea7ba9);
-	--color_h_5: light-dark(#f24e0d, #f67c4c);
-	--color_i_5: light-dark(#19b3b3, #79ecec);
-	--color_j_5: light-dark(#2e9e82, #61d1b5);
+	--text_50: light-dark(#8e8075, #8b7c71);
+	--palette_a_50: light-dark(#4c82b9, #548eca);
+	--palette_b_50: light-dark(#568e56, #5f9b5f);
+	--palette_c_50: light-dark(#b3655a, #c36f63);
+	--palette_d_50: light-dark(#8471b4, #907cc5);
+	--palette_e_50: light-dark(#8f7e2d, #9c8a32);
+	--palette_f_50: light-dark(#98775c, #a68266);
+	--palette_g_50: light-dark(#af637e, #bf6d8a);
+	--palette_h_50: light-dark(#b1684d, #c17255);
+	--palette_i_50: light-dark(#008ea0, #059cae);
+	--palette_j_50: light-dark(#189281, #1e9f8d);
 }

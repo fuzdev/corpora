@@ -5,7 +5,7 @@
   import { addSource, removeSource } from './source.js';
   import { flush } from '$lib/flush.js';
   import type {
-    DEMEncoding,
+    RasterDEMSourceSpecification,
     RasterDEMTileSource as MaplibreRasterDEMTileSource,
   } from 'maplibre-gl';
 
@@ -18,7 +18,7 @@
     minzoom?: number;
     maxzoom?: number;
     volatile?: boolean;
-    encoding?: DEMEncoding;
+    encoding?: RasterDEMSourceSpecification['encoding'];
     redFactor?: number;
     greenFactor?: number;
     blueFactor?: number;
@@ -115,6 +115,14 @@
     }
   });
 </script>
+
+<!-- @component
+Add a raster DEM (elevation) tile source to the map. Use it with `Terrain` or with a `HillshadeLayer`.
+
+Place layer components inside this component's children and they use this source automatically. The children render only after the source is added. `encoding` and the factor props tell MapLibre how to decode the elevation from the tile colors.
+
+When `tiles` changes, the component updates the tiles of the existing source. The other props are applied only when the source is created.
+-->
 
 {#if source.value}
   {#key source.value}

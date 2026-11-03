@@ -29,9 +29,10 @@
  * @module
  */
 
-import { rpc_action, type ActionActorContext, type RpcAction } from '../actions/action_rpc.ts';
-import type { ConnectionCloser } from '../actions/connection_closer.ts';
-import { jsonrpc_errors } from '../http/jsonrpc_errors.ts';
+import { rpc_action, type ActionActorContext, type RpcAction } from '../actions/action_types.ts';
+import { queue_connection_close } from '../actions/connection_closer.ts';
+import { credential_type_required_error } from '../actions/perform_action.ts';
+import { jsonrpc_errors, ThrownJsonrpcError } from '../http/jsonrpc_errors.ts';
 import {
 	builtin_role_specs_by_name,
 	list_roles_with_grant_path,
@@ -39,14 +40,16 @@ import {
 	ROLE_KEEPER,
 	type RoleSchemaResult
 } from './role_schema.ts';
-import { has_role } from './request_context.ts';
+import { has_scoped_role } from './request_context.ts';
 import {
 	query_account_has_global_role,
 	query_account_has_active_global_role,
-	query_count_active_accounts_with_global_role
+	query_count_active_accounts_with_global_role_for_update
 } from './role_grant_queries.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
+import type { QueryDeps } from '../db/query_deps.ts';
 import { GRANT_PATH_ADMIN } from './grant_path_schema.ts';
+import { query_role_grant_offer_supersede_outgoing } from './role_grant_offer_queries.ts';
 import {
 	query_account_by_email,
 	query_account_by_id,
@@ -79,7 +82,7 @@ import {
 	query_app_settings_load_with_username,
 	query_app_settings_update
 } from './app_settings_queries.ts';
-import type { ActionFactoryDeps } from './deps.ts';
+import type { RevokingActionFactoryDeps } from './deps.ts';
 import { is_pg_unique_violation } from '../db/pg_error.ts';
 import {
 	ERROR_ACCOUNT_NOT_FOUND,
@@ -146,35 +149,28 @@ export interface AdminActionOptions {
 	 * `admin_account_list`.
 	 */
 	roles?: RoleSchemaResult;
-	/**
-	 * Live-connection closer — when set, `admin_session_revoke_all` and
-	 * `admin_token_revoke_all` handlers eagerly close affected WebSocket
-	 * sockets for the target account BEFORE emitting the corresponding
-	 * audit event. Mirrors the self-service surface (see
-	 * `AccountActionOptions.connection_closer`). `BackendWebsocketTransport`
-	 * satisfies this interface structurally. When absent, only the
-	 * listener-based close (`transports_ws_auth_guard`) runs.
-	 */
-	connection_closer?: ConnectionCloser | null;
 }
 
 /**
  * Create the admin-only RPC actions.
  *
- * @param deps - `ActionFactoryDeps` (`log`, `audit`). `log` drives RPC-
- *   internal error logging; `audit.emit` writes audit rows via the captured
- *   pool. The bound emitter encapsulates listener fan-out and the optional
- *   `AuditLogConfig`.
+ * @param deps - `RevokingActionFactoryDeps` (`log`, `audit`,
+ *   `connection_closer`). `log` drives RPC-internal error logging;
+ *   `audit.emit` writes a success row in the request transaction and a
+ *   failure row via the captured pool. The bound emitter
+ *   encapsulates listener fan-out and the optional `AuditLogConfig`.
+ *   `connection_closer` closes the target account's live connections after a
+ *   revoke-all, delete, or purge commits.
  * @param options - role schema for `grantable_roles` derivation
  * @returns the `RpcAction` array to spread into a `create_rpc_endpoint` call
  */
 export const create_admin_actions = (
-	deps: ActionFactoryDeps,
+	deps: RevokingActionFactoryDeps,
 	options: AdminActionOptions = {}
 ): Array<RpcAction> => {
 	const role_specs = options.roles?.role_specs ?? builtin_role_specs_by_name;
 	const grantable_roles = list_roles_with_grant_path(role_specs, GRANT_PATH_ADMIN);
-	const connection_closer = options.connection_closer ?? null;
+	const { connection_closer } = deps;
 
 	const account_list_handler = async (
 		input: AdminAccountListInput,
@@ -196,15 +192,22 @@ export const create_admin_actions = (
 		return { sessions };
 	};
 
-	const session_revoke_all_handler = async (
-		input: AdminSessionRevokeAllInput,
+	/**
+	 * Revoke every credential of one kind on an account — the body
+	 * `session_revoke_all_handler` and `token_revoke_all_handler` share,
+	 * differing only in the audit event and the revoke query.
+	 */
+	const revoke_all_for_account = async (
+		event_type: 'session_revoke_all' | 'token_revoke_all',
+		revoke: (deps: QueryDeps, account_id: string) => Promise<number>,
+		input: { account_id: Uuid },
 		ctx: ActionActorContext
-	): Promise<AdminSessionRevokeAllOutput> => {
+	): Promise<{ ok: true; count: number }> => {
 		const auth = ctx.auth;
 		const account = await query_account_by_id(ctx, input.account_id);
 		if (!account) {
-			deps.audit.emit(ctx, {
-				event_type: 'session_revoke_all',
+			await deps.audit.emit(ctx, {
+				event_type,
 				outcome: 'failure',
 				account_id: auth.account.id,
 				// `target_account_id` is null: the FK to `account` would reject
@@ -219,16 +222,16 @@ export const create_admin_actions = (
 			});
 			throw jsonrpc_errors.not_found('account', { reason: ERROR_ACCOUNT_NOT_FOUND });
 		}
-		const count = await query_session_revoke_all_for_account(ctx, input.account_id);
-		// Handler-side belt+suspenders — close the target account's live WS
-		// sockets BEFORE the audit emit so revocation lands even if the audit
-		// INSERT fails. Listener-based close (`transports_ws_auth_guard`
-		// registered via `audit.add_listener`) stays as a fail-safe for
-		// out-of-band emit sites. Idempotent — see
+		const count = await revoke(ctx, input.account_id);
+		// Close the target account's live connections once the revoke has
+		// committed — queued, so it never runs before the commit or on
+		// rollback, and it does not depend on the audit write below. Queued at
+		// every `count`, zero included. See
 		// `account_actions.ts::session_revoke_handler`.
-		if (connection_closer) {
-			connection_closer.close_sockets_for_account(input.account_id);
-		}
+		queue_connection_close(ctx, connection_closer, {
+			kind: 'account',
+			account_id: input.account_id
+		});
 		// TOCTOU window — admin B hard-deletes `input.account_id` between the
 		// pre-check above and this emit; the FK rejects the row, the audit
 		// emitter logs + swallows, and the operation goes unaudited. Bounded
@@ -238,8 +241,8 @@ export const create_admin_actions = (
 		// because the FK linkage powers the username-join in
 		// `audit_log_list_with_usernames`; losing it on every success row
 		// to harden a corner case isn't worth the query-shape change.
-		deps.audit.emit(ctx, {
-			event_type: 'session_revoke_all',
+		await deps.audit.emit(ctx, {
+			event_type,
 			account_id: auth.account.id,
 			target_account_id: input.account_id,
 			ip: ctx.client_ip,
@@ -248,45 +251,17 @@ export const create_admin_actions = (
 		return { ok: true, count };
 	};
 
-	const token_revoke_all_handler = async (
+	const session_revoke_all_handler = (
+		input: AdminSessionRevokeAllInput,
+		ctx: ActionActorContext
+	): Promise<AdminSessionRevokeAllOutput> =>
+		revoke_all_for_account('session_revoke_all', query_session_revoke_all_for_account, input, ctx);
+
+	const token_revoke_all_handler = (
 		input: AdminTokenRevokeAllInput,
 		ctx: ActionActorContext
-	): Promise<AdminTokenRevokeAllOutput> => {
-		const auth = ctx.auth;
-		const account = await query_account_by_id(ctx, input.account_id);
-		if (!account) {
-			deps.audit.emit(ctx, {
-				event_type: 'token_revoke_all',
-				outcome: 'failure',
-				account_id: auth.account.id,
-				// See `session_revoke_all_handler` — FK forces null here; the
-				// probed id lives under `metadata.attempted_account_id`.
-				target_account_id: null,
-				ip: ctx.client_ip,
-				metadata: {
-					reason: ERROR_ACCOUNT_NOT_FOUND,
-					attempted_account_id: input.account_id
-				}
-			});
-			throw jsonrpc_errors.not_found('account', { reason: ERROR_ACCOUNT_NOT_FOUND });
-		}
-		const count = await query_revoke_all_api_tokens_for_account(ctx, input.account_id);
-		// Handler-side belt+suspenders — see `session_revoke_all_handler`.
-		if (connection_closer) {
-			connection_closer.close_sockets_for_account(input.account_id);
-		}
-		// TOCTOU window — see `session_revoke_all_handler` for the rationale on
-		// keeping `target_account_id` populated rather than switching to the
-		// failure-shape.
-		deps.audit.emit(ctx, {
-			event_type: 'token_revoke_all',
-			account_id: auth.account.id,
-			target_account_id: input.account_id,
-			ip: ctx.client_ip,
-			metadata: { count }
-		});
-		return { ok: true, count };
-	};
+	): Promise<AdminTokenRevokeAllOutput> =>
+		revoke_all_for_account('token_revoke_all', query_revoke_all_api_tokens_for_account, input, ctx);
 
 	const audit_log_list_handler = async (
 		input: AuditLogListInput,
@@ -356,7 +331,7 @@ export const create_admin_actions = (
 			throw err;
 		}
 
-		deps.audit.emit(ctx, {
+		await deps.audit.emit(ctx, {
 			event_type: 'invite_create',
 			account_id: auth.account.id,
 			ip: ctx.client_ip,
@@ -382,7 +357,7 @@ export const create_admin_actions = (
 		if (!deleted) {
 			throw jsonrpc_errors.not_found('invite', { reason: ERROR_INVITE_NOT_FOUND });
 		}
-		deps.audit.emit(ctx, {
+		await deps.audit.emit(ctx, {
 			event_type: 'invite_delete',
 			account_id: auth.account.id,
 			ip: ctx.client_ip,
@@ -400,9 +375,10 @@ export const create_admin_actions = (
 	//      keeper/daemon auth with no recovery (keeper role is non-web-
 	//      revocable and purge itself needs keeper auth). Out-of-band only.
 	//   2. **Last admin** — the sole remaining *active* admin is protected
-	//      (soft-deleted admins can't log in, so they don't count). Unlike
-	//      the keeper guard this is keeper-recoverable, but it stops an admin
-	//      tombstoning the last admin in one call.
+	//      (soft-deleted admins can't log in, so they don't count). The count
+	//      locks the rows it counted, so two removals racing for the last two
+	//      admins serialize and the second is refused — no web path re-grants
+	//      a lost admin. `role_grant_revoke` guards the admin grant the same way.
 	// A missing account holds neither role here and falls through to the
 	// handler's own not-found path. `event_type` selects the audit event so
 	// the failure row matches the operation in flight.
@@ -412,11 +388,11 @@ export const create_admin_actions = (
 		event_type: 'account_delete' | 'account_purge'
 	): Promise<void> => {
 		const auth = ctx.auth;
-		const deny = (
+		const deny = async (
 			reason: typeof ERROR_CANNOT_DELETE_KEEPER | typeof ERROR_CANNOT_DELETE_LAST_ADMIN,
 			message: string
-		): never => {
-			deps.audit.emit(ctx, {
+		): Promise<never> => {
+			await deps.audit.emit(ctx, {
 				event_type,
 				outcome: 'failure',
 				actor_id: auth.actor.id,
@@ -429,7 +405,7 @@ export const create_admin_actions = (
 		};
 		const verb = event_type === 'account_purge' ? 'purge' : 'delete';
 		if (await query_account_has_global_role(ctx, target_account_id, ROLE_KEEPER)) {
-			deny(ERROR_CANNOT_DELETE_KEEPER, `cannot ${verb} the keeper account`);
+			await deny(ERROR_CANNOT_DELETE_KEEPER, `cannot ${verb} the keeper account`);
 		}
 		// `_active_` variant: a tombstoned admin is already excluded from the
 		// active count, so removing it can't drop the tally — guarding it would
@@ -438,15 +414,48 @@ export const create_admin_actions = (
 		// unconditional; the last-admin branch fires only for an *active* target.
 		if (
 			(await query_account_has_active_global_role(ctx, target_account_id, ROLE_ADMIN)) &&
-			(await query_count_active_accounts_with_global_role(ctx, ROLE_ADMIN)) <= 1
+			(await query_count_active_accounts_with_global_role_for_update(ctx, ROLE_ADMIN)) <= 1
 		) {
-			deny(ERROR_CANNOT_DELETE_LAST_ADMIN, `cannot ${verb} the last admin account`);
+			await deny(ERROR_CANNOT_DELETE_LAST_ADMIN, `cannot ${verb} the last admin account`);
+		}
+	};
+
+	// Supersede every pending offer the removed account's actors made, audited
+	// — the cascade a revoke runs on the revokee's offers. An offer records no
+	// authority, so one outliving its grantor's account would still confer on
+	// accept. No supersede notification: a cascade notifies the grantor, and the
+	// grantor's connections close with its account. `cause_id` is the account.
+	const cancel_outgoing_offers = async (
+		ctx: ActionActorContext,
+		target_account_id: Uuid,
+		actors: ReadonlyArray<{ id: Uuid }>
+	): Promise<void> => {
+		const superseded = await query_role_grant_offer_supersede_outgoing(
+			ctx,
+			actors.map((a) => a.id)
+		);
+		for (const offer of superseded) {
+			await deps.audit.emit_role_grant_target(ctx, ctx.auth, {
+				event_type: 'role_grant_offer_supersede',
+				target_account_id: offer.to_account_id,
+				target_actor_id: offer.to_actor_id,
+				metadata: {
+					offer_id: offer.id,
+					role: offer.role,
+					scope_id: offer.scope_id,
+					reason: 'account_deleted',
+					cause_id: target_account_id
+				}
+			});
 		}
 	};
 
 	// Soft-delete an account (reversible tombstone). Self-or-admin:
-	// deleting another account requires the admin role. Tombstones the
-	// account + its actor(s), revokes sessions/tokens, closes sockets, and
+	// deleting another account requires the admin role. A self-delete is
+	// session-only — enforced here, not on the spec, whose gate stays open so
+	// an admin deleting another account keeps any credential. Tombstones the
+	// account + its actor(s), supersedes the pending offers its actors made,
+	// revokes sessions/tokens, closes sockets, and
 	// emits `account_delete` + one `actor_delete` per soft-deleted actor —
 	// each carrying its identity snapshot. `delete` = soft.
 	const account_delete_handler = async (
@@ -454,9 +463,19 @@ export const create_admin_actions = (
 		ctx: ActionActorContext
 	): Promise<AccountDeleteOutput> => {
 		const auth = ctx.auth;
+		// `Uuid` outputs lowercase, the form `auth.account.id` is in, so an
+		// uppercased own id still reads as self
 		const target_account_id = input.account_id ?? auth.account.id;
-		// Self-or-admin elevation: deleting someone else needs admin.
-		if (target_account_id !== auth.account.id && !has_role(auth, ROLE_ADMIN)) {
+		// Self path: a session only (API and daemon tokens alike), with the
+		// dispatcher's own credential-type refusal, before the guards below say
+		// anything about the account — a leaked token can't end its own account.
+		if (target_account_id === auth.account.id && ctx.credential_type !== 'session') {
+			const refusal = credential_type_required_error(['session']);
+			throw new ThrownJsonrpcError(refusal.code, refusal.message, refusal.data);
+		}
+		// Self-or-admin elevation: deleting someone else needs the **global**
+		// admin grant — a scoped `admin` row confers no cross-account authority.
+		if (target_account_id !== auth.account.id && !has_scoped_role(auth, ROLE_ADMIN, null)) {
 			throw jsonrpc_errors.forbidden('cannot delete another account', {
 				reason: ERROR_INSUFFICIENT_PERMISSIONS
 			});
@@ -468,7 +487,7 @@ export const create_admin_actions = (
 		const snapshot = await query_account_soft_delete(ctx, target_account_id, auth.actor.id);
 		if (!snapshot) {
 			// Missing or already soft-deleted — UUID probe key, failure audit is safe.
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'account_delete',
 				outcome: 'failure',
 				actor_id: auth.actor.id,
@@ -478,6 +497,7 @@ export const create_admin_actions = (
 			});
 			throw jsonrpc_errors.not_found('account', { reason: ERROR_ACCOUNT_NOT_FOUND });
 		}
+		await cancel_outgoing_offers(ctx, target_account_id, actors);
 		const soft_deleted_actors = [];
 		for (const actor of actors) {
 			if (await query_actor_soft_delete(ctx, actor.id, auth.actor.id)) {
@@ -486,8 +506,13 @@ export const create_admin_actions = (
 		}
 		await query_session_revoke_all_for_account(ctx, target_account_id);
 		await query_revoke_all_api_tokens_for_account(ctx, target_account_id);
-		if (connection_closer) connection_closer.close_sockets_for_account(target_account_id);
-		deps.audit.emit(ctx, {
+		// The tombstone ends every credential of the account; its connections
+		// close once that has committed.
+		queue_connection_close(ctx, connection_closer, {
+			kind: 'account',
+			account_id: target_account_id
+		});
+		await deps.audit.emit(ctx, {
 			event_type: 'account_delete',
 			actor_id: auth.actor.id,
 			account_id: auth.account.id,
@@ -496,7 +521,7 @@ export const create_admin_actions = (
 			metadata: { username: snapshot.username, email: snapshot.email }
 		});
 		for (const actor of soft_deleted_actors) {
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'actor_delete',
 				actor_id: auth.actor.id,
 				account_id: auth.account.id,
@@ -529,9 +554,12 @@ export const create_admin_actions = (
 		await assert_account_removable(ctx, input.account_id, 'account_purge');
 		// Snapshot actors before the cascade removes them.
 		const actors = await query_actors_by_account(ctx, input.account_id);
+		// Before the cascade, whose `ON DELETE CASCADE` would take the offers
+		// with no audit row.
+		await cancel_outgoing_offers(ctx, input.account_id, actors);
 		const snapshot = await query_purge_account(ctx, input.account_id);
 		if (!snapshot) {
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'account_purge',
 				outcome: 'failure',
 				actor_id: auth.actor.id,
@@ -541,13 +569,18 @@ export const create_admin_actions = (
 			});
 			throw jsonrpc_errors.not_found('account', { reason: ERROR_ACCOUNT_NOT_FOUND });
 		}
-		if (connection_closer) connection_closer.close_sockets_for_account(input.account_id);
+		// The cascade removed every credential of the account; its connections
+		// close once that has committed.
+		queue_connection_close(ctx, connection_closer, {
+			kind: 'account',
+			account_id: input.account_id
+		});
 		deps.log.warn(
 			`account hard-purged (irreversible cascading delete): ${input.account_id} by actor ${
 				auth.actor.id
 			}`
 		);
-		deps.audit.emit(ctx, {
+		await deps.audit.emit(ctx, {
 			event_type: 'account_purge',
 			actor_id: auth.actor.id,
 			account_id: auth.account.id,
@@ -556,7 +589,7 @@ export const create_admin_actions = (
 			metadata: { username: snapshot.username, email: snapshot.email }
 		});
 		for (const actor of actors) {
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'actor_purge',
 				actor_id: auth.actor.id,
 				account_id: auth.account.id,
@@ -585,7 +618,7 @@ export const create_admin_actions = (
 		const snapshot = await query_account_undelete(ctx, input.account_id);
 		if (!snapshot) {
 			// Missing or not soft-deleted — UUID probe key, failure audit is safe.
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'account_undelete',
 				outcome: 'failure',
 				actor_id: auth.actor.id,
@@ -601,7 +634,7 @@ export const create_admin_actions = (
 				undeleted_actors.push(actor);
 			}
 		}
-		deps.audit.emit(ctx, {
+		await deps.audit.emit(ctx, {
 			event_type: 'account_undelete',
 			actor_id: auth.actor.id,
 			account_id: auth.account.id,
@@ -610,7 +643,7 @@ export const create_admin_actions = (
 			metadata: { username: snapshot.username, email: snapshot.email }
 		});
 		for (const actor of undeleted_actors) {
-			deps.audit.emit(ctx, {
+			await deps.audit.emit(ctx, {
 				event_type: 'actor_undelete',
 				actor_id: auth.actor.id,
 				account_id: auth.account.id,
@@ -655,7 +688,7 @@ export const create_admin_actions = (
 		const { open_signup: old_value } = await query_app_settings_load(ctx);
 		await query_app_settings_update(ctx, input.open_signup, auth.actor.id);
 
-		deps.audit.emit(ctx, {
+		await deps.audit.emit(ctx, {
 			event_type: 'app_settings_update',
 			account_id: auth.account.id,
 			ip: ctx.client_ip,

@@ -7,15 +7,17 @@
 import { describe, test, assert } from 'vitest';
 import { z } from 'zod';
 
-import { BaseServerEnv, validate_server_env } from '$lib/server/env.ts';
-import { env_schema_to_surface } from '$lib/http/surface.ts';
-import type { SchemaFieldMeta } from '$lib/schema_meta.ts';
+import { BaseServerEnv, validate_server_env } from '#lib/server/env.ts';
+import { env_schema_to_surface } from '#lib/http/surface.ts';
+import type { SchemaFieldMeta } from '#lib/schema_meta.ts';
+import { parse_allowed_origins } from '#lib/http/origin.ts';
+import { admit_origin_wildcards } from '#lib/http/origin_wildcard.ts';
 
 /** Minimal valid env for BaseServerEnv (only required fields, no defaults). */
 const VALID_ENV: Record<string, string> = {
 	NODE_ENV: 'development',
 	SECRET_FUZ_COOKIE_KEYS: 'a'.repeat(32),
-	FUZ_ALLOWED_ORIGINS: 'http://localhost:*',
+	FUZ_ALLOWED_ORIGINS: 'http://localhost:5173',
 	DATABASE_URL: 'memory://'
 };
 
@@ -25,10 +27,35 @@ describe('BaseServerEnv', () => {
 		assert.strictEqual(result.NODE_ENV, 'development');
 		assert.strictEqual(result.PORT, 4040);
 		assert.strictEqual(result.HOST, 'localhost');
-		assert.strictEqual(result.PUBLIC_FUZ_API_URL, '/api');
 		assert.strictEqual(result.DATABASE_URL, 'memory://');
-		assert.strictEqual(result.PUBLIC_FUZ_WEBSOCKET_URL, undefined);
-		assert.strictEqual(result.SMTP_HOST, undefined);
+		assert.strictEqual(result.FUZ_BOOTSTRAP_TOKEN_PATH, undefined);
+	});
+
+	test('declares only the vars the spine reads (the Rust BaseServerEnv set)', () => {
+		assert.deepStrictEqual(Object.keys(BaseServerEnv.shape).sort(), [
+			'DATABASE_URL',
+			'FUZ_ALLOWED_ORIGINS',
+			'FUZ_ALLOW_ORIGIN_WILDCARDS',
+			'FUZ_BOOTSTRAP_TOKEN_PATH',
+			'FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS',
+			'FUZ_DB_CHECKOUT_TIMEOUT_MS',
+			'HOST',
+			'NODE_ENV',
+			'PORT',
+			'SECRET_FUZ_COOKIE_KEYS'
+		]);
+	});
+
+	test('rejects app-owned vars the spine does not read (strict)', () => {
+		for (const name of [
+			'FUZ_FACTS_DIR',
+			'FUZ_FACTS_X_ACCEL_REDIRECT_PREFIX',
+			'PUBLIC_FUZ_API_URL',
+			'SMTP_HOST'
+		]) {
+			const result = BaseServerEnv.safeParse({ ...VALID_ENV, [name]: '/x/' });
+			assert.isFalse(result.success, name);
+		}
 	});
 
 	test('parses full env', () => {
@@ -37,19 +64,12 @@ describe('BaseServerEnv', () => {
 			PORT: '8080',
 			HOST: '0.0.0.0',
 			DATABASE_URL: 'https://example.com/db',
-			PUBLIC_FUZ_API_URL: '/api/v2',
-			PUBLIC_FUZ_WEBSOCKET_URL: 'wss://example.com',
-			PUBLIC_FUZ_CONTACT_EMAIL: 'test@example.com',
-			SMTP_HOST: 'smtp.example.com',
-			SMTP_USER: 'noreply@example.com',
-			SMTP_PASSWORD: 'secret'
+			FUZ_BOOTSTRAP_TOKEN_PATH: '/tmp/token'
 		});
 		assert.strictEqual(result.PORT, 8080);
 		assert.strictEqual(result.HOST, '0.0.0.0');
 		assert.strictEqual(result.DATABASE_URL, 'https://example.com/db');
-		assert.strictEqual(result.PUBLIC_FUZ_API_URL, '/api/v2');
-		assert.strictEqual(result.SMTP_HOST, 'smtp.example.com');
-		assert.strictEqual(result.SMTP_USER, 'noreply@example.com');
+		assert.strictEqual(result.FUZ_BOOTSTRAP_TOKEN_PATH, '/tmp/token');
 	});
 
 	test('coerces PORT from string to number', () => {
@@ -84,6 +104,42 @@ describe('BaseServerEnv', () => {
 		assert.isFalse(result.success);
 	});
 
+	test('the pool checkout bounds read like PORT: unset, or whole ms from 1 to 600000', () => {
+		for (const name of [
+			'FUZ_DB_CHECKOUT_TIMEOUT_MS',
+			'FUZ_DB_AUDIT_CHECKOUT_TIMEOUT_MS'
+		] as const) {
+			// unset is the backend's default (5 s / 30 s), applied by `create_app_backend`
+			assert.strictEqual(BaseServerEnv.parse(VALID_ENV)[name], undefined);
+			for (const [value, expected] of [
+				['250', 250],
+				[' 250 ', 250],
+				['1', 1],
+				['600000', 600_000],
+				// `z.coerce`, like `PORT`: the Rust twin refuses this spelling
+				['5e3', 5000]
+			] as const) {
+				assert.strictEqual(BaseServerEnv.parse({ ...VALID_ENV, [name]: value })[name], expected);
+			}
+			for (const value of ['0', '-1', 'abc', '600001', '', '  ', '1.5']) {
+				const result = BaseServerEnv.safeParse({ ...VALID_ENV, [name]: value });
+				assert.isFalse(result.success, `${name}=${JSON.stringify(value)}`);
+			}
+		}
+	});
+
+	test('FUZ_ALLOW_ORIGIN_WILDCARDS is exactly true or false', () => {
+		assert.strictEqual(BaseServerEnv.parse(VALID_ENV).FUZ_ALLOW_ORIGIN_WILDCARDS, undefined);
+		for (const value of ['true', 'false']) {
+			const result = BaseServerEnv.parse({ ...VALID_ENV, FUZ_ALLOW_ORIGIN_WILDCARDS: value });
+			assert.strictEqual(result.FUZ_ALLOW_ORIGIN_WILDCARDS, value);
+		}
+		for (const value of ['', ' ', 'TRUE', 'True', '1', 'yes', 'on', ' true', 'true ', '0']) {
+			const result = BaseServerEnv.safeParse({ ...VALID_ENV, FUZ_ALLOW_ORIGIN_WILDCARDS: value });
+			assert.isFalse(result.success, JSON.stringify(value));
+		}
+	});
+
 	test('rejects empty FUZ_ALLOWED_ORIGINS', () => {
 		const result = BaseServerEnv.safeParse({
 			...VALID_ENV,
@@ -103,16 +159,6 @@ describe('BaseServerEnv', () => {
 		assert.isFalse(result.success);
 	});
 
-	test('allows empty string for PUBLIC_FUZ_CONTACT_EMAIL', () => {
-		const result = BaseServerEnv.parse({ ...VALID_ENV, PUBLIC_FUZ_CONTACT_EMAIL: '' });
-		assert.strictEqual(result.PUBLIC_FUZ_CONTACT_EMAIL, '');
-	});
-
-	test('allows empty string for SMTP_USER', () => {
-		const result = BaseServerEnv.parse({ ...VALID_ENV, SMTP_USER: '' });
-		assert.strictEqual(result.SMTP_USER, '');
-	});
-
 	test('is extensible via .extend()', () => {
 		const extended = BaseServerEnv.extend({
 			ADMIN_TOKEN: z.string().min(10)
@@ -124,7 +170,7 @@ describe('BaseServerEnv', () => {
 		assert.isTrue(result.success);
 	});
 
-	test('all 15 fields have .meta() with description', () => {
+	test('every field has .meta() with a description', () => {
 		for (const [name, field_schema] of Object.entries(BaseServerEnv.shape)) {
 			const meta = (field_schema as z.ZodType).meta() as { description?: string } | undefined;
 			assert.ok(meta, `${name} should have .meta()`);
@@ -132,7 +178,7 @@ describe('BaseServerEnv', () => {
 		}
 	});
 
-	test('5 fields have sensitivity: secret', () => {
+	test('the secret fields carry sensitivity: secret', () => {
 		const secret_fields: Array<string> = [];
 		for (const [name, field_schema] of Object.entries(BaseServerEnv.shape)) {
 			const meta = (field_schema as z.ZodType).meta() as SchemaFieldMeta | undefined;
@@ -143,9 +189,7 @@ describe('BaseServerEnv', () => {
 		assert.deepStrictEqual(secret_fields.sort(), [
 			'DATABASE_URL',
 			'FUZ_BOOTSTRAP_TOKEN_PATH',
-			'SECRET_FUZ_COOKIE_KEYS',
-			'SMTP_PASSWORD',
-			'SMTP_USER'
+			'SECRET_FUZ_COOKIE_KEYS'
 		]);
 	});
 
@@ -161,17 +205,18 @@ describe('BaseServerEnv', () => {
 });
 
 describe('env_schema_to_surface', () => {
-	test('returns 15 entries for BaseServerEnv', () => {
+	test('returns one entry per BaseServerEnv field', () => {
 		const entries = env_schema_to_surface(BaseServerEnv);
-		assert.strictEqual(entries.length, 15);
+		assert.deepStrictEqual(
+			entries.map((e) => e.name),
+			Object.keys(BaseServerEnv.shape)
+		);
 	});
 
 	test('optional fields detected correctly', () => {
 		const entries = env_schema_to_surface(BaseServerEnv);
 		const optional_names = entries.filter((e) => e.optional).map((e) => e.name);
 		assert.notInclude(optional_names, 'DATABASE_URL');
-		assert.include(optional_names, 'SMTP_HOST');
-		assert.include(optional_names, 'PUBLIC_FUZ_WEBSOCKET_URL');
 		assert.include(optional_names, 'FUZ_BOOTSTRAP_TOKEN_PATH');
 	});
 
@@ -180,7 +225,6 @@ describe('env_schema_to_surface', () => {
 		const default_names = entries.filter((e) => e.has_default).map((e) => e.name);
 		assert.include(default_names, 'PORT');
 		assert.include(default_names, 'HOST');
-		assert.include(default_names, 'PUBLIC_FUZ_API_URL');
 	});
 
 	test('required non-default fields detected correctly', () => {
@@ -204,7 +248,7 @@ describe('env_schema_to_surface', () => {
 		const entries = env_schema_to_surface(BaseServerEnv);
 		const secret_names = entries.filter((e) => e.sensitivity === 'secret').map((e) => e.name);
 		assert.include(secret_names, 'SECRET_FUZ_COOKIE_KEYS');
-		assert.include(secret_names, 'SMTP_PASSWORD');
+		assert.include(secret_names, 'DATABASE_URL');
 		const port_entry = entries.find((e) => e.name === 'PORT')!;
 		assert.strictEqual(port_entry.sensitivity, null);
 	});
@@ -224,6 +268,46 @@ describe('validate_server_env', () => {
 		assert.isArray(result.allowed_origins);
 		assert.isAbove(result.allowed_origins.length, 0);
 		assert.strictEqual(result.bootstrap_token_path, '/tmp/token');
+		assert.isFalse(result.allow_origin_wildcards);
+	});
+
+	test('the wildcard opt-in reads through to allow_origin_wildcards', () => {
+		for (const [value, expected] of [
+			[undefined, false],
+			['false', false],
+			['true', true]
+		] as const) {
+			const env = BaseServerEnv.parse({
+				...VALID_ENV,
+				...(value === undefined ? {} : { FUZ_ALLOW_ORIGIN_WILDCARDS: value })
+			});
+			const result = validate_server_env(env);
+			assert.ok(result.ok);
+			assert.strictEqual(result.allow_origin_wildcards, expected, String(value));
+		}
+	});
+
+	test('a wildcard entry without the opt-in is refused, as create_app_server would', () => {
+		for (const value of [undefined, 'false'] as const) {
+			const env = BaseServerEnv.parse({
+				...VALID_ENV,
+				FUZ_ALLOWED_ORIGINS: 'http://localhost:5173, http://localhost:*',
+				...(value === undefined ? {} : { FUZ_ALLOW_ORIGIN_WILDCARDS: value })
+			});
+			const result = validate_server_env(env);
+			assert.ok(!result.ok);
+			assert.strictEqual(result.field, 'FUZ_ALLOWED_ORIGINS');
+			const refusal = admit_origin_wildcards(
+				parse_origins('http://localhost:5173, http://localhost:*'),
+				false
+			);
+			assert.ok(!refusal.ok);
+			assert.deepStrictEqual(result.errors, [refusal.message]);
+			assert.ok(
+				refusal.message.startsWith('FUZ_ALLOWED_ORIGINS holds a wildcard entry'),
+				refusal.message
+			);
+		}
 	});
 
 	test('invalid cookie keys returns error with field', () => {
@@ -268,10 +352,18 @@ describe('validate_server_env', () => {
 	test('multiple origin patterns produce correct array length', () => {
 		const env = BaseServerEnv.parse({
 			...VALID_ENV,
-			FUZ_ALLOWED_ORIGINS: 'http://localhost:*,https://example.com,https://*.fuz.dev'
+			FUZ_ALLOWED_ORIGINS: 'http://localhost:*,https://example.com,https://*.fuz.dev',
+			FUZ_ALLOW_ORIGIN_WILDCARDS: 'true'
 		});
 		const result = validate_server_env(env);
 		assert.isTrue(result.ok);
 		assert.strictEqual(result.allowed_origins.length, 3);
 	});
 });
+
+/** The matchers `parse_allowed_origins` builds for `raw`. */
+const parse_origins = (raw: string): Array<RegExp> => {
+	const result = parse_allowed_origins(raw);
+	if (!result.ok) throw new Error(raw);
+	return result.origins;
+};

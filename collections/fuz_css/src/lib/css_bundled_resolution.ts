@@ -6,9 +6,8 @@
  * on what elements and classes are actually used in the project.
  *
  * This module provides low-level CSS resolution for advanced use cases.
- * Most users should use `gen_fuz_css` (Gro) or `vite_plugin_fuz_css` (Vite)
- * which handle extraction and caching automatically. See those modules for
- * reference implementations.
+ * Most users should use `vite_plugin_fuz_css`, which handles extraction and
+ * caching automatically. See that module for a reference implementation.
  *
  * @module
  */
@@ -27,8 +26,7 @@ import {
 	get_all_variable_names,
 	find_similar_variable
 } from './variable_graph.ts';
-import { type CssClassVariableIndex, collect_class_variables } from './class_variable_index.ts';
-import { FUZ_LAYER_ORDER_STATEMENT } from './theme.ts';
+import { FUZ_BAKED_THEME_LAYER, FUZ_LAYER_ORDER_STATEMENT } from './theme.ts';
 
 /**
  * Threshold for string similarity to suggest typo corrections.
@@ -94,26 +92,10 @@ const find_similar_name = (name: string, known_names: Set<string>): string | nul
 };
 
 /**
- * Statistics from CSS resolution (only included when `include_stats` is true).
- */
-export interface CssResolutionStats {
-	/** Number of HTML elements included */
-	element_count: number;
-	/** List of HTML element names included */
-	elements: Array<string>;
-	/** Number of rules included from `style.css` */
-	included_rules: number;
-	/** Total number of rules in `style.css` */
-	total_rules: number;
-	/** Number of CSS variables resolved (including transitive deps) */
-	variable_count: number;
-}
-
-/**
  * Result from CSS resolution.
  */
 export interface CssResolutionResult {
-	/** CSS for theme variables (light and dark) */
+	/** CSS for theme variables (base and dark) */
 	theme_css: string;
 	/** CSS for base styles (from `style.css`), destined for `fuz.base` */
 	base_css: string;
@@ -127,8 +109,6 @@ export interface CssResolutionResult {
 	included_elements: Set<string>;
 	/** Diagnostics from resolution */
 	diagnostics: Array<GenerationDiagnostic>;
-	/** Resolution statistics (only when `include_stats` is true) */
-	stats?: CssResolutionStats;
 }
 
 /**
@@ -139,8 +119,6 @@ export interface CssResolutionOptions {
 	style_rule_index: StyleRuleIndex;
 	/** Dependency graph for theme variables */
 	variable_graph: VariableDependencyGraph;
-	/** Index mapping classes to variables */
-	class_variable_index: CssClassVariableIndex;
 	/** HTML elements detected in source files */
 	detected_elements: Set<string>;
 	/** CSS classes detected in source files */
@@ -153,8 +131,6 @@ export interface CssResolutionOptions {
 	additional_elements?: Iterable<string> | 'all';
 	/** Additional variables to always include, or 'all' to include all theme variables */
 	additional_variables?: Iterable<string> | 'all';
-	/** Whether to include resolution statistics in result */
-	include_stats?: boolean;
 	/** Warn when detected elements have no matching style rules (default false) */
 	warn_unmatched_elements?: boolean;
 	/**
@@ -182,9 +158,9 @@ export interface CssResolutionOptions {
  *
  * Algorithm:
  * 1. Collect rules: core rules + element-matching + class-matching
- * 2. Collect variables: from rules, class defs, utility generation, detected vars, additional_variables
+ * 2. Collect variables: from rules, generated utility CSS, detected vars, additional_variables
  * 3. Resolve transitive variable dependencies
- * 4. Generate output: theme_css (light+dark), base_css (source order)
+ * 4. Generate output: theme_css (base+dark), base_css (source order)
  *
  * @param options - resolution options including indexes, detected usage, and config
  * @returns resolution result with theme CSS, base CSS, and diagnostics
@@ -193,14 +169,12 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 	const {
 		style_rule_index,
 		variable_graph,
-		class_variable_index,
 		detected_elements,
 		detected_classes,
 		detected_css_variables,
 		utility_variables_used,
 		additional_elements,
 		additional_variables,
-		include_stats = false,
 		warn_unmatched_elements = false,
 		exclude_elements: raw_exclude_elements,
 		exclude_variables: raw_exclude_variables,
@@ -208,7 +182,13 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 		explicit_variables
 	} = options;
 
-	const diagnostics: Array<GenerationDiagnostic> = [];
+	// the stylesheet's own parse diagnostics (constructs it contains that
+	// don't belong in a base stylesheet) and the theme values the graph left
+	// out surface with every resolution of them
+	const diagnostics: Array<GenerationDiagnostic> = [
+		...style_rule_index.diagnostics,
+		...variable_graph.diagnostics
+	];
 	const included_elements: Set<string> = new Set();
 
 	// Convert to Sets once for safe re-iteration and O(1) lookup
@@ -328,26 +308,20 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 		referenced_variables.add(v);
 	}
 
-	// b) Variables from class definitions (static classes that will be generated)
-	const class_variables = collect_class_variables(class_variable_index, detected_classes);
-	for (const v of class_variables) {
-		all_variables.add(v);
-		referenced_variables.add(v);
-	}
-
-	// c) Variables from utility class generation (collected during generation)
+	// b) Variables from utility class generation (collected during generation) - the
+	// CSS actually emitted, so composite and literal classes count too
 	for (const v of utility_variables_used) {
 		all_variables.add(v);
 		referenced_variables.add(v);
 	}
 
-	// d) Variables directly referenced in source files
+	// c) Variables directly referenced in source files
 	for (const v of detected_css_variables) {
 		all_variables.add(v);
 		referenced_variables.add(v);
 	}
 
-	// e) User-specified additional_variables (or all if 'all')
+	// d) User-specified additional_variables (or all if 'all')
 	if (include_all_variables) {
 		for (const v of get_all_variable_names(variable_graph)) {
 			all_variables.add(v);
@@ -358,31 +332,36 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 		}
 	}
 
-	// g) Remove excluded variables. Warn when an excluded variable is actually referenced by
-	// shipped CSS - its `var()` would resolve to nothing. Force-included-only variables and
-	// unknown (non-theme) names are dropped silently, since neither leaves a dangling reference.
+	// e) Resolve transitive variable dependencies, leaving out excluded variables
+	// and what only they depend on. Warn when an excluded variable is referenced
+	// by shipped CSS or depended on by a shipped variable - its `var()` would
+	// resolve to nothing unless something else defines it. Force-included-only
+	// variables and unknown (non-theme) names are dropped silently, since
+	// neither leaves a dangling reference.
+	const resolution = resolve_variables_transitive(
+		variable_graph,
+		all_variables,
+		exclude_variables ?? undefined
+	);
+	const resolved_variables = resolution.variables;
 	if (exclude_variables) {
 		const known_var_names = get_all_variable_names(variable_graph);
 		for (const v of exclude_variables) {
-			if (referenced_variables.has(v) && known_var_names.has(v)) {
-				diagnostics.push({
-					phase: 'generation',
-					level: 'warning',
-					message: `Variable "--${
-						v
-					}" is referenced by included styles but excluded via exclude_variables - references to it will be undefined`,
-					suggestion: 'Remove it from exclude_variables, or define the variable elsewhere.',
-					identifier: v,
-					locations: null
-				});
-			}
-			all_variables.delete(v);
+			if (!known_var_names.has(v)) continue;
+			const referenced = referenced_variables.has(v);
+			if (!referenced && !resolution.excluded.has(v)) continue;
+			diagnostics.push({
+				phase: 'generation',
+				level: 'warning',
+				message: `Variable "--${v}" is ${
+					referenced ? 'referenced by included styles' : 'required by included theme variables'
+				} but excluded via exclude_variables - references to it will be undefined`,
+				suggestion: 'Remove it from exclude_variables, or define the variable elsewhere.',
+				identifier: v,
+				locations: null
+			});
 		}
 	}
-
-	// Step 4: Resolve transitive variable dependencies
-	const resolution = resolve_variables_transitive(variable_graph, all_variables);
-	const resolved_variables = resolution.variables;
 
 	// Add any cycle warnings
 	for (const warning of resolution.warnings) {
@@ -413,25 +392,14 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 		// Variables not similar to any theme variable are assumed to be user-defined
 	}
 
-	// Step 5: Generate theme CSS
-	const { light_css, dark_css } = generate_theme_css(variable_graph, resolved_variables);
-	const theme_css = [light_css, dark_css].filter(Boolean).join('\n\n');
+	// Step 4: Generate theme CSS
+	const { root_css, dark_css } = generate_theme_css(variable_graph, resolved_variables);
+	const theme_css = [root_css, dark_css].filter(Boolean).join('\n\n');
 
-	// Step 6: Generate base CSS from matched rules, split by destination layer
+	// Step 5: Generate base CSS from matched rules, split by destination layer
 	const layered_css = generate_base_css_by_layer(style_rule_index, included_rule_indices);
 	const base_css = layered_css['fuz.base'];
 	const preferences_css = layered_css['fuz.preferences'];
-
-	// Build stats if requested
-	const stats = include_stats
-		? {
-				element_count: included_elements.size,
-				elements: [...included_elements],
-				included_rules: included_rule_indices.size,
-				total_rules: style_rule_index.rules.length,
-				variable_count: resolved_variables.size
-			}
-		: undefined;
 
 	return {
 		theme_css,
@@ -440,8 +408,7 @@ export const resolve_css = (options: CssResolutionOptions): CssResolutionResult 
 		resolved_variables,
 		included_rule_indices,
 		included_elements,
-		diagnostics,
-		stats
+		diagnostics
 	};
 };
 
@@ -453,13 +420,11 @@ export interface GenerateBundledCssOptions {
 	include_theme?: boolean;
 	/** Include base styles section. @default true */
 	include_base?: boolean;
-	/** Include utility classes section. @default true */
-	include_utilities?: boolean;
 	/**
 	 * A baked theme's own overlay (its variables + stance mirror +
-	 * `color-scheme` pin), rendered unlayered - emitted into the `fuz.theme`
-	 * layer so it outranks the `fuz.preferences` OS mappings the same way the
-	 * runtime renderer's output does.
+	 * `color-scheme` pin), rendered unlayered - emitted into the
+	 * `FUZ_BAKED_THEME_LAYER` sublayer so it outranks the `fuz.preferences` OS
+	 * mappings like the runtime renderer's output does, and loses to it.
 	 */
 	theme_overlay_css?: string | null;
 }
@@ -468,7 +433,7 @@ export interface GenerateBundledCssOptions {
  * Generates combined CSS output from resolution result.
  *
  * @param result - resolution result from `resolve_css`
- * @param utility_css - generated utility CSS (from `generate_classes_css`)
+ * @param utility_css - generated utility CSS, already layered (from `generate_classes_css`)
  * @param options - output options
  * @returns combined CSS string
  */
@@ -477,12 +442,7 @@ export const generate_bundled_css = (
 	utility_css: string,
 	options: GenerateBundledCssOptions = {}
 ): string => {
-	const {
-		include_theme = true,
-		include_base = true,
-		include_utilities = true,
-		theme_overlay_css = null
-	} = options;
+	const { include_theme = true, include_base = true, theme_overlay_css = null } = options;
 
 	const parts: Array<string> = [];
 
@@ -505,16 +465,17 @@ export const generate_bundled_css = (
 		parts.push(`@layer fuz.preferences {\n${result.preferences_css}\n}`);
 	}
 
-	// the baked theme's own overlay, above the preferences like at runtime
+	// the baked theme's own overlay, above the preferences like at runtime and
+	// in a sublayer so a runtime theme's direct `fuz.theme` styles outrank it
 	if (include_theme && theme_overlay_css) {
 		parts.push('/* Theme Overrides */');
-		parts.push(`@layer fuz.theme {\n${theme_overlay_css}\n}`);
+		parts.push(`@layer ${FUZ_BAKED_THEME_LAYER} {\n${theme_overlay_css}\n}`);
 	}
 
 	// Utility classes section
-	if (include_utilities && utility_css) {
+	if (utility_css) {
 		parts.push('/* Utility Classes */');
-		parts.push(`@layer fuz.utilities {\n${utility_css}\n}`);
+		parts.push(utility_css.trimEnd());
 	}
 
 	if (!parts.length) return '';

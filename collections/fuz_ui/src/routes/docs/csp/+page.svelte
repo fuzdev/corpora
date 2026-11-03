@@ -1,14 +1,14 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import GithubLink from '$lib/GithubLink.svelte';
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import { csp_directive_specs } from '$lib/csp.ts';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
+	import GithubLink from '#lib/GithubLink.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import { csp_directive_specs } from '#lib/csp.ts';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
 
 	const TOME_SLUG = 'csp';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -26,9 +26,8 @@
 			>
 				Content Security Policies
 			</MdnLink>
-			with the
-			<DeclarationLink name="create_csp_directives" />
-			helper. Fuz also provides related helpers, types, and CSP data.
+			with the <DeclarationLink name="create_csp_directives" /> helper. Fuz also provides related
+			helpers, types, and CSP data.
 		</p>
 		<p>
 			The API is designed to read as an audit log: every user-added source is named at exactly one
@@ -43,8 +42,8 @@
 
 // Default CSP — restrictive defaults from \`csp_directive_value_defaults\`.
 const csp = create_csp_directives();
-// Use in svelte.config.js:
-// export default {kit: {csp: {directives: csp}}}
+// Use in vite.config.ts:
+// sveltekit({csp: {directives: csp}})
 
 // Layer in your own sources per directive:
 const csp_with_sources = create_csp_directives({
@@ -107,11 +106,10 @@ const csp_blank = create_csp_directives({
 					<DeclarationLink name="CreateCspDirectivesOptions" />
 					<code>replace_defaults</code>
 				</strong>
-				— the starting state. Omitted, it's
-				<DeclarationLink name="csp_directive_value_defaults" />. Provided, it
-				<em>replaces the library defaults wholesale</em>: exactly the directives you list, nothing
-				inherited. <code>{'{}'}</code> starts blank; <code>null</code> throws (avoid the
-				null/undefined footgun where a conditional silently disables defaults).
+				— the starting state. Omitted, it's <DeclarationLink name="csp_directive_value_defaults" />.
+				Provided, it <em>replaces the library defaults wholesale</em>: exactly the directives you
+				list, nothing inherited. <code>{'{}'}</code> starts blank; <code>null</code> throws (avoid
+				the null/undefined footgun where a conditional silently disables defaults).
 			</li>
 			<li>
 				<strong><code>extend</code></strong> — sources to append per directive, layered left to
@@ -171,8 +169,7 @@ create_csp_directives({
 			<code>overrides</code> cannot rescue an <code>extend</code> for a default-deny directive in
 			the same call: extend runs first and throws before <code>overrides</code> would replace the
 			value. Move the sources into <code>overrides</code> directly, or opt in via
-			<code>replace_defaults</code>
-			and then extend.
+			<code>replace_defaults</code> and then extend.
 		</p>
 	</TomeSection>
 
@@ -180,8 +177,7 @@ create_csp_directives({
 		<TomeSectionHeader text="Replacing values via overrides" />
 		<p>
 			The final-pass <code>overrides</code> option replaces a directive's value or removes it
-			entirely. Highest precedence. Wins over <code>replace_defaults</code> and
-			<code>extend</code>.
+			entirely. Highest precedence. Wins over <code>replace_defaults</code> and <code>extend</code>.
 		</p>
 		<Code
 			lang="ts"
@@ -250,8 +246,7 @@ create_csp_directives({replace_defaults: {}, overrides: {/* ... */}});`}
 		<ul>
 			<li>
 				Unknown directive keys in any of <code>replace_defaults</code>, <code>extend</code>, or
-				<code>overrides</code>
-				throw with the offending name.
+				<code>overrides</code> throw with the offending name.
 			</li>
 			<li>
 				Extending a directive whose current value is <code>['none']</code> throws. Opt in via
@@ -260,8 +255,7 @@ create_csp_directives({replace_defaults: {}, overrides: {/* ... */}});`}
 			<li>
 				<code>null</code> for <code>replace_defaults</code> (top-level or per-key) throws. Omit the
 				option for library defaults, pass <code>{'{}'}</code> to start blank, or use
-				<code>overrides</code>
-				to remove a specific directive.
+				<code>overrides</code> to remove a specific directive.
 			</li>
 			<li>
 				<code>null</code> per-key in <code>extend</code> throws with a pointer to
@@ -271,13 +265,11 @@ create_csp_directives({replace_defaults: {}, overrides: {/* ... */}});`}
 			<li>
 				<code>undefined</code> per-key in any of the three stages is treated as omitted (no-op).
 				This lets conditional patterns like
-				<code>{"{'connect-src': is_prod ? [API_URL] : undefined}"}</code>
-				work naturally.
+				<code>{"{'connect-src': is_prod ? [API_URL] : undefined}"}</code> work naturally.
 			</li>
 			<li>
 				Non-object entries in <code>extend</code> (e.g. <code>extend: [undefined]</code>) throw a
-				library error pointing at the option, instead of a cryptic native
-				<code>TypeError</code>.
+				library error pointing at the option, instead of a cryptic native <code>TypeError</code>.
 			</li>
 			<li>
 				The output is validated to ensure <code>'none'</code> never appears alongside other tokens
@@ -291,8 +283,7 @@ create_csp_directives({replace_defaults: {}, overrides: {/* ... */}});`}
 			<li>
 				Source arrays are validated to contain only strings. Non-string elements (slipped through
 				via <code>as any</code>) would render as <code>undefined</code> or
-				<code>[object Object]</code>
-				in the emitted header.
+				<code>[object Object]</code> in the emitted header.
 			</li>
 		</ul>
 	</TomeSection>
@@ -325,10 +316,8 @@ create_csp_directives({replace_defaults: {}, overrides: {/* ... */}});`}
 		</table>
 	</TomeSection>
 	<aside>
-		For more, see the <GithubLink path="fuzdev/fuz_ui/blob/main/src/lib/csp.ts">
-			source code
-		</GithubLink>
-		and tests in
+		For more, see the
+		<GithubLink path="fuzdev/fuz_ui/blob/main/src/lib/csp.ts">source code</GithubLink> and tests in
 		<GithubLink path="fuzdev/fuz_ui/tree/main/src/test">src/test/csp.*.test.ts</GithubLink>.
 	</aside>
 </TomeContent>

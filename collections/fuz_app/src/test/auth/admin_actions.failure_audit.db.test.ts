@@ -17,17 +17,13 @@ import {
 	admin_session_revoke_all_action_spec,
 	admin_token_revoke_all_action_spec,
 	audit_log_list_action_spec
-} from '$lib/auth/admin_action_specs.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import {
-	RPC_PATH,
-	create_admin_route_specs,
-	describe_db,
-	session_options
-} from './admin_rpc_test_helpers.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { RPC_PATH, create_admin_route_specs, session_options } from './admin_rpc_test_helpers.ts';
 
 // Valid v4 UUID that won't collide with bootstrap/test accounts. Must be
 // version-4 because `Uuid = z.uuid()` rejects non-RFC-4122 shapes.

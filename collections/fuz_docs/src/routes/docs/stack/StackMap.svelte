@@ -71,17 +71,17 @@
 
 	/**
 	 * Category → fuz_css color token. Eight distinguishable hues from the design
-	 * system's saturated mid-shade palette (`--color_*_50`).
+	 * system's saturated mid-shade palette (`--palette_*_50`).
 	 */
 	const category_colors: Record<StackCategory, string> = {
-		foundation: 'var(--color_a_50)', // blue
-		build: 'var(--color_f_50)', // brown
-		styling: 'var(--color_g_50)', // pink
-		ui: 'var(--color_d_50)', // purple
-		fullstack: 'var(--color_i_50)', // cyan
-		tooling: 'var(--color_e_50)', // yellow
-		app: 'var(--color_b_50)', // green
-		site: 'var(--color_h_50)' // orange
+		foundation: 'var(--palette_a_50)', // blue
+		build: 'var(--palette_f_50)', // brown
+		styling: 'var(--palette_g_50)', // pink
+		ui: 'var(--palette_d_50)', // purple
+		fullstack: 'var(--palette_i_50)', // cyan
+		tooling: 'var(--palette_e_50)', // yellow
+		app: 'var(--palette_b_50)', // green
+		site: 'var(--palette_h_50)' // orange
 	};
 
 	/** Human-readable legend labels for each category, in display order. */
@@ -99,10 +99,10 @@
 
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { browser } from '$app/environment';
+	import { browser } from '$app/env';
 
 	import { stack_nodes, stack_edges } from './stack_graph.ts';
-	import type { StackNode, StackEdge, StackCategory } from '$lib/stack_graph_types.ts';
+	import type { StackNode, StackEdge, StackCategory } from '#lib/stack_graph_types.ts';
 
 	// Camera (`$state` not raw so in-place `.tx`/`.ty`/`.scale` mutations stay reactive).
 	let camera: Viewport = $state({ scale: 1, tx: 0, ty: 0 });
@@ -435,9 +435,9 @@
 		>
 			<strong>{hovered_node.name}</strong>
 			<p class="description">{hovered_node.description}</p>
-			<small class="color_c">
-				depended on by {dependents_count.get(hovered_node.name) ?? 0} · depends
-				on {dependency_count.get(hovered_node.name) ?? 0}
+			<small>
+				depended on by {dependents_count.get(hovered_node.name) ?? 0} · depends on
+				{dependency_count.get(hovered_node.name) ?? 0}
 			</small>
 		</div>
 	{/if}
@@ -458,7 +458,7 @@
 				</span>
 			{/each}
 		</div>
-		<small class="color_c help">
+		<small class="help">
 			drag to pan · scroll to zoom · click a node to trace its dependencies
 		</small>
 	</div>
@@ -484,7 +484,7 @@
 		cursor: grabbing;
 	}
 	.edge {
-		stroke: var(--border_color, #4a4e57);
+		stroke: var(--border_color);
 		stroke-width: 1.5;
 		opacity: 0.5;
 		transition: opacity 0.12s ease;
@@ -500,31 +500,31 @@
 		opacity: 0.2;
 	}
 	.disc {
-		stroke: var(--bg, #0d0e11);
+		stroke: var(--shade_00);
 		stroke-width: 2;
 	}
 	/* non-ts languages get a distinct ring */
 	.disc.lang-wasm,
 	.disc.lang-rust {
-		stroke: var(--text_color, #cdd2db);
+		stroke: var(--text_color);
 		stroke-dasharray: 3 2;
 	}
 	.node.selected .disc {
-		stroke: var(--text_color, #fff);
+		stroke: var(--text_color);
 		stroke-width: 3;
 		stroke-dasharray: none;
 	}
 	.label {
-		fill: var(--text_color, #cdd2db);
+		fill: var(--text_color);
 		font-size: 12px;
-		font-family: var(--font_family_mono, ui-monospace, monospace);
+		font-family: var(--font_family_mono);
 		user-select: none;
 		pointer-events: none;
 	}
 	.badge {
-		fill: var(--text_color, #cdd2db);
+		fill: var(--text_color);
 		font-size: 9px;
-		font-family: var(--font_family_mono, ui-monospace, monospace);
+		font-family: var(--font_family_mono);
 		text-transform: uppercase;
 		user-select: none;
 		pointer-events: none;
@@ -550,7 +550,7 @@
 		display: inline-block;
 		width: 0.9rem;
 		height: 0.9rem;
-		border-radius: var(--border_radius_xs, 2px);
+		border-radius: var(--border_radius_xs);
 	}
 	.help {
 		opacity: 0.8;

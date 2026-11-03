@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { styleText as st } from 'node:util';
 import { analyzeFromFiles } from 'svelte-docinfo';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
@@ -11,10 +11,17 @@ import {
 } from '@fuzdev/fuz_util/git.ts';
 import { fs_exists } from '@fuzdev/fuz_util/fs.ts';
 import { PackageJson } from '@fuzdev/fuz_util/package_json.ts';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 import { library_json_from_modules, type LibraryJson } from '@fuzdev/fuz_util/library_json.ts';
 import { to_error_message } from '@fuzdev/fuz_util/error.ts';
 
-import { GRO_DIRNAME } from './constants.ts';
+import {
+	GRO_DIRNAME,
+	SVELTEKIT_TSCONFIG_PATH,
+	SVELTEKIT_TSCONFIG_SPECIFIER,
+	TSCONFIG_FILENAME
+} from './constants.ts';
+import { sveltekit_tsconfig_is_unsynced } from './sveltekit_helpers.ts';
 
 /**
  * Cache filename inside a repo's `.gro` directory for `library_load_from_repo`.
@@ -180,8 +187,18 @@ export const library_cache_write = async (
  * uncacheable, so analysis re-runs on every load until the changes are
  * committed - see `library_cache_key`.
  *
+ * Refuses to analyze a repo whose `tsconfig.json` extends `$app/tsconfig` but
+ * that hasn't been synced (see `sveltekit_tsconfig_is_unsynced`): its analysis
+ * would read external types as `any`. The check runs only on a cache miss - a
+ * cache hit is served as written. `svelte-docinfo` logs to a child of `log`
+ * labelled with the repo dir's name: its diagnostics as warnings and errors,
+ * its progress at debug level.
+ *
  * @param repo_dir - absolute path to the repo to analyze
  * @returns the repo's `LibraryLoadResult` (`library_json` + full `package_json`)
+ * @throws Error if the repo extends `$app/tsconfig` without
+ *   `node_modules/$app/tsconfig.json` - install its dependencies if needed, then
+ *   run `gro sync` in it
  */
 export const library_load_from_repo = async (
 	repo_dir: string,
@@ -199,12 +216,21 @@ export const library_load_from_repo = async (
 		if (cached !== null) return cached;
 	}
 
+	if (await sveltekit_tsconfig_is_unsynced(repo_dir)) {
+		throw Error(
+			`library_load_from_repo: ${join(repo_dir, TSCONFIG_FILENAME)} extends` +
+				` \`${SVELTEKIT_TSCONFIG_SPECIFIER}\` but ${join(repo_dir, SVELTEKIT_TSCONFIG_PATH)} is missing,` +
+				` so external types would analyze as \`any\` - run \`npm install\` if its dependencies` +
+				` aren't installed, then \`gro sync\`, in ${repo_dir}`
+		);
+	}
+
 	log?.info('analyzing library', st('dim', `(${repo_dir})`));
 
 	// Read and validate the repo's package.json directly (not the CWD's).
 	const package_json_path = join(repo_dir, 'package.json');
 	const package_json_contents = await readFile(package_json_path, 'utf-8');
-	const package_json = PackageJson.parse(JSON.parse(package_json_contents));
+	const package_json = s.parse_or_throw(PackageJson, JSON.parse(package_json_contents));
 	if (!package_json.name) {
 		throw Error(`library_load_from_repo: missing \`name\` in ${package_json_path}`);
 	}
@@ -212,7 +238,16 @@ export const library_load_from_repo = async (
 		throw Error(`library_load_from_repo: missing \`version\` in ${package_json_path}`);
 	}
 
-	const { modules } = await analyzeFromFiles({ projectRoot: repo_dir });
+	// svelte-docinfo's progress lines are debug-level noise across many repos; keep its warnings
+	const analysis_log = log?.child(basename(repo_dir));
+	const { modules } = await analyzeFromFiles({
+		projectRoot: repo_dir,
+		log: analysis_log && {
+			info: (msg) => analysis_log.debug(msg),
+			warn: (msg) => analysis_log.warn(msg),
+			error: (msg) => analysis_log.error(msg)
+		}
+	});
 
 	const library_json = library_json_from_modules(package_json, modules);
 

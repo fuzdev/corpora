@@ -16,38 +16,27 @@ import { describe, test, assert } from 'vitest';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
 import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
-import { all_admin_action_specs } from '$lib/auth/admin_action_specs.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
+import { all_admin_action_specs } from '#lib/auth/admin_action_specs.ts';
 import {
 	all_role_grant_offer_action_specs,
 	ERROR_ROLE_GRANT_OFFER_NOT_AUTHORIZED,
 	role_grant_offer_create_action_spec
-} from '$lib/auth/role_grant_offer_action_specs.ts';
-import { all_account_action_specs } from '$lib/auth/account_action_specs.ts';
-import { create_stub_db, create_test_audit_emitter } from '$lib/testing/stubs.ts';
-import { create_test_context } from '$lib/testing/entities.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { ActionContext } from '$lib/actions/action_rpc.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+} from '#lib/auth/role_grant_offer_action_specs.ts';
+import { all_account_action_specs } from '#lib/auth/account_action_specs.ts';
+import { create_test_audit_emitter } from '#lib/testing/stubs.ts';
+import { create_test_context } from '#lib/testing/entities.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+
+import { create_test_action_context } from './rpc_test_helpers.ts';
+import { noop_connection_closer } from '#lib/actions/connection_closer.ts';
 
 const log = new Logger('test', { level: 'off' });
-const deps = { log, audit: create_test_audit_emitter() };
-
-/** Minimal ActionContext for invoking handlers directly. */
-const make_action_ctx = (auth_ctx: ReturnType<typeof create_test_context>): ActionContext => {
-	const db = create_stub_db();
-	return {
-		auth: auth_ctx,
-		request_id: 'test',
-		db,
-		pending_effects: [],
-		post_commit_effects: [],
-		client_ip: 'unknown',
-		credential_type: 'session',
-		log,
-		notify: () => {},
-		signal: new AbortController().signal
-	};
+const deps = {
+	log,
+	audit: create_test_audit_emitter(),
+	connection_closer: noop_connection_closer
 };
 
 describe('create_standard_rpc_actions', () => {
@@ -127,7 +116,7 @@ describe('create_standard_rpc_actions', () => {
 		assert.ok(create_action, 'combined surface must expose role_grant_offer_create');
 
 		const auth_ctx = create_test_context([{ role: ROLE_ADMIN }]);
-		const ctx = make_action_ctx(auth_ctx);
+		const ctx = create_test_action_context(auth_ctx);
 
 		const caught = (await assert_rejects(() =>
 			create_action.handler({ to_account_id: 'acct-target' as Uuid, role: ROLE_ADMIN }, ctx)

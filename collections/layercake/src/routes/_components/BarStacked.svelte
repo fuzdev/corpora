@@ -5,12 +5,12 @@
 
 	import BarStacked from '../../_components/BarStacked.svelte';
 
-	// This example loads csv data as json and converts numeric columns to numbers using @rollup/plugin-dsv. See vite.config.js for details
+	// The CSV rows are parsed, and their numbers typed, by @rollup/plugin-dsv. See vite.config.js
 	import data from '../../_data/fruitOrdinal.csv';
 
 	const xKey = [0, 1];
 	const yKey = 'year';
-	const zKey = 'key';
+	const cKey = 'key';
 
 	const seriesNames = Object.keys(data[0]).filter(d => d !== yKey);
 	const seriesColors = ['#00bbff', '#8bcef6', '#c4e2ed', '#f7f6e3'];
@@ -25,12 +25,12 @@
 		padding={{ top: 10 }}
 		x={xKey}
 		y={d => d.data[yKey]}
-		z={zKey}
+		c={cKey}
 		yScale={scaleBand().paddingInner(0.05).round(true)}
 		yDomain={[2016, 2017, 2018, 2019]}
-		zScale={scaleOrdinal()}
-		zDomain={seriesNames}
-		zRange={seriesColors}
+		cScale={scaleOrdinal()}
+		cDomain={seriesNames}
+		cRange={seriesColors}
 		flatData={flatten(series)}
 		data={series}
 	>
@@ -41,12 +41,7 @@
 </div>
 
 <style>
-	/*
-		The wrapper div needs to have an explicit width and height in CSS.
-		It can also be a flexbox child or CSS grid element.
-		The point being it needs dimensions since the <LayerCake> element will
-		expand to fill it.
-	*/
+	/* Give the wrapper a width and height. LayerCake fills it. */
 	.chart-container {
 		width: 100%;
 		height: 250px;

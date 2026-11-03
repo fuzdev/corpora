@@ -2,10 +2,10 @@
  * Database wrapper with duck-typed interface.
  *
  * Accepts any client with a query(text, values) method.
- * Both `pg.Pool` and `@electric-sql/pglite` satisfy this interface.
+ * `pg.Pool`, `@electric-sql/pglite` and `@fuzdev/pglet-wasm` all satisfy this interface.
  *
  * Transaction safety is provided by an injected `transaction` callback —
- * the driver adapters (`db/db_pg.ts`, `db/db_pglite.ts`) supply the driver-appropriate
+ * the driver adapters (`db/db_pg.ts`, `db/db_pglite.ts`, `db/db_pglet.ts`) supply the driver-appropriate
  * implementation. Close is handled externally (returned alongside the `Db`
  * as `DbDriverResult`), not as a method on this class.
  *
@@ -13,7 +13,7 @@
  */
 
 /**
- * Minimal interface that both pg and pglite satisfy.
+ * Minimal interface that pg, pglite and pglet satisfy.
  */
 export interface DbClient {
 	query: <T = unknown>(text: string, values?: Array<unknown>) => Promise<{ rows: Array<T> }>;
@@ -25,16 +25,24 @@ export interface DbClient {
  * `transaction` is injected by `create_db` which knows the driver.
  * For `pg`: acquires a dedicated pool client per transaction.
  * For PGlite: delegates to `pglite.transaction()`.
+ * For pglet: delegates to the adapter's `transaction()`.
  */
 export interface DbDeps {
 	client: DbClient;
 	transaction: <T>(fn: (tx_db: Db) => Promise<T>) => Promise<T>;
+	/**
+	 * A `Db` over the same pool whose checkouts are bounded by `timeout_ms` —
+	 * supplied by the pg adapter (`create_pg_db`). Omitted where there is no
+	 * pool (PGlite, pglet), so `Db.with_checkout_timeout` returns the `Db`
+	 * itself.
+	 */
+	with_checkout_timeout?: (timeout_ms: number) => Db;
 }
 
 /**
  * Result of constructing a driver-specific `Db`.
  *
- * Returned by `create_pg_db()` and `create_pglite_db()`.
+ * Returned by `create_pg_db()`, `create_pglite_db()` and `create_pglet_db_driver()`.
  * The `close` callback is bound to the actual driver — callers
  * never need to know which driver is in use.
  */
@@ -45,7 +53,7 @@ export interface DbDriverResult {
 }
 
 /** Database driver type. */
-export type DbType = 'postgres' | 'pglite-file' | 'pglite-memory';
+export type DbType = 'postgres' | 'pglite-file' | 'pglet-memory';
 
 /**
  * Sentinel transaction function for transaction-scoped `Db` instances.
@@ -62,8 +70,9 @@ export const no_nested_transaction: DbDeps['transaction'] = () => {
 /**
  * Database wrapper providing a consistent query and transaction interface.
  *
- * Construct via `create_pg_db()` from `db/db_pg.ts` or `create_pglite_db()` from
- * `db/db_pglite.ts` for proper transaction support, or via `create_db()` for
+ * Construct via `create_pg_db()` from `db/db_pg.ts`, `create_pglite_db()` from
+ * `db/db_pglite.ts` or `create_pglet_db_driver()` from `db/db_pglet.ts` for proper
+ * transaction support, or via `create_db()` for
  * URL-based auto-detection.
  *
  * @example
@@ -81,10 +90,38 @@ export class Db {
 	readonly client: DbClient;
 
 	readonly #transaction: <T>(fn: (tx_db: Db) => Promise<T>) => Promise<T>;
+	readonly #with_checkout_timeout: ((timeout_ms: number) => Db) | undefined;
 
 	constructor(options: DbDeps) {
 		this.client = options.client;
 		this.#transaction = options.transaction;
+		this.#with_checkout_timeout = options.with_checkout_timeout;
+	}
+
+	/**
+	 * A `Db` over the same pool whose statements check out under `timeout_ms`
+	 * instead of the pool's own bound — the audit emitter's longer wait
+	 * (`db/db_pg.ts`, "Checkout timeout"). With no pool (PGlite, pglet, a
+	 * transaction-scoped `Db`) there is no checkout to bound, and the `Db`
+	 * itself is returned.
+	 *
+	 * @param timeout_ms - the checkout bound, in ms
+	 * @returns a `Db` sharing this one's pool
+	 */
+	with_checkout_timeout(timeout_ms: number): Db {
+		return this.#with_checkout_timeout?.(timeout_ms) ?? this;
+	}
+
+	/**
+	 * Whether this `Db` is scoped to an open transaction — the `Db` a driver
+	 * adapter hands a `transaction` callback, which it builds with
+	 * `no_nested_transaction`. A pool-level `Db` answers `false`.
+	 *
+	 * The audit emitter reads it to write a success row inside the request's
+	 * transaction when one is open (`auth/audit_emitter.ts`).
+	 */
+	get in_transaction(): boolean {
+		return this.#transaction === no_nested_transaction;
 	}
 
 	/**

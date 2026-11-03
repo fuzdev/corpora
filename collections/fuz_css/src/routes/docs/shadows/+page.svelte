@@ -15,8 +15,8 @@
 		intensity_variants,
 		type PaletteVariant,
 		type IntensityVariant
-	} from '$lib/variable_data.ts';
-	import UnfinishedImplementationWarning from '$routes/docs/UnfinishedImplementationWarning.svelte';
+	} from '#lib/variable_data.ts';
+	import UnfinishedImplementationWarning from '#routes/docs/UnfinishedImplementationWarning.svelte';
 
 	const LIBRARY_ITEM_NAME = 'shadows';
 
@@ -29,15 +29,14 @@
 
 <TomeContent {tome}>
 	<UnfinishedImplementationWarning>
-		This is unfinished and will change. It feels simultaneously limiting in usage and bloated in the
-		implementation.
+		The shadow system is the least settled part of fuz_css: expect its variables and classes to
+		change before a stable release.
 	</UnfinishedImplementationWarning>
 	<section>
 		<p>
 			fuz_css provides four semantic shadow types that build on the light model in the
-			<TomeLink slug="shading" />
-			docs: umbra for natural depth, highlight for rim lighting, glow for light emphasis, and shroud
-			for dark overlays.
+			<TomeLink slug="shading" /> docs: umbra for natural depth, highlight for rim lighting, glow
+			for light emphasis, and shroud for dark overlays.
 		</p>
 	</section>
 	<TomeSection>
@@ -45,8 +44,7 @@
 		<p>
 			Umbras are adaptive shadows that darken in light mode and lighten in dark mode. This is the
 			default shadow behavior, creating natural depth perception in both color schemes. In light
-			mode umbra is untinted (pure black); in dark mode it's tinted using
-			<code>hue_neutral</code>/<code>neutral_chroma</code>.
+			mode umbra is untinted (pure black); in dark mode it's tinted toward <code>hue_neutral</code>.
 		</p>
 		<form><ColorSchemeInput /></form>
 		{@render shadow_examples('umbra')}
@@ -59,7 +57,7 @@
 			black).
 		</p>
 		<form><ColorSchemeInput /></form>
-		<div class="panel background-color:var(--fg_30) p_md">
+		<div class="panel background-color:var(--ink_30) p_md">
 			{@render shadow_examples('highlight')}
 		</div>
 	</TomeSection>
@@ -85,6 +83,18 @@
 		<div class="panel lighten_30 p_md">
 			{@render shadow_examples('shroud')}
 		</div>
+	</TomeSection>
+	<TomeSection>
+		<TomeSectionHeader text="Surface shadows" />
+		<p>
+			Three surfaces read their shadow from a variable a theme can retarget: buttons from
+			<code>--button_shadow</code> (with <code>_hover</code> and <code>_active</code>), a floating
+			<code>.pane</code> from <code>--pane_shadow</code>, and an embedded <code>.panel</code> from
+			<code>--panel_shadow</code>, which is <code>none</code> unless a theme lifts its panels. A
+			shadow shape class like <code>shadow_md</code> on the same element still wins, but a shadow
+			color or alpha class alone doesn't tint them, since the variables name their shadow colors
+			outright.
+		</p>
 	</TomeSection>
 	<TomeSection>
 		<TomeSectionHeader text="Colored shadows" />
@@ -169,14 +179,8 @@
 	<form class="intensity_selector">
 		<fieldset class="row mb_0">
 			{#each intensity_variants as intensity (intensity)}
-				<label class="box gap_xs mb_0 px_xs4" class:selected={selected_intensity === intensity}>
-					<input
-						type="radio"
-						name="intensity"
-						value={intensity}
-						bind:group={selected_intensity}
-						class="screen_reader_only"
-					/>
+				<label class="box gap_xs px_xs4" class:selected={selected_intensity === intensity}>
+					<input type="radio" name="intensity" value={intensity} bind:group={selected_intensity} />
 					{intensity}
 				</label>
 			{/each}

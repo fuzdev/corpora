@@ -1,37 +1,38 @@
 <!--
 	@component
-	Generates an SVG Cleveland dot plot, also known as a lollipop-chart.
+	Generates an SVG Cleveland dot plot, also known as a lollipop chart. The y scale must be a band scale.
  -->
 <script>
-	import { getContext } from 'svelte';
+	import { getLayerCakeContext } from 'layercake';
 
-	const { data, xGet, yGet, yScale, zScale, config } = getContext('LayerCake');
+	const k = getLayerCakeContext();
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {number} [r=5] - The circle radius.
+	 * @property {number} [r=5] - The circle radius in pixels.
 	 */
 
 	/** @type {Props} */
 	let { r = 5 } = $props();
 
-	let midHeight = $derived($yScale.bandwidth() / 2);
+	let halfBand = $derived(k.yScale.bandwidth() / 2);
 </script>
 
 <g class="dot-plot">
-	{#each $data as row}
-		{@const yVal = $yGet(row)}
-		{@const xVals = $xGet(row)}
+	{#each k.data as row}
+		{@const yPos = k.yGet(row)}
+		{@const xPositions = k.xGet(row)}
 		<g class="dot-row">
 			<line
-				x1={Math.min(...xVals)}
-				y1={yVal + midHeight}
-				x2={Math.max(...xVals)}
-				y2={yVal + midHeight}
+				x1={Math.min(...xPositions)}
+				y1={yPos + halfBand}
+				x2={Math.max(...xPositions)}
+				y2={yPos + halfBand}
 			></line>
 
-			{#each xVals as circleX, i}
-				<circle cx={circleX} cy={yVal + midHeight} {r} fill={$zScale($config.x[i])}></circle>
+			{#each xPositions as circleX, i}
+				<circle cx={circleX} cy={yPos + halfBand} {r} fill={k.cScale?.(k.config.x[i]) ?? '#ccc'}
+				></circle>
 			{/each}
 		</g>
 	{/each}

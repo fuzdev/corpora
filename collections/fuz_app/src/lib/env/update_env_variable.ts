@@ -1,67 +1,44 @@
 /**
  * Write updates to `.env` files while preserving formatting.
  *
+ * `update_env_content` is the one env-file writer: a pure line rebuild that
+ * `update_env_variable` (read, update, write) and `dev/setup.ts`'s
+ * `setup_env_file` both build on, so every value lands quoted and escaped the
+ * same way and round-trips through `parse_dotenv`.
+ *
  * @module
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import type { FsReadDeps, FsRemoveDeps, FsWriteDeps } from '../runtime/deps.ts';
+import { write_file_atomic } from '../runtime/fs.ts';
 
 /**
- * Options for updating environment variables in a .env file.
- */
-export interface UpdateEnvVariableOptions {
-	/** Path to the .env file. */
-	env_file_path: string;
-	/** Function to read file contents (defaults to `node:fs/promises` `readFile`). */
-	read_file?: (path: string, encoding: string) => Promise<string>;
-	/** Function to write file contents (defaults to `node:fs/promises` `writeFile`). */
-	write_file?: (path: string, content: string, encoding: string) => Promise<void>;
-}
-
-/**
- * Updates or adds an environment variable in the .env file.
+ * Set `key` to `value` in dotenv `content`, returning the new content.
  * Preserves existing formatting, comments, and other variables.
  *
  * Behavior:
  * - **Duplicate keys**: updates the LAST occurrence (matches dotenv behavior)
  * - **Inline comments**: preserved after the value (e.g., `KEY=value # comment`)
- * - **Quote style**: preserved from original (quoted/unquoted)
+ * - **Quote style**: a quoted value stays quoted; an unquoted one stays bare
+ *   unless the new value would not read back bare (surrounding whitespace, a
+ *   `#` comment marker, a leading quote, a line break), which is quoted
  * - **`export ` prefix**: preserved when updating an `export KEY=…` line
+ * - **Absent key**: appended as a quoted assignment
  *
- * @warning Not atomic; not safe for concurrent writers. Reads the file, mutates
- * in memory, then writes it back — a crash or concurrent write can corrupt
- * the file. Acceptable for single-user, infrequent edits; revisit if a
- * concurrent-writer consumer emerges.
+ * The line is rebuilt from its parts, so no character of `value` (`$&`, `` $` ``,
+ * `$'`, `\`) is interpreted.
  *
- * @param key - the environment variable name (e.g., `'SOME_CONFIGURATION_KEY'`)
- * @param value - the new value for the environment variable
- * @param options - file path and optional read/write overrides
- * @mutates filesystem - writes the updated content back to `options.env_file_path`
- * @throws Error if the file read fails for any reason other than `ENOENT`, or if the write fails
+ * @param content - dotenv file content (`''` for a new file)
+ * @param key - the environment variable name
+ * @param value - the new value
+ * @returns the updated content
  */
-export const update_env_variable = async (
-	key: string,
-	value: string,
-	options: UpdateEnvVariableOptions
-): Promise<void> => {
-	const { env_file_path, read_file = readFile, write_file = writeFile } = options;
-
-	const file_path = resolve(env_file_path);
-	let content = '';
-
-	try {
-		content = await read_file(file_path, 'utf-8');
-	} catch (error: any) {
-		if (error?.code !== 'ENOENT') {
-			throw error;
-		}
-	}
-
+export const update_env_content = (content: string, key: string, value: string): string => {
 	// TODO CRLF: split on `/\r?\n/` + remember per-line delimiter (pinned by edge_cases.test.ts)
 	// Preserve trailing-newline state: `split('\n')` on `'a\n'` yields `['a', '']`
 	// — drop that trailing empty so appends don't insert a blank line. Re-add
 	// the trailing `\n` at the end if the original had one.
+	if (content === '') return `${key}=${quote_value(value)}\n`;
 	const has_trailing_newline = content.endsWith('\n');
 	const lines = content.split('\n');
 	if (has_trailing_newline) lines.pop();
@@ -79,25 +56,45 @@ export const update_env_variable = async (
 
 			const inline_comment = extract_inline_comment(value_part);
 			const trimmed_value = value_part.trim();
-			const has_quotes = is_quoted_value(trimmed_value);
-
-			return has_quotes
-				? `${export_prefix}${key}=${quote_value(value)}${inline_comment}`
-				: `${export_prefix}${key}=${value}${inline_comment}`;
+			const written =
+				is_quoted_value(trimmed_value) || !reads_back_bare(value) ? quote_value(value) : value;
+			return `${export_prefix}${key}=${written}${inline_comment}`;
 		}
 		return line;
 	});
 
 	if (last_match_idx === -1) {
-		if (content === '') {
-			await write_file(file_path, `${key}=${quote_value(value)}\n`, 'utf-8');
-			return;
-		}
 		updated_lines.push(`${key}=${quote_value(value)}`);
 	}
 
-	const updated_content = updated_lines.join('\n') + (has_trailing_newline ? '\n' : '');
-	await write_file(file_path, updated_content, 'utf-8');
+	return updated_lines.join('\n') + (has_trailing_newline ? '\n' : '');
+};
+
+/**
+ * Updates or adds an environment variable in an env file — read,
+ * `update_env_content`, then an atomic replace at mode `0o600` (an env file
+ * holds secrets, so the fresh owner-only inode also tightens a permissive
+ * hand-made one). A missing file is created.
+ *
+ * A read-modify-write: a concurrent writer's update can be lost (the last
+ * replace wins), though the file is never left half-written.
+ *
+ * @param deps - file read and write capabilities; pass `remove` too for best-effort temp cleanup on a failed write
+ * @param env_path - path to the env file
+ * @param key - the environment variable name (e.g., `'SOME_CONFIGURATION_KEY'`)
+ * @param value - the new value for the environment variable
+ * @mutates filesystem - atomically replaces `env_path` at mode `0o600`
+ * @throws Error if the read or the write fails
+ */
+export const update_env_variable = async (
+	deps: FsReadDeps & FsWriteDeps & Partial<FsRemoveDeps>,
+	env_path: string,
+	key: string,
+	value: string
+): Promise<void> => {
+	const stat = await deps.stat(env_path);
+	const content = stat ? await deps.read_text_file(env_path) : '';
+	await write_file_atomic(deps, env_path, update_env_content(content, key, value), { mode: 0o600 });
 };
 
 // Keep this tokenization aligned with `parse_dotenv` in `env/dotenv.ts`:
@@ -194,6 +191,18 @@ const quote_value = (value: string): string => {
 };
 
 const has_newline_chars = (value: string): boolean => value.includes('\n') || value.includes('\r');
+
+/**
+ * Whether `value`, written unquoted, reads back unchanged through
+ * `parse_dotenv` — no surrounding whitespace, no leading quote or `#`, no
+ * whitespace-then-`#` comment marker, no line break.
+ */
+const reads_back_bare = (value: string): boolean =>
+	value === value.trim() &&
+	!has_newline_chars(value) &&
+	!is_quoted_value(value) &&
+	!value.startsWith('#') &&
+	!/\s#/.test(value);
 
 /**
  * Order matters: backslashes must be escaped first so the introduced

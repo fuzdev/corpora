@@ -1,25 +1,29 @@
 import { TaskError, type Task } from '@fuzdev/gro';
-import { z } from 'zod';
 import { package_json_load } from '@fuzdev/gro/package_json.ts';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
 
 import { create_blog_post, load_blogs_module } from './blog_helpers.ts';
 import { resolve_blog_config } from './blog.ts';
 
 /** @nodocs */
-export const Args = z
-	.object({
-		_: z.array(z.string()).meta({ description: 'post title' }).max(1).default([]),
-		blog: z
-			.string()
-			.meta({ description: 'dirname of the target blog, defaulting to the first registered' })
-			.optional(),
-		date: z
-			.string()
-			.meta({ description: "the post's date, used for both date_published and date_modified" })
-			.optional()
-	})
-	.strict();
-export type Args = z.infer<typeof Args>;
+export const Args = s.object({
+	_: s.with_default_fn(
+		s.pipe(meta(s.array(s.string), { description: 'post title' }), s.max_length(1)),
+		() => []
+	),
+	blog: s.optional(
+		meta(s.string, {
+			description: 'dirname of the target blog, defaulting to the first registered'
+		})
+	),
+	date: s.optional(
+		meta(s.string, {
+			description: "the post's date, used for both date_published and date_modified"
+		})
+	)
+});
+export type Args = s.Infer<typeof Args>;
 
 /** @nodocs */
 export const task: Task<Args> = {
@@ -33,7 +37,9 @@ export const task: Task<Args> = {
 		} = args;
 
 		if (!raw_title) {
-			throw new TaskError('post title is required, e.g. `gro post "Hello world"`');
+			throw new TaskError(
+				'post title is required, e.g. `gro task src/lib/post.task.ts "Hello world"`'
+			);
 		}
 
 		const dir = process.cwd();
@@ -43,7 +49,7 @@ export const task: Task<Args> = {
 
 		const package_json = await package_json_load();
 		const fuz_blog_import_path =
-			package_json.name === '@fuzdev/fuz_blog' ? '$lib' : '@fuzdev/fuz_blog';
+			package_json.name === '@fuzdev/fuz_blog' ? '#lib' : '@fuzdev/fuz_blog';
 
 		const { blog_post_id, path, slug } = await create_blog_post({
 			dir,

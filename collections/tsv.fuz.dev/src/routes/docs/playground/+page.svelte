@@ -10,7 +10,7 @@
 	const tome = tome_get_by_slug('playground');
 
 	// The `/docs` index renders every tome's component via `DocsContent`, which would
-	// mount `Playground` and pull in its ~900KB-gzipped WASM. Guard like fuz_css's api tome:
+	// mount `Playground` and pull in its ~1MB-gzipped wasm. Guard like fuz_css's api tome:
 	// show only a link at the root, the full playground at `/docs/playground`.
 	const at_root = $derived(page.url.pathname === DOCS_PATH);
 </script>
@@ -18,13 +18,13 @@
 <TomeContent {tome}>
 	{#if at_root}
 		<section>
-			<p>Try tsv's formatter and parser live in the <TomeLink slug="playground" />.</p>
+			<p>Try tsv's formatter and parser in the browser <TomeLink slug="playground" />.</p>
 		</section>
 	{:else}
 		<section>
 			<p>
 				This loads
-				<a href="https://www.npmjs.com/package/@fuzdev/tsv_wasm"><code>@fuzdev/tsv_wasm</code></a>
+				<a href="https://www.npmjs.com/package/@fuzdev/tsv-wasm"><code>@fuzdev/tsv-wasm</code></a>
 				in your browser to format and parse Svelte with TypeScript and CSS.
 			</p>
 			<Playground />

@@ -6,14 +6,18 @@
 	import Details from '@fuzdev/fuz_ui/Details.svelte';
 	import { DEV } from 'esm-env';
 
-	import { logo_zzz } from '$lib/logos.ts';
-	import { library_context } from '$lib/library.ts';
-	import ExternalLink from '$lib/ExternalLink.svelte';
-	import PageFooter from '$routes/PageFooter.svelte';
-	import { frontend_context } from '$lib/frontend.svelte.ts';
+	import { logo_zzz } from '#lib/logos.ts';
+	import { library_context } from '#lib/library.ts';
+	import ExternalLink from '#lib/ExternalLink.svelte';
+	import PageFooter from '#routes/PageFooter.svelte';
+	import { frontend_context } from '#lib/frontend.svelte.ts';
+	import { backend_reachable_context } from '#lib/auth_gate.ts';
 
 	const library = library_context.get();
-	const app = frontend_context.get();
+	// absent on a static build without the daemon (about is a public route)
+	const app = frontend_context.get_maybe();
+	const get_backend_reachable = backend_reachable_context.get_maybe();
+	const backend_reachable = $derived(get_backend_reachable?.() ?? null);
 
 	// TODO probably link to a blog post that's more approachable and less technical
 </script>
@@ -48,8 +52,8 @@
 		<ul>
 			<li>
 				<ExternalLink href="https://github.com/tokio-rs/axum">Axum</ExternalLink> is the Rust
-				backend web server that provides local system access — filesystem, terminals, and AI
-				provider requests.
+				backend web server that provides local system access — filesystem, terminals, AI provider
+				requests, and running local tools over your files.
 			</li>
 			<li>
 				<ExternalLink href="https://svelte.dev/">SvelteKit</ExternalLink> is the frontend framework,
@@ -98,10 +102,7 @@
 				when I regain an appetite for social,
 				<ExternalLink href="https://atproto.com/">AT Protocol</ExternalLink> and
 				<ExternalLink href="https://activitypub.rocks/">ActivityPub</ExternalLink> -- probably both
-				but they're not immediate prioritie (I have an initial
-				<ExternalLink href="https://github.com/fuzdev/fuz_mastodon">
-					Mastodon integration
-				</ExternalLink> with readonly embedded posts)
+				but they're not immediate priorities
 			</li>
 			<li>
 				more, input welcome
@@ -135,7 +136,10 @@
 		<h2 class="mb_lg">More details</h2>
 		<ul>
 			<li>Zzz is free and open source and permissively licensed</li>
-			<li>it's a noncommercial project and its only official domain is zzz.software</li>
+			<li>
+				it's a noncommercial project and its official home is
+				<ExternalLink href="https://github.com/fuzdev/zzz">github.com/fuzdev/zzz</ExternalLink>
+			</li>
 			<li>
 				I'm looking for <ExternalLink href="https://www.ryanatkn.com/funding">funding</ExternalLink>
 				to sustain my continued work on it
@@ -150,34 +154,42 @@
 			a small part of the idea -- especially if you're viewing this on the website not natively via
 			the local backend -- so here's a button for previewing some of what's planned:
 		</p>
-		<button
-			type="button"
-			class:palette_h={app.futuremode}
-			onclick={() => {
-				app.futuremode = !app.futuremode;
-			}}
-		>
-			<Svg
-				data={logo_zzz}
-				size="var(--icon_size_sm)"
-				fill={app.futuremode ? 'var(--palette_h_50)' : 'var(--text_color)'}
-				class="mr_md {app.futuremode ? ' transform:scaleX(-1)' : ''}"
-				style="transition: transform 200ms ease"
-			/>
-			<span>
-				<span class="display:inline-block text-align:right" style:width="6ch">
-					{app.futuremode ? 'disable' : 'enable'}
+		{#if app}
+			<button
+				type="button"
+				class:palette_h={app.futuremode}
+				onclick={() => {
+					app.futuremode = !app.futuremode;
+				}}
+			>
+				<Svg
+					data={logo_zzz}
+					size="var(--icon_size_sm)"
+					fill={app.futuremode ? 'var(--palette_h_50)' : 'var(--text_color)'}
+					class="mr_md {app.futuremode ? ' transform:scaleX(-1)' : ''}"
+					style="transition: transform 200ms ease"
+				/>
+				<span>
+					<span class="display:inline-block text-align:right" style:width="6ch">
+						{app.futuremode ? 'disable' : 'enable'}
+					</span>
+					futuremode
 				</span>
-				futuremode
-			</span>
-			<Svg
-				data={logo_zzz}
-				size="var(--icon_size_sm)"
-				fill={app.futuremode ? 'var(--palette_h_50)' : 'var(--text_color)'}
-				class="ml_md {app.futuremode ? '' : ' transform:scaleX(-1)'}"
-				style="transition: transform 200ms ease"
-			/>
-		</button>
+				<Svg
+					data={logo_zzz}
+					size="var(--icon_size_sm)"
+					fill={app.futuremode ? 'var(--palette_h_50)' : 'var(--text_color)'}
+					class="ml_md {app.futuremode ? '' : ' transform:scaleX(-1)'}"
+					style="transition: transform 200ms ease"
+				/>
+			</button>
+		{:else if backend_reachable === false}
+			<p>Futuremode needs the zzz daemon — run zzz locally to try it.</p>
+		{:else if backend_reachable}
+			<p>Futuremode needs you to be <a href={resolve('/')}>logged in</a>.</p>
+		{:else}
+			<p>Futuremode needs zzz running locally, and you logged in.</p>
+		{/if}
 	</section>
 	<hr />
 	<section>
@@ -198,7 +210,7 @@
 		</p>
 		<aside>
 			⚠️ I am not a security professional and Zzz has not been audited; it may be
-			<strong class="color_c_50">dangerous</strong> to run
+			<strong class="color_c_60">dangerous</strong> to run
 		</aside>
 		<p>
 			Much of the reusable security framework now exists — Zzz runs on
@@ -213,28 +225,50 @@
 				<ul>
 					<li>
 						read and write to the Zzz app directory (<code>PUBLIC_ZZZ_DIR</code>, defaults to
-						<code>./.zzz</code>) for app data like completions, plus any additional paths configured
-						in <code>PUBLIC_ZZZ_SCOPED_DIRS</code> for user files -- all filesystem operations are
-						securely scoped via <code>ScopedFs</code> (symlinks rejected, paths validated) -- this
-						opens a significant surface area for both you and attackers to use, and writing
-						untrusted data could lead to arbitrary code execution if, for example, you're running a
-						hot reloading dev server in a scoped directory (configure with care!)
+						<code>.zzz</code> in the daemon's working directory) for Zzz's own files, plus any
+						additional paths configured in <code>PUBLIC_ZZZ_SCOPED_DIRS</code> and any directories
+						you open as workspaces for user files -- all filesystem operations are securely scoped
+						via <code>ScopedFs</code> (symlinks rejected, paths validated) -- this opens a
+						significant surface area for both you and attackers to use, and writing untrusted data
+						could lead to arbitrary code execution if, for example, you're running a hot reloading
+						dev server in a scoped directory (configure with care!)
 					</li>
 					<li>
-						use your API keys for calls to Claude, ChatGPT, and Gemini -- loaded from
-						<code>./.env.{DEV ? 'development' : 'production'}</code> or set at runtime (held in
-						memory only)
+						use your API keys for calls to Claude, ChatGPT, and Gemini -- read from the backend's
+						environment at startup, e.g. <code>{DEV ? './.env.development' : '~/.zzz/.env'}</code>,
+						and never set or stored through the UI
 					</li>
 					<li>
 						authentication is cookie sessions and bearer tokens with a one-shot bootstrap flow, plus
-						an origin allowlist -- it's young and <strong class="color_c_50">unaudited</strong>, so
+						an origin allowlist -- it's young and <strong class="color_c_60">unaudited</strong>, so
 						do not use this in production
 					</li>
 					<li>
 						run interactive terminals -- full shell access as your user, the most powerful
 						capability here, gated behind the auth
 					</li>
+					<li>
+						read any file in those directories as raw bytes, to play or download it -- served so the
+						browser never runs it as a page
+					</li>
+					<li>
+						run <code>ffmpeg</code> and whisper.cpp, if you've installed them, over audio files you
+						choose -- to finish a recording and to transcribe it on your machine; a media file is
+						untrusted input to a large parser, so these tools are handed open files, never paths or
+						network access
+					</li>
 				</ul>
+			</li>
+			<li>
+				The page can record your microphone, only after you click record and the browser asks -- a
+				notice with a stop button stays on every page while it's open, and the audio goes to a file
+				on your machine and nowhere else.
+			</li>
+			<li>
+				Zzz is a single-operator app for your own machine. Every session and every full-scope API
+				token effectively has your OS user's powers: terminals, opening any directory as a workspace
+				(even <code>/</code>), and writing files there -- don't give an account to anyone you
+				wouldn't give a shell.
 			</li>
 			<li>
 				The frontend
@@ -245,8 +279,8 @@
 				</ExternalLink>
 				is designed to be fairly locked down, including blocking all unknown network connections --
 				it's currently disabled while being reworked (see
-				<ExternalLink href="https://github.com/fuzdev/zzz/blob/main/svelte.config.js">
-					svelte.config.js
+				<ExternalLink href="https://github.com/fuzdev/zzz/blob/main/vite.config.ts">
+					vite.config.ts
 				</ExternalLink>
 				and the <ExternalLink href="https://ui.fuz.dev/docs/csp">Fuz CSP docs</ExternalLink>).
 				Configuration will be needed for many usecases, unlocking shenanigans good and bad, so we'll

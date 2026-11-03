@@ -6,7 +6,7 @@ import {
 	to_docs_path_info,
 	DocsLinks,
 	DOCS_PATH_DEFAULT
-} from '$lib/docs_helpers.svelte.ts';
+} from '#lib/docs_helpers.svelte.ts';
 
 describe('docs_slugify', () => {
 	test('preserves case unlike standard slugify', () => {

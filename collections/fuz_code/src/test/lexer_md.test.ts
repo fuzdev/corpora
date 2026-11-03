@@ -1,8 +1,8 @@
 import { describe, test, assert } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { syntax_events_to_tokens, validate_syntax_events } from '$lib/lexer.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { syntax_events_to_tokens, validate_syntax_events } from '#lib/lexer.ts';
 
 const tokens_of = (text: string): Array<[string, string]> =>
 	syntax_events_to_tokens(syntax_styler_global.lex(text, 'md')).map((t) => [

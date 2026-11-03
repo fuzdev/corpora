@@ -5,8 +5,8 @@ import { describe, test, assert, afterEach, vi } from 'vitest';
 import { flushSync } from 'svelte';
 
 import { create_shared_edge_case_tests } from './contextmenu_test_edge_cases.ts';
-import ContextmenuRoot from '$lib/ContextmenuRoot.svelte';
-import { contextmenu_attachment } from '$lib/contextmenu_state.svelte.ts';
+import ContextmenuRoot from '#lib/ContextmenuRoot.svelte';
+import { contextmenu_attachment } from '#lib/contextmenu_state.svelte.ts';
 import {
 	unmount_component,
 	create_contextmenu_event,

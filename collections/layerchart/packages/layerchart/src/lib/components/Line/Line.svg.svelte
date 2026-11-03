@@ -1,8 +1,5 @@
 <script lang="ts" module>
-  export type {
-    LineProps,
-    LinePropsWithoutHTML,
-  } from './Line.shared.svelte.js';
+  export type { LineProps, LinePropsWithoutHTML } from './Line.shared.svelte.js';
 </script>
 
 <script lang="ts">
@@ -25,6 +22,9 @@
     markerStart,
     markerMid,
     markerEnd,
+    // Consumed by `LineState`, not SVG attributes
+    z1,
+    z2,
     ...rest
   }: LineProps = $props();
 
@@ -39,6 +39,8 @@
         markerStart,
         markerMid,
         markerEnd,
+        z1,
+        z2,
         ...rest,
       }) as LineProps
   );
@@ -50,8 +52,7 @@
   c.chartCtx.registerComponent({
     name: 'Line',
     kind: 'mark',
-    markInfo: () =>
-      lineMarkInfo({ x1, y1, x2, y2, ...rest } as LineProps, c.dataMode),
+    markInfo: () => lineMarkInfo({ x1, y1, x2, y2, ...rest } as LineProps, c.dataMode),
   });
 </script>
 

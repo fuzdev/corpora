@@ -1,7 +1,7 @@
 /**
  * App surface generation — JSON-serializable attack surface from route and middleware specs.
  *
- * Pure schema helpers (`is_null_schema`, `schema_to_surface`, `middleware_applies`,
+ * Pure schema helpers (`is_null_schema`, `schema_to_surface`, `middleware_applies`, `middleware_spec_applies`,
  * `merge_error_schemas`) live in `http/schema_helpers.ts`.
  *
  * @module
@@ -14,18 +14,18 @@ import type { MiddlewareSpec } from './middleware_spec.ts';
 import type { RouteSpec } from './route_spec.ts';
 import type { RouteAuth } from './auth_shape.ts';
 import type { RateLimitKey, RouteErrorSchemas } from './error_schemas.ts';
-import type { RpcAction } from '../actions/action_rpc.ts';
+import type { RpcAction } from '../actions/action_types.ts';
 import type { ActionKind } from '../actions/action_spec.ts';
-import type { WsEndpointSpec } from '../actions/ws_endpoint_spec.ts';
+import type { ResolvedWsEndpointSpec } from '../actions/ws_endpoint_spec.ts';
 import {
 	schema_to_surface,
-	middleware_applies,
+	middleware_spec_applies,
 	merge_error_schemas,
 	is_null_schema,
 	is_strict_object_schema
 } from './schema_helpers.ts';
 import type { Sensitivity } from '../sensitivity.ts';
-import type { SchemaFieldMeta } from '../schema_meta.ts';
+import { schema_meta_value, schema_sensitivity } from '../schema_meta.ts';
 
 // --- Surface types ---
 
@@ -66,6 +66,8 @@ export interface AppSurfaceMiddleware {
 	path: string;
 	/** JSON Schema representations of error responses, keyed by HTTP status code. `null` when none. */
 	error_schemas: Record<string, unknown> | null;
+	/** Paths under `path` the layer does not run on, each with its reason. Absent when none. */
+	carve_outs?: Array<{ path: string; reason: string }>;
 }
 
 /** An env var in the generated attack surface (JSON-serializable). */
@@ -131,11 +133,12 @@ export interface AppSurfaceWsMethod {
 export interface AppSurfaceWsEndpoint {
 	path: string;
 	/**
-	 * Upgrade-time origin allowlist, one entry per `WsEndpointSpec.allowed_origins`
-	 * regex stringified via `RegExp.prototype.toString()` (`'/<source>/<flags>'`).
-	 * Empty array when no origins were declared (any-origin); reviewers read this
-	 * as the exact pattern matched at the upgrade gate, not a wildcard
-	 * approximation. Reconstruct via `new RegExp(source, flags)` if needed.
+	 * Upgrade-time origin allowlist — the spec's own `allowed_origins`, or the
+	 * server's when it declares none — one entry per regex, stringified via
+	 * `RegExp.prototype.toString()` (`'/<source>/<flags>'`). An empty array
+	 * refuses every request that carries an `Origin`. Reviewers read this as the
+	 * exact pattern matched at the upgrade gate, not a wildcard approximation.
+	 * Reconstruct via `new RegExp(source, flags)` if needed.
 	 */
 	allowed_origins: ReadonlyArray<string>;
 	/**
@@ -184,7 +187,7 @@ export interface AppSurfaceSpec {
 	route_specs: Array<RouteSpec>;
 	middleware_specs: Array<MiddlewareSpec>;
 	rpc_endpoints: Array<RpcEndpointSpec>;
-	ws_endpoints: Array<WsEndpointSpec>;
+	ws_endpoints: Array<ResolvedWsEndpointSpec>;
 }
 
 /** An RPC endpoint definition for surface generation. */
@@ -204,9 +207,11 @@ export interface GenerateAppSurfaceOptions {
 	 * Mounted WS endpoints (the same array `create_app_server.ws_endpoints`
 	 * auto-mounts). Each entry's actions surface into
 	 * `AppSurface.ws_endpoints[i].methods` for attack-surface tests +
-	 * startup logging.
+	 * startup logging. Each carries its effective `allowed_origins` —
+	 * `resolve_ws_endpoints` fills in the server's list where a spec omits
+	 * it — so the surface records the exact patterns the upgrade gate matches.
 	 */
-	ws_endpoints?: ReadonlyArray<WsEndpointSpec>;
+	ws_endpoints?: ReadonlyArray<ResolvedWsEndpointSpec>;
 }
 
 // --- Surface generation ---
@@ -222,7 +227,7 @@ export const collect_middleware_errors = (
 ): RouteErrorSchemas | null => {
 	const errors: RouteErrorSchemas = {};
 	for (const mw of middleware) {
-		if (mw.errors && middleware_applies(mw.path, route_path)) {
+		if (mw.errors && middleware_spec_applies(mw, route_path)) {
 			Object.assign(errors, mw.errors);
 		}
 	}
@@ -230,7 +235,9 @@ export const collect_middleware_errors = (
 };
 
 /**
- * Convert env schema to surface entries using `.meta()` metadata.
+ * Convert env schema to surface entries using `.meta()` metadata, read
+ * through each field's wrappers — `schema_meta_value` for the description,
+ * the wider fail-safe `schema_sensitivity` walk for secrets.
  *
  * @param schema - Zod object schema with `.meta()` on fields
  */
@@ -238,12 +245,12 @@ export const env_schema_to_surface = (schema: z.ZodObject): Array<AppSurfaceEnv>
 	const entries: Array<AppSurfaceEnv> = [];
 	for (const [name, field_schema] of Object.entries(schema.shape)) {
 		const field = field_schema as z.ZodType;
-		const meta = field.meta() as SchemaFieldMeta | undefined;
 		const undef_result = field.safeParse(undefined);
 		entries.push({
 			name,
-			description: meta?.description ?? '',
-			sensitivity: meta?.sensitivity ?? null,
+			// read through wrappers — a `.meta()` under `.optional()` is not on the outer schema
+			description: schema_meta_value(field, 'description') ?? '',
+			sensitivity: schema_sensitivity(field) ?? null,
 			has_default: undef_result.success && undef_result.data !== undefined,
 			optional: undef_result.success
 		});
@@ -300,11 +307,18 @@ export const generate_app_surface = (options: GenerateAppSurfaceOptions): AppSur
 					mw_error_schemas = schemas;
 				}
 			}
-			return { name: m.name, path: m.path, error_schemas: mw_error_schemas };
+			return {
+				name: m.name,
+				path: m.path,
+				error_schemas: mw_error_schemas,
+				...(m.carve_outs?.length && {
+					carve_outs: m.carve_outs.map(({ path, reason }) => ({ path, reason }))
+				})
+			};
 		}),
 		routes: route_specs.map((r) => {
 			const applicable_middleware = middleware_specs
-				.filter((m) => middleware_applies(m.path, r.path))
+				.filter((m) => middleware_spec_applies(m, r.path))
 				.map((m) => m.name);
 
 			// Merge auto-derived + middleware + explicit error schemas

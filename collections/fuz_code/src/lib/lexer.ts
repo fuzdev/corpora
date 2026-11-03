@@ -1,5 +1,5 @@
 /**
- * Flat-event lexer substrate — the engine beneath the hand-written per-language
+ * Flat-event lexer substrate — the engine beneath the per-language
  * lexers (`lexer_json.ts`, `lexer_ts.ts`, …).
  *
  * Tokens are emitted as variable-length records into one `Int32Array`:
@@ -30,6 +30,12 @@ export interface TokenTypeInfo {
 	 * Precomputed HTML open tag, e.g. `'<span class="token_null token_keyword">'`.
 	 */
 	open_tag: string;
+	/**
+	 * The whole rendered span of each one-char ASCII leaf of this type, indexed
+	 * by char code, `''` where not yet rendered. `render_syntax_html` fills it
+	 * as it meets them; `null` until the first.
+	 */
+	char_spans: Array<string> | null;
 }
 
 /**
@@ -45,7 +51,7 @@ export class TokenTypeRegistry {
 	 */
 	readonly infos: Array<TokenTypeInfo> = [
 		// id 0 is reserved — it's the close-event tag
-		{ id: 0, name: '', aliases: [], classes: '', open_tag: '' }
+		{ id: 0, name: '', aliases: [], classes: '', open_tag: '', char_spans: null }
 	];
 	#ids: Map<string, number> = new Map();
 
@@ -63,7 +69,9 @@ export class TokenTypeRegistry {
 		let classes = 'token_' + name;
 		for (const a of aliases) classes += ' token_' + a;
 		const id = this.infos.length;
-		this.infos.push({ id, name, aliases, classes, open_tag: '<span class="' + classes + '">' });
+		// `join` rather than `+`: see `render_syntax_html` on flat strings
+		const open_tag = ['<span class="', classes, '">'].join('');
+		this.infos.push({ id, name, aliases, classes, open_tag, char_spans: null });
 		this.#ids.set(key, id);
 		return id;
 	}
@@ -92,6 +100,77 @@ export const token_types_global: TokenTypeRegistry = new TokenTypeRegistry();
  */
 export const token_type = (name: string, alias?: string | Array<string>): number =>
 	token_types_global.intern(name, alias);
+
+/**
+ * A fixed table of ASCII words, each carrying an integer, that a span of text
+ * is looked up in without slicing it out. A lexer classifying every identifier
+ * through `map.get(text.slice(start, end))` allocates and hashes a string per
+ * identifier; `find` compares char codes against the few words of the span's
+ * length and first char and returns the matching word's integer, so the lexer
+ * branches on a number. The integer is the lexer's to define: a kind, or a
+ * kind with flag bits beside it.
+ */
+export class WordIndex {
+	// candidates by `(first char code + length * 64) & 255`, which spreads a lexer's
+	// keywords over the slots; a bucket is checked by length then chars
+	readonly #buckets: Array<Array<string> | undefined>;
+	// the words' values, parallel to `#buckets`
+	readonly #values: Array<Array<number> | undefined>;
+	readonly #max_len: number;
+
+	/**
+	 * @param words - `[word, value]` entries, as a `Map` from `words_map`
+	 * iterates. Each word must be non-empty ASCII and each value a non-zero
+	 * 32-bit integer; a repeated word keeps its last value.
+	 */
+	constructor(words: Iterable<readonly [word: string, value: number]>) {
+		let max_len = 0;
+		const map = new Map(words);
+		for (const [w, value] of map) {
+			if (w === '') throw Error('empty word');
+			for (let i = 0; i < w.length; i++) {
+				if (w.charCodeAt(i) > 127) throw Error(`not an ASCII word: ${w}`);
+			}
+			if (value === 0 || (value | 0) !== value) {
+				throw Error(`not a non-zero 32-bit integer for ${w}: ${value}`);
+			}
+			if (w.length > max_len) max_len = w.length;
+		}
+		this.#max_len = max_len;
+		const buckets: Array<Array<string> | undefined> = Array.from({ length: 256 }, () => undefined);
+		const values: Array<Array<number> | undefined> = Array.from({ length: 256 }, () => undefined);
+		for (const [w, value] of map) {
+			const slot = (w.charCodeAt(0) + w.length * 64) & 255;
+			(buckets[slot] ??= []).push(w);
+			(values[slot] ??= []).push(value);
+		}
+		// a pushed array keeps spare capacity; copies are exact-size
+		this.#buckets = buckets.map((bucket) => bucket?.slice());
+		this.#values = values.map((bucket) => bucket?.slice());
+	}
+
+	/**
+	 * Returns the value of the word `text[start, end)` spells, or `0` when it is
+	 * none of the table's.
+	 */
+	find(text: string, start: number, end: number): number {
+		const len = end - start;
+		if (len > this.#max_len) return 0;
+		const c0 = text.charCodeAt(start);
+		if (c0 > 127) return 0;
+		const slot = (c0 + len * 64) & 255;
+		const bucket = this.#buckets[slot];
+		if (bucket === undefined) return 0;
+		for (let b = 0; b < bucket.length; b++) {
+			const w = bucket[b]!;
+			if (w.length !== len) continue;
+			let k = 1;
+			while (k < len && w.charCodeAt(k) === text.charCodeAt(start + k)) k++;
+			if (k === len) return this.#values[slot]![b]!;
+		}
+		return 0;
+	}
+}
 
 /**
  * Builds a word→kind classification map from `[kind, words]` entries, where
@@ -124,10 +203,29 @@ export interface SyntaxLang {
 	 * Must never throw and must always terminate with `lexer.pos === lexer.end`.
 	 */
 	lex: (lexer: Lexer) => void;
+	/**
+	 * Lexes from `lexer.pos` as `lex` does, but stops at the first `}` that closes
+	 * no `{` of the region's own, for a host whose region ends at that brace
+	 * (a Svelte `{expression}`). Returns the brace's index, leaving `lexer.pos`
+	 * there, or `-1` after lexing to `lexer.end` without meeting one. The lexer
+	 * finds the brace as it tokenizes, so a brace in a string, comment, or regex
+	 * doesn't count. Optional: a host falls back to finding the brace itself.
+	 *
+	 * With a `stop_word`, it also stops before that word where it stands alone
+	 * outside every bracket of the region (the `as` of a Svelte `{#each}`), and
+	 * returns the word's index instead; the host tells the two apart by the char
+	 * there.
+	 */
+	lex_to_brace?: (lexer: Lexer, stop_word?: string) => number;
 }
 
 /**
- * The result of lexing: the source text plus its flat token event stream.
+ * Returned by `Lexer.embed_to_brace` when it lexed nothing.
+ */
+export const EMBED_UNAVAILABLE = -2;
+
+/**
+ * The result of lexing: the source text plus its flat event stream.
  */
 export interface LexedSyntax {
 	text: string;
@@ -175,8 +273,26 @@ export class Lexer {
 	// current embed nesting, guarded by MAX_EMBED_DEPTH
 	#embed_depth = 0;
 
-	constructor(capacity = 256) {
-		this.events = new Int32Array(capacity < 256 ? 256 : capacity);
+	/**
+	 * One instance alive for the class's lifetime. V8 holds the hidden class of
+	 * an initialized `Lexer` only through live instances, and `lex_syntax` makes
+	 * one per call, so without it a major GC between calls clears the class and
+	 * discards every optimized lexer function that embeds it. Every field is
+	 * declared here, so this instance's hidden class is the one every lexer has.
+	 * A static rather than a module variable: V8 frees a module variable that no
+	 * function reads once the module has evaluated, and bundlers drop an unused
+	 * export.
+	 *
+	 * @internal
+	 */
+	static readonly shape_anchor: Lexer = new Lexer();
+
+	/**
+	 * @param events - the buffer to emit into from index 0; `#grow` replaces it
+	 *   with a larger copy when it fills
+	 */
+	constructor(events: Int32Array = new Int32Array(256)) {
+		this.events = events;
 	}
 
 	// cold path of the emitters' capacity checks — kept out of line so the
@@ -258,10 +374,57 @@ export class Lexer {
 		this.#last_leaf = -1;
 		return true;
 	}
+
+	/**
+	 * Lexes an embedded region that starts at `start` and ends at its closing
+	 * `}`, somewhere before `end`, with the language registered under `lang_id`,
+	 * which finds the brace through `SyntaxLang.lex_to_brace`. Returns the
+	 * brace's index, or `-1` when the region ran to `end` without one, or
+	 * `EMBED_UNAVAILABLE` when nothing was lexed: the language is unregistered or
+	 * has no `lex_to_brace`, or nesting is at `MAX_EMBED_DEPTH`. With a
+	 * `stop_word` the region also ends before that word at its top level, and
+	 * the word's index is returned.
+	 */
+	embed_to_brace(lang_id: string, start: number, end: number, stop_word?: string): number {
+		if (start >= end) return EMBED_UNAVAILABLE;
+		if (this.#embed_depth >= MAX_EMBED_DEPTH) return EMBED_UNAVAILABLE;
+		const lex_to_brace = this.langs?.get(lang_id)?.lex_to_brace;
+		if (lex_to_brace === undefined) return EMBED_UNAVAILABLE;
+		const prev_pos = this.pos;
+		const prev_end = this.end;
+		this.pos = start;
+		this.end = end;
+		this.#last_leaf = -1;
+		this.#embed_depth++;
+		const close = lex_to_brace(this, stop_word);
+		this.#embed_depth--;
+		this.pos = prev_pos;
+		this.end = prev_end;
+		this.#last_leaf = -1;
+		return close;
+	}
 }
 
 /**
- * Lexes `text` with `lang`, returning the flat token event stream.
+ * The largest scratch buffer kept between calls, in ints (1 MiB). A larger one,
+ * grown for an outsized input, is left to its result.
+ */
+const SCRATCH_RETAIN_MAX = 1 << 18;
+
+// the buffer every lex writes into, reused across calls; null while a lex runs, so a
+// re-entrant call (a custom lexer calling `lex_syntax`) gets a buffer of its own, and
+// after a lexer throws the next call makes a new one
+let scratch_events: Int32Array | null = new Int32Array(256);
+
+/**
+ * Lexes `text` with `lang`, returning the flat event stream.
+ *
+ * The result is valid until the next `lex_syntax` call: every call writes its
+ * events into one reused buffer, which is also why `events` runs past
+ * `events_len`. Use the result right away, or keep a copy with
+ * `copy_lexed_syntax`. A buffer allocated per call would be off-heap memory,
+ * zero-filled up front and freed only at a later GC, which on small inputs
+ * costs more than the lexing.
  *
  * @param langs - registry used to resolve embedded languages by id
  * @param types - token-type registry stamped on the result; must be the one
@@ -273,15 +436,34 @@ export const lex_syntax = (
 	langs?: Map<string, SyntaxLang>,
 	types: TokenTypeRegistry = token_types_global
 ): LexedSyntax => {
+	const scratch = scratch_events;
+	scratch_events = null;
 	// capacity heuristic: dense token streams run ~1 int per source char
-	const lexer = new Lexer(text.length);
+	const lexer = new Lexer(
+		scratch !== null && scratch.length >= text.length
+			? scratch
+			: new Int32Array(text.length < 256 ? 256 : text.length)
+	);
 	lexer.text = text;
 	lexer.pos = 0;
 	lexer.end = text.length;
 	lexer.langs = langs ?? null;
 	lang.lex(lexer);
-	return { text, events: lexer.events, events_len: lexer.events_len, types };
+	const { events } = lexer;
+	scratch_events = events.length <= SCRATCH_RETAIN_MAX ? events : scratch;
+	return { text, events, events_len: lexer.events_len, types };
 };
+
+/**
+ * Copies a lexed event stream out of the buffer `lex_syntax` reuses, sized to
+ * `events_len`, for a result kept past the next lex.
+ */
+export const copy_lexed_syntax = (lexed: LexedSyntax): LexedSyntax => ({
+	text: lexed.text,
+	events: lexed.events.slice(0, lexed.events_len),
+	events_len: lexed.events_len,
+	types: lexed.types
+});
 
 /**
  * Escapes `text[from..to)` for HTML text content in a single pass.
@@ -307,9 +489,25 @@ const escape_html_slice = (text: string, from: number, to: number): string => {
 	return seg === from ? text.slice(from, to) : out + text.slice(seg, to);
 };
 
+// cold path of the renderer's one-char leaves: builds the span and caches it on its type
+const fill_char_span = (info: TokenTypeInfo, c: number): string => {
+	const spans = (info.char_spans ??= new Array<string>(128).fill(''));
+	const escaped = c === 38 ? '&amp;' : c === 60 ? '&lt;' : String.fromCharCode(c);
+	return (spans[c] = [info.open_tag, escaped, '</span>'].join(''));
+};
+
 /**
- * Renders a lexed token event stream to HTML in one forward pass.
+ * Renders a lexed event stream to HTML in one forward pass.
  * Gap text is copy-escaped; token spans use the precomputed open tags.
+ *
+ * The result is built by appending, which in V8 makes a rope the first read
+ * copies into one string, at a cost per piece. So the loop appends few pieces
+ * and flat ones: an open tag is a single string rather than the tree `+` would
+ * have left at intern time, which every span would otherwise carry into the
+ * rope, and a one-char leaf, the most common kind in code, appends its whole
+ * span from `TokenTypeInfo.char_spans`. Text is sliced without a scan while
+ * the next character needing an escape, tracked by monotonic probes, lies
+ * past it.
  */
 export const render_syntax_html = (lexed: LexedSyntax): string => {
 	const { text, events, events_len } = lexed;
@@ -317,30 +515,56 @@ export const render_syntax_html = (lexed: LexedSyntax): string => {
 	let out = '';
 	let pos = 0;
 	let i = 0;
-	while (i < events_len) {
+	// the next `&`, `<`, and nbsp at or after `pos`, and `escape_at`, the nearest of them
+	let amp = -1;
+	let lt = -1;
+	let nbsp = -1;
+	let escape_at = -1;
+	for (;;) {
+		if (escape_at < pos) {
+			amp = advance_probe(text, amp, pos, '&');
+			lt = advance_probe(text, lt, pos, '<');
+			nbsp = advance_probe(text, nbsp, pos, '\u00a0');
+			escape_at = amp < lt ? (amp < nbsp ? amp : nbsp) : lt < nbsp ? lt : nbsp;
+		}
+		if (i >= events_len) break;
 		const tag = events[i]!;
 		if (tag > 0) {
 			const start = events[i + 1]!;
 			const end = events[i + 2]!;
-			if (start > pos) out += escape_html_slice(text, pos, start);
-			out += infos[tag]!.open_tag + escape_html_slice(text, start, end) + '</span>';
+			const info = infos[tag]!;
+			let c: number;
+			if (end - start === 1 && (c = text.charCodeAt(start)) < 128) {
+				if (start > pos) {
+					out += escape_at < start ? escape_html_slice(text, pos, start) : text.slice(pos, start);
+				}
+				const spans = info.char_spans;
+				let span: string;
+				if (spans === null || (span = spans[c]!) === '') span = fill_char_span(info, c);
+				out += span;
+			} else if (escape_at < end) {
+				if (start > pos) out += escape_html_slice(text, pos, start);
+				out += info.open_tag + escape_html_slice(text, start, end) + '</span>';
+			} else {
+				if (start > pos) out += text.slice(pos, start);
+				out += info.open_tag + text.slice(start, end) + '</span>';
+			}
 			pos = end;
 			i += 3;
-		} else if (tag < 0) {
-			const start = events[i + 1]!;
-			if (start > pos) out += escape_html_slice(text, pos, start);
-			out += infos[-tag]!.open_tag;
-			pos = start;
-			i += 2;
 		} else {
-			const end = events[i + 1]!;
-			if (end > pos) out += escape_html_slice(text, pos, end);
-			out += '</span>';
-			pos = end;
+			// an open at its start, or a close at its end
+			const at = events[i + 1]!;
+			if (at > pos) {
+				out += escape_at < at ? escape_html_slice(text, pos, at) : text.slice(pos, at);
+			}
+			out += tag < 0 ? infos[-tag]!.open_tag : '</span>';
+			pos = at;
 			i += 2;
 		}
 	}
-	if (pos < text.length) out += escape_html_slice(text, pos, text.length);
+	if (pos < text.length) {
+		out += escape_at < text.length ? escape_html_slice(text, pos, text.length) : text.slice(pos);
+	}
 	return out;
 };
 
@@ -558,15 +782,26 @@ export const skip_quoted = (text: string, from: number, end: number, quote: numb
 };
 
 /**
+ * What `advance_probe` returns when the text has no further occurrence: past
+ * the end of any string, since V8 caps string length below it. It is a small
+ * integer rather than `Infinity` so probe-cache fields, which start at `-1`,
+ * never change representation: a double stored there gives the cache a hidden
+ * class that only live caches hold, so a major GC between `lex` calls would
+ * discard every optimized lexer function that embeds it.
+ */
+export const PROBE_NOT_FOUND = 0x3fffffff;
+
+/**
  * Returns the cached next occurrence of `ch` at or after `from`, re-probing
- * with `indexOf` only when the cached position has fallen behind. `Infinity`
- * when the text has no further occurrence — a monotonic probe that keeps
- * delimiter scans linear across a construct that is dense in `ch`.
+ * with `indexOf` only when the cached position has fallen behind.
+ * `PROBE_NOT_FOUND` when the text has no further occurrence — a monotonic
+ * probe that keeps delimiter scans linear across a construct that is dense in
+ * `ch`.
  */
 export const advance_probe = (text: string, cached: number, from: number, ch: string): number => {
 	if (cached >= from) return cached;
 	const found = text.indexOf(ch, from);
-	return found === -1 ? Infinity : found;
+	return found === -1 ? PROBE_NOT_FOUND : found;
 };
 
 /**

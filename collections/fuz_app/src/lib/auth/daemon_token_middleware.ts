@@ -18,13 +18,8 @@ import { DEV } from 'esm-env';
 import type { MiddlewareHandler } from 'hono';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
-import {
-	ACCOUNT_ID_KEY,
-	AUTH_API_TOKEN_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TOKEN_SCOPE_KEY
-} from '../hono_context.ts';
-import { token_scope_full } from './token_scope.ts';
+import { RESOLVED_AUTH_KEY } from '../hono_context.ts';
+import { get_resolved_auth } from './resolved_auth.ts';
 import { is_browser_context } from '../http/origin.ts';
 import { query_role_grant_find_account_id_for_role } from './role_grant_queries.ts';
 import type { QueryDeps } from '../db/query_deps.ts';
@@ -56,10 +51,15 @@ export const resolve_keeper_account_id = async (deps: QueryDeps): Promise<string
 };
 
 /**
- * Create middleware that authenticates via daemon token.
+ * Create middleware that authenticates via daemon token — the first leg of the
+ * auth middleware chain, as in the Rust spine's `resolve_auth_from_headers`.
+ *
+ * Being first, it starts the chain from a clean slate: it clears
+ * `RESOLVED_AUTH_KEY` on entry, so a layer mounted before the credential legs
+ * cannot pre-set an identity that every leg would then skip past.
  *
  * Checks the `X-Daemon-Token` header. Behavior:
- * - No header: pass through (don't touch existing context).
+ * - No header: pass through.
  * - Header present + `Origin` / `Referer` present: discard the credential
  *   (browser context) and pass through — daemon tokens are loopback-only and
  *   never carry an `Origin` in production, so a header-bearing request is not
@@ -78,9 +78,10 @@ export const resolve_keeper_account_id = async (deps: QueryDeps): Promise<string
  *   mirrors the Rust spine's `resolve.rs` (`None`), so the request falls
  *   through to anonymous and a daemon-gated action returns
  *   `credential_type_required` downstream.
- * - Header present + valid + ok: set `c.var.auth_account_id =
- *   state.keeper_account_id`, `CREDENTIAL_TYPE_KEY = 'daemon_token'`
- *   (overrides any existing session / bearer identity).
+ * - Header present + valid + ok: set the `daemon_token` arm of `ResolvedAuth`
+ *   (`RESOLVED_AUTH_KEY`) for the keeper account. The session and bearer legs
+ *   after it see the request resolved and skip, so a cookie or bearer sent
+ *   beside the daemon token is never looked up.
  *
  * Acting-actor resolution + `RequestContext` construction are deferred
  * to the dispatcher's authorization phase. Multi-actor keeper accounts
@@ -90,7 +91,7 @@ export const resolve_keeper_account_id = async (deps: QueryDeps): Promise<string
  * @param state - the daemon token runtime state
  * @param deps - query dependencies (pool-level db for keeper-account resolution)
  * @param log - the logger instance
- * @mutates Hono context - sets `ACCOUNT_ID_KEY`, `CREDENTIAL_TYPE_KEY`, and `AUTH_API_TOKEN_ID_KEY` on a valid token
+ * @mutates Hono context - clears `RESOLVED_AUTH_KEY` on entry, then sets it on a valid token
  */
 export const create_daemon_token_middleware = (
 	state: DaemonTokenState,
@@ -98,6 +99,12 @@ export const create_daemon_token_middleware = (
 	log: Logger
 ): MiddlewareHandler => {
 	return async (c, next): Promise<Response | void> => {
+		// the chain's clean slate — nothing before the credential legs resolves
+		const cleared = get_resolved_auth(c);
+		if (cleared !== null) {
+			log.debug(`daemon token leg cleared a credential (${cleared.credential_type}) set before it`);
+		}
+		c.set(RESOLVED_AUTH_KEY, null);
 		const token_header = c.req.header(DAEMON_TOKEN_HEADER);
 
 		if (!token_header) {
@@ -161,12 +168,14 @@ export const create_daemon_token_middleware = (
 			return;
 		}
 
-		c.set(ACCOUNT_ID_KEY, state.keeper_account_id);
-		c.set(CREDENTIAL_TYPE_KEY, 'daemon_token');
-		// Singular, filesystem-proved, keeper-bound — no minting step at which a
-		// narrowing could have been chosen.
-		c.set(TOKEN_SCOPE_KEY, token_scope_full());
-		c.set(AUTH_API_TOKEN_ID_KEY, null);
+		// Full authority (`resolved_auth_scope`): singular, filesystem-proved,
+		// keeper-bound — no minting step at which a narrowing could have been
+		// chosen. No row, no expiry.
+		c.set(RESOLVED_AUTH_KEY, {
+			credential_type: 'daemon_token',
+			account_id: state.keeper_account_id,
+			credential_deadline: null
+		});
 
 		await next();
 	};

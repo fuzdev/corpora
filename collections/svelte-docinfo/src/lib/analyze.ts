@@ -1,8 +1,8 @@
 /**
  * One-shot analysis wrappers — `analyze` and `analyzeFromFiles`.
  *
- * Both wrap a single-use `AnalysisSession`: `createSession → setFiles → query
- * → dispose`. Incremental consumers (Vite plugin, LSP) should use
+ * Both wrap a single-use `AnalysisSession`: `createAnalysisSession → setFiles →
+ * query → dispose`. Incremental consumers (Vite plugin, LSP) should use
  * `createAnalysisSession` directly so parsed ASTs and svelte2tsx output
  * survive between calls.
  *
@@ -17,9 +17,12 @@
  * @module
  */
 
+import type ts from 'typescript';
+
 import { errorsOf, formatDiagnostic, warningsOf } from './diagnostics.ts';
 import type { AnalysisLog } from './log.ts';
 import { createAnalysisSession, type AnalysisSession } from './session.ts';
+import type { RootFileNames } from './typescript-program.ts';
 import {
 	createSourceOptionsWithInclude,
 	type ExcludeOption,
@@ -55,7 +58,7 @@ export interface AnalyzeOptions {
 	sourceFiles: ReadonlyArray<SourceFileInfo>;
 	/** Module source options for path extraction and source filtering. */
 	sourceOptions: ModuleSourceOptions;
-	/** Behavior when duplicate declaration names are found across modules. */
+	/** Opt-in check that declaration names are unique across modules (see `OnDuplicates`). */
 	onDuplicates?: OnDuplicates;
 	/** Optional logger for status and diagnostic messages. */
 	log?: AnalysisLog;
@@ -67,6 +70,19 @@ export interface AnalyzeOptions {
 	 * you have a reason to control the cache scope.
 	 */
 	resolveImport?: ResolveImport;
+	/**
+	 * Path to the tsconfig, relative to the project root, or `false` to analyze
+	 * without one (see `LoadTsconfigOptions.tsconfig`).
+	 * @default 'tsconfig.json'
+	 */
+	tsconfig?: string | false;
+	/** Compiler options merged over the tsconfig's (see `LoadTsconfigOptions.compilerOptions`). */
+	compilerOptions?: ts.CompilerOptions;
+	/**
+	 * Root files for the program in place of the tsconfig's (see `RootFileNames`).
+	 * @default the tsconfig's roots
+	 */
+	rootFileNames?: RootFileNames;
 }
 
 /**
@@ -78,19 +94,23 @@ export interface AnalyzeOptions {
  *
  * @returns analyzed modules (sorted alphabetically) + concatenated ingest +
  *   query diagnostics
- * @throws Error if `sourceOptions` validation fails or `tsconfig.json` is
- *   missing at `projectRoot`. Also propagates `onDuplicates: 'throw'` errors.
+ * @throws Error if `sourceOptions` validation fails or the tsconfig is
+ *   missing or can't be loaded (see `loadTsconfig`; `tsconfig: false` skips it). Also
+ *   propagates `onDuplicates: 'throw'` errors.
  */
 export const analyze = async (options: AnalyzeOptions): Promise<AnalyzeResultJson> => {
 	const session = createAnalysisSession({
 		sourceOptions: options.sourceOptions,
 		log: options.log,
 		resolveImport: options.resolveImport,
+		tsconfig: options.tsconfig,
+		compilerOptions: options.compilerOptions,
+		rootFileNames: options.rootFileNames,
 		// One-shot with caller-provided inputs: no watch loop, so TS/JS context
 		// is read exactly once via the LS disk fallback either way — closure
-		// ownership is pure overhead. Gated *Svelte* dependencies are the
-		// exception (the LS can't serve raw `.svelte` from disk); callers pass
-		// them in `sourceFiles` — the query gate keeps them out of output.
+		// ownership is pure overhead. *Svelte* dependencies are the exception
+		// (the LS can't serve raw `.svelte` from disk); callers pass them in
+		// `sourceFiles` — the query gate keeps the gated ones out of output.
 		contextClosure: false
 	});
 	try {
@@ -120,42 +140,21 @@ export interface AnalyzeFromFilesOptions {
 	projectRoot: string;
 	/** Partial overrides for default source options (SvelteKit `src/lib` layout). */
 	sourceOptions?: SourceOptionsOverrides;
-	/** Behavior when duplicate declaration names are found across modules. */
+	/** Opt-in check that declaration names are unique across modules (see `OnDuplicates`). */
 	onDuplicates?: OnDuplicates;
 	/** Optional logger for status and diagnostic messages. */
 	log?: AnalysisLog;
 	/**
-	 * Glob patterns to include (relative to `projectRoot`; an absolute pattern
-	 * inside the root relativizes, an out-of-root one throws — see
-	 * `normalizeIncludePatterns`).
-	 *
-	 * Filters glob-based discovery. Providing `include` under the default
-	 * `discovery: 'auto'` collapses the chain to glob immediately; combining
-	 * with `discovery: 'exports'` throws.
-	 *
-	 * Explicit patterns also widen the source scope: their static bases join
-	 * `sourceOptions.sourcePaths` (see `widenSourcePathsForInclude`), so
-	 * include-discovered files outside the configured source paths still emit
-	 * modules, with paths relative to the widened set's common root. A pattern
-	 * with no static base (`'**\/*.ts'`, a literal root file) scopes the whole
-	 * project root as source and logs an info line; an out-of-root base
-	 * (`'../other/**'`) throws.
-	 *
-	 * When omitted, the glob fallback derives an include from
-	 * `sourceOptions.sourcePaths` via `deriveIncludePatterns`, so custom
-	 * `sourcePaths` (e.g., `['packages/foo']`) survive the fallback instead of
-	 * silently defaulting to `src/lib`.
+	 * Glob patterns to include, relative to `projectRoot`. Collapses
+	 * `discovery: 'auto'` to glob (combining with `'exports'` throws), and each
+	 * pattern's static base widens `sourceOptions.sourcePaths` so the matched
+	 * files emit modules (see `createSourceOptionsWithInclude`).
 	 */
 	include?: Array<string>;
 	/**
-	 * Glob patterns to exclude — takes precedence over `sourceOptions.exclude`
-	 * (no merge between the two). An array replaces the default patterns
-	 * wholesale; the callback form extends them without restating them
-	 * (`(defaults) => [...defaults, '**\/*.gen.ts']` — see `ExcludeOption`).
-	 * The callback always receives the built-in defaults, even when
-	 * `sourceOptions.exclude` is also set (that value is superseded whole).
-	 * The always-on baseline (`node_modules` + dot-directories below a matched
-	 * source path) applies beneath it and is unaffected by overrides.
+	 * Glob patterns to exclude — supersedes `sourceOptions.exclude` whole (no
+	 * merge; the callback form still receives the built-in defaults). An array
+	 * replaces the defaults, a callback extends them — see `ExcludeOption`.
 	 */
 	exclude?: ExcludeOption;
 	/**
@@ -188,6 +187,19 @@ export interface AnalyzeFromFilesOptions {
 	discovery?: Discovery;
 	/** Dist directory name for exports-based discovery. @default 'dist' */
 	distDir?: string;
+	/**
+	 * Path to the tsconfig, relative to the project root, or `false` to analyze
+	 * without one (see `LoadTsconfigOptions.tsconfig`).
+	 * @default 'tsconfig.json'
+	 */
+	tsconfig?: string | false;
+	/** Compiler options merged over the tsconfig's (see `LoadTsconfigOptions.compilerOptions`). */
+	compilerOptions?: ts.CompilerOptions;
+	/**
+	 * Root files for the program in place of the tsconfig's (see `RootFileNames`).
+	 * @default the tsconfig's roots
+	 */
+	rootFileNames?: RootFileNames;
 }
 
 /**
@@ -200,7 +212,9 @@ export interface AnalyzeFromFilesOptions {
  * 3. **Analysis** — `session.query()`
  *
  * @returns analyzed modules + concatenated ingest, discovery, and query diagnostics
- * @throws Error if `sourceOptions` validation fails or `tsconfig.json` is missing
+ * @throws Error on invalid or contradictory options, a missing or unloadable
+ *   `tsconfig.json` (see `loadTsconfig`), failed strict `'exports'` discovery,
+ *   or a collision under `onDuplicates: 'throw'`
  */
 export const analyzeFromFiles = async (
 	options: AnalyzeFromFilesOptions
@@ -215,7 +229,10 @@ export const analyzeFromFiles = async (
 		onDuplicates,
 		log,
 		discovery,
-		distDir
+		distDir,
+		tsconfig,
+		compilerOptions,
+		rootFileNames
 	} = options;
 
 	// A custom resolver with resolution turned off is a contradiction — the
@@ -269,7 +286,10 @@ export const analyzeFromFiles = async (
 	const session: AnalysisSession = createAnalysisSession({
 		sourceOptions: resolvedSourceOptions,
 		log,
-		resolveImport: sessionResolver
+		resolveImport: sessionResolver,
+		tsconfig,
+		compilerOptions,
+		rootFileNames
 		// Closure stays on (the session default) despite being one-shot:
 		// discovery excludes gated files, so a gated `.svelte` dependency
 		// (`export {default as X} from './internal/X.svelte'`) exists nowhere

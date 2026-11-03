@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { ComponentProps } from 'svelte';
 	import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
-	import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+	import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 	import Dialog from '@fuzdev/fuz_ui/Dialog.svelte';
 
 	import PickerDialog from './PickerDialog.svelte';
@@ -32,7 +32,7 @@
 
 <PickerDialog
 	bind:show
-	items={diskfiles.items.values}
+	items={diskfiles.on_disk}
 	{onpick}
 	{filter}
 	{exclude_ids}
@@ -51,6 +51,9 @@
 	sort_key_default="path_asc"
 	show_sort_controls
 	heading="Pick a file"
+	search_text={(diskfile) => diskfile.path}
+	search_placeholder="filter by path"
+	windowed
 >
 	{#snippet children(diskfile, pick)}
 		<DiskfileListitem

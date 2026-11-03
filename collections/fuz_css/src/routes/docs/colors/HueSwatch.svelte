@@ -1,9 +1,9 @@
 <script lang="ts">
 	import StyleVariableButton from '@fuzdev/fuz_ui/StyleVariableButton.svelte';
-	import { theme_state_context } from '@fuzdev/fuz_ui/theme_state.svelte.ts';
 
-	import type { PaletteVariant } from '$lib/variable_data.ts';
-	import { PALETTE_HUES } from '$lib/ramps.ts';
+	import type { PaletteVariant } from '#lib/variable_data.ts';
+	import { PALETTE_HUES } from '#lib/ramps.ts';
+	import { watch_resolved_style } from '#routes/docs/resolved_style.svelte.ts';
 
 	const {
 		letter,
@@ -17,22 +17,19 @@
 		description: string;
 	} = $props();
 
-	const get_theme_state = theme_state_context.get();
-
 	const variable_name = $derived(`hue_${letter}`);
 
 	// the angle the page currently renders, re-read after each theme or scheme
 	// change so the readout tracks the swatch; the default angle stands in
-	// during SSR/prerender so the static HTML doesn't ship NaN
-	let hue: number = $state(PALETTE_HUES[letter]);
-	$effect(() => {
-		const theme_state = get_theme_state();
-		theme_state.color_scheme;
-		theme_state.theme;
-		const n = Number(
-			getComputedStyle(document.documentElement).getPropertyValue('--' + variable_name)
-		);
-		hue = Number.isNaN(n) ? PALETTE_HUES[letter] : n;
+	// during SSR/prerender, and for a value that isn't a plain number
+	let rendered_hue: number | null = $state(null);
+	const hue = $derived(rendered_hue ?? PALETTE_HUES[letter]);
+	watch_resolved_style(() => {
+		const value = getComputedStyle(document.documentElement)
+			.getPropertyValue('--' + variable_name)
+			.trim();
+		const n = value === '' ? NaN : Number(value);
+		rendered_hue = Number.isFinite(n) ? n : null;
 	});
 </script>
 

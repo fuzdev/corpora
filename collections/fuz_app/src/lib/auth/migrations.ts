@@ -12,7 +12,7 @@
  * and the new column never lands — a silent, total auth outage. (The
  * `deleted_at` / `deleted_by` soft-delete columns were added to v0's base DDL
  * this way; an older deployed DB never got them and every login broke.) So:
- * never edit, rename, reorder, or re-purpose an entry in `auth_migrations`
+ * never edit, rename, reorder, or re-purpose an entry in `AUTH_MIGRATIONS`
  * below. Add every additive change as a NEW appended entry using idempotent
  * `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` — a fresh bootstrap and an old
  * deployed DB then converge on the same shape:
@@ -76,19 +76,14 @@ import {
 	ROLE_GRANT_OFFER_SCOPE_KIND_GLOBAL_TOKEN
 } from './role_grant_offer_ddl.ts';
 import type { Db } from '../db/db.ts';
-import type { Migration, MigrationNamespace } from '../db/migrate.ts';
+import {
+	create_spine_migration_namespace,
+	type Migration,
+	type MigrationNamespace
+} from '../db/migrate.ts';
 
 /** Namespace identifier for fuz_app auth migrations. */
-export const AUTH_MIGRATION_NAMESPACE = 'fuz_auth';
-
-/**
- * Migration namespaces reserved by fuz_app. Consumers passing
- * `migration_namespaces` to `create_app_backend` must choose a name not in
- * this list — the runtime check rejects matches with a thrown error. Typed
- * as `ReadonlyArray<string>` (not a literal tuple) so `.includes()` accepts
- * any consumer-supplied namespace string without a cast.
- */
-export const reserved_migration_namespaces: ReadonlyArray<string> = [AUTH_MIGRATION_NAMESPACE];
+const AUTH_MIGRATION_NAMESPACE = 'fuz_auth';
 
 /**
  * Auth schema migrations in order.
@@ -110,7 +105,7 @@ export const reserved_migration_namespaces: ReadonlyArray<string> = [AUTH_MIGRAT
  *   (registry-membership validation against `create_scope_kind_schema`);
  *   v2 may add INSERT-time `(role, scope_kind)` enforcement.
  */
-export const auth_migrations: Array<Migration> = [
+const AUTH_MIGRATIONS: Array<Migration> = [
 	// v0: full auth schema (frozen — never edit this body; see module doc)
 	{
 		name: 'full_auth_schema',
@@ -282,11 +277,43 @@ export const auth_migrations: Array<Migration> = [
 		up: async (db: Db): Promise<void> => {
 			await db.query('ALTER TABLE auth_session DROP COLUMN IF EXISTS last_seen_at');
 		}
+	},
+	// The expiry-audit stamp that makes the offer sweep idempotent.
+	//
+	// An expired pending offer has no terminal state — expiry is computed from
+	// `expires_at`, never written — so without a stamp every
+	// `cleanup_expired_role_grant_offers` run re-audited every expired offer.
+	// The sweep now claims rows by setting `expire_audited_at` in the same
+	// transaction as their `role_grant_offer_expire` audit rows, so each expiry
+	// is audited exactly once and concurrent sweeps claim disjoint rows.
+	//
+	// Not a lifecycle state: the column stays out of the
+	// `role_grant_offer_single_terminal` CHECK and the pending predicate, and
+	// off the wire. A re-offer of a stamped row clears it (the create upsert),
+	// so the refreshed offer's own expiry is audited too. The partial index
+	// serves exactly the sweep's claim predicate.
+	{
+		name: 'role_grant_offer_expire_audited_at',
+		up: async (db: Db): Promise<void> => {
+			await db.query(
+				'ALTER TABLE role_grant_offer ADD COLUMN IF NOT EXISTS expire_audited_at TIMESTAMPTZ NULL'
+			);
+			await db.query(`CREATE INDEX IF NOT EXISTS role_grant_offer_expire_sweep
+  ON role_grant_offer (expires_at)
+  WHERE accepted_at IS NULL
+    AND declined_at IS NULL
+    AND retracted_at IS NULL
+    AND superseded_at IS NULL
+    AND expire_audited_at IS NULL`);
+		}
 	}
 ];
 
-/** Pre-composed migration namespace for auth tables. */
-export const auth_migration_ns: MigrationNamespace = {
-	namespace: AUTH_MIGRATION_NAMESPACE,
-	migrations: auth_migrations
-};
+/**
+ * Pre-composed migration namespace for auth tables — the spine's own (see
+ * `create_spine_migration_namespace`).
+ */
+export const AUTH_MIGRATION_NS: MigrationNamespace = create_spine_migration_namespace(
+	AUTH_MIGRATION_NAMESPACE,
+	AUTH_MIGRATIONS
+);

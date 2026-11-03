@@ -2,6 +2,7 @@
 /** @import { Binding, AST, ValidatedCompileOptions, ValidatedModuleCompileOptions } from '#compiler' */
 /** @import { AnalysisState, Visitors } from './types' */
 /** @import { Analysis, ComponentAnalysis, Js, ReactiveStatement, Template } from '../types' */
+/** @import { Scope } from '../scope.js' */
 import { walk } from 'zimmerframe';
 import { parse } from '../1-parse/acorn.js';
 import * as e from '../../errors.js';
@@ -13,8 +14,8 @@ import {
 	unwrap_pattern
 } from '../../utils/ast.js';
 import * as b from '#compiler/builders';
-import { Scope, ScopeRoot, create_scopes, get_rune, set_scope } from '../scope.js';
-import check_graph_for_cycles from './utils/check_graph_for_cycles.js';
+import { ScopeRoot, create_scopes, get_rune, set_scope } from '../scope.js';
+import check_graph_for_cycles from '../../utils/check_graph_for_cycles.js';
 import { create_attribute, is_custom_element_node } from '../nodes.js';
 import { analyze_css } from './css/css-analyze.js';
 import { prune } from './css/css-prune.js';
@@ -285,7 +286,7 @@ export function analyze_module(source, options) {
 		runes: true,
 		immutable: true,
 		tracing: false,
-		async_deriveds: new Set(),
+		async_deriveds: new Map(),
 		comments,
 		classes: new Map(),
 		pickled_awaits: new Set()
@@ -557,7 +558,7 @@ export function analyze_component(root, source, options) {
 		source,
 		snippet_renderers: new Map(),
 		snippets: new Set(),
-		async_deriveds: new Set(),
+		async_deriveds: new Map(),
 		pickled_awaits: new Set(),
 		instance_body: {
 			sync: [],
@@ -832,6 +833,11 @@ export function analyze_component(root, source, options) {
 					} else {
 						e.export_undefined(specifier, name);
 					}
+				} else if (binding.initial?.type === 'SnippetBlock') {
+					// If a snippet is exported, a consumer could only import this named export and not the default export (the component).
+					// In this case we need to set hasGlobal of our output to true so that e.g. vite-plugin-svelte does not tell Vite to
+					// tree-shake the CSS if the default export is not used.
+					analysis.css.has_global = true;
 				}
 			}
 		}
@@ -1228,6 +1234,23 @@ function calculate_blockers(instance, analysis) {
 
 	flush_sync_group();
 
+	// a store subscription must wait on whatever blocks the store itself; this must happen
+	// before function tracing so that functions reading `$store` inherit the blocker
+	for (const [name, binding] of instance.scope.declarations) {
+		if (binding.kind !== 'store_sub') continue;
+
+		const store_blocker = instance.scope.get(name.slice(1))?.blocker;
+		if (!store_blocker) continue;
+
+		if (
+			!binding.blocker ||
+			/** @type {ESTree.SimpleLiteral & { value: number }} */ (binding.blocker.property).value <
+				/** @type {ESTree.SimpleLiteral & { value: number }} */ (store_blocker.property).value
+		) {
+			binding.blocker = store_blocker;
+		}
+	}
+
 	for (const fn of functions) {
 		/** @type {Set<Binding>} */
 		const reads_writes = new Set();
@@ -1318,7 +1341,8 @@ function order_reactive_statements(unsorted_reactive_declarations) {
 	 * @returns
 	 */
 	const add_declaration = (node, declaration) => {
-		if ([...reactive_declarations.values()].includes(declaration)) return;
+		// Visited set: each ReactiveStatement is stored under exactly one LabeledStatement node
+		if (reactive_declarations.has(node)) return;
 
 		for (const binding of declaration.dependencies) {
 			if (declaration.assignments.has(binding)) continue;

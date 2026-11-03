@@ -15,8 +15,8 @@ import {
 	CELL_GRANT_COLUMNS,
 	query_cell_grant_create,
 	query_cell_grants_for_caller_in_cells
-} from '$lib/db/cell_grant_queries.ts';
-import { query_cell_create } from '$lib/db/cell_queries.ts';
+} from '#lib/db/cell_grant_queries.ts';
+import { query_cell_create } from '#lib/db/cell_queries.ts';
 
 import { describe_db } from '../cell_db_fixture.ts';
 
@@ -38,13 +38,12 @@ describe_db('CellGrantQueries', (get_db) => {
 		});
 		// The aliased JOIN read: an unqualified `SELECT *` here would pull the
 		// joined `cell` columns onto the row too, which this key set rejects.
-		const matched = await query_cell_grants_for_caller_in_cells(
-			deps,
-			[cell.id],
-			null,
-			[ROLE],
-			[null]
-		);
+		const matched = await query_cell_grants_for_caller_in_cells(deps, [cell.id], {
+			actor_id: null,
+			is_admin: false,
+			role_grant_roles: [ROLE],
+			role_grant_scope_ids: [null]
+		});
 		assert.strictEqual(matched.length, 1);
 		assert.deepEqual(Object.keys(matched[0]!).sort(), [...CELL_GRANT_COLUMNS].sort());
 		assert.strictEqual(matched[0]!.id, created.id);

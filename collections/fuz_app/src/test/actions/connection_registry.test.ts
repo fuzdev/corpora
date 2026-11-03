@@ -1,0 +1,1641 @@
+/**
+ * Tests for ConnectionRegistry — connection tracking, revocation, the
+ * per-account connection cap, and two-phase registration.
+ *
+ * Uses a fake `WSContextInit` to construct real `WSContext`
+ * instances without a live WebSocket. Exercises the three revocation paths
+ * (session, account, api_token) and verifies bookkeeping stays in sync.
+ *
+ * @module
+ */
+
+import { afterEach, describe, assert, test, vi } from 'vitest';
+import { WSContext } from 'hono/ws';
+import { Logger } from '@fuzdev/fuz_util/log.ts';
+
+import {
+	ConnectionRegistry,
+	DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT,
+	type ConnectionIdentity,
+	connection_identity_matches
+} from '#lib/actions/connection_registry.ts';
+import {
+	WS_CLOSE_CONNECTION_LIMIT,
+	WS_CLOSE_CONNECTION_LIMIT_REASON,
+	WS_CLOSE_GOING_AWAY,
+	WS_CLOSE_GOING_AWAY_REASON,
+	WS_CLOSE_PERMISSION_REVOKED,
+	WS_CLOSE_SESSION_REVOKED,
+	WS_CLOSE_SESSION_REVOKED_REASON
+} from '#lib/actions/transports.ts';
+import type { JsonrpcNotification } from '#lib/http/jsonrpc.ts';
+import { create_fake_ws } from '#lib/testing/ws_round_trip.ts';
+import { create_uuid } from '#lib/primitive_schemas.ts';
+import { create_test_identity } from './connection_identity_helpers.ts';
+
+const ACCOUNT_A = create_uuid();
+const ACCOUNT_B = create_uuid();
+const HASH_A = 'hash_session_a';
+const HASH_B = 'hash_session_b';
+const TOKEN_A = 'token_id_a';
+const TOKEN_B = 'token_id_b';
+
+describe('connection_identity_matches', () => {
+	// the twin of the Rust spine's `ConnectionIdentity::matches`
+	const session: ConnectionIdentity = {
+		session_hash: HASH_A,
+		account_id: ACCOUNT_A,
+		api_token_id: null,
+		required_roles: ['admin', 'keeper']
+	};
+	const bearer: ConnectionIdentity = {
+		session_hash: null,
+		account_id: ACCOUNT_A,
+		api_token_id: TOKEN_A,
+		required_roles: []
+	};
+	const daemon: ConnectionIdentity = {
+		session_hash: null,
+		account_id: ACCOUNT_A,
+		api_token_id: null,
+		required_roles: []
+	};
+
+	test('a session target matches the session hash alone', () => {
+		assert.ok(connection_identity_matches(session, { kind: 'session', session_hash: HASH_A }));
+		assert.ok(!connection_identity_matches(session, { kind: 'session', session_hash: HASH_B }));
+		assert.ok(!connection_identity_matches(bearer, { kind: 'session', session_hash: HASH_A }));
+	});
+
+	test('a token target matches the API token id alone', () => {
+		assert.ok(connection_identity_matches(bearer, { kind: 'token', api_token_id: TOKEN_A }));
+		assert.ok(!connection_identity_matches(bearer, { kind: 'token', api_token_id: TOKEN_B }));
+		assert.ok(!connection_identity_matches(session, { kind: 'token', api_token_id: TOKEN_A }));
+	});
+
+	test('an account target matches every credential of the account', () => {
+		for (const identity of [session, bearer, daemon]) {
+			assert.ok(connection_identity_matches(identity, { kind: 'account', account_id: ACCOUNT_A }));
+			assert.ok(!connection_identity_matches(identity, { kind: 'account', account_id: ACCOUNT_B }));
+		}
+	});
+
+	test('a role target matches the account when the role is one its endpoint gated on', () => {
+		assert.ok(
+			connection_identity_matches(session, { kind: 'role', account_id: ACCOUNT_A, role: 'keeper' })
+		);
+		assert.ok(
+			!connection_identity_matches(session, { kind: 'role', account_id: ACCOUNT_B, role: 'admin' }),
+			'another account'
+		);
+		assert.ok(
+			!connection_identity_matches(session, { kind: 'role', account_id: ACCOUNT_A, role: 'other' }),
+			'a role the endpoint did not list'
+		);
+		assert.ok(
+			!connection_identity_matches(bearer, { kind: 'role', account_id: ACCOUNT_A, role: 'admin' }),
+			'an ungated connection'
+		);
+	});
+});
+
+describe('ConnectionRegistry.add_connection', () => {
+	test('returns a unique id per connection', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const id_b = t.add_connection(
+			b.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		assert.notStrictEqual(id_a, id_b);
+	});
+
+	test('api_token_id defaults to null (backward-compatible 3-arg call)', () => {
+		const t = new ConnectionRegistry();
+		const { ws } = create_fake_ws();
+		t.add_connection(ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		// revoking by a made-up token id closes nothing
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: 'nonexistent' }), 0);
+	});
+
+	test('is_ready reflects connection count', () => {
+		const t = new ConnectionRegistry();
+		assert.strictEqual(t.connection_count() > 0, false);
+		const { ws } = create_fake_ws();
+		t.add_connection(ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.strictEqual(t.connection_count() > 0, true);
+	});
+
+	test('connection_count tracks add/remove', () => {
+		const t = new ConnectionRegistry();
+		assert.strictEqual(t.connection_count(), 0);
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.strictEqual(t.connection_count(), 1);
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+		assert.strictEqual(t.connection_count(), 2);
+		t.remove_connection(id_a);
+		assert.strictEqual(t.connection_count(), 1);
+		t.close_connections({ kind: 'account', account_id: ACCOUNT_B });
+		assert.strictEqual(t.connection_count(), 0);
+	});
+
+	test('keeps a copy of the identity — the caller changing its record moves nothing', () => {
+		for (const register of ['add_connection', 'register_pending'] as const) {
+			const t = new ConnectionRegistry();
+			const { ws } = create_fake_ws();
+			const required_roles = ['admin'];
+			const identity = create_test_identity({
+				session_hash: HASH_A,
+				account_id: ACCOUNT_A,
+				required_roles
+			});
+			t[register](ws, identity);
+			identity.session_hash = HASH_B;
+			identity.account_id = ACCOUNT_B;
+			required_roles.push('keeper');
+
+			assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_B }), 0);
+			assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_B }), 0);
+			assert.strictEqual(
+				t.close_connections({ kind: 'role', account_id: ACCOUNT_A, role: 'keeper' }),
+				0
+			);
+			assert.strictEqual(
+				t.close_connections({ kind: 'session', session_hash: HASH_A }),
+				1,
+				register
+			);
+		}
+	});
+});
+
+describe('ConnectionRegistry.close_connections session', () => {
+	test('closes only the matching session, returns count', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A }));
+
+		const count = t.close_connections({ kind: 'session', session_hash: HASH_A });
+		assert.strictEqual(count, 1);
+		assert.deepStrictEqual(a.closes, [
+			{ code: WS_CLOSE_SESSION_REVOKED, reason: 'Session revoked' }
+		]);
+		assert.deepStrictEqual(b.closes, []);
+	});
+
+	test('closes all sockets sharing the session hash', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 2);
+	});
+
+	test('returns 0 when no sockets match', () => {
+		const t = new ConnectionRegistry();
+		const { ws } = create_fake_ws();
+		t.add_connection(ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: 'nope' }), 0);
+	});
+});
+
+describe('ConnectionRegistry.close_connections account', () => {
+	test('closes all sockets for the account across session and bearer', () => {
+		const t = new ConnectionRegistry();
+		const session_ws = create_fake_ws();
+		const bearer_ws = create_fake_ws();
+		const daemon_ws = create_fake_ws();
+		const other_ws = create_fake_ws();
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer_ws.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon_ws.ws, create_test_identity({ account_id: ACCOUNT_A }));
+		t.add_connection(
+			other_ws.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 3);
+		assert.strictEqual(session_ws.closes.length, 1);
+		assert.strictEqual(bearer_ws.closes.length, 1);
+		assert.strictEqual(daemon_ws.closes.length, 1);
+		assert.strictEqual(other_ws.closes.length, 0);
+	});
+});
+
+describe('ConnectionRegistry.close_connections token', () => {
+	test('closes only the socket bound to that api_token.id', () => {
+		const t = new ConnectionRegistry();
+		const bearer_a = create_fake_ws();
+		const bearer_b = create_fake_ws();
+		const session_ws = create_fake_ws();
+		t.add_connection(
+			bearer_a.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(
+			bearer_b.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_B })
+		);
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 1);
+		assert.strictEqual(bearer_a.closes.length, 1);
+		assert.strictEqual(bearer_b.closes.length, 0);
+		assert.strictEqual(session_ws.closes.length, 0);
+	});
+
+	test('does not affect session-authenticated sockets on the same account', () => {
+		const t = new ConnectionRegistry();
+		const session_ws = create_fake_ws();
+		const bearer_ws = create_fake_ws();
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer_ws.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 1);
+		assert.strictEqual(session_ws.closes.length, 0);
+	});
+
+	test('returns 0 when no bearer connections match', () => {
+		const t = new ConnectionRegistry();
+		const { ws } = create_fake_ws();
+		t.add_connection(ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 0);
+	});
+});
+
+describe('ConnectionRegistry.close_all_connections', () => {
+	test('closes every connection, pending and admitted, with the going-away close', () => {
+		const t = new ConnectionRegistry();
+		const session = create_fake_ws();
+		const bearer = create_fake_ws();
+		const daemon = create_fake_ws();
+		const pending = create_fake_ws();
+		t.add_connection(
+			session.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon.ws, create_test_identity({ account_id: ACCOUNT_B }));
+		const pending_id = t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		assert.strictEqual(t.close_all_connections(), 4);
+		for (const fake of [session, bearer, daemon, pending]) {
+			assert.deepStrictEqual(fake.closes, [
+				{ code: WS_CLOSE_GOING_AWAY, reason: WS_CLOSE_GOING_AWAY_REASON }
+			]);
+		}
+		assert.strictEqual(t.connection_count(), 0);
+		assert.strictEqual(t.pending_connection_count(), 0);
+		// a pending registration closed at shutdown is refused at admission
+		assert.strictEqual(t.admit(pending_id), false);
+		// closing again closes nothing
+		assert.strictEqual(t.close_all_connections(), 0);
+	});
+
+	test("aborts each closed connection's controller", () => {
+		const t = new ConnectionRegistry();
+		const controller = new AbortController();
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			controller
+		);
+		t.close_all_connections();
+		assert.strictEqual(controller.signal.aborted, true);
+	});
+
+	test('a socket whose close throws does not spare the rest', () => {
+		const t = new ConnectionRegistry();
+		const before = create_fake_ws();
+		const after = create_fake_ws();
+		const boom = new Error('already closed');
+		t.add_connection(
+			before.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			new WSContext({
+				send: () => {},
+				close: () => {
+					throw boom;
+				},
+				readyState: 1
+			}),
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		t.add_connection(after.ws, create_test_identity({ account_id: ACCOUNT_B }));
+
+		assert.throws(() => t.close_all_connections(), boom);
+		assert.strictEqual(before.closes.length, 1);
+		assert.strictEqual(after.closes.length, 1, 'the socket after the throw was closed');
+		// the throwing socket's connection is removed too
+		assert.strictEqual(t.connection_count(), 0);
+		// closing even though a close threw: a later registration is born closed
+		assert.strictEqual(t.is_closing(), true);
+	});
+});
+
+describe('ConnectionRegistry born-closed registrations', () => {
+	const GOING_AWAY = { code: WS_CLOSE_GOING_AWAY, reason: WS_CLOSE_GOING_AWAY_REASON };
+
+	test('a pending registration after close_all is closed going-away and refused at admission', () => {
+		const t = new ConnectionRegistry();
+		assert.strictEqual(t.is_closing(), false);
+		t.close_all_connections();
+		assert.strictEqual(t.is_closing(), true);
+
+		const late = create_fake_ws();
+		const controller = new AbortController();
+		const id = t.register_pending(
+			late.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			controller
+		);
+		assert.deepStrictEqual(late.closes, [GOING_AWAY], 'closed before register_pending returns');
+		assert.strictEqual(controller.signal.aborted, true);
+		assert.strictEqual(t.pending_connection_count(), 0, 'never inserted');
+		assert.strictEqual(t.admit(id), false);
+		assert.strictEqual(t.connection_count(), 0);
+		// a revocation finds nothing to close
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 0);
+		assert.strictEqual(late.closes.length, 1);
+	});
+
+	test('a one-step add_connection after close_all is closed going-away, never admitted', () => {
+		const t = new ConnectionRegistry();
+		t.close_all_connections();
+
+		const late = create_fake_ws();
+		const controller = new AbortController();
+		const id = t.add_connection(
+			late.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A }),
+			controller
+		);
+		assert.deepStrictEqual(late.closes, [GOING_AWAY]);
+		assert.strictEqual(controller.signal.aborted, true);
+		assert.strictEqual(t.is_registered(id), false);
+		assert.strictEqual(t.connection_count(), 0);
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, { jsonrpc: '2.0', method: 'm' }), 0);
+	});
+
+	test('a socket whose close throws at birth is logged, not thrown', () => {
+		const errors: Array<Array<unknown>> = [];
+		const log = new Logger('test', { level: 'off' });
+		log.error = (...args: Array<unknown>) => {
+			errors.push(args);
+		};
+		const t = new ConnectionRegistry({ log });
+		t.close_all_connections();
+		const controller = new AbortController();
+		const throwing = new WSContext({
+			send: () => {},
+			close: () => {
+				throw new Error('already closed');
+			},
+			readyState: 1
+		});
+		const id = t.register_pending(
+			throwing,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			controller
+		);
+		assert.strictEqual(controller.signal.aborted, true);
+		assert.strictEqual(t.admit(id), false);
+		assert.strictEqual(errors.length, 1);
+	});
+});
+
+describe('ConnectionRegistry.remove_connection', () => {
+	test('clears all per-connection bookkeeping (cannot be revoked twice)', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.remove_connection(id_a);
+
+		// both maps now empty — no close code from any revocation path
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 0);
+		assert.strictEqual(a.closes.length, 0);
+	});
+
+	test('is idempotent — safe after revocation has already cleaned up', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.close_connections({ kind: 'session', session_hash: HASH_A });
+		// already cleaned up; this must not throw or double-close
+		t.remove_connection(id_a);
+		t.remove_connection(id_a);
+		assert.strictEqual(a.closes.length, 1);
+	});
+
+	test('removes only the connection the id names', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+
+		// an id the registry never issued removes nothing
+		t.remove_connection(create_uuid());
+		assert.strictEqual(t.connection_count(), 2);
+
+		t.remove_connection(id_a);
+		assert.strictEqual(t.connection_count(), 1);
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 1);
+		assert.deepStrictEqual(a.closes, []);
+		assert.strictEqual(b.closes.length, 1);
+	});
+});
+
+describe('ConnectionRegistry per-account connection cap', () => {
+	const CONNECTION_LIMIT_CLOSE = {
+		code: WS_CLOSE_CONNECTION_LIMIT,
+		reason: WS_CLOSE_CONNECTION_LIMIT_REASON
+	};
+
+	test('past the default cap the oldest connection closes with 4004', () => {
+		assert.strictEqual(DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT, 50);
+		const t = new ConnectionRegistry();
+		const sockets = Array.from({ length: DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT }, () => {
+			const fake = create_fake_ws();
+			t.add_connection(
+				fake.ws,
+				create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+			);
+			return fake;
+		});
+		// at the cap, nothing has closed
+		assert.ok(sockets.every((s) => s.closes.length === 0));
+		assert.strictEqual(t.connection_count(), DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT);
+
+		const newest = create_fake_ws();
+		t.add_connection(
+			newest.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.deepStrictEqual(sockets[0]!.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.ok(sockets.slice(1).every((s) => s.closes.length === 0));
+		assert.deepStrictEqual(newest.closes, []);
+		assert.strictEqual(t.connection_count(), DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT);
+	});
+
+	test('evicts oldest-first, one per connection past the cap', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 2 });
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const c = create_fake_ws();
+		const d = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+
+		t.add_connection(c.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(a.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.deepStrictEqual(b.closes, []);
+
+		t.add_connection(d.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(a.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.deepStrictEqual(b.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.deepStrictEqual(c.closes, []);
+		assert.deepStrictEqual(d.closes, []);
+		assert.strictEqual(t.connection_count(), 2);
+	});
+
+	test('a cap of 1 closes the previous connection for each new one', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(a.closes, []);
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(a.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.deepStrictEqual(b.closes, []);
+	});
+
+	test('counts per account, across every credential type', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 3 });
+		const other = create_fake_ws();
+		t.add_connection(
+			other.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		const session = create_fake_ws();
+		const bearer = create_fake_ws();
+		const daemon = create_fake_ws();
+		t.add_connection(
+			session.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon.ws, create_test_identity({ account_id: ACCOUNT_A }));
+		// another account's connection neither counts nor is evicted
+		assert.deepStrictEqual(session.closes, []);
+
+		// a second session of the same account is past the account's cap
+		const second_session = create_fake_ws();
+		t.add_connection(
+			second_session.ws,
+			create_test_identity({ session_hash: 'hash_session_a2', account_id: ACCOUNT_A })
+		);
+		assert.deepStrictEqual(session.closes, [CONNECTION_LIMIT_CLOSE]);
+
+		// the bearer and daemon connections are next in line — none is exempt
+		const fifth = create_fake_ws();
+		t.add_connection(
+			fifth.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.deepStrictEqual(bearer.closes, [CONNECTION_LIMIT_CLOSE]);
+		const sixth = create_fake_ws();
+		t.add_connection(
+			sixth.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.deepStrictEqual(daemon.closes, [CONNECTION_LIMIT_CLOSE]);
+
+		assert.deepStrictEqual(other.closes, []);
+		assert.strictEqual(t.connection_count(), 4);
+	});
+
+	test('a removed or revoked connection frees its slot', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 2 });
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A }));
+
+		t.remove_connection(id_a);
+		const c = create_fake_ws();
+		t.add_connection(c.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(b.closes, []);
+
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_B }), 1);
+		const d = create_fake_ws();
+		t.add_connection(d.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		assert.deepStrictEqual(c.closes, []);
+		assert.deepStrictEqual(d.closes, []);
+	});
+
+	test('null disables the cap', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: null });
+		const sockets = Array.from({ length: DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT + 5 }, () => {
+			const fake = create_fake_ws();
+			t.add_connection(
+				fake.ws,
+				create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+			);
+			return fake;
+		});
+		assert.ok(sockets.every((s) => s.closes.length === 0));
+		assert.strictEqual(t.connection_count(), DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT + 5);
+	});
+
+	test('an evicted connection is fully untracked — its later remove is a no-op', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(
+			b.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A, api_token_id: TOKEN_B })
+		);
+		assert.deepStrictEqual(a.closes, [CONNECTION_LIMIT_CLOSE]);
+
+		// the runtime adapter fires onClose for the evicted socket afterwards
+		t.remove_connection(id_a);
+		assert.strictEqual(t.connection_count(), 1);
+
+		// nothing reaches it any more: no broadcast, no second close
+		const notification: JsonrpcNotification = { jsonrpc: '2.0', method: 'ping' };
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, notification), 1);
+		assert.strictEqual(a.sends.length, 0);
+		assert.strictEqual(b.sends.length, 1);
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 1);
+		assert.deepStrictEqual(a.closes, [CONNECTION_LIMIT_CLOSE]);
+	});
+
+	test('eviction drains the pending peer requests of the evicted connection', async () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const a = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const outcome = t.request_connection(id_a, 'peer/ping', {}, { timeout_ms: 60_000 });
+
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.deepStrictEqual(await outcome, { ok: false, error: { kind: 'connection_gone' } });
+	});
+
+	test('a close that throws on the evicted socket still admits the new connection', () => {
+		const errors: Array<Array<unknown>> = [];
+		const log = new Logger('test', { level: 'off' });
+		log.error = (...args: Array<unknown>) => {
+			errors.push(args);
+		};
+		const t = new ConnectionRegistry({ max_connections_per_account: 1, log });
+		const throwing = new WSContext({
+			send: () => {},
+			close: () => {
+				throw new Error('already closed');
+			},
+			readyState: 1
+		});
+		t.add_connection(
+			throwing,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		const id = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.strictEqual(typeof id, 'string');
+		// the failure goes to the registry's log
+		assert.strictEqual(errors.length, 1);
+		assert.strictEqual(errors[0]![0], 'error closing superseded client:');
+		// the evicted entry is gone despite the failed close
+		assert.strictEqual(t.connection_count(), 1);
+	});
+
+	test('an eviction logs the account, the closed count, and the cap', () => {
+		const infos: Array<Array<unknown>> = [];
+		const log = new Logger('test', { level: 'off' });
+		log.info = (...args: Array<unknown>) => {
+			infos.push(args);
+		};
+		const t = new ConnectionRegistry({ max_connections_per_account: 2, log });
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		// another account's connection, and reaching the cap, log nothing
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		assert.deepStrictEqual(infos, []);
+
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		// the Rust spine's registry logs the same line
+		assert.deepStrictEqual(infos, [
+			['ws: connection cap closed oldest', { account_id: ACCOUNT_A, closed: 1, max: 2 }]
+		]);
+
+		// a revocation and a plain remove are not cap evictions
+		t.close_connections({ kind: 'account', account_id: ACCOUNT_A });
+		assert.strictEqual(infos.length, 1);
+	});
+
+	test('rejects a cap that is not a positive integer or null', () => {
+		for (const max of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			assert.throws(
+				() => new ConnectionRegistry({ max_connections_per_account: max }),
+				/max_connections_per_account must be a positive integer or null/,
+				String(max)
+			);
+		}
+	});
+});
+
+describe('ConnectionRegistry log', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	/** A socket whose `send` and `close` both throw. */
+	const create_throwing_ws = (): WSContext =>
+		new WSContext({
+			send: () => {
+				throw new Error('send failed');
+			},
+			close: () => {
+				throw new Error('already closed');
+			},
+			readyState: 1
+		});
+
+	/** Spy on every `Logger`'s `error`, recording the label it was called on. */
+	const spy_logger_errors = (): Array<Array<unknown>> => {
+		const calls: Array<Array<unknown>> = [];
+		vi.spyOn(Logger.prototype, 'error').mockImplementation(function (
+			this: Logger,
+			...args: Array<unknown>
+		) {
+			calls.push([this.label, ...args]);
+		});
+		return calls;
+	};
+
+	test('unset falls back to a [ws] logger rather than staying silent', () => {
+		const calls = spy_logger_errors();
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		t.add_connection(
+			create_throwing_ws(),
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(calls.length, 1);
+		assert.strictEqual(calls[0]![0], '[ws]');
+		assert.strictEqual(calls[0]![1], 'error closing superseded client:');
+	});
+
+	test('null silences it', () => {
+		const calls = spy_logger_errors();
+		const infos = vi.spyOn(Logger.prototype, 'info').mockImplementation(() => {});
+		const t = new ConnectionRegistry({ max_connections_per_account: 1, log: null });
+		t.add_connection(
+			create_throwing_ws(),
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		// evicts the throwing socket — neither the eviction nor the failed close logs
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.deepStrictEqual(calls, []);
+		assert.strictEqual(infos.mock.calls.length, 0);
+	});
+
+	test('a failed broadcast send goes to the log and does not stop the fan-out', async () => {
+		const errors: Array<Array<unknown>> = [];
+		const log = new Logger('test', { level: 'off' });
+		log.error = (...args: Array<unknown>) => {
+			errors.push(args);
+		};
+		const t = new ConnectionRegistry({ log });
+		t.add_connection(
+			create_throwing_ws(),
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const ok = create_fake_ws();
+		t.add_connection(ok.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+		const notification: JsonrpcNotification = { jsonrpc: '2.0', method: 'ping' };
+
+		t.broadcast(notification);
+		assert.strictEqual(ok.sends.length, 1);
+		assert.deepStrictEqual(
+			errors.map((args) => args[0]),
+			['error sending to client:']
+		);
+		// a later turn, so the next fan-out is not part of the same synchronous run
+		// (whose frames after the first wait for the write pump)
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// the filtered fan-out counts only the send that went through
+		assert.strictEqual(
+			t.broadcast_filtered(notification, () => true),
+			1
+		);
+		assert.strictEqual(ok.sends.length, 2);
+		assert.deepStrictEqual(
+			errors.map((args) => args[0]),
+			['error sending to client:', 'error sending to client:']
+		);
+	});
+});
+
+describe('ConnectionRegistry revocation bookkeeping', () => {
+	test('revoked connection stops matching any future close_connections call', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+
+		// first revocation path closes the socket once
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 1);
+		assert.strictEqual(a.closes.length, 1);
+
+		// subsequent revocations via any other key find nothing to close
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 0);
+		assert.strictEqual(a.closes.length, 1);
+	});
+
+	test('daemon-token connection (null session_hash + null api_token_id) is only reachable via account', () => {
+		const t = new ConnectionRegistry();
+		const daemon = create_fake_ws();
+		t.add_connection(daemon.ws, create_test_identity({ account_id: ACCOUNT_A }));
+
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 0);
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 0);
+		assert.strictEqual(daemon.closes.length, 0);
+
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 1);
+		assert.strictEqual(daemon.closes.length, 1);
+	});
+
+	test('adding the same ws twice registers two connection ids (contract: caller must not re-add)', () => {
+		// Documents current behavior: add_connection trusts the caller to
+		// only call it once per socket. If misused, each id is its own
+		// connection and needs its own remove_connection.
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const id1 = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const id2 = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		assert.notStrictEqual(id1, id2);
+		// revocation still closes the socket, possibly more than once
+		t.close_connections({ kind: 'account', account_id: ACCOUNT_A });
+		t.close_connections({ kind: 'account', account_id: ACCOUNT_B });
+		assert.ok(a.closes.length >= 1);
+	});
+});
+
+describe('ConnectionRegistry.broadcast_filtered', () => {
+	const notification: JsonrpcNotification = {
+		jsonrpc: '2.0',
+		method: 'thing_changed',
+		params: { id: 'abc' }
+	};
+
+	test('returns 0 and sends nothing when the predicate matches no connections', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+
+		const count = t.broadcast_filtered(notification, () => false);
+		assert.strictEqual(count, 0);
+		assert.deepStrictEqual(a.sends, []);
+		assert.deepStrictEqual(b.sends, []);
+	});
+
+	test('returns matching count and sends only to matching connections', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const c = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+		t.add_connection(c.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+
+		const count = t.broadcast_filtered(
+			notification,
+			(identity) => identity.account_id === ACCOUNT_A
+		);
+		assert.strictEqual(count, 2);
+		assert.deepStrictEqual(a.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(b.sends, []);
+		assert.deepStrictEqual(c.sends, [JSON.stringify(notification)]);
+	});
+
+	test('returns total count and sends to every connection when the predicate matches all', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+
+		const count = t.broadcast_filtered(notification, () => true);
+		assert.strictEqual(count, 2);
+		assert.strictEqual(a.sends.length, 1);
+		assert.strictEqual(b.sends.length, 1);
+	});
+
+	test('returns 0 on a registry with no connections', () => {
+		const t = new ConnectionRegistry();
+		assert.strictEqual(
+			t.broadcast_filtered(notification, () => true),
+			0
+		);
+	});
+
+	test('predicate sees full ConnectionIdentity for session, bearer, and daemon connections', () => {
+		const t = new ConnectionRegistry();
+		const session_ws = create_fake_ws();
+		const bearer_ws = create_fake_ws();
+		const daemon_ws = create_fake_ws();
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer_ws.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon_ws.ws, create_test_identity({ account_id: ACCOUNT_A }));
+
+		const seen: Array<ConnectionIdentity> = [];
+		const count = t.broadcast_filtered(notification, (identity) => {
+			seen.push({ ...identity });
+			return false;
+		});
+
+		assert.strictEqual(count, 0);
+		assert.strictEqual(seen.length, 3);
+		assert.ok(
+			seen.some((i) => i.session_hash === HASH_A && i.api_token_id === null),
+			'session connection exposed'
+		);
+		assert.ok(
+			seen.some((i) => i.session_hash === null && i.api_token_id === TOKEN_A),
+			'bearer connection exposed'
+		);
+		assert.ok(
+			seen.some((i) => i.session_hash === null && i.api_token_id === null),
+			'daemon connection exposed'
+		);
+	});
+
+	test('excludes sockets after remove_connection', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		const id_a = t.add_connection(
+			a.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+		t.remove_connection(id_a);
+
+		const count = t.broadcast_filtered(notification, () => true);
+		assert.strictEqual(count, 1);
+		assert.deepStrictEqual(a.sends, []);
+		assert.deepStrictEqual(b.sends, [JSON.stringify(notification)]);
+	});
+});
+
+describe('ConnectionRegistry.send_to_account', () => {
+	const notification: JsonrpcNotification = {
+		jsonrpc: '2.0',
+		method: 'thing_changed',
+		params: { id: 'abc' }
+	};
+
+	test('delivers to the single matching connection and returns 1', () => {
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+
+		const count = t.send_to_account(ACCOUNT_A, notification);
+		assert.strictEqual(count, 1);
+		assert.deepStrictEqual(a.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(b.sends, []);
+	});
+
+	test('delivers to every socket bound to the account (multi-tab) and returns N', () => {
+		const t = new ConnectionRegistry();
+		const session_ws = create_fake_ws();
+		const bearer_ws = create_fake_ws();
+		const daemon_ws = create_fake_ws();
+		const other_ws = create_fake_ws();
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer_ws.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon_ws.ws, create_test_identity({ account_id: ACCOUNT_A }));
+		t.add_connection(
+			other_ws.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		const count = t.send_to_account(ACCOUNT_A, notification);
+		assert.strictEqual(count, 3);
+		assert.deepStrictEqual(session_ws.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(bearer_ws.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(daemon_ws.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(other_ws.sends, []);
+	});
+
+	test('returns 0 when the account has no connections', () => {
+		const t = new ConnectionRegistry();
+		const { ws } = create_fake_ws();
+		t.add_connection(ws, create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }));
+
+		const count = t.send_to_account(ACCOUNT_A, notification);
+		assert.strictEqual(count, 0);
+	});
+
+	test('returns 0 on a registry with no connections', () => {
+		const t = new ConnectionRegistry();
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, notification), 0);
+	});
+
+	test('two consecutive sends both deliver, each returns the full count', async () => {
+		// Regression guard against any future per-invocation state
+		// (rate limit window, dedup, queue handoff) sneaking in — today
+		// `send_to_account` is stateless pass-through and both calls should
+		// behave identically.
+		const t = new ConnectionRegistry();
+		const a = create_fake_ws();
+		const b = create_fake_ws();
+		t.add_connection(a.ws, create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }));
+		t.add_connection(b.ws, create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A }));
+
+		const first: JsonrpcNotification = {
+			jsonrpc: '2.0',
+			method: 'thing_changed',
+			params: { id: 'first' }
+		};
+		const second: JsonrpcNotification = {
+			jsonrpc: '2.0',
+			method: 'thing_changed',
+			params: { id: 'second' }
+		};
+
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, first), 2);
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, second), 2);
+		// the second frame of one synchronous run waits for the write pump
+		await Promise.resolve();
+		assert.deepStrictEqual(a.sends, [JSON.stringify(first), JSON.stringify(second)]);
+		assert.deepStrictEqual(b.sends, [JSON.stringify(first), JSON.stringify(second)]);
+	});
+
+	test('excludes a socket revoked via a different identity axis, returns N-1', () => {
+		// Revoking via session hash exercises a different code path
+		// (`#close_where` keyed on `session_hash`) than `send_to_account`'s
+		// `account_id` walk — so a shared bookkeeping bug in one path can't
+		// hide in the other.
+		const t = new ConnectionRegistry();
+		const session_ws = create_fake_ws();
+		const bearer_ws = create_fake_ws();
+		const daemon_ws = create_fake_ws();
+		const other_account_ws = create_fake_ws();
+		t.add_connection(
+			session_ws.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bearer_ws.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		t.add_connection(daemon_ws.ws, create_test_identity({ account_id: ACCOUNT_A }));
+		t.add_connection(
+			other_account_ws.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'session', session_hash: HASH_A }), 1);
+
+		const count = t.send_to_account(ACCOUNT_A, notification);
+		assert.strictEqual(count, 2);
+		assert.deepStrictEqual(session_ws.sends, []);
+		assert.deepStrictEqual(bearer_ws.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(daemon_ws.sends, [JSON.stringify(notification)]);
+		assert.deepStrictEqual(other_account_ws.sends, []);
+	});
+});
+
+describe('ConnectionRegistry two-phase registration', () => {
+	const REVOKED_CLOSE = { code: WS_CLOSE_SESSION_REVOKED, reason: WS_CLOSE_SESSION_REVOKED_REASON };
+	const CONNECTION_LIMIT_CLOSE = {
+		code: WS_CLOSE_CONNECTION_LIMIT,
+		reason: WS_CLOSE_CONNECTION_LIMIT_REASON
+	};
+
+	const notification: JsonrpcNotification = {
+		jsonrpc: '2.0',
+		method: 'thing_changed',
+		params: { id: 'x' }
+	};
+
+	test('a pending connection is not a connection until admitted', () => {
+		const t = new ConnectionRegistry();
+		const { ws } = create_fake_ws();
+		const id = t.register_pending(
+			ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(t.connection_count(), 0);
+		assert.strictEqual(t.pending_connection_count(), 1);
+		assert.strictEqual(t.connection_count() > 0, false);
+		assert.strictEqual(t.is_registered(id), false);
+
+		assert.strictEqual(t.admit(id), true);
+
+		assert.strictEqual(t.connection_count(), 1);
+		assert.strictEqual(t.pending_connection_count(), 0);
+		assert.strictEqual(t.connection_count() > 0, true);
+		assert.strictEqual(t.is_registered(id), true);
+	});
+
+	test('a pending connection receives nothing until admitted', async () => {
+		const t = new ConnectionRegistry();
+		const fake = create_fake_ws();
+		const id = t.register_pending(
+			fake.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		// every delivery path skips it
+		assert.strictEqual(t.broadcast(notification), 0);
+		assert.strictEqual(
+			t.broadcast_filtered(notification, () => true),
+			0
+		);
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, notification), 0);
+		assert.deepStrictEqual(await t.request_connection(id, 'peer/ping', {}), {
+			ok: false,
+			error: { kind: 'connection_gone' }
+		});
+		assert.deepStrictEqual(fake.sends, []);
+
+		assert.strictEqual(t.admit(id), true);
+
+		assert.strictEqual(t.broadcast(notification), 1);
+		assert.strictEqual(
+			t.broadcast_filtered(notification, () => true),
+			1
+		);
+		assert.strictEqual(t.send_to_account(ACCOUNT_A, notification), 1);
+		// the frames after the first of one synchronous run wait for the write pump
+		await Promise.resolve();
+		assert.strictEqual(fake.sends.length, 3);
+	});
+
+	test('a broadcast predicate never sees a pending connection', () => {
+		const t = new ConnectionRegistry();
+		t.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		const seen: Array<ConnectionIdentity> = [];
+		t.broadcast_filtered(notification, (identity) => {
+			seen.push(identity);
+			return true;
+		});
+
+		assert.deepStrictEqual(
+			seen.map((identity) => identity.account_id),
+			[ACCOUNT_B]
+		);
+	});
+
+	test('a session revoked while pending is refused and evicts nothing', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const live = create_fake_ws();
+		t.add_connection(
+			live.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const pending = create_fake_ws();
+		const id = t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(
+			t.close_connections({ kind: 'session', session_hash: HASH_B }),
+			1,
+			'the close finds the pending entry'
+		);
+		assert.deepStrictEqual(pending.closes, [REVOKED_CLOSE]);
+		assert.strictEqual(t.pending_connection_count(), 0);
+
+		assert.strictEqual(t.admit(id), false, 'a registration closed while pending is refused');
+		assert.deepStrictEqual(live.closes, [], 'a refused admission evicts nothing');
+		assert.strictEqual(t.connection_count(), 1);
+		assert.strictEqual(t.is_registered(id), false);
+	});
+
+	test('a refused admission reads why its pending entry was closed, once', () => {
+		const t = new ConnectionRegistry();
+		const by_role = t.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({
+				session_hash: HASH_A,
+				account_id: ACCOUNT_A,
+				required_roles: ['admin']
+			})
+		);
+		const by_session = t.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		const by_shutdown = t.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ account_id: ACCOUNT_B, api_token_id: TOKEN_A })
+		);
+		const admitted = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ account_id: ACCOUNT_B, api_token_id: TOKEN_A })
+		);
+
+		t.close_connections({ kind: 'role', account_id: ACCOUNT_A, role: 'admin' });
+		t.close_connections({ kind: 'session', session_hash: HASH_B });
+		t.close_all_connections();
+
+		assert.strictEqual(t.admit(by_role), false);
+		assert.strictEqual(t.take_pending_close_code(by_role), WS_CLOSE_PERMISSION_REVOKED);
+		assert.strictEqual(t.take_pending_close_code(by_role), null, 'read once');
+		assert.strictEqual(t.take_pending_close_code(by_session), WS_CLOSE_SESSION_REVOKED);
+		assert.strictEqual(t.take_pending_close_code(by_shutdown), WS_CLOSE_GOING_AWAY);
+		// an admitted connection's close is not a refused admission's
+		assert.strictEqual(t.take_pending_close_code(admitted), null);
+
+		// and the socket's own close drops an unread record
+		const fresh = new ConnectionRegistry();
+		const left = fresh.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ account_id: ACCOUNT_A })
+		);
+		fresh.close_connections({ kind: 'account', account_id: ACCOUNT_A });
+		fresh.remove_connection(left);
+		assert.strictEqual(fresh.take_pending_close_code(left), null);
+	});
+
+	test('an account close reaches a pending connection', () => {
+		const t = new ConnectionRegistry();
+		const pending = create_fake_ws();
+		const id = t.register_pending(pending.ws, create_test_identity({ account_id: ACCOUNT_A }));
+		const other = create_fake_ws();
+		const other_id = t.register_pending(other.ws, create_test_identity({ account_id: ACCOUNT_B }));
+
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 1);
+
+		assert.deepStrictEqual(pending.closes, [REVOKED_CLOSE]);
+		assert.strictEqual(t.admit(id), false);
+		assert.deepStrictEqual(other.closes, []);
+		assert.strictEqual(t.admit(other_id), true);
+	});
+
+	test('a token close reaches a pending connection', () => {
+		const t = new ConnectionRegistry();
+		const pending = create_fake_ws();
+		const id = t.register_pending(
+			pending.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_A })
+		);
+		const other = create_fake_ws();
+		const other_id = t.register_pending(
+			other.ws,
+			create_test_identity({ account_id: ACCOUNT_A, api_token_id: TOKEN_B })
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'token', api_token_id: TOKEN_A }), 1);
+
+		assert.deepStrictEqual(pending.closes, [REVOKED_CLOSE]);
+		assert.strictEqual(t.admit(id), false);
+		assert.deepStrictEqual(other.closes, []);
+		assert.strictEqual(t.admit(other_id), true);
+	});
+
+	test('the cap evicts at admission, not at registration', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const live = create_fake_ws();
+		t.add_connection(
+			live.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const pending = create_fake_ws();
+
+		const id = t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A })
+		);
+		assert.deepStrictEqual(live.closes, [], 'registering pending closes nothing');
+
+		assert.strictEqual(t.admit(id), true);
+		assert.deepStrictEqual(live.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.deepStrictEqual(pending.closes, []);
+		assert.strictEqual(t.connection_count(), 1);
+	});
+
+	test('pending connections do not count toward the cap', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 2 });
+		const live = create_fake_ws();
+		t.add_connection(
+			live.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		// any number of pending registrations leave the account's one admitted
+		// connection alone
+		for (let i = 0; i < 5; i++)
+			t.register_pending(
+				create_fake_ws().ws,
+				create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A })
+			);
+
+		const admitted = create_fake_ws();
+		t.add_connection(
+			admitted.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.deepStrictEqual(live.closes, [], 'two admitted connections fit under a cap of two');
+		assert.strictEqual(t.connection_count(), 2);
+		assert.strictEqual(t.pending_connection_count(), 5);
+	});
+
+	test('the cap never evicts a pending connection', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		// registered first, so it is the account's oldest entry
+		const pending = create_fake_ws();
+		const pending_id = t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const first = create_fake_ws();
+		t.add_connection(
+			first.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const second = create_fake_ws();
+		t.add_connection(
+			second.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.deepStrictEqual(pending.closes, []);
+		assert.deepStrictEqual(first.closes, [CONNECTION_LIMIT_CLOSE]);
+		assert.strictEqual(t.pending_connection_count(), 1);
+
+		// and admitting it later supersedes the admitted one in turn
+		assert.strictEqual(t.admit(pending_id), true);
+		assert.deepStrictEqual(second.closes, [CONNECTION_LIMIT_CLOSE]);
+	});
+
+	test('removing a pending connection removes its entry, and its admission is refused', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const live = create_fake_ws();
+		t.add_connection(
+			live.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const pending = create_fake_ws();
+		const id = t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_A })
+		);
+
+		t.remove_connection(id);
+
+		assert.strictEqual(t.pending_connection_count(), 0);
+		assert.strictEqual(t.admit(id), false);
+		assert.deepStrictEqual(live.closes, []);
+		// removal alone sends no close frame — the caller that refused it does
+		assert.deepStrictEqual(pending.closes, []);
+	});
+
+	test('admit refuses an id the registry never registered', () => {
+		const t = new ConnectionRegistry();
+		const other = new ConnectionRegistry();
+		const id = other.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(t.admit(id), false);
+		assert.strictEqual(t.admit(create_uuid()), false);
+		assert.strictEqual(t.connection_count(), 0);
+	});
+
+	test('admitting an admitted connection again evicts nothing', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 2 });
+		const first = create_fake_ws();
+		t.add_connection(
+			first.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const second = create_fake_ws();
+		const id = t.register_pending(
+			second.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+
+		assert.strictEqual(t.admit(id), true);
+		assert.strictEqual(t.admit(id), true);
+
+		assert.deepStrictEqual(first.closes, []);
+		assert.strictEqual(t.connection_count(), 2);
+	});
+});
+
+describe('ConnectionRegistry server-side close', () => {
+	test('a revocation aborts the registered controller of a pending and an admitted connection', () => {
+		const t = new ConnectionRegistry();
+		const pending_abort = new AbortController();
+		const admitted_abort = new AbortController();
+		const other_abort = new AbortController();
+		t.register_pending(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			pending_abort
+		);
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			admitted_abort
+		);
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B }),
+			other_abort
+		);
+
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 2);
+
+		assert.strictEqual(pending_abort.signal.aborted, true);
+		assert.strictEqual(admitted_abort.signal.aborted, true);
+		assert.strictEqual(other_abort.signal.aborted, false);
+	});
+
+	test('a socket whose close throws does not spare the sockets after it', () => {
+		// One dead socket ahead of the others in the map would otherwise abort
+		// the loop and leave the rest open on a revoked credential.
+		const t = new ConnectionRegistry({ log: null });
+		const boom = new Error('already closed');
+		const failing_abort = new AbortController();
+		const failing = new WSContext({
+			send: () => {},
+			close: () => {
+				throw boom;
+			},
+			readyState: 1
+		});
+		const before = create_fake_ws();
+		const after = create_fake_ws();
+		const pending = create_fake_ws();
+		const bystander = create_fake_ws();
+		t.add_connection(
+			before.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		const failing_id = t.add_connection(
+			failing,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			failing_abort
+		);
+		t.add_connection(
+			after.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.register_pending(
+			pending.ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		t.add_connection(
+			bystander.ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+
+		assert.throws(() => t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), boom);
+
+		const revoked = [{ code: WS_CLOSE_SESSION_REVOKED, reason: WS_CLOSE_SESSION_REVOKED_REASON }];
+		assert.deepStrictEqual(before.closes, revoked);
+		assert.deepStrictEqual(after.closes, revoked, 'the socket after the throw was closed');
+		assert.deepStrictEqual(pending.closes, revoked, 'and the pending registration');
+		assert.deepStrictEqual(bystander.closes, []);
+		// the failing socket's connection is gone and its handlers aborted
+		assert.strictEqual(t.is_registered(failing_id), false);
+		assert.strictEqual(failing_abort.signal.aborted, true);
+		assert.strictEqual(t.connection_count(), 1, 'only the bystander remains');
+		// nothing is left to close, so a repeat neither throws nor counts
+		assert.strictEqual(t.close_connections({ kind: 'account', account_id: ACCOUNT_A }), 0);
+	});
+
+	test('a cap eviction aborts the evicted connection controller, and only it', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const oldest_abort = new AbortController();
+		const newest_abort = new AbortController();
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			oldest_abort
+		);
+
+		t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			newest_abort
+		);
+
+		assert.strictEqual(oldest_abort.signal.aborted, true);
+		assert.strictEqual(newest_abort.signal.aborted, false);
+	});
+
+	test('remove_connection leaves the controller alone', () => {
+		const t = new ConnectionRegistry();
+		const abort = new AbortController();
+		const id = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A }),
+			abort
+		);
+
+		t.remove_connection(id);
+
+		assert.strictEqual(abort.signal.aborted, false);
+	});
+
+	test('is_registered is false once the connection is revoked, evicted, or removed', () => {
+		const t = new ConnectionRegistry({ max_connections_per_account: 1 });
+		const revoked = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_A, account_id: ACCOUNT_A })
+		);
+		assert.strictEqual(t.is_registered(revoked), true);
+		t.close_connections({ kind: 'session', session_hash: HASH_A });
+		assert.strictEqual(t.is_registered(revoked), false);
+
+		const evicted = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		const newest = t.add_connection(
+			create_fake_ws().ws,
+			create_test_identity({ session_hash: HASH_B, account_id: ACCOUNT_B })
+		);
+		assert.strictEqual(t.is_registered(evicted), false);
+		assert.strictEqual(t.is_registered(newest), true);
+
+		t.remove_connection(newest);
+		assert.strictEqual(t.is_registered(newest), false);
+		assert.strictEqual(t.is_registered(create_uuid()), false);
+	});
+});

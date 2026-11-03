@@ -2,13 +2,12 @@
 
 import { test, vi, beforeEach, assert } from 'vitest';
 import { z } from 'zod';
-import { create_uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Cell, type CellOptions } from '$lib/cell.svelte.ts';
-import { CellJson, type SchemaKeys } from '$lib/cell_types.ts';
-import { HANDLED } from '$lib/cell_helpers.ts';
-import { Frontend } from '$lib/frontend.svelte.ts';
+import { Cell, type CellOptions } from '#lib/cell.svelte.ts';
+import { CellJson, type SchemaKeys } from '#lib/cell_types.ts';
+import { HANDLED } from '#lib/cell_helpers.ts';
+import { Frontend } from '#lib/frontend.svelte.ts';
 
 import { monkeypatch_zzz_for_tests } from './test_helpers.ts';
 
@@ -57,7 +56,7 @@ test('Cell supports overriding assign_property', () => {
 			this.assignment_log.push(`Assigned ${key}: ${String(value)}`);
 
 			if (key === 'text' && typeof value === 'string') {
-				super.assign_property(key, `modified_${value}` as any);
+				super.assign_property(key, `modified_${value}`);
 				return;
 			}
 

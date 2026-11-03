@@ -22,7 +22,12 @@ import { describe, test, beforeAll, assert } from 'vitest';
 import type { AppSurface, AppSurfaceSpec } from '../http/surface.ts';
 import { ROLE_ADMIN } from '../auth/role_schema.ts';
 import type { TestAccount } from './app_server.ts';
-import { resolve_valid_path, generate_valid_body } from './schema_generators.ts';
+import { create_test_request_headers } from './test_origin.ts';
+import {
+	resolve_valid_path,
+	generate_valid_body,
+	to_route_content_type
+} from './schema_generators.ts';
 import { is_null_schema, is_strict_object_schema } from '../http/schema_helpers.ts';
 import { is_keeper_auth, is_public_auth } from '../http/auth_shape.ts';
 import {
@@ -31,7 +36,6 @@ import {
 	assert_no_sensitive_fields_in_json,
 	pick_auth_headers
 } from './integration_helpers.ts';
-import type { BackendCapabilities } from './cross_backend/capabilities.ts';
 import type { SetupTest, TestFixture } from './cross_backend/setup.ts';
 
 // --- Schema introspection ---
@@ -123,8 +127,6 @@ export interface DataExposureTestOptions {
 	 * TS by the consumer; same shape for in-process and cross-process tests.
 	 */
 	surface_source: AppSurfaceSpec;
-	/** Backend capability declarations. */
-	capabilities: BackendCapabilities;
 	/** Fields that must never appear in any response. Default: `sensitive_field_blocklist`. */
 	sensitive_fields?: ReadonlyArray<string>;
 	/** Fields that must not appear in non-admin responses. Default: `admin_only_field_blocklist`. */
@@ -149,7 +151,6 @@ export const describe_data_exposure_tests = (options: DataExposureTestOptions): 
 		admin_only_fields = admin_only_field_blocklist
 	} = options;
 	const skip_set = new Set(options.skip_routes);
-	void options.capabilities;
 
 	describe('data exposure — schema-level', () => {
 		test('no sensitive fields in any output schema', () => {
@@ -207,7 +208,9 @@ export const describe_data_exposure_tests = (options: DataExposureTestOptions): 
 
 				const res = await fixture.transport(url, {
 					method: spec.method,
-					headers: { host: 'localhost', origin: 'http://localhost:5173' }
+					headers: create_test_request_headers({
+						'content-type': to_route_content_type(spec)
+					})
 				});
 
 				if (res.headers.get('Content-Type')?.includes('text/event-stream')) {
@@ -241,11 +244,12 @@ export const describe_data_exposure_tests = (options: DataExposureTestOptions): 
 				if (skip_set.has(route_key)) continue;
 
 				const url = resolve_valid_path(spec.path, spec.params);
-				const headers = authed_account.create_session_headers();
-
 				const res = await fixture.transport(url, {
 					method: spec.method,
-					headers
+					headers: {
+						...authed_account.create_session_headers(),
+						'content-type': to_route_content_type(spec)
+					}
 				});
 
 				assert.strictEqual(res.status, 403, `${route_key} should return 403 for non-admin user`);
@@ -287,10 +291,7 @@ export const describe_data_exposure_tests = (options: DataExposureTestOptions): 
 
 				const request_init: RequestInit = {
 					method: spec.method,
-					headers: {
-						...headers,
-						...(body ? { 'content-type': 'application/json' } : {})
-					},
+					headers: { ...headers, 'content-type': to_route_content_type(spec) },
 					...(body ? { body: JSON.stringify(body) } : {})
 				};
 

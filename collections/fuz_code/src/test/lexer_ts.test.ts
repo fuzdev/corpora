@@ -1,15 +1,15 @@
 import { describe, test, assert } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { SyntaxStyler } from '$lib/syntax_styler.ts';
-import { lexer_ts } from '$lib/lexer_ts.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { SyntaxStyler } from '#lib/syntax_styler.ts';
+import { lexer_ts } from '#lib/lexer_ts.ts';
 import {
 	syntax_events_to_tokens,
 	token_type,
 	validate_syntax_events,
 	type SyntaxLang
-} from '$lib/lexer.ts';
+} from '#lib/lexer.ts';
 
 /**
  * Lexes `text` as ts and returns `[type, text]` pairs.
@@ -183,6 +183,14 @@ describe('lexer_ts identifiers', () => {
 		]);
 	});
 
+	test('a single uppercase letter is capitalized, not a constant', () => {
+		assert.deepEqual(picked('f(T, K); ID', ['constant', 'capitalized_identifier']), [
+			['capitalized_identifier', 'T'],
+			['capitalized_identifier', 'K'],
+			['constant', 'ID']
+		]);
+	});
+
 	test('function calls and function-valued variables', () => {
 		assert.deepEqual(picked('foo(); const f = (a) => a;', ['function', 'function_variable']), [
 			['function', 'foo'],
@@ -254,6 +262,115 @@ describe('lexer_ts type syntax', () => {
 		]);
 	});
 
+	test('annotations without an initializer are types', () => {
+		const types = ['type_name', 'constant', 'capitalized_identifier'];
+		for (const [text, expected] of [
+			['let c: ID;', [['type_name', 'ID']]],
+			[
+				'function f(x: T, y?: U): R {}',
+				[
+					['type_name', 'T'],
+					['type_name', 'U'],
+					['type_name', 'R']
+				]
+			],
+			[
+				'let m: Map<K, Array<V>>;',
+				[
+					['type_name', 'Map'],
+					['type_name', 'K'],
+					['type_name', 'Array'],
+					['type_name', 'V']
+				]
+			],
+			[
+				'class C { a: A; b!: B; m(): R { return X; } }',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['type_name', 'R'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'interface I { a: A; f(x: B): C }',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['type_name', 'C']
+				]
+			],
+			['const {a, b}: Props = $props();', [['type_name', 'Props']]],
+			[
+				'const f = (x: A): B => X;',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'let f: (a: A) => B = g; X',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'const f = (): A | (() => B) => { X }',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'const f = (): ((a: A) => B) => { X }',
+				[
+					['type_name', 'A'],
+					['type_name', 'B'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'type F = Map<K, V> | null\nconst Q = X',
+				[
+					['type_name', 'Map'],
+					['type_name', 'K'],
+					['type_name', 'V'],
+					['capitalized_identifier', 'Q'],
+					['capitalized_identifier', 'X']
+				]
+			],
+			[
+				'x = y as Foo<T> | Bar; X',
+				[
+					['type_name', 'T'],
+					['type_name', 'Bar'],
+					['capitalized_identifier', 'X']
+				]
+			]
+		] as Array<[string, Array<[string, string]>]>) {
+			assert.deepEqual(picked(text, types), expected, text);
+		}
+	});
+
+	test('a colon that is not an annotation stays an operator', () => {
+		for (const text of [
+			'a ? B : C',
+			'f(a ? B : C, {k: V})',
+			'({a: FOO, b: BAR})',
+			'const {name: user_name = 1} = user;',
+			'switch (x) { case FOO: break; default: X }',
+			'outer: for (;;) {}',
+			'// c\nouter: for (;;) {}',
+			'x = {a: 1, f() { return a ? B : C; }}'
+		]) {
+			assert.deepEqual(picked(text, ['type_annotation', 'type_name']), [], text);
+		}
+	});
+
 	test('type annotations with initializers', () => {
 		const tokens = tokens_of('const x: Map<string, Foo> = y;');
 		const annotation = tokens.find(([type]) => type === 'type_annotation');
@@ -266,6 +383,49 @@ describe('lexer_ts type syntax', () => {
 
 	test('object literal colons are not annotations', () => {
 		assert.deepEqual(picked('const o = {a: b};', ['type_annotation']), []);
+	});
+
+	test('an annotation colon is an operator', () => {
+		const tokens = tokens_of('const x: T = y; f(a?: U) {}');
+		assert.deepEqual(
+			tokens.filter(([, text]) => text === ':').map(([type]) => type),
+			['operator', 'operator']
+		);
+	});
+
+	test('bigint is a builtin type', () => {
+		assert.deepEqual(picked('let a: number | bigint;', ['builtin']), [
+			['builtin', 'number'],
+			['builtin', 'bigint']
+		]);
+	});
+});
+
+describe('lexer_ts module renames', () => {
+	test('an `as` that renames a binding is not a type assertion', () => {
+		for (const text of [
+			"import {a as B, c as d} from 'x';",
+			"import * as ns from 'x';",
+			"import D, {a as B} from 'x';",
+			"import type {A as B} from 'x';",
+			'export {a as B, c as default};',
+			"export * as ns from 'x';",
+			"export type * as ns from 'x';"
+		]) {
+			assert.deepEqual(picked(text, ['type_assertion']), [], text);
+		}
+	});
+
+	test('`as` outside a specifier list still asserts', () => {
+		for (const text of [
+			'const x = y as Foo;',
+			'export const o = {a: b as Foo};',
+			'export default {a: b as Foo};',
+			"import x from 'y'; const z = {a: q as Foo};",
+			'const r = a * b as Foo;'
+		]) {
+			assert.deepEqual(picked(text, ['type_assertion']), [['type_assertion', 'Foo']], text);
+		}
 	});
 });
 

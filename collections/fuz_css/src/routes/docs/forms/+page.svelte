@@ -9,7 +9,7 @@
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 	import TomeLink from '@fuzdev/fuz_ui/TomeLink.svelte';
 
-	import UnfinishedImplementationWarning from '$routes/docs/UnfinishedImplementationWarning.svelte';
+	import UnfinishedImplementationWarning from '#routes/docs/UnfinishedImplementationWarning.svelte';
 
 	const LIBRARY_ITEM_NAME = 'forms';
 
@@ -22,7 +22,7 @@
 
 	const faces = ['😊', '😑', '🤔', '😉'];
 
-	// @fuz-classes xs sm md lg xl
+	// @fuz-classes sized_xs sized_sm sized_md sized_lg sized_xl
 
 	let username = $state.raw('');
 	let password = $state.raw('');
@@ -38,11 +38,29 @@
 <!-- eslint-disable svelte/no-useless-mustaches -->
 
 <TomeContent {tome}>
-	<UnfinishedImplementationWarning>Forms need more work.</UnfinishedImplementationWarning>
 	<section>
 		<p>
 			Form elements have basic default styles that can be omitted with <code>.unstyled</code>.
 		</p>
+		<p>
+			A single <code>select</code> draws its arrow in the text color, so it follows the color scheme
+			and the disabled look; list boxes (<code>multiple</code>, or a <code>size</code> above 1) have
+			none. <code>aria-invalid="true"</code> turns a control's border and focus ring negative, and
+			<code>aria-disabled="true"</code> gives it the disabled look while keeping it focusable. A
+			disabled checkbox or radio takes the default cursor, though a <code>label</code> wrapping it
+			still shows the pointer.
+		</p>
+		<Code content={`<input aria-invalid="true" />\n<input aria-disabled="true" />`} />
+		<div class="width_atmost_sm">
+			<label>
+				<div class="title">aria-invalid</div>
+				<input aria-invalid="true" placeholder=">" />
+			</label>
+			<label>
+				<div class="title">aria-disabled</div>
+				<input aria-disabled="true" placeholder=">" />
+			</label>
+		</div>
 	</section>
 
 	<TomeSection>
@@ -142,7 +160,7 @@
 			<code>form</code> with checkboxes
 		</TomeSectionHeader>
 		<UnfinishedImplementationWarning>
-			This will change, probably to toggles.
+			Checkbox styles will likely change, probably to toggles.
 		</UnfinishedImplementationWarning>
 		<!-- TODO make this a form, but figure out the checkbox problem - maybe a last-child exception? -->
 		<form>
@@ -168,9 +186,8 @@
 			</fieldset>
 		</form>
 		<aside>
-			The above are wrapped with: <Code content={`<label class="row">`} inline />
-			with <code>.disabled</code> as needed:
-			<Code content={`<label class="row disabled">`} inline />
+			The above are wrapped with: <Code content={`<label class="row">`} inline /> with
+			<code>.disabled</code> as needed: <Code content={`<label class="row disabled">`} inline />
 		</aside>
 	</TomeSection>
 
@@ -209,15 +226,15 @@
 		<TomeSectionHeader text="Size composites" />
 		<p>
 			The <TomeLink slug="classes" hash="#Composite-classes">size composite classes</TomeLink>
-			<code>.xs</code>, <code>.sm</code>, <code>.md</code>, <code>.lg</code>, and <code>.xl</code>
-			scale inputs and buttons, adjusting height and padding. Apply directly or on a container to
-			cascade to children.
+			<code>.sized_xs</code>, <code>.sized_sm</code>, <code>.sized_md</code>,
+			<code>.sized_lg</code>, and <code>.sized_xl</code> scale inputs and buttons, adjusting height
+			and padding. Apply directly or on a container to cascade to children.
 		</p>
 		<Code
-			content={`<input class="xs" />\n<input class="sm" />\n<input />\n<input class="lg" />\n<input class="xl" />`}
+			content={`<input class="sized_xs" />\n<input class="sized_sm" />\n<input />\n<input class="sized_lg" />\n<input class="sized_xl" />`}
 		/>
-		<div class="column gap_sm mb_lg width_atmost_sm">
-			{#each ['xs', 'sm', 'md', 'lg', 'xl'] as size (size)}
+		<div class="column gap_sm mb_flow width_atmost_sm">
+			{#each ['sized_xs', 'sized_sm', 'sized_md', 'sized_lg', 'sized_xl'] as size (size)}
 				<div class="row align-items:center gap_sm">
 					<input class={size} placeholder={size} />
 					<button type="button" class={size}>{size}</button>
@@ -225,12 +242,12 @@
 			{/each}
 		</div>
 		<p>Set on a container and children inherit the sizing:</p>
-		<Code content={`<form class="xs">...</form>`} />
+		<Code content={`<form class="sized_xs">...</form>`} />
 		<div class="width_atmost_sm">
-			<form class="xs">
+			<form class="sized_xs">
 				<fieldset>
 					<label>
-						<div class="title">inherits .xs</div>
+						<div class="title">inherits .sized_xs</div>
 						<select>
 							{#each faces as face (face)}
 								<option value={face}>{face}</option>

@@ -11,23 +11,37 @@
 import { describe, test, assert, vi, afterEach } from 'vitest';
 import { Hono } from 'hono';
 
-import { RateLimiter } from '$lib/rate_limiter.ts';
-import { create_proxy_middleware } from '$lib/http/proxy.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { REQUEST_CONTEXT_KEY, type RequestContext } from '$lib/auth/request_context.ts';
-import { ACCOUNT_ID_KEY, CREDENTIAL_TYPE_KEY, TEST_CONTEXT_PRESET_KEY } from '$lib/hono_context.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { apply_route_specs } from '$lib/http/route_spec.ts';
-import { fuz_auth_guard_resolver } from '$lib/auth/auth_guard_resolver.ts';
-import { create_keyring } from '$lib/auth/keyring.ts';
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { PASSWORD_LENGTH_MIN, PASSWORD_LENGTH_MAX } from '$lib/auth/password.ts';
-import { ERROR_RATE_LIMIT_EXCEEDED, ERROR_INVALID_CREDENTIALS } from '$lib/http/error_schemas.ts';
-import { create_stub_db, create_noop_stub, create_test_audit_emitter } from '$lib/testing/stubs.ts';
-import { create_recording_audit_emitter } from '$lib/testing/audit_drift_guard.ts';
-import type { ConnectionCloser } from '$lib/actions/connection_closer.ts';
-import type { AuditLogInput } from '$lib/auth/audit_log_schema.ts';
+import { RateLimiter } from '#lib/rate_limiter.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import { REQUEST_CONTEXT_KEY, type RequestContext } from '#lib/auth/request_context.ts';
+import {
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
+} from '#lib/hono_context.ts';
+import { create_test_resolved_auth } from '#lib/testing/resolved_auth.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { apply_route_specs } from '#lib/http/route_spec.ts';
+import { fuz_auth_guard_resolver } from '#lib/auth/auth_guard_resolver.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { PASSWORD_LENGTH_MIN, PASSWORD_LENGTH_MAX } from '#lib/auth/password.ts';
+import { ERROR_RATE_LIMIT_EXCEEDED, ERROR_INVALID_CREDENTIALS } from '#lib/http/error_schemas.ts';
+import { Db } from '#lib/db/db.ts';
+import { create_stub_db, create_noop_stub, create_test_audit_emitter } from '#lib/testing/stubs.ts';
+import { create_recording_audit_emitter } from '#lib/testing/audit_drift_guard.ts';
+import type { AuditLogInput } from '#lib/auth/audit_log_schema.ts';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
+import { create_realtime_closer, type ConnectionCloser } from '#lib/actions/connection_closer.ts';
+import { flush_pending_effects, flush_post_commit_effects } from '#lib/http/pending_effects.ts';
+import { create_recording_closer } from '#lib/testing/connection_closer_helpers.ts';
+import {
+	create_test_limiter,
+	TEST_CONNECTION_IP,
+	TEST_LIMITER_MAX_ATTEMPTS,
+	TEST_LIMITER_WINDOW_MS,
+	test_proxy_middleware
+} from '../rate_limiter_test_helpers.ts';
+import { create_test_keyring } from './session_test_helpers.ts';
 
 const log = new Logger('test', { level: 'off' });
 
@@ -38,7 +52,7 @@ const { mock_update_password, mock_revoke_all, mock_revoke_all_tokens } = vi.hoi
 	mock_revoke_all_tokens: vi.fn(() => Promise.resolve(0))
 }));
 
-vi.mock('$lib/auth/account_queries.js', () => ({
+vi.mock('#lib/auth/account_queries.ts', () => ({
 	query_account_by_username_or_email: vi.fn(),
 	query_update_account_password: mock_update_password,
 	query_account_by_id: vi.fn(),
@@ -46,19 +60,19 @@ vi.mock('$lib/auth/account_queries.js', () => ({
 	query_active_actors_by_account: vi.fn(() => Promise.resolve([]))
 }));
 
-vi.mock('$lib/auth/session_queries.js', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$lib/auth/session_queries.ts')>();
+vi.mock('#lib/auth/session_queries.ts', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('#lib/auth/session_queries.ts')>();
 	return {
 		...actual,
 		query_create_session: vi.fn(() => Promise.resolve()),
-		query_session_enforce_limit: vi.fn(() => Promise.resolve(0)),
+		query_session_enforce_limit: vi.fn(() => Promise.resolve([])),
 		query_session_revoke_all_for_account: mock_revoke_all
 	};
 });
 
-vi.mock('$lib/auth/api_token_queries.js', () => ({
+vi.mock('#lib/auth/api_token_queries.ts', () => ({
 	query_create_api_token: vi.fn(() => Promise.resolve()),
-	query_api_token_enforce_limit: vi.fn(() => Promise.resolve()),
+	query_api_token_enforce_limit: vi.fn(() => Promise.resolve([])),
 	query_revoke_api_token_for_account: vi.fn(() => Promise.resolve(true)),
 	query_api_token_list_for_account: vi.fn(() => Promise.resolve([])),
 	query_revoke_all_api_tokens_for_account: mock_revoke_all_tokens,
@@ -68,34 +82,31 @@ vi.mock('$lib/auth/api_token_queries.js', () => ({
 // Audit fan-out is intercepted via the bound `audit` slot on the deps
 // factory below (a `create_test_audit_emitter()` no-op).
 
-vi.mock('$lib/auth/role_grant_queries.js', () => ({
+vi.mock('#lib/auth/role_grant_queries.ts', () => ({
 	query_role_grant_find_active_for_actor: vi.fn(() => Promise.resolve([]))
 }));
 
 // --- Shared fixtures ---
 
-/** Simulated connection IP for all test requests. */
-const TEST_CONNECTION_IP = '127.0.0.1';
-
-/**
- * Proxy middleware for tests: trusts the simulated connection IP
- * so that `X-Forwarded-For` headers are honored in test requests.
- */
-const test_proxy_middleware = create_proxy_middleware({
-	trusted_proxies: [TEST_CONNECTION_IP],
-	get_connection_ip: () => TEST_CONNECTION_IP
-});
-
-const WINDOW_MS = 60_000;
-const MAX_ATTEMPTS = 3;
-
-const create_test_limiter = (): RateLimiter =>
-	new RateLimiter({ max_attempts: MAX_ATTEMPTS, window_ms: WINDOW_MS, cleanup_interval_ms: 0 });
-
-const keyring = create_keyring('integration_test_key_a')!;
+const keyring = create_test_keyring('integration-test-key-at-least-32-chars');
 const session_options = create_session_config('test_session');
 
-const db = create_stub_db();
+/**
+ * Transactions open on `db` right now — to pin that a request waiting for a
+ * rate-limit slot, or in its Argon2 work, holds none.
+ */
+const transactions = { open: 0 };
+const db = new Db({
+	client: { query: async () => ({ rows: [] }) },
+	transaction: async (fn) => {
+		transactions.open++;
+		try {
+			return await fn(create_stub_db());
+		} finally {
+			transactions.open--;
+		}
+	}
+});
 const noop = create_noop_stub('deps');
 
 const fake_account = {
@@ -104,8 +115,8 @@ const fake_account = {
 	email: null,
 	email_verified: false,
 	password_hash: 'fake_hash',
-	created_at: '2025-01-01T00:00:00.000Z',
-	updated_at: '2025-01-01T00:00:00.000Z',
+	created_at: '2025-01-01T00:00:00Z',
+	updated_at: '2025-01-01T00:00:00Z',
 	created_by: null,
 	updated_by: null,
 	deleted_at: null,
@@ -116,7 +127,7 @@ const fake_actor = {
 	id: 'act_test' as Uuid,
 	account_id: 'acc_test' as Uuid,
 	name: 'testuser',
-	created_at: '2025-01-01T00:00:00.000Z',
+	created_at: '2025-01-01T00:00:00Z',
 	updated_at: null,
 	updated_by: null,
 	deleted_at: null,
@@ -162,6 +173,9 @@ const create_password_change_app = (
 		? create_recording_audit_emitter(audit_events).emitter
 		: create_test_audit_emitter();
 
+	const realtime_closer = create_realtime_closer();
+	if (connection_closer) realtime_closer.add(connection_closer);
+
 	const route_specs = create_account_route_specs(
 		{
 			log,
@@ -173,26 +187,40 @@ const create_password_change_app = (
 			},
 			read_secure_file: noop,
 			delete_file: noop,
-			audit
+			audit,
+			connection_closer: realtime_closer
 		},
 		{
 			session_options,
 			login_ip_rate_limiter,
 			login_account_rate_limiter,
-			login_fail_floor_ms: 0,
-			connection_closer
+			login_fail_floor_ms: 0
 		}
 	);
 
 	const app = new Hono();
+	// the request's two side-effect queues, flushed the way `create_app_server`
+	// flushes them — the handler queues its connection close post-commit
+	app.use('*', async (c, next) => {
+		c.set('pending_effects', []);
+		c.set('post_commit_effects', []);
+		try {
+			await next();
+		} finally {
+			await flush_pending_effects(c.var.pending_effects, log);
+			await flush_post_commit_effects(c.var.post_commit_effects, log);
+		}
+	});
 	app.use('*', test_proxy_middleware);
 
 	// inject authenticated request context before route guards
 	app.use('/*', async (c, next) => {
-		c.set(ACCOUNT_ID_KEY, fake_ctx.account.id);
+		c.set(
+			RESOLVED_AUTH_KEY,
+			create_test_resolved_auth({ credential_type: 'session', account_id: fake_ctx.account.id })
+		);
 		c.set(REQUEST_CONTEXT_KEY, fake_ctx);
-		c.set(TEST_CONTEXT_PRESET_KEY, true);
-		c.set(CREDENTIAL_TYPE_KEY, 'session');
+		c.set(TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET);
 		await next();
 	});
 
@@ -417,7 +445,7 @@ describe('password change rate limiting', () => {
 		const { app, mock_verify_password } = create_password_change_app(limiter);
 
 		// exhaust the limit with wrong-password attempts
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401);
 		}
@@ -431,8 +459,53 @@ describe('password change rate limiting', () => {
 		assert.ok(body.retry_after > 0);
 
 		// verify no password work was done on the blocked request
-		assert.strictEqual(mock_verify_password.mock.calls.length, MAX_ATTEMPTS);
+		assert.strictEqual(mock_verify_password.mock.calls.length, TEST_LIMITER_MAX_ATTEMPTS);
 
+		limiter.dispose();
+	});
+
+	test('a concurrent burst of wrong current passwords gets at most the cap past the limiter', async () => {
+		// Every request of the burst would pass a check made before the verify;
+		// the reservation counts each one in flight, so exactly the cap gets
+		// through.
+		const limiter = create_test_limiter();
+		const { app, mock_verify_password } = create_password_change_app(limiter);
+
+		const responses = await Promise.all(
+			Array.from({ length: TEST_LIMITER_MAX_ATTEMPTS * 2 }, async () =>
+				password_change_request(app)
+			)
+		);
+
+		const statuses = responses.map((r) => r.status).sort((a, b) => a - b);
+		assert.deepStrictEqual(statuses, [
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(401),
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(429)
+		]);
+		assert.strictEqual(mock_verify_password.mock.calls.length, TEST_LIMITER_MAX_ATTEMPTS);
+
+		limiter.dispose();
+	});
+
+	test('a change waiting for a slot, or in its verify, holds no database transaction', async () => {
+		const limiter = create_test_limiter();
+		const { app, mock_verify_password } = create_password_change_app(limiter);
+		const verifies: Array<(valid: boolean) => void> = [];
+		mock_verify_password.mockImplementation(
+			() => new Promise<boolean>((resolve) => verifies.push(resolve))
+		);
+		const requests = Array.from({ length: TEST_LIMITER_MAX_ATTEMPTS * 2 }, async () =>
+			password_change_request(app)
+		);
+		while (verifies.length < TEST_LIMITER_MAX_ATTEMPTS) await new Promise((r) => setImmediate(r));
+		await new Promise((r) => setImmediate(r));
+
+		assert.strictEqual(verifies.length, TEST_LIMITER_MAX_ATTEMPTS);
+		assert.strictEqual(transactions.open, 0, 'a parked or verifying change holds no transaction');
+
+		mock_verify_password.mockImplementation(() => Promise.resolve(false));
+		for (const resolve of verifies) resolve(false);
+		await Promise.all(requests);
 		limiter.dispose();
 	});
 
@@ -441,7 +514,7 @@ describe('password change rate limiting', () => {
 		const { app, mock_verify_password } = create_password_change_app(limiter);
 
 		// exhaust the limit
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await password_change_request(app);
 		}
 
@@ -466,7 +539,7 @@ describe('password change rate limiting', () => {
 		assert.strictEqual(res.status, 401);
 
 		// IP is the test connection IP (no X-Forwarded-For) — one attempt consumed
-		assert.strictEqual(limiter.check(TEST_CONNECTION_IP).remaining, MAX_ATTEMPTS - 1);
+		assert.strictEqual(limiter.check(TEST_CONNECTION_IP).remaining, TEST_LIMITER_MAX_ATTEMPTS - 1);
 
 		limiter.dispose();
 	});
@@ -500,8 +573,8 @@ describe('password change rate limiting', () => {
 	test('login_ip_rate_limiter null allows unlimited failed attempts', async () => {
 		const { app } = create_password_change_app(null);
 
-		// well beyond MAX_ATTEMPTS — should never see 429
-		for (let i = 0; i < MAX_ATTEMPTS + 5; i++) {
+		// well beyond TEST_LIMITER_MAX_ATTEMPTS — should never see 429
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS + 5; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401, `request ${i + 1} should be 401, not 429`);
 		}
@@ -511,7 +584,7 @@ describe('password change rate limiting', () => {
 		const limiter = create_test_limiter();
 		const { app } = create_password_change_app(limiter);
 
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await password_change_request(app);
 		}
 
@@ -528,7 +601,7 @@ describe('password change rate limiting', () => {
 		const { app } = create_password_change_app(limiter);
 
 		// exhaust limit for 10.0.0.1
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await password_change_request(app, undefined, { 'X-Forwarded-For': '10.0.0.1' });
 		}
 
@@ -554,7 +627,7 @@ describe('password change per-account rate limiting', () => {
 		const { app } = create_password_change_app(null, account_limiter);
 
 		// exhaust the per-account limit with wrong-password attempts
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401);
 		}
@@ -570,6 +643,25 @@ describe('password change per-account rate limiting', () => {
 		account_limiter.dispose();
 	});
 
+	test('a concurrent burst gets at most the per-account cap past the limiter', async () => {
+		const account_limiter = create_test_limiter();
+		const { app } = create_password_change_app(null, account_limiter);
+
+		const responses = await Promise.all(
+			Array.from({ length: TEST_LIMITER_MAX_ATTEMPTS * 2 }, async () =>
+				password_change_request(app)
+			)
+		);
+
+		const statuses = responses.map((r) => r.status).sort((a, b) => a - b);
+		assert.deepStrictEqual(statuses, [
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(401),
+			...Array<number>(TEST_LIMITER_MAX_ATTEMPTS).fill(429)
+		]);
+
+		account_limiter.dispose();
+	});
+
 	test('wrong current password records against per-account limiter', async () => {
 		const account_limiter = create_test_limiter();
 		const { app } = create_password_change_app(null, account_limiter);
@@ -578,7 +670,10 @@ describe('password change per-account rate limiting', () => {
 		assert.strictEqual(res.status, 401);
 
 		// account ID is the rate limit key — one attempt consumed
-		assert.strictEqual(account_limiter.check(fake_account.id).remaining, MAX_ATTEMPTS - 1);
+		assert.strictEqual(
+			account_limiter.check(fake_account.id).remaining,
+			TEST_LIMITER_MAX_ATTEMPTS - 1
+		);
 
 		account_limiter.dispose();
 	});
@@ -598,7 +693,7 @@ describe('password change per-account rate limiting', () => {
 		assert.strictEqual(res.status, 200);
 
 		// per-account counter fully reset
-		assert.strictEqual(account_limiter.check(fake_account.id).remaining, MAX_ATTEMPTS);
+		assert.strictEqual(account_limiter.check(fake_account.id).remaining, TEST_LIMITER_MAX_ATTEMPTS);
 
 		account_limiter.dispose();
 	});
@@ -606,14 +701,14 @@ describe('password change per-account rate limiting', () => {
 	test('IP and account limiters are independent', async () => {
 		const ip_limiter = create_test_limiter();
 		const account_limiter = new RateLimiter({
-			max_attempts: MAX_ATTEMPTS + 2,
-			window_ms: WINDOW_MS,
+			max_attempts: TEST_LIMITER_MAX_ATTEMPTS + 2,
+			window_ms: TEST_LIMITER_WINDOW_MS,
 			cleanup_interval_ms: 0
 		});
 		const { app } = create_password_change_app(ip_limiter, account_limiter);
 
 		// exhaust IP limiter (3 attempts), account limiter still has capacity (5)
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await password_change_request(app);
 		}
 
@@ -633,7 +728,7 @@ describe('password change per-account rate limiting', () => {
 		const { app, mock_verify_password } = create_password_change_app(null, account_limiter);
 
 		// exhaust the limit
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			await password_change_request(app);
 		}
 
@@ -653,8 +748,8 @@ describe('password change per-account rate limiting', () => {
 	test('login_account_rate_limiter null allows unlimited failed attempts', async () => {
 		const { app } = create_password_change_app(null, null);
 
-		// well beyond MAX_ATTEMPTS — should never see 429
-		for (let i = 0; i < MAX_ATTEMPTS + 5; i++) {
+		// well beyond TEST_LIMITER_MAX_ATTEMPTS — should never see 429
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS + 5; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401, `request ${i + 1} should be 401, not 429`);
 		}
@@ -671,28 +766,13 @@ describe('password change connection_closer wiring', () => {
 	// between auth-load and update. Mocking the query at the module boundary
 	// is the simplest path.
 	//
-	// Safety/security framing: a refactor that lifted the eager close above
-	// the `if (!updated)` early-return would silently disconnect the caller's
-	// live WS sockets on every concurrent-change 401 (a flapping
-	// re-authentication path under contention), violating the listener-only
-	// invariant the failure-outcome guard is supposed to preserve.
+	// Safety/security framing: a refactor that lifted the close above
+	// the `if (!updated)` early-return would disconnect the caller's
+	// live connections on every concurrent-change 401 (a flapping
+	// re-authentication path under contention), though nothing was revoked.
 
 	test('does NOT close on concurrent-change 401 (update returned false)', async () => {
-		const calls: Array<{ method: string; id: string }> = [];
-		const closer: ConnectionCloser = {
-			close_sockets_for_session: (id) => {
-				calls.push({ method: 'session', id });
-				return 1;
-			},
-			close_sockets_for_token: (id) => {
-				calls.push({ method: 'token', id });
-				return 1;
-			},
-			close_sockets_for_account: (id) => {
-				calls.push({ method: 'account', id });
-				return 1;
-			}
-		};
+		const { closer, calls } = create_recording_closer();
 		const audit_events: Array<AuditLogInput> = [];
 		const { app, mock_verify_password } = create_password_change_app(
 			null,
@@ -738,28 +818,14 @@ describe('password change connection_closer wiring', () => {
 		assert.strictEqual(meta.credential_type, 'session');
 	});
 
-	test('fires close_sockets_for_account on the success path', async () => {
+	test("closes the account's connections on the success path", async () => {
 		// Mirror assertion to the negative test above — the same closer
 		// stub on a happy-path call DOES record an account-wide close,
 		// closing the "is the closer wired at all?" alternative explanation
 		// for the no-close result above. Without this, a regression that
 		// dropped the success-path close entirely would also pass the
 		// concurrent-change test.
-		const calls: Array<{ method: string; id: string }> = [];
-		const closer: ConnectionCloser = {
-			close_sockets_for_session: (id) => {
-				calls.push({ method: 'session', id });
-				return 1;
-			},
-			close_sockets_for_token: (id) => {
-				calls.push({ method: 'token', id });
-				return 1;
-			},
-			close_sockets_for_account: (id) => {
-				calls.push({ method: 'account', id });
-				return 1;
-			}
-		};
+		const { closer, calls } = create_recording_closer();
 		const { app, mock_verify_password } = create_password_change_app(null, null, closer);
 		mock_verify_password.mockResolvedValueOnce(true);
 		// default mock_update_password resolution is `true` (success)
@@ -768,37 +834,23 @@ describe('password change connection_closer wiring', () => {
 		assert.strictEqual(res.status, 200);
 
 		assert.strictEqual(calls.length, 1);
-		assert.deepStrictEqual(calls[0], { method: 'account', id: fake_account.id });
+		assert.deepStrictEqual(calls[0], { kind: 'account', account_id: fake_account.id });
 	});
 
 	test('does NOT close on per-IP rate-limit 429', async () => {
 		// Pins the contract that the closer never fires when the request is
-		// rate-limited. A refactor that moved the eager close above the
+		// rate-limited. A refactor that moved the close above the
 		// rate-limit gate would silently disconnect the caller's live WS
 		// sockets on every blocked request — the opposite of what rate
 		// limiting is supposed to do (it would amplify churn under attack).
-		const calls: Array<{ method: string; id: string }> = [];
-		const closer: ConnectionCloser = {
-			close_sockets_for_session: (id) => {
-				calls.push({ method: 'session', id });
-				return 1;
-			},
-			close_sockets_for_token: (id) => {
-				calls.push({ method: 'token', id });
-				return 1;
-			},
-			close_sockets_for_account: (id) => {
-				calls.push({ method: 'account', id });
-				return 1;
-			}
-		};
+		const { closer, calls } = create_recording_closer();
 		const limiter = create_test_limiter();
 		const { app } = create_password_change_app(limiter, null, closer);
 
 		// Exhaust the IP limit with wrong-password attempts. Each failure
-		// records against the limiter but must NOT fire the eager close
+		// records against the limiter but must NOT queue the close
 		// (those are 401, not the success path).
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401);
 		}
@@ -820,25 +872,11 @@ describe('password change connection_closer wiring', () => {
 		// Companion to the per-IP test above — the per-account limiter
 		// runs after request-context resolution, so it's a separate gate
 		// and a separate refactor target. Same contract on both gates.
-		const calls: Array<{ method: string; id: string }> = [];
-		const closer: ConnectionCloser = {
-			close_sockets_for_session: (id) => {
-				calls.push({ method: 'session', id });
-				return 1;
-			},
-			close_sockets_for_token: (id) => {
-				calls.push({ method: 'token', id });
-				return 1;
-			},
-			close_sockets_for_account: (id) => {
-				calls.push({ method: 'account', id });
-				return 1;
-			}
-		};
+		const { closer, calls } = create_recording_closer();
 		const account_limiter = create_test_limiter();
 		const { app } = create_password_change_app(null, account_limiter, closer);
 
-		for (let i = 0; i < MAX_ATTEMPTS; i++) {
+		for (let i = 0; i < TEST_LIMITER_MAX_ATTEMPTS; i++) {
 			const res = await password_change_request(app);
 			assert.strictEqual(res.status, 401);
 		}

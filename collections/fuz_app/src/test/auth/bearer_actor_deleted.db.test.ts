@@ -1,8 +1,8 @@
 /**
  * Bearer auth + dispatcher authorization phase: empty actor list.
  *
- * The bearer middleware validates the token and sets `ACCOUNT_ID_KEY` /
- * `CREDENTIAL_TYPE_KEY` only — actor + role_grant resolution lives in the
+ * The bearer middleware validates the token and sets the account-grain
+ * `ResolvedAuth` only — actor + role_grant resolution lives in the
  * dispatcher's authorization phase. When the actor list is empty the
  * authorization phase surfaces `ERROR_NO_ACTORS_ON_ACCOUNT` (500).
  *
@@ -24,17 +24,13 @@
 
 import { test, assert } from 'vitest';
 
-import { admin_session_revoke_all_action_spec } from '$lib/auth/admin_action_specs.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { ERROR_NO_ACTORS_ON_ACCOUNT } from '$lib/http/error_schemas.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import {
-	RPC_PATH,
-	create_admin_route_specs,
-	describe_db,
-	session_options
-} from './admin_rpc_test_helpers.ts';
+import { admin_session_revoke_all_action_spec } from '#lib/auth/admin_action_specs.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { ERROR_NO_ACTORS_ON_ACCOUNT } from '#lib/http/error_schemas.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { describe_db } from '../auth_db_default.ts';
+import { RPC_PATH, create_admin_route_specs, session_options } from './admin_rpc_test_helpers.ts';
 
 describe_db('bearer auth + dispatcher authorization phase — empty actor list', (get_db) => {
 	test('all actors deleted → 500 no_actors_on_account (resolve_acting_actor empty list)', async () => {

@@ -7,8 +7,8 @@
 
 	import PersonalEcosystemLinks from './PersonalEcosystemLinks.svelte';
 	import PersonalProjectLinks from './PersonalProjectLinks.svelte';
-	import { logo_webdevladder } from '$lib/logos.ts';
-	import Videos from '$lib/Videos.svelte';
+	import { logo_webdevladder } from '#lib/logos.ts';
+	import Videos from '#lib/Videos.svelte';
 	import { channels } from './channel_data.ts';
 
 	const site = site_context.get();
@@ -24,17 +24,16 @@
 	</section>
 	<section class="box gap_lg">
 		<Card href={resolve('/blog')} icon="🖊️">blog</Card>
-		<Card href={resolve('/tools')} icon="🪄" align="right">tools</Card>
+		<Card href={resolve('/tools')} icon="🪄" align="end">tools</Card>
 	</section>
 	<section class="panel p_md shadow_inset_bottom_xs width:100%">
 		<div class="panel shadow_inset_xs shade_00 p_xl">
 			<h2 class="mt_md">welcome</h2>
 			<p>
-				Webdevladder is a blog and collection of YouTube channels for my open source webdev <a
-					href="https://www.ryanatkn.com/">work</a
-				>. I'm writing blog posts and making educational videos on the technical topics I find most
-				interesting, often advanced and very niche. Some topics have both a blog post and
-				accompanying video.
+				Webdevladder is a blog and collection of YouTube channels for my open source webdev
+				<a href="https://www.ryanatkn.com/">work</a>. I'm writing blog posts and making educational
+				videos on the technical topics I find most interesting, often advanced and very niche. Some
+				topics have both a blog post and accompanying video.
 			</p>
 			<aside>
 				<PersonalEcosystemLinks />

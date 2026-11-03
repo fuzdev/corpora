@@ -32,6 +32,21 @@ import {
 	type WsWaiter
 } from './ws_client.ts';
 import { create_jsonrpc_request } from '../../http/jsonrpc_helpers.ts';
+import { heartbeat_action_spec } from '../../actions/heartbeat.ts';
+
+/**
+ * A cross-process `WsClient` with one addition: `send_text` writes a frame
+ * verbatim, for the cases a JSON-serializing `send` cannot express (a frame
+ * that is not JSON at all).
+ */
+export interface WsTransportClient extends WsClient {
+	/**
+	 * Send `text` as one text frame, unserialized.
+	 *
+	 * @throws Error if called after the socket closed
+	 */
+	send_text: (text: string) => Promise<void>;
+}
 
 /** Construction options for `create_ws_transport`. */
 export interface WsTransportOptions {
@@ -50,9 +65,11 @@ export interface WsTransportOptions {
 	 * Origin header for the upgrade. Backends running with
 	 * `ALLOWED_ORIGINS=http://localhost:*` accept `http://localhost:<port>`.
 	 * Defaults to `base_url` — acceptable because cross-process tests
-	 * always run against `localhost`.
+	 * always run against `localhost`. `null` sends no `Origin` at all, which a
+	 * daemon-token upgrade needs: both spines discard a daemon token (and a
+	 * bearer token) presented in a browser context.
 	 */
-	readonly origin?: string;
+	readonly origin?: string | null;
 	/**
 	 * Optional per-call default for `wait_for` timeouts. Falls back to
 	 * `WS_CLIENT_DEFAULT_TIMEOUT_MS` if omitted.
@@ -67,6 +84,13 @@ export interface WsTransportOptions {
 	 * behavior).
 	 */
 	readonly on_request?: WsRequestResponder;
+	/**
+	 * Extra headers for the upgrade request — e.g. an `X-Forwarded-For` that a
+	 * backend trusting the loopback proxy resolves as the connection's client
+	 * IP, which keys the per-IP action rate limiter for every message on the
+	 * socket. `cookies` and `origin` set their own headers.
+	 */
+	readonly headers?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -78,21 +102,31 @@ export interface WsTransportOptions {
  * `messages` array; `wait_for` checks already-received messages first
  * before waiting for new arrivals.
  *
+ * An open socket is not yet an **admitted** connection: both spines answer
+ * the handshake first and admit the connection a credential re-check later,
+ * and deliver no server-initiated message to it until then. Requests sent
+ * meanwhile are queued and answered, so a suite that only round-trips can
+ * use this directly; one that waits for a push (a broadcast, a targeted
+ * notification) opens with `create_admitted_ws_transport` instead.
+ *
  * @throws Error if the upgrade fails (status, network) — the rejection
  *   message carries the underlying error so the test surfaces the real
  *   cause rather than hanging.
  */
-export const create_ws_transport = async (options: WsTransportOptions): Promise<WsClient> => {
+export const create_ws_transport = async (
+	options: WsTransportOptions
+): Promise<WsTransportClient> => {
 	const { base_url, ws_path, cookies, origin, default_timeout_ms, on_request } = options;
 	const default_timeout = default_timeout_ms ?? WS_CLIENT_DEFAULT_TIMEOUT_MS;
 
 	const ws_url = `${base_url.replace(/^http/i, 'ws')}${ws_path}`;
-	const headers: Record<string, string> = {};
+	const headers: Record<string, string> = { ...options.headers };
 	if (cookies.length > 0) headers.Cookie = cookies.join('; ');
 
 	const socket = new WebSocket(ws_url, {
 		headers,
-		origin: origin ?? base_url
+		// `ws` sends no `Origin` header when the option is undefined
+		origin: origin === null ? undefined : (origin ?? base_url)
 	});
 
 	const received: Array<unknown> = [];
@@ -120,7 +154,11 @@ export const create_ws_transport = async (options: WsTransportOptions): Promise<
 		});
 	});
 
-	socket.on('close', () => {
+	let close_code: number | null = null;
+	let close_reason: string | null = null;
+	socket.on('close', (code: number, reason: Buffer) => {
+		close_code = code;
+		close_reason = reason.toString('utf-8');
 		for (const resolve of close_resolvers) resolve();
 		close_resolvers = [];
 	});
@@ -186,16 +224,24 @@ export const create_ws_transport = async (options: WsTransportOptions): Promise<
 		});
 	};
 
-	const send_impl = async (message: unknown): Promise<void> => {
+	const send_text_impl = async (text: string): Promise<void> => {
 		if (is_closed() || socket.readyState !== WebSocket.OPEN) throw new Error('send after close');
-		socket.send(JSON.stringify(message));
+		socket.send(text);
 	};
+	const send_impl = (message: unknown): Promise<void> => send_text_impl(JSON.stringify(message));
 
 	return {
 		get messages() {
 			return received;
 		},
+		get close_code() {
+			return close_code;
+		},
+		get close_reason() {
+			return close_reason;
+		},
 		send: send_impl,
+		send_text: send_text_impl,
 		async request<R = unknown>(
 			id: number | string,
 			method: string,
@@ -224,4 +270,38 @@ export const create_ws_transport = async (options: WsTransportOptions): Promise<
 		wait_for: wait_for_impl,
 		wait_for_close
 	};
+};
+
+/** The request id `create_admitted_ws_transport` round-trips `heartbeat` under. */
+export const WS_ADMISSION_PROBE_ID = 'admitted';
+
+/**
+ * Open a real-upgrade WS client and round-trip `heartbeat` on it, so the
+ * backend has **admitted** the connection by the time this resolves.
+ *
+ * Both spines answer the upgrade handshake before the connection is
+ * registered and admitted (the credential is re-read in between), and deliver
+ * no broadcast or targeted notification to a connection still pending
+ * admission. A request is answered only once the connection is admitted, so
+ * the round trip is the one signal a client has. Suites that open a socket and
+ * then wait for a server-initiated message, or that need connections
+ * registered in a known order, open through this.
+ *
+ * `heartbeat` is a protocol action, present on every WS endpoint. Its response
+ * frame (id `WS_ADMISSION_PROBE_ID`) stays in the client's `messages`.
+ *
+ * @throws Error if the upgrade fails, or the heartbeat is refused or times out
+ *   — the socket is closed first
+ */
+export const create_admitted_ws_transport = async (
+	options: WsTransportOptions
+): Promise<WsTransportClient> => {
+	const client = await create_ws_transport(options);
+	try {
+		await client.request(WS_ADMISSION_PROBE_ID, heartbeat_action_spec.method, {});
+	} catch (error) {
+		await client.close().catch(() => {});
+		throw error;
+	}
+	return client;
 };

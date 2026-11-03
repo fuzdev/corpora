@@ -3,10 +3,11 @@
   import { getId } from './context.svelte.js';
   import Layer from './Layer.svelte';
   import type { CommonLayerProps } from './types.js';
+  import type { BackgroundLayerSpecification } from 'maplibre-gl';
 
   interface Props extends Omit<CommonLayerProps<FEATURE>, 'source' | 'sourceLayer'> {
-    paint: maplibregl.BackgroundLayerSpecification['paint'];
-    layout?: maplibregl.BackgroundLayerSpecification['layout'];
+    paint: BackgroundLayerSpecification['paint'];
+    layout?: BackgroundLayerSpecification['layout'];
     applyToClusters?: boolean | undefined;
   }
 
@@ -35,6 +36,12 @@
     onmouseleave = undefined,
   }: Props = $props();
 </script>
+
+<!-- @component
+Add a MapLibre `background` layer to the map. A background layer fills the full map with a color or a pattern.
+
+This is a thin wrapper around `Layer` with `type` set to `background`. It does not use a source, so you can put it anywhere inside the map.
+-->
 
 <Layer
   {id}

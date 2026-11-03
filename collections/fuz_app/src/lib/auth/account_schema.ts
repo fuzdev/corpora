@@ -18,10 +18,9 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
-import { Blake3Hash } from '@fuzdev/fuz_util/hash_schemas.ts';
+import { Uuid, Blake3Hash, Username, Email } from '../primitive_schemas.ts';
 
-import { Username, Email } from '../primitive_schemas.ts';
+import { is_iso8601_seconds_live } from '../timestamp.ts';
 
 // Types
 
@@ -79,6 +78,7 @@ export interface Actor {
  * revoked role_grant. Bounds the value at the schema layer so both the admin
  * input (when the route surfaces a reason field) and the revokee-facing
  * `role_grant_revoke` WS notification validate against the same ceiling.
+ * Counted in UTF-16 code units.
  */
 export const ROLE_GRANT_REVOKED_REASON_LENGTH_MAX = 500;
 
@@ -108,14 +108,68 @@ export interface RoleGrant {
 	source_offer_id: Uuid | null;
 }
 
+/**
+ * Whether a role grant is live, from its wire fields — not revoked, and not
+ * past `expires_at`.
+ *
+ * Server-side this is belt-and-suspenders: every `role_grant` a request
+ * context holds came through `query_role_grant_find_active_for_actor`, whose
+ * `role_grant_active_sql` predicate (`auth/role_grant_sql.ts`) is the
+ * authoritative gate on both spines (the Rust twin's in-memory
+ * `RoleGrantRow` carries no timestamps at all and re-checks nothing).
+ *
+ * `expires_at` arrives second-truncated, so the expiry check is
+ * `is_iso8601_seconds_live` (`timestamp.ts`): it admits through the end of
+ * the second the stamp names, so the predicate can never report a grant
+ * expired *before* the SQL gate would — a bare `expires_at > now` would deny
+ * an admitted grant for up to a second.
+ *
+ * @param p - the grant's revocation + expiry fields
+ * @param now - current time (defaults to `new Date()`, pass for testability and hot-path efficiency)
+ * @returns `true` when the grant is neither revoked nor expired
+ */
 export const is_role_grant_active = (
 	p: { revoked_at?: string | null; expires_at: string | null },
 	now: Date = new Date()
-): boolean => !p.revoked_at && (!p.expires_at || new Date(p.expires_at) > now);
+): boolean =>
+	!p.revoked_at && (!p.expires_at || is_iso8601_seconds_live(p.expires_at, now.getTime()));
+
+/**
+ * Whether `role_grants` holds a live global grant of `role` — `scope_id` is
+ * `null` and the grant passes `is_role_grant_active`.
+ *
+ * This is the question a role gate asks. A scoped grant confers its role on
+ * one resource only, and a scoped grant of a builtin role (`admin`, `keeper`)
+ * confers nothing, so matching on the role name alone would read a grant for
+ * one resource as authority everywhere. Server-side the same rule is
+ * `has_scoped_role(ctx, role, null)` over a request context and
+ * `query_account_has_global_role` in SQL; this is the form for a bare list of
+ * grants — `AuthState.role_grants`, an admin listing row.
+ *
+ * The scope match is `scope_id === null`, so a grant decoded without the
+ * field is not read as global. Client-side the answer shapes the UI and
+ * nothing else: the server re-checks every request.
+ *
+ * @param role_grants - the grants to search, e.g. `AuthState.role_grants`
+ * @param role - the role to check
+ * @param now - current time (defaults to `new Date()`, pass for testability)
+ * @returns `true` iff a live grant of `role` with no scope is present
+ */
+export const has_global_role = (
+	role_grants: ReadonlyArray<{
+		role: string;
+		scope_id: string | null;
+		revoked_at?: string | null;
+		expires_at: string | null;
+	}>,
+	role: string,
+	now: Date = new Date()
+): boolean =>
+	role_grants.some((p) => p.role === role && p.scope_id === null && is_role_grant_active(p, now));
 
 /**
  * A session's storage key — the blake3 hash of its raw token, branded so a
- * bare `string` can't stand in for one. `Blake3Hash` (`hash_schemas.ts`) is
+ * bare `string` can't stand in for one. `Blake3Hash` (`primitive_schemas.ts`) is
  * the shape; this is the meaning. Mint only via `hash_session_token`, or
  * `SessionId.parse` at an external boundary.
  *
@@ -127,11 +181,10 @@ export type SessionId = z.infer<typeof SessionId>;
 
 /**
  * Server-side auth session row, keyed by blake3 hash of the session token.
- * Structurally identical to the wire shape `AuthSessionJson` — kept as the
- * DB-row name so query signatures keep saying which side of the boundary
- * they read.
+ * The wire shape `AuthSessionJson` less `is_current`, which no column holds —
+ * the session list computes it per request.
  */
-export type AuthSession = AuthSessionJson;
+export type AuthSession = Omit<AuthSessionJson, 'is_current'>;
 
 /** API token for CLI/programmatic access. */
 export interface ApiToken {
@@ -168,7 +221,11 @@ export const AuthSessionJson = z.strictObject({
 	id: SessionId,
 	account_id: Uuid,
 	created_at: z.string(),
-	expires_at: z.string()
+	expires_at: z.string(),
+	is_current: z.boolean().meta({
+		description:
+			'Whether this is the session the request authenticated with — `false` on every row for a non-session credential.'
+	})
 });
 export type AuthSessionJson = z.infer<typeof AuthSessionJson>;
 

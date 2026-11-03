@@ -19,20 +19,25 @@ import { DEV } from 'esm-env';
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 
 import type { Db } from '../db/db.ts';
+import { is_db_checkout_error } from '../db/db_checkout_error.ts';
 import {
 	type RouteErrorSchemas,
 	type RateLimitKey,
 	ERROR_INVALID_JSON_BODY,
 	ERROR_INVALID_REQUEST_BODY,
 	ERROR_INVALID_ROUTE_PARAMS,
-	ERROR_INVALID_QUERY_PARAMS
+	ERROR_INVALID_QUERY_PARAMS,
+	ERROR_SERVICE_UNAVAILABLE,
+	ERROR_UNSUPPORTED_CONTENT_TYPE
 } from './error_schemas.ts';
+import { is_post_content_type_refused } from './simple_request.ts';
 import {
-	ThrownJsonrpcError,
 	jsonrpc_error_code_to_http_status,
 	jsonrpc_error_code_to_name,
-	dev_only
+	dev_only,
+	to_thrown_jsonrpc_error
 } from './jsonrpc_errors.ts';
+import type { JsonrpcErrorObject } from './jsonrpc.ts';
 import { is_null_schema, merge_error_schemas } from './schema_helpers.ts';
 import { dispatch_with_post_commit_rollback } from './pending_effects.ts';
 import type { MiddlewareSpec } from './middleware_spec.ts';
@@ -72,8 +77,9 @@ export type AuthGuardResolver = (auth: RouteAuth) => AuthGuards;
  * and before input validation; resolves the acting actor (when `auth.actor !==
  * 'none'`) from the `acting` selector — `c.var.validated_query.acting` on GETs,
  * read off the raw body on mutations — and sets the request context on the Hono
- * context. Per-route order in `apply_route_specs`: params → query →
- * pre-authorization auth (401 + rule-3 scope) → authorization phase →
+ * context. Per-route order in `apply_route_specs`: content type (415) →
+ * params → query → pre-authorization auth (401 + rule-3 scope) →
+ * authorization phase →
  * post-authorization auth (403) → input validation (400) → handler.
  *
  * Returns a `Response` to short-circuit (resolution failure → 400 / 500),
@@ -89,10 +95,10 @@ export type RouteMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
 /**
  * Per-request deps provided by the framework to route handlers.
  *
- * Audit writes and other rollback-resilient fire-and-forget calls run
- * through `AppDeps.audit.emit(ctx, input)` (see `auth/audit_emitter.ts`),
- * which captures the pool inside its closure — handlers can never
- * accidentally write audits against the request transaction.
+ * Audit writes run through `AppDeps.audit.emit(ctx, input)` (see
+ * `auth/audit_emitter.ts`). It writes a success row in the route's
+ * transaction when one is open and a failure row on the pool it closes over,
+ * so a refused attempt's row survives the rollback.
  *
  * Routes whose body manages its own transaction (signup, bootstrap)
  * declare `transaction: false` on the spec, which makes `route.db` the
@@ -163,14 +169,46 @@ export interface RouteSpec {
 	 * overloaded `input: z.null()`, which otherwise can't distinguish "no
 	 * body" (`GET /health`) from "raw bytes" (a binary upload).
 	 *
-	 * Purely descriptive metadata — the dispatcher doesn't read it. Its one
-	 * consumer is the schema-driven round-trip test suite, which auto-skips
-	 * `raw_body` routes (it can neither synthesize a meaningful body nor
-	 * assert a JSON output shape), so consumers no longer hand-maintain a
-	 * `skip_routes` entry per binary route. Also surfaces in `AppSurfaceRoute`
-	 * so generated docs render "raw" instead of a misleading `null` body.
+	 * A `raw_body` `POST` takes any `Content-Type` a browser can't send
+	 * cross-origin without a preflight; every other `POST` route requires
+	 * `application/json`, bodyless or not (415 `unsupported_content_type`
+	 * otherwise — see `http/simple_request.ts`). The schema-driven round-trip
+	 * test suite auto-skips `raw_body` routes (it can neither synthesize a
+	 * meaningful body nor assert a JSON output shape), so consumers don't
+	 * hand-maintain a `skip_routes` entry per binary route. Also surfaces in
+	 * `AppSurfaceRoute` so generated docs render "raw" instead of a
+	 * misleading `null` body.
 	 */
 	raw_body?: boolean;
+	/**
+	 * Marks a route that issues a credential — a session cookie — while
+	 * declaring no auth itself: login, signup, bootstrap. A forged cross-site
+	 * request to one is login CSRF, so it must take the origin check, and
+	 * assembly refuses it outside the auth middleware's scope, where no origin
+	 * carve-out can reach (`assert_credential_routes_in_auth_scope`). A route
+	 * that reads a credential (`auth.account` not `'none'`) is held there
+	 * without the mark.
+	 */
+	mints_credential?: boolean;
+	/**
+	 * Marks a route that reads the resolved credential in its handler while
+	 * declaring no auth gate — it answers an anonymous caller itself instead
+	 * of taking the dispatcher's `401` (account status, the cell-scoped fact
+	 * read, the JSON-RPC endpoint whose dispatcher gates each action).
+	 * Outside the auth middleware's scope no session or bearer parsing runs
+	 * and it would see every caller as anonymous, so assembly refuses it
+	 * there (`assert_credential_routes_in_auth_scope`), as it does a route
+	 * whose `auth.account` is not `'none'`.
+	 *
+	 * The handler owns the token-scope rule a gate would otherwise apply: a
+	 * scope-narrowed API token reaches no non-RPC surface that reads account
+	 * data, and `auth.required_scope` is refused on a route that admits
+	 * anonymous callers. Read the credential through `get_public_account_id`
+	 * (`auth/request_context.ts`), not `get_resolved_auth`, so a narrowed token is
+	 * answered as the anonymous caller. The RPC endpoint is the exception — its
+	 * dispatcher gates each method against the scope.
+	 */
+	reads_credential?: boolean;
 	/**
 	 * Rate limit key type — declares what this route's rate limiter is keyed on.
 	 *
@@ -251,6 +289,28 @@ export function get_route_query(c: Context, _schema?: z.ZodType): unknown {
 }
 
 /**
+ * Create the content-type check for a route spec: a `POST` whose
+ * `Content-Type` the route refuses (`is_post_content_type_refused` — anything
+ * but JSON, or for a `raw_body` route anything a browser sends cross-origin
+ * without a preflight) gets 415 before anything else on the route runs. The
+ * Rust spine's JSON handlers check the same, first thing after the origin.
+ *
+ * Returns an empty array for other methods, which are never CORS-simple and
+ * so always preflighted.
+ */
+const create_content_type_check = (spec: RouteSpec): Array<MiddlewareHandler> => {
+	if (spec.method !== 'POST') return [];
+	const raw_body = spec.raw_body ?? false;
+	const check: MiddlewareHandler = async (c, next): Promise<Response | void> => {
+		if (is_post_content_type_refused(c.req.header('content-type'), raw_body)) {
+			return c.json({ error: ERROR_UNSUPPORTED_CONTENT_TYPE }, 415);
+		}
+		await next();
+	};
+	return [check];
+};
+
+/**
  * Create input validation middleware for a route spec.
  *
  * Returns an empty array for GET routes (no body to parse — GET input is
@@ -258,9 +318,10 @@ export function get_route_query(c: Context, _schema?: z.ZodType): unknown {
  * and for null-input routes (no body expected). For other routes with input
  * schemas, returns a middleware that parses and validates the JSON body,
  * storing the result on the context as `validated_input`. Input validation
- * runs before the authorization phase, so the authorization phase reads
- * `c.var.validated_input.acting` directly — no separate body pre-parse /
- * cache machinery is needed.
+ * runs after the authorization phase and the post-authorization guards, so a
+ * caller they refuse never sees a parse failure; the authorization phase reads
+ * `acting` off the raw body itself (`read_route_acting` in
+ * `auth/request_context.ts`), treating a malformed body as no selector.
  *
  * @mutates `c.var.validated_input` - set to the parsed and validated body on success
  */
@@ -348,13 +409,29 @@ const create_query_validation = (query_schema?: z.ZodObject): Array<MiddlewareHa
 	return [validate];
 };
 
+/** Whether a JSON body is the catch layer's `{error: 'internal_error'}` shape. */
+const is_internal_error_body = (body: unknown): boolean =>
+	body !== null &&
+	typeof body === 'object' &&
+	(body as { error?: unknown }).error === 'internal_error';
+
+/** Whether a JSON body is the catch layer's failed-checkout `{error: 'service_unavailable'}`. */
+const is_service_unavailable_body = (body: unknown): boolean =>
+	body !== null &&
+	typeof body === 'object' &&
+	(body as { error?: unknown }).error === ERROR_SERVICE_UNAVAILABLE;
+
 /**
  * Wrap a handler with DEV-only output and error validation.
  *
  * In development, validates 2xx JSON responses against the output schema
- * and non-2xx responses against declared error schemas.
+ * and non-2xx responses against declared error schemas. Wraps the error
+ * catch layer, so the body built from a thrown error is validated too — except
+ * a 500 `internal_error` and a failed checkout's 503 `service_unavailable`,
+ * which the catch layer can answer on any route and so are always accepted.
  * Logs an error for mismatches and returns the response unchanged —
- * does not throw. In production, returns the handler unchanged.
+ * does not throw. Non-JSON responses (SSE, binary) are skipped. In
+ * production, returns the handler unchanged.
  */
 const wrap_output_validation = (
 	handler: Handler,
@@ -369,34 +446,27 @@ const wrap_output_validation = (
 		// Only validate JSON responses — streaming responses (SSE) would hang on .json().
 		const content_type = response.headers.get('Content-Type');
 		if (!content_type?.includes('application/json')) return response;
-		if (response.ok) {
-			try {
-				const cloned = response.clone();
-				const body = await cloned.json();
-				const result = output_schema.safeParse(body);
-				if (!result.success) {
-					log.error(`Output schema mismatch: ${c.req.method} ${c.req.path}`, result.error.issues);
-				}
-			} catch {
-				// clone() or json() failed on a response claiming application/json
-			}
-		} else if (error_schemas) {
-			const status_schema = error_schemas[response.status];
-			if (status_schema) {
-				try {
-					const cloned = response.clone();
-					const body = await cloned.json();
-					const result = status_schema.safeParse(body);
-					if (!result.success) {
-						log.error(
-							`Error schema mismatch (${response.status}): ${c.req.method} ${c.req.path}`,
-							result.error.issues
-						);
-					}
-				} catch {
-					// clone() or json() failed on a response claiming application/json
-				}
-			}
+		const schema = response.ok ? output_schema : error_schemas?.[response.status];
+		if (!schema) return response;
+		let body: unknown;
+		try {
+			body = await response.clone().json();
+		} catch {
+			// clone() or json() failed on a response claiming application/json
+			return response;
+		}
+		// the catch layer can answer `internal_error` on any route, so no route
+		// declares it — checking it against a route's 500 schema would only
+		// misreport a schema problem the route can't fix
+		if (response.status === 500 && is_internal_error_body(body)) return response;
+		// the same for a failed pool checkout's 503, which any route can answer
+		if (response.status === 503 && is_service_unavailable_body(body)) return response;
+		const result = schema.safeParse(body);
+		if (!result.success) {
+			const label = response.ok
+				? 'Output schema mismatch'
+				: `Error schema mismatch (${response.status})`;
+			log.error(`${label}: ${c.req.method} ${c.req.path}`, result.error.issues);
 		}
 		return response;
 	};
@@ -416,9 +486,15 @@ export const apply_middleware_specs = (app: Hono, specs: Array<MiddlewareSpec>):
 /**
  * Wrap a handler with error catch logic.
  *
- * Catches `ThrownJsonrpcError` and maps it to a flat REST `ApiError` body
- * (`{error: <reason>, message?, ...rest_data}`) at the matching HTTP status.
- * Catches generic `Error` and maps to `{error: 'internal_error', message?}`
+ * Catches a thrown JSON-RPC error — a `ThrownJsonrpcError` from any copy of
+ * fuz_app, recognized by its brand (`to_thrown_jsonrpc_error`) — and maps it
+ * to a flat REST `ApiError` body (`{error: <reason>, message?, ...rest_data}`)
+ * at the matching HTTP status.
+ * A failed pool checkout (`DbCheckoutError`) answers the flat 503
+ * `{error: 'service_unavailable'}` with no `message`, byte for byte the Rust
+ * spine's `db_unavailable_response`.
+ * Catches anything else, a foreign error class carrying a JSON-RPC `code`
+ * included, and maps to `{error: 'internal_error', message?}`
  * at 500 (`message` populated only in DEV). Existing handlers that return
  * `c.json()` directly are unaffected — the catch layer only activates when
  * something is thrown.
@@ -445,9 +521,17 @@ const wrap_error_catch = (handler: Handler, log: Logger): Handler => {
 		try {
 			return await handler(c, next);
 		} catch (err) {
-			if (err instanceof ThrownJsonrpcError) {
-				const status = jsonrpc_error_code_to_http_status(err.code);
-				return c.json(build_rest_error_body(err), status);
+			// a failed pool checkout is the database unavailable: the flat 503 the
+			// Rust spine's `db_unavailable_response` answers, no message
+			if (is_db_checkout_error(err)) {
+				log.error('pool checkout failed:', err);
+				return c.json({ error: ERROR_SERVICE_UNAVAILABLE }, 503);
+			}
+			// recognized by brand, so a second fuz_app copy's error maps too
+			const thrown = to_thrown_jsonrpc_error(err);
+			if (thrown) {
+				const status = jsonrpc_error_code_to_http_status(thrown.code);
+				return c.json(build_rest_error_body(thrown), status);
 			}
 			// generic error — internal_error. Raw exception messages can leak
 			// internals; surface them only in development (same gate as the
@@ -463,7 +547,7 @@ const wrap_error_catch = (handler: Handler, log: Logger): Handler => {
 };
 
 /**
- * Build the REST body for a thrown `ThrownJsonrpcError`. Splits out
+ * Build the REST body for a thrown JSON-RPC error. Splits out
  * for unit-test directness and keeps the catch handler readable.
  *
  * Reason resolution order:
@@ -474,7 +558,7 @@ const wrap_error_catch = (handler: Handler, log: Logger): Handler => {
  * the body. Non-object `data` is dropped — we don't want a primitive
  * `data` to overwrite the structured shape.
  */
-const build_rest_error_body = (err: ThrownJsonrpcError): Record<string, unknown> => {
+const build_rest_error_body = (err: JsonrpcErrorObject): Record<string, unknown> => {
 	let reason: string;
 	const rest: Record<string, unknown> = {};
 	if (
@@ -506,13 +590,17 @@ const build_rest_error_body = (err: ThrownJsonrpcError): Record<string, unknown>
  * adds input validation middleware (for routes with non-null input schemas),
  * runs the optional authorization phase to resolve the acting actor + build
  * the request context, wraps handler with DEV-only output and error
- * validation, wraps with error catch layer (catches `ThrownJsonrpcError`
- * and generic errors), and registers the route.
+ * validation, wraps with error catch layer (a thrown JSON-RPC error,
+ * recognized via `to_thrown_jsonrpc_error`, maps to its status; any other
+ * throw to a 500), and registers the route.
  *
- * Per-route middleware order: params → query → pre-authorization auth
- * guards (401 + rule-3 scope) → authorization phase →
- * post-authorization auth guards (403) → input validation (400) →
- * handler. Body validation runs behind every authority gate, so a caller
+ * Per-route middleware order: content type (415, `POST` only) → params →
+ * query → pre-authorization auth guards (401 + rule-3 scope) →
+ * authorization phase → post-authorization auth guards (403) → input
+ * validation (400) → handler. The content type goes first because it says
+ * almost nothing about the route, and a forged request should be refused
+ * before any credential is read. Body
+ * validation runs behind every authority gate, so a caller
  * any of them refuse never sees route-shape information from a parse
  * failure — a 400 there would confirm the route exists and describe how
  * to call it. Params and query still validate first (they address the
@@ -563,6 +651,7 @@ export const apply_route_specs = (
 			pre_authorization: pre_authorization_guards,
 			post_authorization: post_authorization_guards
 		} = resolve_auth_guards(spec.auth);
+		const content_type_check = create_content_type_check(spec);
 		const params_validation = create_params_validation(spec.params);
 		const query_validation = create_query_validation(spec.query);
 		const input_validation = create_input_validation(spec.input, spec.method);
@@ -596,13 +685,14 @@ export const apply_route_specs = (
 					: inner(c, { db, ...route_context })
 			);
 		};
-		// Step 2: output validation
-		handler = wrap_output_validation(handler, spec.output, merged_errors, log);
-		// Step 3: error catch layer
+		// Step 2: error catch layer — a thrown error becomes its REST body here
 		handler = wrap_error_catch(handler, log);
+		// Step 3: output validation, outside the catch so thrown-error bodies are checked too
+		handler = wrap_output_validation(handler, spec.output, merged_errors, log);
 		app.on(
 			spec.method,
 			[spec.path],
+			...content_type_check,
 			...params_validation,
 			...query_validation,
 			...pre_authorization_guards,

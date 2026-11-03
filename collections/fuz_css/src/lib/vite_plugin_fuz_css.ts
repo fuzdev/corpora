@@ -4,11 +4,39 @@
  * Uses Vite's transform hook to extract CSS classes from source files
  * as they're processed, including node_modules dependencies. In bundled
  * mode (the default) it also resolves the base reset and theme variables,
- * emitting only the rules, elements, and variables the source actually uses.
- * Generates CSS on-demand via virtual module with HMR support. In dev it
- * eagerly pre-scans project sources at server startup so the first served
- * CSS is complete (see `prescan`), and resyncs clients whose HMR socket
- * connects after a missed update.
+ * emitting only the rules, elements, and variables the source actually uses -
+ * including the `var(--*)` references of imported CSS files, like a
+ * dependency's stylesheet.
+ * Generates CSS on-demand via virtual module with HMR support.
+ *
+ * In dev it eagerly pre-scans project sources at server startup so the first
+ * served CSS is complete (see `prescan`), and extracts everything else as
+ * the dev server transforms it - a pre-bundled dependency by way of the
+ * source files its sourcemap lists, or as its bundled code when those can't
+ * be read. CSS that changes while a page is still loading can't be
+ * hot-updated into it, because the virtual module hasn't evaluated yet to
+ * accept the update. So each client reports when it evaluates the module,
+ * and the server answers with an update if that client holds code a refetch
+ * would replace.
+ *
+ * In build the generated CSS depends on every module's transform, so the
+ * virtual module loads as a placeholder rule and the build finishes it
+ * afterwards. `renderChunk` renders the CSS, runs it through Vite's CSS
+ * pipeline (`preprocessCSS`: PostCSS or lightningcss, as configured), and
+ * restates the virtual module's text with the result before Vite renders
+ * the stylesheet, so the stylesheet holds the generated CSS from the start -
+ * minified, named from its content, and where import order put it - in
+ * code-split and single-stylesheet builds alike (see
+ * `vite_plugin_fuz_css_build.ts`). If the restatement can't run, the build
+ * splices the CSS in at the placeholder's position in `generateBundle`
+ * instead, unprocessed, with a warning.
+ *
+ * The build's passes and the dev server's evaluation report each need a
+ * different position in the plugin order, so `vite_plugin_fuz_css` returns
+ * several plugin objects - pass its result to `plugins` as is. A plugin
+ * that rewrites CSS in its own `transform` hook (not PostCSS or
+ * lightningcss) applies to the virtual module in dev but not to the CSS the
+ * build restates.
  *
  * @example
  * ```ts
@@ -29,34 +57,28 @@
  * @module
  */
 
-import { normalizePath, type Logger as ViteLogger, type Plugin, type ViteDevServer } from 'vite';
-import { isAbsolute, join } from 'node:path';
-import { hash_blake3 } from '@fuzdev/fuz_util/hash_blake3.ts';
+import {
+	normalizePath,
+	type HotPayload,
+	type NormalizedHotChannelClient,
+	type Logger as ViteLogger,
+	type Plugin,
+	type ViteDevServer
+} from 'vite';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { hash as crypto_hash } from 'node:crypto';
 import { fs_search } from '@fuzdev/fuz_util/fs.ts';
 import { each_concurrent } from '@fuzdev/fuz_util/async.ts';
+import { ensure_end } from '@fuzdev/fuz_util/string.ts';
 
-import { format_diagnostic, CssGenerationError } from './diagnostics.ts';
-import { generate_css } from './generate_css.ts';
-import { create_bundled_resources } from './bundled_resources.ts';
-import { extract_file_cached } from './extract_file_cached.ts';
-import { merge_class_definitions } from './css_class_definitions.ts';
-import { css_class_interpreters } from './css_class_interpreters.ts';
-import { load_css_properties } from './css_literal.ts';
-import {
-	DEFAULT_CACHE_DIR,
-	get_file_cache_path,
-	save_cached_extraction,
-	delete_cached_extraction
-} from './css_cache.ts';
+import { create_css_generator } from './css_generator.ts';
+import { CssExtractionState } from './css_extraction_state.ts';
+import { DEFAULT_CACHE_DIR, create_cache_path_resolver } from './css_cache.ts';
 import { default_cache_deps } from './deps_defaults.ts';
 import { filter_file_default } from './file_filter.ts';
-import { CssClasses } from './css_classes.ts';
-import type { StyleRuleIndex } from './style_rule_parser.ts';
-import { type VariableDependencyGraph, get_all_variable_names } from './variable_graph.ts';
-import { extract_css_variables } from './css_variable_utils.ts';
-import type { CssClassVariableIndex } from './class_variable_index.ts';
 import type { CssGeneratorBaseOptions } from './css_plugin_options.ts';
-import { FUZ_CSS_PLACEHOLDER_RULE, splice_css_at_placeholder } from './css_placeholder_splice.ts';
+import { FUZ_CSS_PLACEHOLDER_RULE } from './css_placeholder_splice.ts';
+import { create_build_passes } from './vite_plugin_fuz_css_build.ts';
 
 /** Banner comment at the top and bottom of generated CSS output. */
 export const FUZ_CSS_BANNER = '/* generated by vite_plugin_fuz_css */';
@@ -85,11 +107,6 @@ const VIRTUAL_ID = 'virtual:fuz.css';
 const RESOLVED_VIRTUAL_ID = '/__fuz.css';
 
 /**
- * Skip cache on CI (no point writing cache that won't be reused).
- */
-const is_ci = !!process.env.CI;
-
-/**
  * Debounce delay for HMR updates in milliseconds.
  *
  * Short delay to batch rapid file changes (e.g., save-all, rename operations)
@@ -100,14 +117,98 @@ const HMR_DEBOUNCE_MS = 10;
 
 /**
  * Concurrency for the dev pre-scan (file read + cache read + extract + cache
- * write). Matches the Gro generator's default - the value controls I/O
- * interleaving, not CPU parallelism (AST parsing is synchronous on the main
- * thread).
+ * write). The value controls I/O interleaving, not CPU parallelism (AST
+ * parsing is synchronous on the main thread).
  */
 const PRESCAN_CONCURRENCY = 8;
 
 /** Default directories scanned by the dev pre-scan, relative to the Vite root. */
 const PRESCAN_ROOTS_DEFAULT = ['src'];
+
+/**
+ * The HTML entry the dev pre-scan extracts alongside its directories,
+ * relative to the Vite root. A build runs `transform` on it as an input; the
+ * dev server serves it without one.
+ */
+const PRESCAN_ROOT_HTML = 'index.html';
+
+/**
+ * Custom HMR event a client sends each time it evaluates the virtual
+ * module, carrying the hash of the module code it evaluated.
+ */
+const EVALUATED_EVENT = 'fuz_css:evaluated';
+
+/** Hex characters of the module code's hash that the evaluation report carries. */
+const EVALUATED_HASH_LENGTH = 16;
+
+/**
+ * The statement appended to the virtual module's dev client code, reporting
+ * its evaluation to the server. Also what the server looks for in the
+ * module's current code to tell whether a reporting client holds it.
+ */
+const to_evaluated_report = (hash: string): string =>
+	`if (import.meta.hot) import.meta.hot.send(${JSON.stringify(EVALUATED_EVENT)}, ${JSON.stringify({ hash })});`;
+
+/**
+ * Directory under Vite's `cacheDir` that the dependency optimizer writes its
+ * pre-bundled chunks to. An environment other than the client gets a
+ * suffixed sibling (`deps_ssr`), which the same path prefix covers.
+ */
+const OPTIMIZED_DEPS_DIR = 'deps';
+
+/**
+ * Parses a sourcemap for the files it was generated from.
+ *
+ * @param map_text - the sourcemap's JSON text
+ * @param map_dir - the directory holding the sourcemap, which relative sources resolve against
+ * @returns the sources as normalized absolute paths, or `null` when the text isn't a sourcemap listing any
+ */
+const parse_sourcemap_sources = (map_text: string, map_dir: string): Array<string> | null => {
+	let map: { sources?: unknown; sourceRoot?: unknown } | null;
+	try {
+		map = JSON.parse(map_text);
+	} catch {
+		return null;
+	}
+	if (!Array.isArray(map?.sources)) return null;
+	const source_root = typeof map.sourceRoot === 'string' ? map.sourceRoot : '';
+	const sources: Array<string> = [];
+	for (const source of map.sources) {
+		if (typeof source !== 'string') continue;
+		sources.push(normalizePath(isAbsolute(source) ? source : join(map_dir, source_root, source)));
+	}
+	return sources;
+};
+
+/** A query parameter Vite appends to bust a cache: a dep version hash or an HMR timestamp. */
+const CACHE_BUSTER_PARAM_MATCHER = /^(?:v=[\w.-]+|t=\d+)$/;
+
+/**
+ * Converts a Vite module id to the id its extraction is keyed by, dropping a
+ * query made only of Vite's cache-busting parameters - the `v` version hash
+ * the dev server gives a dependency's URL and the `t` HMR timestamp. Such an
+ * id is the file itself, so it's filtered, parsed, cached, and deleted as the
+ * plain path, sharing one entry with the same file's SSR transform and
+ * pre-scan.
+ *
+ * Any other query is kept, because it names a different module than the
+ * file: `Foo.svelte?svelte&type=style&lang.css` is the component's CSS, and
+ * `?raw`, `?url`, and `?worker` ids carry a generated wrapper rather than
+ * the file's source.
+ *
+ * @param id - a resolved module id, as `transform` receives it
+ * @returns the id without its query when that query only busts a cache, otherwise `id` unchanged
+ *
+ * @internal Exported for its tests.
+ */
+export const to_extraction_id = (id: string): string => {
+	const query_index = id.indexOf('?');
+	if (query_index === -1) return id;
+	const params = id.slice(query_index + 1).split('&');
+	return params.every((param) => CACHE_BUSTER_PARAM_MATCHER.test(param))
+		? id.slice(0, query_index)
+		: id;
+};
 
 /**
  * Options for the fuz_css Vite plugin.
@@ -119,18 +220,43 @@ export interface VitePluginFuzCssOptions extends CssGeneratorBaseOptions {
 	 *
 	 * Extraction state accumulates from Vite's transform hook, so without a
 	 * pre-scan the first CSS served on a cold start includes only the files
-	 * the module graph happened to visit first - classes from modules the SSR
-	 * walk never reaches (client-only branches, dynamic imports) are missing
-	 * until a corrective HMR update, which is dropped when the browser hasn't
-	 * connected yet. The pre-scan extracts every file passing `filter_file`
-	 * under the given directories before the virtual module is first served,
-	 * so the initial CSS is complete. Warm starts are cheap via the extraction
-	 * cache.
+	 * the module graph happened to visit first, and the rest arrives as
+	 * corrective HMR updates while the page loads. The pre-scan extracts every
+	 * file passing `filter_file` under the given directories, plus the Vite
+	 * root's `index.html`, before the virtual module is first served, so the
+	 * initial CSS is complete. Warm starts are cheap via the extraction cache.
 	 *
 	 * `true` scans `src` under the Vite root; `false` disables; an array gives
 	 * custom directories (resolved against the Vite root unless absolute).
-	 * node_modules deps are never pre-scanned - they stream in via transform
-	 * and are covered by the connect-time resync.
+	 * The root `index.html` is included whichever directories are given: the
+	 * dev server serves it without running `transform` on it, so nothing else
+	 * would extract it. Pre-scanned files are kept current - one the watcher
+	 * reports added or changed is extracted again, whether or not any module
+	 * imports it.
+	 *
+	 * node_modules dependencies are never pre-scanned, and neither are project
+	 * files outside the scanned directories. They're extracted when the dev
+	 * server first transforms them, which is during the first load of a page
+	 * that uses them, so that page's CSS is completed by an update a moment
+	 * after it's first served rather than up front (or by the next reload,
+	 * with `server.hmr` or `server.ws` off).
+	 *
+	 * What dev and build extract differs at the edges:
+	 *
+	 * - dev only: files under the scanned directories that no module imports
+	 *   (SvelteKit's `src/app.html` among them), including ones imported only
+	 *   with `?raw` - the pre-scan reads them from disk, where a build
+	 *   extracts just the modules it transforms; and a pre-bundled dependency
+	 *   that's extracted from its bundled code while `filter_file` rejects
+	 *   the files it ships (the default filter skips `.mjs`), which a build
+	 *   doesn't extract at all
+	 * - build only: an HTML entry outside the scanned directories other than
+	 *   the root `index.html`; a module of a pre-bundled dependency that the
+	 *   pre-bundler dropped as unused, such as one holding nothing but a
+	 *   `@fuz-classes` comment; and the comment hints and static Svelte
+	 *   `class` attributes of a pre-bundled dependency whose sourcemap is
+	 *   missing or names files that aren't installed, which is extracted
+	 *   from its bundled code instead
 	 *
 	 * @default true
 	 */
@@ -142,50 +268,48 @@ export interface VitePluginFuzCssOptions extends CssGeneratorBaseOptions {
  *
  * Extracts CSS classes from source files during Vite's transform phase
  * and generates optimized CSS via the `virtual:fuz.css` virtual module.
+ *
+ * @returns the plugin as several objects sharing state, to pass to Vite's
+ * `plugins` together: an `enforce: 'pre'` one that does the extraction, serves
+ * the virtual module, and splices the build's CSS ahead of other plugins, a
+ * build-only one positioned after Vite's CSS processing that completes the
+ * build's stylesheets, and a serve-only `enforce: 'post'` one that adds the
+ * evaluation report to the virtual module's client code
  */
-export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Plugin => {
+export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Array<Plugin> => {
 	const {
 		filter_file = filter_file_default,
-		class_definitions: user_class_definitions,
-		include_default_classes = true,
-		class_interpreters = css_class_interpreters,
-		additional_classes,
-		exclude_classes,
 		acorn_plugins,
-		on_error = is_ci ? 'throw' : 'log',
-		on_warning = 'log',
+		cache_salt,
 		cache_dir = DEFAULT_CACHE_DIR,
-		base_css,
-		variables,
-		theme,
-		additional_elements,
-		additional_variables,
-		exclude_elements,
-		exclude_variables,
 		deps = default_cache_deps,
 		prescan = true
 	} = options;
 
-	// Derive include flags from null check
-	const include_base = base_css !== null;
-	const include_theme = variables !== null;
+	// configResolved runs before every other hook, so `logger` is always set
+	// by the time these are called
+	let logger: ViteLogger | null = null;
+	const log_warn = (msg: string): void => logger?.warn(msg);
+	const log_error = (msg: string): void => logger?.error(msg);
+	const log_info = (msg: string): void => logger?.info(msg);
 
-	// Merge class definitions (validates that definitions exist when needed)
-	const all_class_definitions = merge_class_definitions(
-		user_class_definitions,
-		include_default_classes
-	);
+	const generator = create_css_generator(options, {
+		warn: (message) => log_warn(`[fuz_css] ${message}`),
+		error: (message) => log_error(`[fuz_css] ${message}`)
+	});
 
-	// Convert to Sets for efficient lookup
-	const include_set = additional_classes ? new Set(additional_classes) : null;
-	const exclude_set = exclude_classes ? new Set(exclude_classes) : null;
+	/** The Vite root, normalized with a trailing `/` - set in `configResolved`. */
+	let vite_root = '';
+	/** A file's cache path under the Vite root - set in `configResolved`. */
+	let get_cache_path: ((id: string) => string | null) | null = null;
+	const extraction = new CssExtractionState({
+		css_classes: generator.create_css_classes(),
+		get_cache_path: (id) => get_cache_path?.(id) ?? null,
+		deps,
+		acorn_plugins,
+		cache_salt
+	});
 
-	// Plugin state
-	const css_classes = new CssClasses(include_set, exclude_set);
-	const hashes: Map<string, string> = new Map();
-	/** CSS variables detected per file via simple regex scan (filtered against theme) */
-	const detected_variables_by_file: Map<string, Set<string>> = new Map();
-	let virtual_module_loaded = false;
 	/**
 	 * Every resolved virtual-module id `load()` has served - the bare
 	 * `/__fuz.css` plus each query variant (`?inline`/`?direct`/`?used`). HMR must
@@ -197,217 +321,128 @@ export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Plug
 	const loaded_virtual_ids: Set<string> = new Set();
 	let is_dev = false;
 	let server: ViteDevServer | null = null;
-	let logger: ViteLogger | null = null;
-	let css_properties: Set<string> | null = null;
-	let resolved_cache_dir: string | null = null;
-	let project_root: string | null = null;
+	/**
+	 * Path prefix of the dev server's pre-bundled dependency chunks, normalized.
+	 * `null` in build, which bundles dependencies from their sources.
+	 */
+	let optimized_deps_prefix: string | null = null;
 	let hmr_timeout: ReturnType<typeof setTimeout> | null = null;
-	let last_generated_css: string | null = null;
-	let pending_css: string | null = null; // CSS generated during HMR, reused by load()
-	let last_served_css: string | null = null; // last CSS returned by load(); connect-time resync diffs against it
+	/**
+	 * The CSS announced to the virtual module's served variants in dev - what
+	 * the first `load()` returned, then what each update pushed - or `null`
+	 * before anything is served, when there's nothing an ingest could
+	 * outdate. The debounced update diffs its render against it.
+	 */
+	let announced_css: string | null = null;
+	/**
+	 * The last dev render, keyed by the extraction version - so the served
+	 * variants and the debounced update share one render per change, and its
+	 * diagnostics dispatch once.
+	 */
+	let dev_render: { key: number; css: string } | null = null;
 	let prescan_promise: Promise<void> | null = null; // load() awaits this so the first served CSS is complete
-	/** Suppresses per-file HMR invalidation while the pre-scan runs (it invalidates once at the end). */
-	let prescan_active = false;
-	// whether an ingest was suppressed while the pre-scan ran, so the scan's
-	// trailing invalidation (a full render) only happens when needed
-	let prescan_suppressed_update = false;
 	/**
-	 * Per-file epoch guarding against a deletion (or newer ingest) racing an
-	 * in-flight ingest. `ingest_file` awaits the disk cache read; an `unlink`
-	 * arriving during that await deletes the entry, but the resolved await would
-	 * otherwise re-add it and resurrect the deleted file. Captured before the
-	 * await, re-checked after.
+	 * The hash each client last reported and was pushed an update for, so the
+	 * same report isn't answered twice. Cleared when the client reports the
+	 * current code. Vite hands a hot channel listener one client object per
+	 * connection, which keys this for the connection's life.
 	 */
-	const transform_epochs: Map<string, number> = new Map();
-	let epoch_seq = 0;
+	const pushed_evaluated_hashes: WeakMap<NormalizedHotChannelClient, string> = new WeakMap();
+	/**
+	 * The pre-scan's directories as normalized absolute paths ending in `/`.
+	 * Set with `prescan_root_html` when the dev server is configured and the
+	 * pre-scan is enabled; together they're the files `is_prescanned` matches.
+	 */
+	let prescan_dirs: Array<string> = [];
+	/** The Vite root's `index.html` as a normalized absolute path, when the pre-scan is enabled. */
+	let prescan_root_html: string | null = null;
 
-	/**
-	 * Records every `var(--*)` reference in a file via regex scan. Stored unfiltered;
-	 * `render_css` narrows to theme variables once `variable_graph` is loaded.
-	 *
-	 * Filtering here (the old behavior) silently dropped detections from any file
-	 * transformed before the graph loads - and the graph loads asynchronously
-	 * (eagerly at `configureServer` in dev, on the first `load()` in build).
-	 * In SvelteKit dev, route nodes (e.g. `+page.svelte`) are resolved, and
-	 * thus transformed, during SSR *before* the layout's `virtual:fuz.css` import
-	 * triggers that first `load()`; a theme `var()` used only there was dropped, and
-	 * the cached content hash meant it never re-scanned until the file was edited.
-	 */
-	const update_detected_variables = (id: string, code: string): void => {
-		const file_vars = extract_css_variables(code);
-		if (file_vars.size > 0) {
-			detected_variables_by_file.set(id, file_vars);
-		} else {
-			detected_variables_by_file.delete(id);
-		}
+	const wrap_css = (css: string): string => `${FUZ_CSS_BANNER}\n\n${css}\n\n${FUZ_CSS_BANNER}`;
+
+	/** Renders the dev CSS from everything extracted, reusing the last render when nothing changed. */
+	const render_dev_css = (): string => {
+		const key = extraction.version;
+		if (dev_render?.key === key) return dev_render.css;
+		const css = wrap_css(
+			generator.render({
+				css_classes: extraction.css_classes,
+				detected_css_variables: extraction.detected_css_variables()
+			})
+		);
+		dev_render = { key, css };
+		return css;
 	};
 
-	// Bundled CSS resources (when bundled mode is enabled: started eagerly at
-	// configureServer in dev, lazily on first load() in build)
-	let style_rule_index: StyleRuleIndex | null = null;
-	let variable_graph: VariableDependencyGraph | null = null;
-	let class_variable_index: CssClassVariableIndex | null = null;
-
-	// Promise for in-flight resource loading (prevents duplicate loads)
-	let bundled_resources_promise: Promise<void> | null = null;
-
-	/** Ensures bundled CSS resources are loaded. Safe to call multiple times. */
-	const ensure_bundled_resources = async (): Promise<void> => {
-		if (style_rule_index !== null) return; // Already loaded
-		if (bundled_resources_promise) {
-			await bundled_resources_promise; // Wait for in-flight loading
-			return;
-		}
-		bundled_resources_promise = (async () => {
-			const resources = await create_bundled_resources({
-				base_css,
-				variables,
-				theme,
-				class_definitions: all_class_definitions,
-				deps
+	const build_passes = create_build_passes({
+		virtual_id: RESOLVED_VIRTUAL_ID,
+		loaded_virtual_ids,
+		// one environment's CSS comes from the modules in its own graph, so a
+		// build never carries another environment's classes, and a watch
+		// rebuild drops a file that was deleted or is no longer imported
+		render: (context) => {
+			const ids: Set<string> = new Set();
+			for (const id of context.getModuleIds()) ids.add(to_extraction_id(id));
+			const css = generator.render({
+				css_classes: extraction.css_classes.subset(ids),
+				detected_css_variables: extraction.detected_css_variables(ids)
 			});
-			style_rule_index = resources.style_rule_index;
-			variable_graph = resources.variable_graph;
-			class_variable_index = resources.class_variable_index;
-		})();
-		await bundled_resources_promise;
-	};
-
-	// configResolved runs before every other hook, so `logger` is always set
-	// by the time these are called
-	const log_warn = (msg: string): void => logger?.warn(msg);
-	const log_error = (msg: string): void => logger?.error(msg);
-	const log_info = (msg: string): void => logger?.info(msg);
+			return { css: wrap_css(css), empty: css.trim() === '' };
+		},
+		log_warn,
+		log_error
+	});
 
 	/**
-	 * Generates banner-wrapped CSS from the current classes, dispatching
-	 * diagnostics per the `on_error`/`on_warning` settings.
+	 * Creates the update that makes a client refetch the virtual module. Vite
+	 * wraps the CSS module so it self-accepts (`import.meta.hot.accept()`),
+	 * re-running `updateStyle` with fresh content on a `js-update`. The
+	 * module's plain URL is its own id (no `\0` encoding), so it doubles as the
+	 * HMR path.
 	 */
-	const render_css = (): string => {
-		const {
-			all_classes,
-			all_classes_with_locations,
-			explicit_classes,
-			all_elements,
-			explicit_elements,
-			explicit_variables
-		} = css_classes.get_all();
-
-		// Aggregate per-file `var(--*)` references (stored unfiltered by
-		// `update_detected_variables`) and narrow to theme variables - non-theme refs
-		// may be user-defined and have no definition to emit. The graph is loaded at
-		// every render-time call site (`load()`/HMR/`generateBundle` all run after
-		// `ensure_bundled_resources`); when it isn't (utility-only mode), variables
-		// aren't emitted anyway. `generate_css` merges in `explicit_variables`.
-		const theme_var_names = variable_graph ? get_all_variable_names(variable_graph) : null;
-		const detected_css_variables: Set<string> = new Set();
-		if (theme_var_names) {
-			for (const vars of detected_variables_by_file.values()) {
-				for (const v of vars) {
-					if (theme_var_names.has(v)) {
-						detected_css_variables.add(v);
-					}
-				}
+	const create_virtual_module_update = (): HotPayload => ({
+		type: 'update',
+		updates: [
+			{
+				type: 'js-update',
+				path: RESOLVED_VIRTUAL_ID,
+				acceptedPath: RESOLVED_VIRTUAL_ID,
+				timestamp: Date.now()
 			}
-		}
-
-		const { css: final_css, diagnostics: all_diagnostics } = generate_css({
-			all_classes,
-			all_classes_with_locations,
-			explicit_classes,
-			all_elements,
-			explicit_elements,
-			explicit_variables,
-			extraction_diagnostics: css_classes.get_diagnostics(),
-			detected_css_variables,
-			class_definitions: all_class_definitions,
-			interpreters: class_interpreters,
-			css_properties,
-			include_base,
-			include_theme,
-			theme,
-			// Resources load lazily; null until ready falls back to utility-only.
-			resources:
-				style_rule_index && variable_graph && class_variable_index
-					? { style_rule_index, variable_graph, class_variable_index }
-					: null,
-			additional_elements,
-			additional_variables,
-			exclude_elements,
-			exclude_variables
-		});
-
-		// Separate errors and warnings
-		const errors = all_diagnostics.filter((d) => d.level === 'error');
-		const warnings = all_diagnostics.filter((d) => d.level === 'warning');
-
-		// Handle warnings based on on_warning setting
-		if (warnings.length > 0) {
-			if (on_warning === 'throw') {
-				throw new CssGenerationError(warnings);
-			} else if (on_warning === 'log') {
-				for (const warning of warnings) {
-					log_warn(`[fuz_css] ${format_diagnostic(warning)}`);
-				}
-			}
-			// 'ignore' - do nothing
-		}
-
-		// Handle errors based on on_error setting
-		if (errors.length > 0) {
-			if (on_error === 'throw') {
-				throw new CssGenerationError(errors);
-			}
-			for (const error of errors) {
-				log_error(`[fuz_css] ${format_diagnostic(error)}`);
-			}
-		}
-
-		return `${FUZ_CSS_BANNER}\n\n${final_css}\n\n${FUZ_CSS_BANNER}`;
-	};
+		]
+	});
 
 	/**
 	 * Invalidates every served virtual-module variant and pushes the js-update
-	 * that makes connected clients refetch. Shared by the debounced HMR path
-	 * and the connect-time resync.
+	 * that makes connected clients refetch. Only the client environment has
+	 * browsers to push to. A client that hasn't evaluated the module yet drops
+	 * the update - `resync_evaluated_client` covers it.
 	 */
 	const invalidate_and_push = (new_css: string): void => {
-		// Deliberately not updating last_served_css: only load() marks CSS as
-		// served, so if the pushed js-update never causes a refetch, the next
-		// ws connection re-diffs against what clients actually hold and pushes
-		// again - convergence relies on that refetch loop.
-		last_generated_css = new_css;
-		pending_css = new_css; // Store for reuse in load() to avoid regenerating
-
-		// Invalidate every served variant, not just the bare id. The bare
-		// `/__fuz.css` backs the client `<style>` and gets a `js-update` so Vite
-		// re-runs `updateStyle` with fresh content live. The `?inline`/`?direct`/
-		// `?used` variants have no client HMR boundary - they're read fresh by the
-		// next SSR render - so invalidating their cached module is enough; without
-		// it, SvelteKit keeps inlining stale `<head>` CSS on every reload.
-		const bare = server!.moduleGraph.getModuleById(RESOLVED_VIRTUAL_ID);
-		if (bare) {
-			server!.moduleGraph.invalidateModule(bare);
-			// Vite wraps the CSS module so it self-accepts (`import.meta.hot.accept()`),
-			// re-running `updateStyle` with fresh content on a `js-update`. The module's
-			// plain URL is its own id (no `\0` encoding), so it doubles as the HMR path.
-			server!.hot.send({
-				type: 'update',
-				updates: [
-					{
-						type: 'js-update',
-						path: RESOLVED_VIRTUAL_ID,
-						acceptedPath: RESOLVED_VIRTUAL_ID,
-						timestamp: Date.now()
-					}
-				]
-			});
+		announced_css = new_css;
+		invalidate_served_modules();
+		const { client } = server!.environments;
+		if (client.moduleGraph.getModuleById(RESOLVED_VIRTUAL_ID)) {
+			client.hot.send(create_virtual_module_update());
 		}
-		for (const vid of loaded_virtual_ids) {
-			if (vid === RESOLVED_VIRTUAL_ID) continue; // bare handled above
-			const variant = server!.moduleGraph.getModuleById(vid);
-			if (variant) {
-				server!.moduleGraph.invalidateModule(variant);
+	};
+
+	/**
+	 * Invalidates every served virtual-module variant, not just the bare id,
+	 * in every dev environment, so the next request of any of them runs
+	 * `load()` again. The bare `/__fuz.css` backs the client `<style>`; the
+	 * `?inline`/`?direct`/`?used` variants have no client HMR boundary - they're
+	 * read fresh by the next SSR render - so invalidating their cached module
+	 * is enough; without it, SvelteKit keeps inlining stale `<head>` CSS on
+	 * every reload. Each environment has its own module graph, and the
+	 * inlined variant lives in a server one (SvelteKit's `ssr`, or whatever a
+	 * framework or adapter names its own), so every environment is walked
+	 * rather than a fixed pair.
+	 */
+	const invalidate_served_modules = (): void => {
+		for (const { moduleGraph } of Object.values(server!.environments)) {
+			for (const vid of loaded_virtual_ids) {
+				const mod = moduleGraph.getModuleById(vid);
+				if (mod) moduleGraph.invalidateModule(mod);
 			}
 		}
 	};
@@ -420,31 +455,26 @@ export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Plug
 	const invalidate_virtual_module = (): void => {
 		if (!server) return;
 
-		// Skip HMR if bundled resources aren't loaded yet - in dev they load
-		// eagerly at configureServer, in build lazily on the first load() call;
-		// either way the eventual load regenerates the CSS
-		if ((include_base || include_theme) && style_rule_index === null) {
-			return;
-		}
-
 		if (hmr_timeout) {
 			clearTimeout(hmr_timeout);
 		}
 		hmr_timeout = setTimeout(() => {
 			hmr_timeout = null;
 
-			// render_css can throw under on_error/on_warning: 'throw'; from a timer
+			// the render can throw under on_error/on_warning: 'throw'; from a timer
 			// that would be an uncaughtException killing the dev server, so route
-			// it to the log here - load() re-renders and throws where Vite owns
-			// the error
+			// it to the log here and drop the served modules, so the next request
+			// re-renders in load() and throws where Vite owns the error (the
+			// overlay) instead of serving the last good CSS as if nothing changed
 			let new_css: string;
 			try {
-				new_css = render_css();
+				new_css = render_dev_css();
 			} catch (error) {
 				log_error(`[fuz_css] ${error}`);
+				invalidate_served_modules();
 				return;
 			}
-			if (new_css === last_generated_css) {
+			if (new_css === announced_css) {
 				return; // No change, skip HMR
 			}
 			invalidate_and_push(new_css);
@@ -452,259 +482,263 @@ export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Plug
 	};
 
 	/**
-	 * Ingests one file into extraction state: content-hash short-circuit,
-	 * cache-aware extraction, then classes/variables/hash updates and the
-	 * cache write. Shared by `transform()` and the dev pre-scan. The per-file
-	 * epoch guard drops this ingest's result when a deletion or a newer ingest
-	 * for the same file races the awaited cache read.
+	 * Answers a client's report that it evaluated the virtual module: pushes
+	 * that client an update when a refetch would give it different code than
+	 * the code it reported.
 	 *
-	 * The cache write is fire-and-forget by default so `transform()` doesn't
-	 * block Vite on cache IO; the pre-scan passes `await_cache_write` so its
-	 * concurrency bound covers the writes too. The pre-scan also passes the
-	 * `epoch` it claimed before its disk read, extending the guard window to
-	 * cover a deletion racing that read.
+	 * This is what delivers an update the client couldn't take. Vite's client
+	 * drops a `js-update` for a module that hasn't registered its accept
+	 * callback, and a module evaluates only once its whole static import graph
+	 * has loaded - so CSS that changes while a page's graph is still loading
+	 * (dependencies and files outside the pre-scan transforming for the first
+	 * time) is pushed to a client that can't apply it. The report arrives
+	 * after the callback is registered, and Vite's client holds it until the
+	 * socket is open, so the answer always lands.
+	 *
+	 * The comparison is against the module's cached transform, which is what
+	 * a refetch serves: the same code means there's nothing to deliver, and
+	 * the refetched module's own report ends the exchange there. A module
+	 * that's invalidated has no cached transform, and gets the push. CSS that
+	 * moved without being rendered yet needs nothing here - the pending
+	 * debounced update reaches this client now that it accepts.
+	 *
+	 * A client is pushed at most once for the code it reports, until it
+	 * reports the current code. Its refetch reporting that same code again
+	 * means a push can't change what it holds, which is also what bounds the
+	 * exchange when the report statement doesn't reach the cached transform
+	 * verbatim (a later `enforce: 'post'` plugin reprinting the module) and
+	 * the comparison can never match.
+	 *
+	 * @param data - the event's payload, untrusted
+	 * @param client - the client that reported, and the only one pushed
 	 */
-	const ingest_file = async (
-		id: string,
-		code: string,
-		options?: { await_cache_write?: boolean; epoch?: number }
-	): Promise<void> => {
-		const { await_cache_write = false, epoch: claimed_epoch } = options ?? {};
-		// Compute content hash; skip if unchanged
-		const hash = hash_blake3(code);
-		if (hashes.get(id) === hash) {
+	const resync_evaluated_client = (data: unknown, client: NormalizedHotChannelClient): void => {
+		const hash = (data as { hash?: unknown } | null)?.hash;
+		if (typeof hash !== 'string') return;
+		const current_code =
+			server?.environments.client.moduleGraph.getModuleById(RESOLVED_VIRTUAL_ID)?.transformResult
+				?.code;
+		if (current_code?.includes(to_evaluated_report(hash))) {
+			pushed_evaluated_hashes.delete(client);
 			return;
 		}
-
-		const cache_path =
-			!is_ci && resolved_cache_dir && project_root
-				? get_file_cache_path(id, resolved_cache_dir, project_root)
-				: null;
-
-		// Capture an epoch before the (awaiting) cache read so a deletion or
-		// newer ingest racing the await can be detected after it resolves; a
-		// caller-claimed epoch that was superseded already means this ingest is
-		// stale before it starts.
-		if (claimed_epoch !== undefined && transform_epochs.get(id) !== claimed_epoch) {
-			return;
-		}
-		const epoch = claimed_epoch ?? ++epoch_seq;
-		if (claimed_epoch === undefined) transform_epochs.set(id, epoch);
-
-		const { extraction, from_cache, cache_path_to_write } = await extract_file_cached({
-			deps,
-			content: code,
-			content_hash: hash,
-			cache_path,
-			filename: id,
-			acorn_plugins
-		});
-
-		// Bail if the file was deleted or re-ingested during the cache read;
-		// re-adding here would resurrect a deleted or stale entry.
-		if (transform_epochs.get(id) !== epoch) {
-			return;
-		}
-
-		// Log extraction diagnostics (only when freshly parsed; cached diagnostics
-		// were already logged on the miss that produced them).
-		if (!from_cache && extraction.diagnostics) {
-			for (const d of extraction.diagnostics) {
-				const loc = `${d.location.file}:${d.location.line}:${d.location.column}`;
-				const msg = `[fuz_css] ${loc}: ${d.message}`;
-				if (d.level === 'error') {
-					log_error(msg);
-				} else if (on_warning === 'log') {
-					log_warn(msg);
-				}
-				// 'ignore' and 'throw' (handled at generation time) - don't log here
-			}
-		}
-
-		// Update CssClasses
-		css_classes.add(id, extraction);
-		update_detected_variables(id, code);
-		hashes.set(id, hash);
-
-		// Save to cache - see the `await_cache_write` note in the doc comment
-		let cache_write: Promise<void> | undefined;
-		if (cache_path_to_write) {
-			cache_write = save_cached_extraction(deps, cache_path_to_write, hash, extraction).catch(
-				() => {
-					// Ignore cache errors
-				}
-			);
-		}
-
-		// Trigger HMR if the virtual module was already served; suppressed
-		// during the pre-scan, which invalidates once at the end instead of
-		// re-rendering per file.
-		if (virtual_module_loaded) {
-			if (prescan_active) {
-				prescan_suppressed_update = true;
-			} else {
-				invalidate_virtual_module();
-			}
-		}
-
-		if (await_cache_write && cache_write) await cache_write;
+		if (pushed_evaluated_hashes.get(client) === hash) return;
+		pushed_evaluated_hashes.set(client, hash);
+		client.send(create_virtual_module_update());
 	};
 
 	/**
+	 * Ingests one file's code - see `CssExtractionState.ingest` - and once
+	 * CSS has been served, schedules the update a change calls for.
+	 */
+	const ingest = async (
+		id: string,
+		code: string,
+		options?: { epoch?: number; await_cache_write?: boolean }
+	): Promise<void> => {
+		if ((await extraction.ingest(id, code, options)) && announced_css !== null) {
+			invalidate_virtual_module();
+		}
+	};
+
+	/**
+	 * Reads a file from disk and ingests it - the pre-scan's per-file step, and
+	 * how the watcher keeps a pre-scanned file current.
+	 *
+	 * Reads disk bytes while `transform()` receives Vite's input for the same
+	 * id. Those match unless an earlier `enforce: 'pre'` plugin rewrote the
+	 * code (vite-plugin-svelte's preprocessing), in which case the file
+	 * extracts once per form and the later ingest wins.
+	 *
+	 * @param id - the file's normalized absolute path
+	 * @returns whether the file was read; `false` when it's missing or unreadable
+	 */
+	const ingest_file_from_disk = async (id: string): Promise<boolean> => {
+		// claim the epoch before the disk read, so a deletion racing the read
+		// is detected instead of resurrected
+		const epoch = extraction.claim_epoch(id);
+		const r = await deps.read_text({ path: id });
+		if (!r.ok) return false; // deleted or unreadable; a later add or transform covers it if it reappears
+		// await the cache write too, so the pre-scan's concurrency bounds it
+		await ingest(id, r.value, { await_cache_write: true, epoch });
+		return true;
+	};
+
+	/**
+	 * Ingests a dependency the dev server pre-bundled, by way of the files it
+	 * was bundled from.
+	 *
+	 * The bundled chunk is not what a build extracts: its comments are gone,
+	 * taking any `@fuz-classes` hints with them, and a Svelte component arrives
+	 * compiled, its static `class` attributes folded into template strings the
+	 * extractor doesn't read. The chunk's sourcemap lists the files it came
+	 * from, so those are extracted instead, each under its own path - the entry
+	 * an SSR transform of the same file shares.
+	 *
+	 * The chunk is extracted as the code it is, which still finds the classes
+	 * its JS expressions name, whenever the sources can't stand in for it: the
+	 * sourcemap is missing or unreadable, or it names a file that isn't on
+	 * disk. A package that ships compiled files with sourcemaps of its own
+	 * has the second shape - the pre-bundler follows those back to sources the
+	 * package didn't publish. The chunk is extracted alongside whatever
+	 * sources were read, since one chunk can bundle several packages; a class
+	 * found both ways counts once. Inlined `sourcesContent` isn't used for a
+	 * missing file: it holds the package's unpublished source, which a build,
+	 * transforming the published files, never extracts.
+	 *
+	 * @param id - the chunk's normalized absolute path
+	 * @param code - the chunk's code
+	 */
+	const ingest_optimized_dep = async (id: string, code: string): Promise<void> => {
+		const map = await deps.read_text({ path: id + '.map' });
+		const sources = map.ok ? parse_sourcemap_sources(map.value, dirname(id)) : null;
+		// whether the sources fall short of the chunk - unknown, or not all readable
+		let sources_incomplete = sources === null;
+		if (sources !== null) {
+			const source_ids = sources.filter((source) => filter_file(source, vite_root));
+			await each_concurrent(source_ids, PRESCAN_CONCURRENCY, async (source_id) => {
+				// isolated per file, like the pre-scan: a throw here would otherwise
+				// fail the dependency's transform
+				try {
+					if (!(await ingest_file_from_disk(source_id))) sources_incomplete = true;
+				} catch (error) {
+					log_error(`[fuz_css] failed to extract ${source_id}: ${error}`);
+				}
+			});
+		}
+		if (sources_incomplete && filter_file(id, vite_root)) await ingest(id, code);
+	};
+
+	/**
+	 * Whether a file is in the pre-scanned set - under one of the pre-scan's
+	 * directories, or the Vite root's `index.html`. Always `false` when the
+	 * pre-scan is disabled.
+	 *
+	 * @param id - the file's normalized absolute path
+	 */
+	const is_prescanned = (id: string): boolean =>
+		id === prescan_root_html || prescan_dirs.some((dir) => id.startsWith(dir));
+
+	/**
 	 * Dev-only eager scan: extracts every matching file under the configured
-	 * roots before the virtual module is first served, so the initial CSS is
-	 * complete - including classes from modules the SSR walk never reaches.
-	 * `load()` awaits the returned promise. See the `prescan` option.
+	 * roots, plus the Vite root's `index.html`, before the virtual module is
+	 * first served, so the initial CSS is complete - including classes from
+	 * modules the SSR walk never reaches. `load()` awaits the returned promise.
+	 * See the `prescan` option.
 	 */
 	const run_prescan = async (): Promise<void> => {
 		const started = performance.now();
-		const roots = Array.isArray(prescan) ? prescan : PRESCAN_ROOTS_DEFAULT;
 		const found = await Promise.all(
-			roots.map((root) =>
-				fs_search(isAbsolute(root) ? root : join(project_root!, root), {
-					file_filter: filter_file,
-					sort: null
-				})
+			prescan_dirs.map((dir) =>
+				fs_search(dir, { file_filter: (id) => filter_file(id, vite_root), sort: null })
 			)
 		);
 		// Normalize to Vite's posix-style ids so pre-scan entries share keys
 		// with transform ingests (`hashes`, deletion handling) on every platform.
-		const file_ids = found.flat().map((p) => normalizePath(p.id));
-		prescan_active = true;
-		try {
-			await each_concurrent(file_ids, PRESCAN_CONCURRENCY, async (id) => {
-				// Per-file isolation: `each_concurrent` is fail-fast, so an uncaught
-				// throw (a custom deps or acorn plugin, not parse errors - those
-				// become diagnostics) would silently skip every remaining file;
-				// transform() ingests independently and this matches that.
-				try {
-					// Reads disk bytes while transform later receives Vite's input for
-					// the same id; with enforce: 'pre' those are identical, so the
-					// content-hash short-circuit makes the second ingest a no-op. A
-					// loader that rewrites content before 'pre' plugins would extract
-					// twice, with the transform result winning - harmless, just noted.
-					// claim the epoch before the disk read so a deletion racing the
-					// read is detected inside ingest_file instead of resurrected
-					const epoch = ++epoch_seq;
-					transform_epochs.set(id, epoch);
-					const r = await deps.read_text({ path: id });
-					if (!r.ok) return; // deleted mid-scan or unreadable; transform covers it if it reappears
-					// await the cache write too, so PRESCAN_CONCURRENCY bounds it
-					await ingest_file(id, r.value, { await_cache_write: true, epoch });
-				} catch (error) {
-					log_error(`[fuz_css] pre-scan failed to extract ${id}: ${error}`);
-				}
-			});
-		} finally {
-			prescan_active = false;
+		// A set, because a scanned directory can hold the root's `index.html`.
+		const file_ids = new Set(found.flat().map((p) => normalizePath(p.id)));
+		if (prescan_root_html !== null && filter_file(prescan_root_html, vite_root)) {
+			file_ids.add(prescan_root_html); // skipped at the read when the project has none
 		}
-		// Every load() awaits the pre-scan, so this only compensates for updates
-		// the scan actually suppressed after the module was served
-		if (virtual_module_loaded && prescan_suppressed_update) {
-			prescan_suppressed_update = false;
-			invalidate_virtual_module();
-		}
+		let file_count = 0;
+		// no update is pushed while this runs: every load() awaits the
+		// pre-scan, so nothing has been served that an ingest could outdate
+		await each_concurrent([...file_ids], PRESCAN_CONCURRENCY, async (id) => {
+			// Per-file isolation: `each_concurrent` is fail-fast, so an uncaught
+			// throw (a custom deps or acorn plugin, not parse errors - those
+			// become diagnostics) would silently skip every remaining file;
+			// transform() ingests independently and this matches that.
+			try {
+				if (await ingest_file_from_disk(id)) file_count++;
+			} catch (error) {
+				log_error(`[fuz_css] pre-scan failed to extract ${id}: ${error}`);
+			}
+		});
 		const elapsed = Math.round(performance.now() - started);
-		log_info(`[fuz_css] pre-scanned ${file_ids.length} files in ${elapsed}ms`);
+		log_info(`[fuz_css] pre-scanned ${file_count} files in ${elapsed}ms`);
 	};
 
-	return {
+	const plugin: Plugin = {
 		name: 'vite-plugin-fuz-css',
 		// Run before other plugins (like Svelte) to see original source files
 		enforce: 'pre',
 
+		config(user_config) {
+			// the cache is this plugin's own output, a file per extracted source, so the dev
+			// server's watcher skips it - each watched file costs an inotify watch, a budget
+			// shared with every process the user runs. The root resolves as Vite resolves it.
+			const root = user_config.root ? resolve(user_config.root) : process.cwd();
+			return {
+				server: { watch: { ignored: [normalizePath(join(root, cache_dir)) + '/**'] } }
+			};
+		},
+
 		configResolved(resolved_config) {
-			const root = resolved_config.root;
-			project_root = root.endsWith('/') ? root : root + '/';
-			resolved_cache_dir = join(root, cache_dir);
+			vite_root = ensure_end(resolved_config.root, '/');
+			get_cache_path = create_cache_path_resolver(cache_dir, vite_root);
 			logger = resolved_config.logger;
 			is_dev = resolved_config.command === 'serve';
+			optimized_deps_prefix = is_dev
+				? normalizePath(join(resolved_config.cacheDir, OPTIMIZED_DEPS_DIR))
+				: null;
 		},
 
 		configureServer(dev_server) {
 			server = dev_server;
 
-			// Start bundled-resource loading now instead of at the first load() -
-			// it overlaps with the pre-scan and the framework's own startup,
-			// taking the base-CSS parse off the first request's critical path.
-			// Errors are swallowed here: load() awaits the same cached promise
-			// and surfaces the same error at request time.
-			if (include_base || include_theme) {
-				ensure_bundled_resources().catch(() => {
-					// Surfaced by load() awaiting the same cached promise
-				});
-			}
+			// Start loading the generator's resources now instead of at the first
+			// load() - it overlaps with the pre-scan and the framework's own
+			// startup, taking the base-CSS parse off the first request's critical
+			// path. Errors are swallowed here: a failed load isn't kept, so load()
+			// retries it and surfaces its error at request time.
+			generator.ensure_ready().catch(() => {
+				// Retried and surfaced by load()
+			});
 
 			// Eager pre-scan (dev only): seed extraction state before the first
 			// CSS serve. load() awaits this promise.
 			if (prescan !== false) {
+				const roots = Array.isArray(prescan) ? prescan : PRESCAN_ROOTS_DEFAULT;
+				prescan_dirs = roots.map((root) => {
+					const dir = normalizePath(isAbsolute(root) ? root : join(vite_root, root));
+					return dir.endsWith('/') ? dir : dir + '/';
+				});
+				prescan_root_html = normalizePath(join(vite_root, PRESCAN_ROOT_HTML));
 				prescan_promise = run_prescan().catch((error) => {
 					log_error(`[fuz_css] pre-scan failed: ${error}`);
 				});
 			}
 
-			// Connect-time resync: a client that loaded the page while extraction
-			// was still discovering files (late dep transforms, dynamic imports)
-			// may have missed the corrective HMR update - updates are dropped when
-			// no socket is connected. When its socket opens, re-check and push if
-			// the CSS moved past what load() served.
-			dev_server.ws.on('connection', () => {
-				if (!virtual_module_loaded || last_served_css === null) return;
-				if ((include_base || include_theme) && style_rule_index === null) return;
-				// Fast path: once bundled resources are loaded (checked above; load()
-				// awaits them before serving), every state change schedules the
-				// debounce timer, so no pending timer plus generated == served proves
-				// there's nothing to push - skip the render (the common case for every
-				// new tab).
-				if (hmr_timeout === null && last_generated_css === last_served_css) return;
-				// same throw-routing as the debounce timer: a ws event handler has
-				// no promise to reject into
-				let css: string;
-				try {
-					css = render_css();
-				} catch (error) {
-					log_error(`[fuz_css] ${error}`);
-					return;
-				}
-				if (css !== last_served_css) {
-					invalidate_and_push(css);
-				}
-			});
+			// The evaluation handshake - see `resync_evaluated_client`. Reports
+			// come from browsers, so only the client environment's channel
+			dev_server.environments.client.hot.on(EVALUATED_EVENT, resync_evaluated_client);
 
-			// Handle file deletion - watcher 'unlink' event
-			dev_server.watcher.on('unlink', (raw_file) => {
-				// chokidar reports platform paths - normalize so the key matches the
-				// transform/prescan ingests (`hashes`, `transform_epochs`)
+			// Keep the pre-scanned set current. `transform` re-ingests a file the
+			// module graph reaches, but nothing transforms the rest of what the
+			// pre-scan extracted - the root `index.html`, SvelteKit's `app.html`,
+			// a file no module imports yet - so an edit to one would otherwise go
+			// unseen until the server restarts.
+			const rescan_file = (raw_file: string): void => {
 				const file = normalizePath(raw_file);
-				// Invalidate any in-flight transform for this file so its post-await
-				// re-add can't resurrect the deleted entry.
-				transform_epochs.delete(file);
-				if (hashes.has(file)) {
-					css_classes.delete(file);
-					hashes.delete(file);
-					detected_variables_by_file.delete(file);
+				if (!is_prescanned(file) || !filter_file(file, vite_root)) return;
+				ingest_file_from_disk(file).catch((error) => {
+					log_error(`[fuz_css] failed to extract ${file}: ${error}`);
+				});
+			};
+			dev_server.watcher.on('add', rescan_file);
+			dev_server.watcher.on('change', rescan_file);
 
-					// Delete cache file (fire and forget)
-					if (!is_ci && resolved_cache_dir && project_root) {
-						const cache_path = get_file_cache_path(file, resolved_cache_dir, project_root);
-						delete_cached_extraction(deps, cache_path).catch(() => {
-							// Ignore cache deletion errors
-						});
-					}
-
-					if (virtual_module_loaded) {
-						invalidate_virtual_module();
-					}
+			// Handle file deletion - watcher 'unlink' event. chokidar reports
+			// platform paths, so normalize to match the ingests' keys
+			dev_server.watcher.on('unlink', (raw_file) => {
+				if (extraction.remove(normalizePath(raw_file)) && announced_css !== null) {
+					invalidate_virtual_module();
 				}
 			});
 		},
 
-		async buildStart() {
-			// Load CSS properties for literal-class validation during render_css()
-			css_properties = await load_css_properties();
-			// Note: Bundled CSS resources (style_rule_index, variable_graph, class_variable_index)
-			// load via ensure_bundled_resources() - started eagerly in configureServer
-			// (dev), or lazily on the first load() call (build)
+		buildStart() {
+			build_passes.build_start(this.environment);
 		},
 
 		buildEnd() {
@@ -735,149 +769,98 @@ export const vite_plugin_fuz_css = (options: VitePluginFuzCssOptions = {}): Plug
 			if (id.split('?', 1)[0] !== RESOLVED_VIRTUAL_ID) {
 				return undefined;
 			}
-			virtual_module_loaded = true;
 			loaded_virtual_ids.add(id); // bare + each `?inline`/`?direct`/`?used` variant, for HMR invalidation
-			// Ensure resources are ready (started eagerly in dev, lazily here in
-			// build); in dev also wait for the pre-scan so the first served CSS
+			// Ensure the generator is ready (started eagerly in dev, lazily here
+			// in build); in dev also wait for the pre-scan so the first served CSS
 			// is complete.
-			const pending: Array<Promise<void>> = [];
-			if (include_base || include_theme) {
-				pending.push(ensure_bundled_resources());
-			}
-			if (prescan_promise) {
-				pending.push(prescan_promise);
-			}
-			if (pending.length > 0) {
-				await Promise.all(pending);
-			}
+			await Promise.all([generator.ensure_ready(), prescan_promise]);
 			if (is_dev) {
 				// Dev: return real CSS. Vite's CSS pipeline wraps it for client-side
 				// injection with HMR, and SvelteKit's dev SSR inlines it into the
 				// document `<head>` so the first paint is styled (no FOUC on refresh).
-				// Reuse CSS computed during an HMR pass when available.
-				const css = pending_css ?? render_css();
-				pending_css = null;
-				last_generated_css = css; // Track for HMR diffing
-				last_served_css = css; // Track for connect-time resync
+				const css = render_dev_css();
+				if (announced_css === null) {
+					announced_css = css; // Track for HMR diffing
+				} else if (css !== announced_css) {
+					// A fresh render ahead of the debounced update: the variants
+					// served before it still hold the older CSS. `announced_css`
+					// stays what they hold so that update sees the change and
+					// invalidates them, instead of finding it already recorded here.
+					invalidate_virtual_module();
+				}
 				return css;
 			}
-			// Build: emit a marker rule (not a comment - comments are minified away)
-			// so generateBundle can find the importer's CSS asset (loaded on every
-			// page) and splice the full generated CSS in at the marker's position,
-			// which is where import order put this module.
+			// Build: the CSS isn't known yet - other modules are still to be
+			// transformed - so load a marker rule that renderChunk restates with
+			// the generated CSS. The marker is a declaration, not a comment
+			// (minified away), so if the restatement can't run, generateBundle
+			// can still find the importer's CSS asset and splice the CSS in at
+			// the marker's position, where import order put this module.
 			return FUZ_CSS_PLACEHOLDER_RULE;
 		},
 
+		async renderChunk(_code, chunk) {
+			await build_passes.render_chunk(this, chunk);
+			return null;
+		},
+
 		generateBundle(_options, bundle) {
-			// Regenerate CSS with all extracted classes. Runs after all transforms,
-			// so the full set of used classes is available.
-			const generated_css = render_css();
-
-			// Splice the generated CSS into the asset that holds the virtual module's
-			// placeholder marker, at the marker's own position. Vite places that
-			// marker in the CSS of whatever imported `virtual:fuz.css` (typically the
-			// root layout/entry), which is loaded on every page, at the offset import
-			// order gives it - so writing there keeps the source's ordering, and an
-			// app stylesheet imported after `virtual:fuz.css` can still override a
-			// theme token at equal specificity. Appending to an arbitrary "first" CSS
-			// asset instead breaks code-split builds (e.g. SvelteKit's per-route CSS):
-			// pages that don't load that chunk render completely unstyled.
-			let spliced_count = 0;
-			for (const chunk of Object.values(bundle)) {
-				if (
-					chunk.type === 'asset' &&
-					typeof chunk.source === 'string' &&
-					chunk.fileName.endsWith('.css')
-				) {
-					let spliced = splice_css_at_placeholder(chunk.source, generated_css);
-					if (spliced === null) continue;
-					spliced_count++;
-					// Two entries' CSS merged into one asset leave a second marker; the
-					// generated CSS is already placed at the first, so strip the rest.
-					let stripped = splice_css_at_placeholder(spliced, '');
-					while (stripped !== null) {
-						spliced = stripped;
-						stripped = splice_css_at_placeholder(spliced, '');
-					}
-					chunk.source = spliced;
-				}
-			}
-
-			// Normal path: exactly one marked asset, loaded on every page.
-			if (spliced_count === 1) return;
-
-			// Marker landed in more than one asset - the full CSS is now duplicated
-			// across them. Functional but bloated; surface it rather than ship silently.
-			if (spliced_count > 1) {
-				log_error(
-					`[fuz_css] placeholder marker found in ${spliced_count} CSS assets; generated CSS is` +
-						` duplicated across them. Expected a single globally-loaded asset.`
-				);
-				return;
-			}
-
-			// spliced_count === 0 below: the marker is gone. Only act when the virtual
-			// module was actually imported and there's real CSS to deliver - otherwise
-			// there's nothing to place (e.g. plugin installed but `virtual:fuz.css`
-			// never imported, or a fully empty generation that's only banners).
-			if (!virtual_module_loaded) return;
-			const has_real_css = generated_css.replaceAll(FUZ_CSS_BANNER, '').trim().length > 0;
-			if (!has_real_css) return;
-
-			let css_asset_count = 0;
-			for (const chunk of Object.values(bundle)) {
-				if (
-					chunk.type === 'asset' &&
-					typeof chunk.source === 'string' &&
-					chunk.fileName.endsWith('.css')
-				) {
-					css_asset_count++;
-				}
-			}
-
-			// `virtual:fuz.css` was imported but there's nowhere to place its output -
-			// every page would render completely unstyled. Fail the build rather than
-			// ship a broken artifact (e.g. a config that inlines CSS into JS chunks,
-			// where the marker rides in a chunk these asset checks skip).
-			if (css_asset_count === 0) {
-				throw new Error(
-					'[fuz_css] virtual:fuz.css was imported but no CSS asset exists to hold the generated' +
-						' styles - every page would be unstyled. Check the build config (cssCodeSplit /' +
-						' CSS-in-JS inlining).'
-				);
-			}
-
-			// Marker stripped but CSS assets exist (e.g. a minifier pruned the unused
-			// custom property): append to every one so styles are present on every
-			// page. Output may be duplicated; this is a degraded path, so surface it.
-			log_error(
-				`[fuz_css] placeholder marker not found in any CSS asset (likely stripped by a CSS` +
-					` minifier); appending generated CSS to all ${css_asset_count} CSS assets as a` +
-					` fallback. Output may be duplicated.`
-			);
-			for (const chunk of Object.values(bundle)) {
-				if (
-					chunk.type === 'asset' &&
-					typeof chunk.source === 'string' &&
-					chunk.fileName.endsWith('.css')
-				) {
-					chunk.source = chunk.source + '\n' + generated_css;
-				}
-			}
+			build_passes.generate_bundle(this, bundle);
 		},
 
 		async transform(code, id) {
-			// Skip non-matching files
-			if (!filter_file(id)) {
+			// The dev server's client requests carry cache-busting queries the
+			// file's other ingests don't (`/node_modules/pkg/index.js?v=<hash>`)
+			const file_id = to_extraction_id(id);
+			if (optimized_deps_prefix !== null && file_id.startsWith(optimized_deps_prefix)) {
+				await ingest_optimized_dep(file_id, code);
+				return null;
+			}
+			// Skip non-matching files, and the generated CSS itself - its
+			// variable references would keep every variable it once emitted
+			if (file_id.split('?', 1)[0] === RESOLVED_VIRTUAL_ID || !filter_file(file_id, vite_root)) {
 				return null;
 			}
 
-			await ingest_file(id, code);
+			await ingest(file_id, code);
 
 			return null;
 		}
 
 		// Note: handleHotUpdate not needed - transform hook handles file changes,
-		// and configureServer's watcher.on('unlink') handles file deletion
+		// and configureServer's watcher listeners handle the files it doesn't
+		// reach and file deletion
 	};
+
+	/**
+	 * The serve-only half, at `enforce: 'post'` so its `transform` sees the
+	 * virtual module after `vite:css-post` has wrapped the CSS as the client
+	 * JS that injects it.
+	 */
+	const plugin_serve: Plugin = {
+		name: 'vite-plugin-fuz-css:serve',
+		apply: 'serve',
+		enforce: 'post',
+
+		transform(code, id) {
+			// Only the module a client evaluates and hot-updates: the bare id, not
+			// the `?inline`/`?direct` variants, and not a server environment's copy
+			if (id !== RESOLVED_VIRTUAL_ID || this.environment.config.consumer !== 'client') {
+				return null;
+			}
+			// No report where it couldn't be answered with a hot update: without
+			// a websocket the send only fails, logging an error in the browser
+			// per evaluation, and with HMR off the server sends no updates
+			const { ws, hmr } = this.environment.config.server;
+			if (ws === false || hmr === false) return null;
+			// Report the evaluation - see `resync_evaluated_client`. The hash
+			// identifies this code, so the server can tell it from what a refetch
+			// would serve. The CSS module's client JS has no sourcemap to keep in
+			// step (its CSS sourcemap, when enabled, rides inside the CSS string).
+			const hash = crypto_hash('sha256', code).slice(0, EVALUATED_HASH_LENGTH);
+			return { code: `${code}\n${to_evaluated_report(hash)}`, map: null };
+		}
+	};
+
+	return [plugin, build_passes.plugin, plugin_serve];
 };

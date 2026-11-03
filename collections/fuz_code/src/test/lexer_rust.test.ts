@@ -1,14 +1,14 @@
 import { describe, test, assert } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
 import {
 	Lexer,
 	syntax_events_to_tokens,
 	token_types_global,
 	validate_syntax_events
-} from '$lib/lexer.ts';
-import { lexer_rust } from '$lib/lexer_rust.ts';
+} from '#lib/lexer.ts';
+import { lexer_rust } from '#lib/lexer_rust.ts';
 
 const tokens_of = (text: string): Array<[string, string]> =>
 	syntax_events_to_tokens(syntax_styler_global.lex(text, 'rust')).map((t) => [

@@ -11,29 +11,31 @@
  * Every `note` cites a **public** `security.md` property (the table ships
  * in a public package — no internal-planning refs). Stateful invariants
  * (fail-closed tombstone, last-admin guard, deterministic lifecycle) are
- * imperative and live in `account_lifecycle.cross.test.ts`, not here.
+ * imperative and live in `describe_account_lifecycle_cross_tests`, not here.
  *
  * @module
  */
 
 import {
+	ERROR_AUTHENTICATION_REQUIRED,
 	ERROR_CREDENTIAL_TYPE_REQUIRED,
 	ERROR_INSUFFICIENT_PERMISSIONS,
 	ERROR_INVALID_CREDENTIALS,
 	ERROR_NO_MATCHING_INVITE,
 	ERROR_ROLE_GRANT_NOT_FOUND,
 	ERROR_TOKEN_SCOPE_REQUIRED
-} from '$lib/http/error_schemas.ts';
+} from '#lib/http/error_schemas.ts';
 import {
 	ERROR_CANNOT_DELETE_KEEPER,
 	ERROR_PURGE_NOT_CONFIRMED
-} from '$lib/auth/admin_action_specs.ts';
-import { ERROR_ROLE_GRANT_OFFER_NOT_FOUND } from '$lib/auth/role_grant_offer_action_specs.ts';
-import { DEFAULT_TEST_PASSWORD } from '$lib/testing/test_credentials.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { ERROR_ROLE_GRANT_OFFER_NOT_FOUND } from '#lib/auth/role_grant_offer_action_specs.ts';
+import { ERROR_TOKEN_SCOPE_INVALID } from '#lib/auth/account_action_specs.ts';
+import { DEFAULT_TEST_PASSWORD } from '#lib/testing/test_credentials.ts';
 import {
 	SCOPED_TOKEN_ADMITTED_METHOD,
 	type ConformanceCase
-} from '$lib/testing/cross_backend/conformance_case.ts';
+} from '#lib/testing/cross_backend/conformance_case.ts';
 
 /** A well-formed UUID that never names a real row — exercises the not-found / mask paths. */
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
@@ -162,9 +164,12 @@ const credential_ceiling_cases: ReadonlyArray<ConformanceCase> = [
 		expect: {
 			status: 403,
 			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
-			fields: { required_credential_types: ['session'] }
+			fields: { required_credential_types: ['session'] },
+			// With the `account_delete` self-path rows: the handler-enforced
+			// refusal is byte-identical to this dispatcher one.
+			equivalence_group: 'session_only_refusal'
 		},
-		note: 'security.md §Credential-channel gating on credential-minting actions — token minting requires a browser-context session, closing bearer/daemon-spawn-bearer persistence'
+		note: 'security.md §Credential-channel gating — token minting requires a browser-context session, closing bearer/daemon-spawn-bearer persistence'
 	},
 	{
 		name: 'api_token (bearer) → account_token_create with empty params → 403 credential_type_required (authority gates precede input validation)',
@@ -172,7 +177,7 @@ const credential_ceiling_cases: ReadonlyArray<ConformanceCase> = [
 			method: 'account_token_create',
 			as: 'token',
 			// Deliberately malformed — `scope` is required. Both dispatchers run
-			// 401 → authz → 403 → 400, so the caller hears that this channel may
+			// 401 → authz → 403 → 429 → 400, so the caller hears that this channel may
 			// never mint a token and learns nothing about the shape of the request
 			// it would have to send. A 400 here would confirm the method exists
 			// and describe how to call it, to a channel that should have learned
@@ -184,7 +189,23 @@ const credential_ceiling_cases: ReadonlyArray<ConformanceCase> = [
 			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
 			fields: { required_credential_types: ['session'] }
 		},
-		note: 'security.md §Credential-channel gating on credential-minting actions — a leaked bearer cannot mint sibling tokens to outlive revocation; the empty params also pin that no input-shape detail precedes the credential denial'
+		note: 'security.md §Credential-channel gating — a leaked bearer cannot mint sibling tokens to outlive revocation; the empty params also pin that no input-shape detail precedes the credential denial'
+	},
+	{
+		name: "api_token (bearer) → role_grant_offer_create → 403 credential_type_required (the keeper's admin authority doesn't ride a bearer)",
+		request: {
+			method: 'role_grant_offer_create',
+			as: 'token',
+			// Well-formed, so the row isolates the credential denial: over a
+			// session the keeper (a global admin) would reach the handler.
+			params: { to_account_id: NIL_UUID, role: 'admin' }
+		},
+		expect: {
+			status: 403,
+			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
+			fields: { required_credential_types: ['session'] }
+		},
+		note: 'security.md §Credential-channel gating — a leaked bearer cannot offer a role to an account its holder controls, whose own-session accept would leave a grant outliving the token'
 	},
 	{
 		name: 'api_token (bearer) → /logout → 403 credential_type_required',
@@ -194,14 +215,15 @@ const credential_ceiling_cases: ReadonlyArray<ConformanceCase> = [
 			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
 			fields: { required_credential_types: ['session'] }
 		},
-		note: 'security.md §Credential-channel gating on credential-minting actions — logout is a session-bound operation; a bearer holds no session to end, so it is refused rather than returning a misleading 200 + a phantom logout audit row (gated for forensic fidelity, not lockout)'
+		note: 'security.md §Credential-channel gating — logout is a session-bound operation; a bearer holds no session to end, so it is refused rather than returning a misleading 200 + a phantom logout audit row (gated for forensic fidelity, not lockout)'
 	},
 	// Browser/CLI split (anti-replay): a VALID bearer token replayed from a
 	// browser context (Origin present) must be discarded, so an authed action
 	// sees no credential and 401s — wire-INDISTINGUISHABLE from sending nothing.
-	// The `browser_bearer_replay` equivalence group pins that byte-identity on
-	// each spine: `bearer_browser` (token discarded) and `anonymous` (no token)
-	// produce the same 401. The `token` principal elsewhere is the honored
+	// The `bearer_soft_fail` equivalence group pins that byte-identity on
+	// each spine: `bearer_browser` (token discarded), `malformed_bearer` (a
+	// value that cannot be a token, refused before any database work) and
+	// `anonymous` (no token) produce the same 401. The `token` principal elsewhere is the honored
 	// counterpart (no Origin → same token authenticates), so a 401 here proves
 	// the discard fired rather than the token being invalid. account_verify is
 	// the minimal account-required read; it returns 200 to an honored bearer, so
@@ -209,14 +231,20 @@ const credential_ceiling_cases: ReadonlyArray<ConformanceCase> = [
 	{
 		name: 'bearer token + Origin → account_verify → 401 (browser-context discard, no replay)',
 		request: { method: 'account_verify', as: 'bearer_browser' },
-		expect: { status: 401, equivalence_group: 'browser_bearer_replay' },
+		expect: { status: 401, equivalence_group: 'bearer_soft_fail' },
 		note: 'security.md §Browser/CLI split — a stolen API token cannot be replayed from a browser context; the bearer is discarded when Origin/Referer is present, so the request is wire-indistinguishable from anonymous'
 	},
 	{
-		name: 'anonymous → account_verify → 401 (browser-replayed bearer equivalence baseline)',
+		name: 'malformed bearer → account_verify → 401 (shape precheck, indistinguishable from anonymous)',
+		request: { method: 'account_verify', as: 'malformed_bearer' },
+		expect: { status: 401, equivalence_group: 'bearer_soft_fail' },
+		note: 'a bearer value that cannot be a token soft-fails before any database work — no pool checkout, no query — and the refusal says nothing a prober can tell apart from sending no credential'
+	},
+	{
+		name: 'anonymous → account_verify → 401 (bearer soft-fail equivalence baseline)',
 		request: { method: 'account_verify', as: 'anonymous' },
-		expect: { status: 401, equivalence_group: 'browser_bearer_replay' },
-		note: 'security.md §Browser/CLI split — the no-credential baseline a browser-replayed bearer must be byte-identical to (the equivalence group asserts both 401s match)'
+		expect: { status: 401, equivalence_group: 'bearer_soft_fail' },
+		note: 'security.md §Browser/CLI split — the no-credential baseline a discarded or malformed bearer must be byte-identical to (the equivalence group asserts the 401s match)'
 	}
 ];
 
@@ -280,12 +308,52 @@ const token_scope_cases: ReadonlyArray<ConformanceCase> = [
 			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
 			fields: { required_credential_types: ['session'] }
 		},
-		note: 'security.md §Credential-channel gating on credential-minting actions — the credential gate runs before the scope gate on both spines, so a bearer refused by channel is never told which scope it lacked'
-	}
+		note: 'security.md §Credential-channel gating — the credential gate runs before the scope gate on both spines, so a bearer refused by channel is never told which scope it lacked'
+	},
+	// The mint's `scope` is decoded strictly on both spines, and every refusal
+	// carries the `token_scope_invalid` the field declares.
+	{
+		name: 'session → account_token_create with a well-formed narrowed scope → 200 (control for the refusals below)',
+		request: {
+			method: 'account_token_create',
+			as: 'keeper',
+			params: {
+				scope: { kind: 'methods', methods: ['account_token_list', 'account_token_list'] },
+				lifetime: { kind: 'eternal' }
+			}
+		},
+		expect: { status: 200 },
+		note: 'security.md §API Token Security — a session mints a narrowed token; duplicate method names collapse into one on both spines'
+	},
+	...(
+		[
+			['an unknown key', { kind: 'full', junk: 1 }],
+			['a version', { kind: 'full', version: 99 }],
+			['a grandfathered flag', { kind: 'full', grandfathered: true }],
+			['methods on kind full', { kind: 'full', methods: ['account_token_list'] }],
+			['a null methods on kind full', { kind: 'full', methods: null }],
+			[
+				'an over-cap document',
+				{
+					kind: 'methods',
+					methods: Array.from({ length: 160 }, (_, i) => `scope_cap_method_${i}_${'x'.repeat(16)}`)
+				}
+			]
+		] as const
+	).map(([label, scope]): ConformanceCase => ({
+		name: `session → account_token_create with ${label} in scope → 400`,
+		request: {
+			method: 'account_token_create',
+			as: 'keeper',
+			params: { scope, lifetime: { kind: 'eternal' } }
+		},
+		expect: { status: 400, error_reason: ERROR_TOKEN_SCOPE_INVALID },
+		note: 'security.md §API Token Security — the mint scope is a closed shape on both spines: a minter cannot stamp the version or forge grandfathered, a full scope carries no method list, and a document past the 4 KiB cap is a malformed request, never a 500 — each refused with the reason `scope` declares'
+	}))
 ];
 
 // --- Batch 2: privilege gates (declarative) ---------------------------
-// Stateful fail-closed/last-admin cases live in account_lifecycle.cross.test.ts.
+// Stateful fail-closed/last-admin cases live in describe_account_lifecycle_cross_tests.
 
 const privilege_gate_cases: ReadonlyArray<ConformanceCase> = [
 	{
@@ -306,6 +374,31 @@ const privilege_gate_cases: ReadonlyArray<ConformanceCase> = [
 		request: { method: 'account_delete', as: 'keeper', params: {} },
 		expect: { status: 403, error_reason: ERROR_CANNOT_DELETE_KEEPER },
 		note: 'security.md §Authorization "Account-removal target guards" — a keeper-role account is never API-removable; auth + daemon-token resolution both pivot on it'
+	},
+	{
+		// The same self-delete over the keeper's API token: the handler's
+		// session-only check on the self path runs before the keeper guard, so
+		// the refusal is the credential one and says nothing about the account.
+		name: 'api_token self-delete → account_delete → 403 credential_type_required (before the keeper guard)',
+		request: { method: 'account_delete', as: 'token', params: {} },
+		expect: {
+			status: 403,
+			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
+			fields: { required_credential_types: ['session'] },
+			equivalence_group: 'session_only_refusal'
+		},
+		note: 'security.md §Credential-channel gating "account_delete self path" — a leaked bearer cannot end the account it belongs to; handler-enforced, since an admin deleting another account keeps any credential'
+	},
+	{
+		name: 'daemon token self-delete → account_delete → 403 credential_type_required (before the keeper guard)',
+		request: { method: 'account_delete', as: 'daemon', params: {} },
+		expect: {
+			status: 403,
+			error_reason: ERROR_CREDENTIAL_TYPE_REQUIRED,
+			fields: { required_credential_types: ['session'] },
+			equivalence_group: 'session_only_refusal'
+		},
+		note: 'security.md §Credential-channel gating "account_delete self path" — the daemon token is refused too: the self path admits a session and nothing else'
 	}
 ];
 
@@ -323,6 +416,26 @@ const idor_and_enumeration_cases: ReadonlyArray<ConformanceCase> = [
 		},
 		expect: { status: 404, error_reason: ERROR_ROLE_GRANT_OFFER_NOT_FOUND },
 		note: 'security.md §Authorization "404-over-403 is the general mask" — a missing offer and an offer the caller cannot view are wire-indistinguishable'
+	},
+	{
+		name: 'decline nonexistent offer → 404 (existence not disclosed)',
+		request: {
+			method: 'role_grant_offer_decline',
+			as: 'fresh_non_admin',
+			params: { offer_id: NIL_UUID }
+		},
+		expect: { status: 404, error_reason: ERROR_ROLE_GRANT_OFFER_NOT_FOUND },
+		note: 'security.md §Authorization "404-over-403 is the general mask" — decline is scoped to the recipient account, so another account’s offer answers this same 404 (role_grant_offer_lifecycle.ts pins the identity)'
+	},
+	{
+		name: 'retract nonexistent offer → 404 (existence not disclosed)',
+		request: {
+			method: 'role_grant_offer_retract',
+			as: 'fresh_non_admin',
+			params: { offer_id: NIL_UUID }
+		},
+		expect: { status: 404, error_reason: ERROR_ROLE_GRANT_OFFER_NOT_FOUND },
+		note: 'security.md §Authorization "404-over-403 is the general mask" — retract is scoped to the grantor actor, so another actor’s offer answers this same 404 (role_grant_offer_lifecycle.ts pins the identity)'
 	},
 	{
 		name: 'admin revokes nonexistent role_grant → 404 (existence not disclosed)',
@@ -410,7 +523,7 @@ const idor_and_enumeration_cases: ReadonlyArray<ConformanceCase> = [
 // must be refused at the auth phase (401) before input validation (400)
 // ever runs — otherwise a parse error leaks the route's input schema /
 // shape to an anonymous prober. The anonymous end of the dispatchers'
-// 401 → authz → 403 → 400 order on both impls; the 403 end is pinned by the
+// 401 → authz → 403 → 429 → 400 order on both impls; the 403 end is pinned by the
 // bearer `account_token_create` row in the credential-ceiling batch above.
 // The Rust dispatcher validates input handler-side today, so these rows also
 // guard that a future input-validation port can't reorder ahead of the auth
@@ -426,8 +539,8 @@ const phase_order_cases: ReadonlyArray<ConformanceCase> = [
 			as: 'anonymous',
 			params: { session_id: 12345 }
 		},
-		expect: { status: 401 },
-		note: 'security.md §Authorization "Phase ordering hides route shape from callers who lack the authority to call" — the 401 → authz → 403 → 400 dispatch order: pre-authorization auth fires before input validation, so an unauthenticated caller never learns route shape from a parse failure'
+		expect: { status: 401, error_reason: ERROR_AUTHENTICATION_REQUIRED },
+		note: 'security.md §Authorization "Phase ordering hides route shape from callers who lack the authority to call" — the 401 → authz → 403 → 429 → 400 dispatch order: pre-authorization auth fires before input validation, so an unauthenticated caller never learns route shape from a parse failure'
 	},
 	{
 		// REST twin: `/password` is account + session gated; a malformed body
@@ -438,7 +551,7 @@ const phase_order_cases: ReadonlyArray<ConformanceCase> = [
 			as: 'anonymous',
 			params: { current_password: 999, new_password: false }
 		},
-		expect: { status: 401 },
+		expect: { status: 401, error_reason: ERROR_AUTHENTICATION_REQUIRED },
 		note: 'security.md §Authorization "Phase ordering hides route shape from callers who lack the authority to call" — require_auth fires before body parsing, so an unauthenticated caller never sees route-shape information from input parse failures'
 	}
 ];

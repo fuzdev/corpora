@@ -4,66 +4,33 @@
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 	import CopyToClipboard from '@fuzdev/fuz_ui/CopyToClipboard.svelte';
 	import Details from '@fuzdev/fuz_ui/Details.svelte';
-	import ColorSchemeInput from '@fuzdev/fuz_ui/ColorSchemeInput.svelte';
-	import type { ThemeState } from '@fuzdev/fuz_ui/theme_state.svelte.ts';
 
-	import { render_theme_style } from '$lib/theme.ts';
-	import type { Theme, ThemeScheme } from '$lib/variable.ts';
-	import { theme_knobs, theme_knob_axes, type KnobAxis, type ThemeKnob } from '$lib/knobs.ts';
-	import type { ThemeGateEntry } from '$lib/theme_check.ts';
-	import { PALETTE_HUES } from '$lib/ramps.ts';
+	import { render_theme_style } from '#lib/theme.ts';
+	import type { ThemeScheme } from '#lib/variable.ts';
+	import { theme_knobs, theme_knob_axes, type KnobAxis, type ThemeKnob } from '#lib/knobs.ts';
+	import type { ThemeGateEntry } from '#lib/theme_check.ts';
+	import { PALETTE_HUES } from '#lib/ramps.ts';
 	import {
 		palette_variants,
 		intent_variants,
 		type ColorSchemeVariant,
 		type PaletteVariant
-	} from '$lib/variable_data.ts';
-	import {
-		discard_confirm_message,
-		render_theme_ts,
-		type ThemeEditorState
-	} from '$routes/theme_editor_state.svelte.ts';
-	import { UNSAVED_THEME_NAME } from '$routes/theme_draft.ts';
-	import KnobControl from '$routes/KnobControl.svelte';
-	import RampStrip from '$routes/RampStrip.svelte';
+	} from '#lib/variable_data.ts';
+	import { render_theme_ts, type ThemeEditorState } from '#routes/theme_editor_state.svelte.ts';
+	import { root_color_scheme } from '#routes/root_color_scheme.svelte.ts';
+	import KnobControl from '#routes/KnobControl.svelte';
+	import RampStrip from '#routes/RampStrip.svelte';
 
 	const {
-		editor,
-		theme_state,
-		onload_theme
+		editor
 	}: {
 		editor: ThemeEditorState;
-		theme_state: ThemeState;
-		/**
-		 * Called after the "based on" select loads a theme as the new base, so
-		 * the page can apply it and sync its own picker selection.
-		 */
-		onload_theme?: (theme: Theme) => void;
 	} = $props();
 
-	// the OS preference, tracked live so an OS flip while 'auto' doesn't keep
-	// edits writing to the stale slot; false during SSR, corrected on mount
-	let os_prefers_dark = $state(false);
-	$effect(() => {
-		const query = matchMedia('(prefers-color-scheme: dark)');
-		const update = () => {
-			os_prefers_dark = query.matches;
-		};
-		update();
-		query.addEventListener('change', update);
-		return () => query.removeEventListener('change', update);
-	});
-
-	// the scheme whose slots edits write to
-	const editing_scheme: ColorSchemeVariant = $derived(
-		theme_state.color_scheme === 'dark' || (theme_state.color_scheme === 'auto' && os_prefers_dark)
-			? 'dark'
-			: 'light'
-	);
-
-	const failing_gates: Array<ThemeGateEntry> = $derived(
-		editor.check_report.entries.filter((e) => !e.pass)
-	);
+	// the scheme whose slots edits write to: the one the page renders, read
+	// off the root class rather than derived from the 'auto' setting and the
+	// OS, which can disagree with what's on screen
+	const editing_scheme: ColorSchemeVariant = $derived(root_color_scheme());
 
 	const format_gate_value = (entry: ThemeGateEntry): string => {
 		switch (entry.gate) {
@@ -111,29 +78,17 @@
 	// switching the "based on" theme flattens it as the new base, discarding any
 	// edits, so guard the switch behind a confirm when the draft is dirty
 	const on_base_change = (e: Event & { currentTarget: EventTarget & HTMLSelectElement }): void => {
-		const name = e.currentTarget.value;
-		if (
-			editor.dirty &&
-			// eslint-disable-next-line no-alert -- deliberate guard against silently discarding edits
-			!confirm(discard_confirm_message(editor, name))
-		) {
+		const theme = editor.themes.find((t) => t.name === e.currentTarget.value);
+		// eslint-disable-next-line no-alert -- deliberate guard against silently discarding edits
+		if (!theme || !editor.load_theme_guarded(theme, (message) => confirm(message))) {
 			e.currentTarget.value = editor.based_on;
-			return;
-		}
-		const theme = editor.themes.find((t) => t.name === name);
-		if (theme) {
-			editor.load_theme(theme);
-			onload_theme?.(theme);
 		}
 	};
 
-	const trimmed_name = $derived(editor.name.trim());
-	const name_collides = $derived(
-		trimmed_name === UNSAVED_THEME_NAME || editor.themes.some((t) => t.name === trimmed_name)
-	);
-
 	const output_ts = $derived(render_theme_ts(editor.output));
-	const output_css = $derived(render_theme_style(editor.output));
+	const output_css = $derived(
+		render_theme_style(editor.resolved_output.theme, editor.resolved_output)
+	);
 </script>
 
 {#snippet knob_control(knob: ThemeKnob, compact: boolean)}
@@ -150,7 +105,7 @@
 {/snippet}
 
 <header class="mb_flow">
-	<div class="row gap_lg flex-wrap:wrap mb_lg">
+	<div class="row gap_lg flex-wrap:wrap mb_flow">
 		<label>
 			<div class="title">name</div>
 			<input bind:value={editor.name} />
@@ -184,32 +139,32 @@
 				{editor.is_palette_tier ? 'palette-tier' : 'semantic-tier'}
 			</span>
 			{#if editor.dirty}
-				<button type="button" class="sm" onclick={() => editor.reset_all()}>
+				<button type="button" class="sized_sm" onclick={() => editor.reset_all()}>
 					reset all{editor.overrides.size ? ` (${editor.overrides.size})` : ''}
 				</button>
 			{/if}
 		</div>
 	</div>
-	{#if name_collides}
-		<aside>the name "{trimmed_name}" collides with an existing theme - consider renaming</aside>
+	{#if editor.name_collides}
+		<aside>
+			the name "{editor.trimmed_name}" collides with an existing theme - consider renaming
+		</aside>
 	{/if}
-	<div class="row gap_lg">
-		<ColorSchemeInput />
+	<p>
 		{#if editor.stance}
 			<small>
-				single-scheme theme - edits write to the base slots and the
-				<strong>{editor.stance}</strong>
+				single-scheme theme - edits write to the base slots and the <strong>{editor.stance}</strong>
 				appearance renders in both color schemes
 			</small>
 		{:else}
 			<small>edits write to the <strong>{editing_scheme}</strong> scheme's slots</small>
 		{/if}
-	</div>
+	</p>
 </header>
 
 <!-- the same knobs appear again in their axis sections below - same state,
 	two densities -->
-<section class="design_band panel p_md">
+<section class="panel p_md">
 	<div class="mb_md">
 		<small>intents - what each meaning points at</small>
 		<div class="knobs row flex-wrap:wrap gap_md">
@@ -237,7 +192,7 @@
 			{#if axis === 'color'}
 				<!-- live feedback: the derived neutral and intent scales repaint as
 					knobs move -->
-				<div class="ramp_strips mb_lg">
+				<div class="ramp-strips mb_flow">
 					<RampStrip prefix="shade" />
 					<RampStrip prefix="text" />
 					{#each intent_variants as intent (intent)}
@@ -259,7 +214,7 @@
 						{sm_meta?.title ?? 'granular tokens'}
 						<small>({sm_meta?.hint ?? 'escape hatches - pin individual tokens'})</small>
 					</summary>
-					<div class="knobs row flex-wrap:wrap gap_lg align-items:flex-end mt_md">
+					<div class="knobs row flex-wrap:wrap gap_lg align-items:flex-end">
 						{#each sm_knobs as knob (knob.name)}
 							{@render knob_control(knob, false)}
 						{/each}
@@ -269,11 +224,10 @@
 			{#if axis === 'color'}
 				<details class="mt_lg">
 					<summary>
-						palette hues <small>
-							(the letter slots - moving these makes the theme palette-tier)
-						</small>
+						palette hues
+						<small>(the letter slots - moving these makes the theme palette-tier)</small>
 					</summary>
-					<div class="ramp_strips mt_md mb_lg">
+					<div class="ramp-strips mb_flow">
 						{#each palette_variants as letter (letter)}
 							<RampStrip prefix="palette_{letter}" />
 						{/each}
@@ -293,29 +247,26 @@
 	<h3>Gates</h3>
 	<p>
 		<code>validate_theme</code> and <code>check_theme</code> run live against the draft - the same
-		lint and gamut/monotonicity/contrast gates the shipped themes pass in CI.
+		lint and gamut/monotonicity/contrast gates the shipped themes are held to in CI.
 	</p>
-	{#if editor.issues.length === 0 &&
-		failing_gates.length === 0 &&
-		editor.check_report.unchecked.length === 0
-	}
-		<p class="positive_50">
+	{#if editor.gates_pass}
+		<p class="positive_60">
 			all gates pass <small>({editor.check_report.entries.length} checks)</small>
 		</p>
 	{:else}
 		{#if editor.issues.length}
 			<ul class="unstyled">
 				{#each editor.issues as issue (issue.level + (issue.variable ?? '') + issue.message)}
-					<li class={issue.level === 'error' ? 'negative_50' : 'caution_50'}>
+					<li class={issue.level === 'error' ? 'negative_60' : 'caution_60'}>
 						{issue.level}: {issue.message}
 					</li>
 				{/each}
 			</ul>
 		{/if}
-		{#if failing_gates.length}
+		{#if editor.failing_gates.length}
 			<ul class="unstyled">
-				{#each failing_gates as entry (entry.gate + entry.scheme + entry.subject)}
-					<li class="negative_50">
+				{#each editor.failing_gates as entry (entry.gate + entry.scheme + entry.subject)}
+					<li class="negative_60">
 						{entry.gate} · {entry.scheme} · {entry.subject}: {format_gate_value(entry)}
 					</li>
 				{/each}
@@ -324,9 +275,8 @@
 		{#if editor.check_report.unchecked.length}
 			<details>
 				<summary>
-					{editor.check_report.unchecked.length} unchecked <small>
-						(values the numeric gates can't resolve)
-					</small>
+					{editor.check_report.unchecked.length} unchecked
+					<small>(values the gates can't evaluate)</small>
 				</summary>
 				<ul class="unstyled">
 					{#each editor.check_report.unchecked as u (u.variable + u.value)}
@@ -347,25 +297,25 @@
 	<!-- lazily rendered: the highlighted output is the costliest thing on the
 		page and would re-render on every knob drag while open -->
 	<Details summary="theme object">
-		<div class="rendered mt_md">
-			<div class="copy">
+		<div class="rendered-output">
+			<div class="copy-button">
 				<CopyToClipboard text={output_ts} />
 			</div>
 			<Code content={output_ts} lang="ts" />
 		</div>
 	</Details>
 	<Details summary="rendered CSS">
-		{#if editor.output.variables.length || editor.output.scheme_mirror?.length}
-			<div class="rendered mt_md">
-				<div class="copy">
+		{#if editor.output.variables.length || editor.stance}
+			<div class="rendered-output">
+				<div class="copy-button">
 					<CopyToClipboard text={output_css} />
 				</div>
 				<Code content={output_css} lang="css" />
 			</div>
 		{:else}
-			<p class="mt_md">
-				The theme is empty: every variable keeps its base default, so it renders no CSS. Move a
-				knob to see its output.
+			<p>
+				The theme is empty: every variable keeps its base default, so it renders no CSS. Move a knob
+				to see its output.
 			</p>
 		{/if}
 	</Details>
@@ -376,20 +326,21 @@
 	.knobs.compact {
 		gap: var(--space_lg) var(--space_md);
 	}
-	.ramp_strips {
+	.ramp-strips {
 		display: grid;
+		/* wide enough for a labeled strip of every stop before wrapping */
 		grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
 		gap: var(--space_sm) var(--space_lg);
 	}
-	.rendered {
-		position: relative; /* for the .copy button */
+	.rendered-output {
+		position: relative; /* for the .copy-button */
 	}
-	.rendered :global(.code_example) {
+	.rendered-output :global(.code_example) {
 		width: 100%;
-		max-height: 320px;
+		max-height: var(--distance_sm);
 		overflow: auto;
 	}
-	.copy {
+	.copy-button {
 		position: absolute;
 		top: var(--space_md);
 		right: var(--space_md);

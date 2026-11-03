@@ -1,10 +1,10 @@
 <script lang="ts">
-	import ContextmenuEntry from '$lib/ContextmenuEntry.svelte';
-	import Contextmenu from '$lib/Contextmenu.svelte';
-	import { ContextmenuState } from '$lib/contextmenu_state.svelte.ts';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
+	import ContextmenuEntry from '#lib/ContextmenuEntry.svelte';
+	import Contextmenu from '#lib/Contextmenu.svelte';
+	import { ContextmenuState } from '#lib/contextmenu_state.svelte.ts';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
 	import { selected_contextmenu_root_component_context } from './selected_root_component.svelte.ts';
 
 	const selected = selected_contextmenu_root_component_context.get();
@@ -52,11 +52,11 @@ Try selecting text and then opening the contextmenu on it.`;
 				<div bind:this={text_el} class="mb_lg">
 					<p>
 						When the Fuz contextmenu opens and the user has selected text, the menu includes a
-						<code>copy text</code>
-						entry.
+						<code>copy text</code> entry.
 					</p>
 					<p>
-						Try <button type="button" onclick={select_text} class:color_a={toggled}>
+						Try
+						<button type="button" onclick={select_text} class:palette_a={toggled}>
 							selecting text
 						</button>
 						and then opening the contextmenu on it.

@@ -12,44 +12,36 @@
 
 import { test, assert } from 'vitest';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
 import {
 	account_delete_action_spec,
 	account_purge_action_spec,
 	ERROR_CANNOT_DELETE_KEEPER,
 	ERROR_CANNOT_DELETE_LAST_ADMIN
-} from '$lib/auth/admin_action_specs.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
 import {
 	create_test_extra_actor,
 	create_test_role_grant_direct,
 	soft_delete_test_actor
-} from '$lib/testing/db_entities.ts';
-import { install_audit_drift_guard } from '$lib/testing/audit_drift_guard.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/testing/db_entities.ts';
+import { install_audit_drift_guard } from '#lib/testing/audit_drift_guard.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
 
-const factory = create_pglite_factory(async (db) => {
-	await run_migrations(db, [auth_migration_ns]);
-});
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
-
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> =>
 	create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: create_standard_rpc_actions(ctx.deps),
 		log: ctx.deps.log

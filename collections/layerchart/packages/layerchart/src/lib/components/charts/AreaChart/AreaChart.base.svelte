@@ -23,7 +23,7 @@
     xDomain,
     radial = false,
     series: seriesProp,
-    seriesLayout = 'overlap',
+    seriesLayout = 'auto',
     axis = true,
     brush = false,
     grid = true,
@@ -34,8 +34,9 @@
     onPointClick,
     props = {},
     profile = false,
-    marks,
+    marks: marksProp,
     tooltip: tooltipProp,
+    ref = $bindable(),
     context = $bindable(),
     ...restProps
   }: AreaChartBaseProps<TData> = $props();
@@ -62,6 +63,7 @@
 </script>
 
 <Chart
+  bind:ref
   bind:context
   {data}
   {xDomain}
@@ -101,9 +103,9 @@
     },
   }}
 >
-  {#snippet marks({ context }: { context: any })}
-    {#if typeof marks === 'function'}
-      {@render marks({ context })}
+  {#snippet marks({ context, facet }: { context: any; facet: any })}
+    {#if typeof marksProp === 'function'}
+      {@render marksProp({ context, facet })}
     {:else}
       {#each context.series.visibleSeries as s (s.key)}
         <Area

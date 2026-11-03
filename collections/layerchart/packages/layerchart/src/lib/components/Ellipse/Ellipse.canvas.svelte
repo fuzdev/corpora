@@ -1,8 +1,5 @@
 <script lang="ts" module>
-  export type {
-    EllipseProps,
-    EllipsePropsWithoutHTML,
-  } from './Ellipse.shared.svelte.js';
+  export type { EllipseProps, EllipsePropsWithoutHTML } from './Ellipse.shared.svelte.js';
 </script>
 
 <script lang="ts">
@@ -27,10 +24,7 @@
     itemClass?: string | undefined
   ) {
     return styleOverrides
-      ? merge(
-          { styles: { strokeWidth: itemStrokeWidth ?? c.staticStrokeWidth } },
-          styleOverrides
-        )
+      ? merge({ styles: { strokeWidth: itemStrokeWidth ?? c.staticStrokeWidth } }, styleOverrides)
       : {
           // Use raw `rest.fill` / `rest.stroke` (not `staticFill`) so canvas
           // accepts non-string values like `CanvasPattern` / `CanvasGradient`.
@@ -66,13 +60,13 @@
           resolvedOpacity,
           resolvedClass
         );
-        renderEllipse(ctx, item, styleOpts);
+        renderEllipse(ctx, { ...item, rotate: rest.rotate }, styleOpts);
       }
     } else {
       const styleOpts = getStyleOptions(styleOverrides);
       renderEllipse(
         ctx,
-        { cx: c.motionCx, cy: c.motionCy, rx: c.motionRx, ry: c.motionRy },
+        { cx: c.motionCx, cy: c.motionCy, rx: c.motionRx, ry: c.motionRy, rotate: rest.rotate },
         styleOpts
       );
     }
@@ -95,6 +89,7 @@
         pointerleave: (rest as any).onpointerleave,
       },
       deps: () => [
+        rest.rotate,
         c.dataMode,
         c.dataMode ? c.resolvedItems : null,
         c.motionCx,

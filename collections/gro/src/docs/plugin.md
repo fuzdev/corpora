@@ -3,12 +3,18 @@
 During the [`gro dev`](dev.md) and [`gro build`](build.md) tasks,
 Gro uses `Plugin`s to support custom usecases outside of the normal build pipeline.
 
+> Where it's going: the lifecycle stays.
+> On the [runtime](runtime.md), the Node tools plugins wrap
+> run as subprocesses under the run's kernel rules until each is replaced.
+
 In this early implementation of plugins in Gro,
 plugins run serially, in the order they are returned from `plugins` in the `gro.config.ts`.
 Each step of Gro's build processes - `gro dev` for development and `gro build` for production -
 runs a method of each plugin, batched together as `setup -> adapt -> teardown`,
 with some behavioral inconsistencies:
 
+- `gro dev` passes plugins `{dev: true, watch: true}` (`watch: false` with `--no-watch`),
+  and `gro build` passes `{dev: false, watch: false}`
 - `adapt` only runs during production aka `gro build`
 - `teardown` does not run for `gro dev` in the default `watch` mode,
   but it does run with `gro dev --no-watch`
@@ -22,12 +28,14 @@ Maybe let you map the array of each method batch. (is that possible with those?)
 Gro's builtin plugins:
 
 - [`@fuzdev/gro/gro_plugin_server.ts`](../lib/gro_plugin_server.ts) - Node server support
+- [`@fuzdev/gro/gro_plugin_deno_server.ts`](../lib/gro_plugin_deno_server.ts) - runs a Deno server
+  beside the Vite dev server, unbundled
 - [`@fuzdev/gro/gro_plugin_sveltekit_library.ts`](../lib/gro_plugin_sveltekit_library.ts) -
   see [the docs](./gro_plugin_sveltekit_library.md)
 - [`@fuzdev/gro/gro_plugin_sveltekit_app.ts`](../lib/gro_plugin_sveltekit_app.ts) -
   see [the docs](./gro_plugin_sveltekit_app.md)
-- [`@fuzdev/gro/gro_plugin_gen.ts`](../lib/gro_plugin_gen.ts) - watch `src/`
-  and efficiently run `gen` when genfiles or their deps change
+- [`@fuzdev/gro/gro_plugin_gen.ts`](../lib/gro_plugin_gen.ts) - watch the config's `watch.dir` (default `src/`)
+  and efficiently run `gen` when genfiles, their imports, or their `inputs` change
 
 > server and gen plugin docs are not yet written
 
@@ -51,7 +59,8 @@ export interface PluginContext<TArgs = object> extends TaskContext<TArgs> {
 }
 ```
 
-The `adapt` step only runs for production during `gro build`, taking after SvelteKit adapters.
+`PluginContext` extends the task context, so plugins get the same args, config, `graph`, `watcher`,
+logger, and `invoke_task` as tasks; see [`TaskContext` in the task docs](task.md#type-taskcontext).
 
 ## error handling
 

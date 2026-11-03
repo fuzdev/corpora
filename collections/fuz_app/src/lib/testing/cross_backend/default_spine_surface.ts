@@ -15,13 +15,6 @@ import '../assert_dev_env.ts';
  *   `create_app_server`), and
  * - the `cross_backend_ts_*` self-test projects.
  *
- * **`$lib`-free by contract.** This module and everything it imports use
- * relative specifiers (no `$lib` SvelteKit alias) so the spawned TS test
- * binary — run under Gro's loader, which resolves `.js`→`.ts` and package
- * imports but **not** the `$lib` alias — can import it transitively. Keep
- * it that way: a `$lib` import anywhere in this graph breaks the binary
- * spawn while still typechecking under vitest.
- *
  * @module
  */
 
@@ -47,6 +40,7 @@ import { create_test_app_surface_spec } from '../stubs.ts';
 // (→ `session_middleware` → `hono/cookie`). Import only the constants this
 // module uses internally; callers that need a bare constant reach for the leaf.
 import {
+	SPINE_ACCOUNT_PATH_PREFIX,
 	SPINE_CELL_EDITOR_ROLE,
 	SPINE_EXPECTED_SCHEMA_URL,
 	SPINE_PARTICIPANT_ROLE,
@@ -65,8 +59,8 @@ export const spine_session_options: SessionOptions<string> = create_session_conf
  * suite's bootstrap-seeded role) and `SPINE_PARTICIPANT_ROLE`
  * (`grant_paths: ['admin']`; the role-gated-participation suite's
  * admin-grantable role). Threaded into the cell spec set's role-validity gate
- * **and** the auth grantability gates; the Rust stub mirrors the same
- * membership in both its `RoleRegistry` and `known_roles`. The `participant`
+ * **and** the auth grantability gates; the same membership is in the Rust
+ * stub's `RoleRegistry` (which the cell spec set also reads). The `participant`
  * entry also gives the admin suite real app-role grant-path coverage
  * (`admin_account_list.grantable_roles` carries it on both spines).
  */
@@ -75,19 +69,19 @@ export const spine_roles: RoleSchemaResult = create_role_schema([
 	{ name: SPINE_PARTICIPANT_ROLE, grant_paths: [GRANT_PATH_ADMIN] }
 ]);
 
-/** Options for {@link spine_rpc_endpoints}. */
+/** Options for `spine_rpc_endpoints`. */
 export interface SpineRpcEndpointsOptions {
 	/**
 	 * WS notification sender threaded into the role-grant-offer sub-factory for
 	 * server-initiated fan-out (`role_grant_offer_received` / `_accepted` /
 	 * `_declined` / `_retracted` / `_supersede`, flat `role_grant_revoke`).
 	 *
-	 * **Shared-instance trap.** Pass the SAME `BackendWebsocketTransport`
-	 * instance the WS endpoint registers connections against — the transport
-	 * *is* the connection registry, so a separate instance would fan out to an
+	 * **Shared-instance trap.** Pass the SAME `ConnectionRegistry`
+	 * instance the WS endpoint registers connections against — the registry
+	 * *is* the fan-out target, so a separate instance would fan out to an
 	 * empty registry and reach nobody (silently). The TS spine binary
-	 * constructs one `ws_transport` and threads it both here and into
-	 * `register_ws_endpoint`.
+	 * constructs one `ConnectionRegistry` and threads it both here and into
+	 * `register_action_ws`.
 	 *
 	 * Omitted (the default) for the shared `create_spine_surface_spec` path —
 	 * surface generation doesn't depend on it, and it must stay absent there so
@@ -136,7 +130,7 @@ export const spine_rpc_endpoints = (
  * the stream at `SPINE_SSE_PATH`.
  */
 export const create_spine_route_specs = (ctx: AppServerContext): Array<RouteSpec> => [
-	...prefix_route_specs('/api/account', [
+	...prefix_route_specs(SPINE_ACCOUNT_PATH_PREFIX, [
 		...create_account_route_specs(ctx.deps, {
 			session_options: spine_session_options,
 			// Honor the limiters the server was assembled with (on `AppServerContext`
@@ -171,7 +165,7 @@ export const create_spine_route_specs = (ctx: AppServerContext): Array<RouteSpec
 
 /**
  * The spine's `/ready` route spec — the column-presence schema-drift deploy
- * gate, reading {@link SPINE_EXPECTED_SCHEMA_URL}. Mounted **live** by the TS
+ * gate, reading `SPINE_EXPECTED_SCHEMA_URL`. Mounted **live** by the TS
  * spine binary (in `build_spine_app`) and the in-process readiness parity leg,
  * but kept **off** the declared surface (`create_spine_surface_spec`) like the
  * fact-serving / ws / sse behaviors — `describe_ready_cross_tests` (gated on
@@ -196,5 +190,8 @@ export const create_spine_surface_spec = (): AppSurfaceSpec =>
 		session_options: spine_session_options,
 		create_route_specs: create_spine_route_specs,
 		rpc_endpoints: spine_rpc_endpoints,
-		bootstrap: { mode: 'surface_only' }
+		bootstrap: { mode: 'surface_only' },
+		// both spine binaries mount the daemon-token layer (the TS one rotates a
+		// token on disk); `GET /api/surface` stays off, the default on both
+		daemon_token: true
 	});

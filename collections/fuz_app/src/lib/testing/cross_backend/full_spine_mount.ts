@@ -15,6 +15,9 @@ import '../assert_dev_env.ts';
  * - the `_testing_*` daemon-token backdoors (`create_testing_actions`),
  * - the full cell verb set (CRUD + grant + field + item + audit),
  * - the opt-in `actor_lookup` / `actor_search` resolvers,
+ * - the `_testing_origin_check` probe the origin conformance table drives,
+ * - the `_testing_shorten_credential_expiry` seam the credential-deadline
+ *   suite drives,
  * - the `_testing_action_manifest` backdoor, appended last (it dumps the live
  *   method set for the cross-impl manifest-parity gate, so it must enumerate
  *   every method above it).
@@ -22,20 +25,21 @@ import '../assert_dev_env.ts';
  * Single-sourcing the mount here lets the binary, the in-process parity
  * setup, and the `spine_method_coverage` reconciliation test all build the
  * same list — so a method can never be mounted in one place and forgotten
- * in another. The reconciliation test enumerates `build_full_spine_rpc_actions`
- * with stub deps and asserts the live method set equals the tagged coverage
- * manifest; see `src/test/cross_backend/spine_method_coverage.ts`.
+ * in another.
  *
- * **`$lib`-free by contract** — like `default_spine_surface.ts`, this module
- * is reached by the spawned TS binary under Gro's loader (which resolves
- * `.js`→`.ts` but not the `$lib` alias), so every import is relative. Keep
- * it that way.
+ * The binary's WS endpoint serves the same list: `build_full_spine_mount`
+ * builds it once and hands the WS mount the protocol actions plus every RPC
+ * action, twinning the Rust `testing_spine_stub`, which compiles one action
+ * registry and serves it on both transports. The reconciliation test
+ * enumerates `build_full_spine_rpc_actions` with stub deps and asserts the live method set equals the tagged coverage
+ * manifest; see `src/test/cross_backend/spine_method_coverage.ts`.
  *
  * @module
  */
 
-import type { RpcAction } from '../../actions/action_rpc.ts';
+import type { Action, RpcAction } from '../../actions/action_types.ts';
 import { peer_ping_action } from '../../actions/peer_ping.ts';
+import { protocol_actions } from '../../actions/protocol.ts';
 import type { AppDeps } from '../../auth/deps.ts';
 import type { DaemonTokenState } from '../../auth/daemon_token.ts';
 import type { NotificationSender } from '../../auth/role_grant_offer_notifications.ts';
@@ -43,17 +47,43 @@ import { create_standard_rpc_actions } from '../../auth/standard_rpc_actions.ts'
 import { create_all_cell_actions } from '../../auth/all_cell_actions.ts';
 import { create_actor_lookup_actions } from '../../auth/actor_lookup_actions.ts';
 import { create_actor_search_actions } from '../../auth/actor_search_actions.ts';
+import type { Db } from '../../db/db.ts';
 import type { RpcEndpointSpec } from '../../http/surface.ts';
-import type { AppServerContext } from '../../server/app_server_context.ts';
+import { create_stub_app_deps } from '../stubs.ts';
+import { CELL_DROP_TABLES } from '../../db/cell_ddl.ts';
+import { FACT_DROP_TABLES } from '../../db/fact_ddl.ts';
 import {
 	create_testing_action_manifest_action,
-	create_testing_actions
+	create_testing_actions,
+	create_testing_shorten_credential_expiry_action
 } from './testing_reset_actions.ts';
+import { create_testing_origin_check_action } from './testing_origin_check.ts';
 import { test_cell_gated_create_authorize } from './test_cell_gated_create_authorize.ts';
+import { test_cell_grant_steward_revoke_authorize } from './test_cell_grant_steward_revoke_authorize.ts';
 import { spine_roles, spine_session_options } from './default_spine_surface.ts';
 import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
 
-/** Options for {@link build_full_spine_rpc_actions} / {@link full_spine_rpc_endpoints}. */
+/**
+ * The domain tables the spine binary's `_testing_reset` empties beside the
+ * auth ones: the `fuz_cell` and `fuz_facts` namespaces' drop lists
+ * (`CELL_DROP_TABLES`, `FACT_DROP_TABLES`), children first. Without it a test
+ * would see the cells and facts a previous test left. The Rust
+ * `testing_spine_stub` empties the same set, taken from its `fuz_cell` /
+ * `fuz_fact` column registries.
+ */
+const SPINE_DOMAIN_RESET_TABLES = [...CELL_DROP_TABLES, ...FACT_DROP_TABLES];
+
+/**
+ * `_testing_reset`'s `reset_state` for the full spine mount — empties
+ * `SPINE_DOMAIN_RESET_TABLES` on the reset's own transaction.
+ */
+const reset_spine_domain_state = async (db: Db): Promise<void> => {
+	for (const table of SPINE_DOMAIN_RESET_TABLES) {
+		await db.query(`DELETE FROM ${table}`);
+	}
+};
+
+/** Options for `build_full_spine_rpc_actions` / `build_full_spine_mount`. */
 export interface FullSpineMountOptions {
 	/**
 	 * Daemon-token runtime state threaded into `create_testing_actions` — the
@@ -65,8 +95,8 @@ export interface FullSpineMountOptions {
 	readonly daemon_token_state: DaemonTokenState;
 	/**
 	 * WS notification sender for the role-grant-offer fan-out. Pass the SAME
-	 * `BackendWebsocketTransport` the WS endpoint registers connections against
-	 * (the transport is the connection registry). Omitted for enumeration.
+	 * `ConnectionRegistry` the WS endpoint registers connections against
+	 * (the registry is the fan-out target). Omitted for enumeration.
 	 */
 	readonly notification_sender?: NotificationSender | null;
 }
@@ -96,21 +126,35 @@ export const build_full_spine_rpc_actions = (
 		),
 		...create_testing_actions(deps, {
 			session_options: spine_session_options,
-			daemon_token_state: options.daemon_token_state
+			daemon_token_state: options.daemon_token_state,
+			reset_state: reset_spine_domain_state
 		}),
 		// Mount the directory-model `cell_gated_create` test policy (twin of the
 		// Rust stub's `TestCellGatedCreateAuthorize`) so the cross-backend
 		// authorizer-parity suite has a known gate: `kind: 'space'` roots are
-		// admin-only, contributions are gated by the root's `data.policy`, and
-		// plain parentless creates stay open (the other cell suites are
-		// unaffected). The handler hands the governing root's `data` to the
-		// (pure) authorizer.
+		// admin-only, contributions are gated by the root's `policy`, and plain
+		// parentless creates stay open (the other cell suites are unaffected).
+		// The handler hands the governing root's `policy` to the (pure)
+		// authorizer, whose `validate_policy` accepts or refuses each policy
+		// write. Beside it the steward-revoke test policy (twin of the Rust
+		// stub's `TestCellGrantStewardRevokeAuthorize`): a scoped `participant`
+		// grant stewards its scope, for the `cell_grant_steward` cross suite.
 		...create_all_cell_actions(
-			{ ...deps, authorize_create: test_cell_gated_create_authorize },
+			{
+				...deps,
+				authorize_create: test_cell_gated_create_authorize,
+				authorize_grant_revoke: test_cell_grant_steward_revoke_authorize
+			},
 			{ roles: spine_roles }
 		),
 		...create_actor_lookup_actions(deps),
 		...create_actor_search_actions(deps),
+		// the origin conformance table's probe — kept out of
+		// `create_testing_actions` (see its spec doc)
+		create_testing_origin_check_action(),
+		// the credential-deadline suite's shorten-only seam — kept out of
+		// `create_testing_actions` for the same reason
+		create_testing_shorten_credential_expiry_action(),
 		// `peer/ping` is mounted on the HTTP RPC endpoint too (not just WS) so an
 		// HTTP invocation reaches the handler and refuses with `peer_no_transport`
 		// rather than `method_not_found`. It's a protocol action, so it's filtered
@@ -126,16 +170,78 @@ export const build_full_spine_rpc_actions = (
 	return actions;
 };
 
+/** The spine binary's RPC and WS action sets, built from one action list. */
+export interface FullSpineMount {
+	/** Every action on the RPC endpoint — `build_full_spine_rpc_actions`'s list. */
+	readonly rpc_actions: Array<RpcAction>;
+	/**
+	 * The WS endpoint's actions: `protocol_actions` first, then every RPC
+	 * action not already among them (`peer/ping` is on both lists). The same
+	 * handler instances as `rpc_actions`.
+	 */
+	readonly ws_actions: Array<Action>;
+}
+
 /**
- * Factory-form full mount at {@link SPINE_RPC_PATH}, the shape
- * `create_app_server`'s `rpc_endpoints` slot accepts. The spine binary wires
- * this directly; the surface builder (`create_spine_surface_spec`) keeps using
- * the narrower `spine_rpc_endpoints` so the declared surface stays the
- * standard bundle only.
+ * Build the full live mount for both of the spine binary's endpoints: the
+ * RPC list, and the WS list that serves the same actions behind the protocol
+ * actions.
+ *
+ * The Rust `testing_spine_stub` serves one action registry on RPC and WS, so
+ * mounting the full list on WS keeps the two spines' WS method sets equal —
+ * the cell verbs among them, whose dispatcher-charged rate limit
+ * `describe_ws_action_rate_limit_cross_tests` drives over a socket. The one
+ * difference is `cancel`: a registered protocol action on TS, read-loop-owned
+ * (never dispatched) on Rust.
+ *
+ * @param deps - the backend `AppDeps`
+ * @param options - daemon-token state + optional WS notification sender
+ * @returns the RPC and WS action lists, built once and sharing handler instances
  */
-export const full_spine_rpc_endpoints = (
-	ctx: AppServerContext,
+export const build_full_spine_mount = (
+	deps: AppDeps,
 	options: FullSpineMountOptions
-): Array<RpcEndpointSpec> => [
-	{ path: SPINE_RPC_PATH, actions: build_full_spine_rpc_actions(ctx.deps, options) }
+): FullSpineMount => {
+	const rpc_actions = build_full_spine_rpc_actions(deps, options);
+	const protocol_methods = new Set(protocol_actions.map((action) => action.spec.method));
+	return {
+		rpc_actions,
+		ws_actions: [
+			...protocol_actions,
+			...rpc_actions.filter((action) => !protocol_methods.has(action.spec.method))
+		]
+	};
+};
+
+/**
+ * Daemon-token state for building the mount only to read it — the
+ * `_testing_reset` handler that would write it never runs.
+ */
+const RESOLUTION_ONLY_DAEMON_TOKEN_STATE: DaemonTokenState = {
+	current_token: 'resolution_only',
+	previous_token: null,
+	rotated_at: new Date(0),
+	keeper_account_id: null
+};
+
+/**
+ * The spine binary's whole live RPC mount as an endpoint list, built on stub
+ * deps for method resolution only — no handler built here ever runs.
+ *
+ * What a suite resolving off-surface methods takes as its `live_rpc_endpoints`
+ * (the conformance table, the differential, and the auth-row generator), so
+ * rows can name the cell verbs, the actor resolvers and the `_testing_*`
+ * backdoors the spines mount beside the declared surface. The requests go to
+ * the spawned backend, which runs its own handlers. Both spines mount this
+ * method set (the action-manifest parity gate holds them to it).
+ *
+ * @returns one endpoint at `SPINE_RPC_PATH` carrying `build_full_spine_rpc_actions`'s list
+ */
+export const create_spine_live_rpc_endpoints = (): Array<RpcEndpointSpec> => [
+	{
+		path: SPINE_RPC_PATH,
+		actions: build_full_spine_rpc_actions(create_stub_app_deps(), {
+			daemon_token_state: RESOLUTION_ONLY_DAEMON_TOKEN_STATE
+		})
+	}
 ];

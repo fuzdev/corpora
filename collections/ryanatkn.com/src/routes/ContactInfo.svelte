@@ -1,7 +1,7 @@
 <div class="h-card">
-	<a class="u-url u-uid" href="https://www.ryanatkn.com/" hidden aria-hidden="true"
-		>https://www.ryanatkn.com/</a
-	>
+	<a class="u-url u-uid" href="https://www.ryanatkn.com/" hidden aria-hidden="true">
+		https://www.ryanatkn.com/
+	</a>
 	<h2 class="mb_xl2">contact me</h2>
 	<ul class="contact-info panel shade_00 shadow_xs py_md pr_md position:relative">
 		<li>
@@ -11,20 +11,15 @@
 			<span class="p-nickname">@ryanatkn</span> on
 			<a class="u-url" rel="me" href="https://github.com/ryanatkn">GitHub</a>,
 			<a class="u-url" rel="me" href="https://www.npmjs.com/~ryanatkn">npm</a>, and (not really
-			active)
-			<a class="u-url" rel="me" href="https://www.youtube.com/@ryanatkn">YouTube</a>
+			active) <a class="u-url" rel="me" href="https://www.youtube.com/@ryanatkn">YouTube</a>
 		</li>
 		<li>
-			Mastodon as <a class="u-url" rel="me" href="https://fosstodon.org/@ryanatkn"
-				>@ryanatkn@fosstodon.org</a
-			>
-			and
+			Mastodon as
 			<a class="u-url" rel="me" href="https://hci.social/@ryanatkn">@ryanatkn@hci.social</a>
 		</li>
 		<li>
-			Bluesky as <a class="u-url" rel="me" href="https://bsky.app/profile/ryanatkn.com"
-				>@ryanatkn.com</a
-			>
+			Bluesky as
+			<a class="u-url" rel="me" href="https://bsky.app/profile/ryanatkn.com">@ryanatkn.com</a>
 		</li>
 		<li>
 			<a class="u-url" rel="me" href="https://www.webdevladder.net/">webdevladder.net</a> is my
@@ -38,13 +33,8 @@
 				</li>
 				<li>
 					@webdevladder_vods on
-					<a class="u-url" rel="me" href="https://www.youtube.com/@webdevladder_vods">YouTube</a> for
-					lower effort videos
-				</li>
-				<li>
-					<span class="overflow-wrap:anywhere">@webdevladder@fosstodon.org</span>
-					on
-					<a class="u-url" rel="me" href="https://fosstodon.org/@webdevladder">Mastodon</a>
+					<a class="u-url" rel="me" href="https://www.youtube.com/@webdevladder_vods">YouTube</a>
+					for lower effort videos
 				</li>
 			</ul>
 		</li>

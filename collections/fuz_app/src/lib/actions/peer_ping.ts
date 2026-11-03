@@ -25,10 +25,10 @@
  * constants and `PingResponse` (parity by test, not codegen).
  *
  * **Frontend-safe.** Like `heartbeat.ts` / `cancel.ts`, this module names
- * the dispatcher types (`ActionContext`, `RpcAction`) type-only and builds
- * `peer_ping_action` as a plain literal — it never imports the runtime
- * `action_rpc.ts` (which would drag the HTTP dispatch core + Hono into any
- * frontend that pulls `protocol_action_specs`). The frontend responder
+ * the handler types (`ActionContext`, `RpcAction`) type-only from
+ * `actions/action_types.ts` and never imports the dispatch core
+ * (`action_rpc.ts`, which would drag Hono into any frontend that pulls
+ * `protocol_action_specs`). The frontend responder
  * (`peer_ping_responder`) lives here too so a real frontend can answer the
  * server's probe.
  *
@@ -38,8 +38,9 @@
 import { z } from 'zod';
 
 import { ThrownJsonrpcError, JSONRPC_ERROR_CODES } from '../http/jsonrpc_errors.ts';
+import { safe_parse_dropping_unknown_keys } from '../http/schema_helpers.ts';
 import type { RequestResponseActionSpec } from './action_spec.ts';
-import type { ActionContext, RpcAction } from './action_rpc.ts';
+import type { ActionContext, RpcAction } from './action_types.ts';
 import { DEFAULT_PEER_REQUEST_TIMEOUT, type PeerRequestError } from './peer_request.ts';
 
 /** Wire method name (both directions). Twin of the Rust `PEER_PING_METHOD`. */
@@ -106,6 +107,13 @@ export type PingResponse = z.infer<typeof PingResponse>;
  * client→server invocation drives a server→client request); `auth: public`
  * (liveness is non-sensitive; the upgrade authenticated the socket);
  * `side_effects: false` (no state change — the handler only round-trips a ping).
+ *
+ * Public is not ungoverned: `rate_limit: 'ip'` is the one throttle an
+ * unauthenticated method can be given (there is no account to key on). It
+ * bounds anonymous fan-out and keeps the class at parity with the Rust spec's
+ * `RateLimitClass::Ip` — there the no-transport refusal costs two pool
+ * checkouts per call; here the public auth shape skips the authorization
+ * phase, so the refusal is free and the class is carried for the bound alone.
  */
 export const peer_ping_action_spec = {
 	method: PEER_PING_METHOD,
@@ -116,6 +124,7 @@ export const peer_ping_action_spec = {
 	input: PingActionInput,
 	output: PingResponse,
 	async: true,
+	rate_limit: 'ip',
 	description:
 		'Liveness round-trip — the handler pings the originating client back over its socket, ' +
 		'validates the echo, and returns it. Refused as no-transport over HTTP RPC.'
@@ -183,7 +192,8 @@ export const peer_ping_handler = async (
 	const outcome = await ctx.request_client(PEER_PING_METHOD, request_params, { timeout_ms });
 	if (!outcome.ok) throw peer_request_error_to_jsonrpc(outcome.error);
 
-	const parsed = PingResponse.safeParse(outcome.value);
+	// the reply is remote-authored — a newer client may add fields
+	const parsed = safe_parse_dropping_unknown_keys(PingResponse, outcome.value);
 	if (!parsed.success) {
 		throw new ThrownJsonrpcError(
 			JSONRPC_ERROR_CODES.validation_error,
@@ -223,10 +233,8 @@ export const peer_ping_responder = (params: unknown): PingResponse => {
  * Protocol-action tuple — spread into the server's `actions` array (via
  * `protocol_actions` from `actions/protocol.ts`) so the dispatcher resolves the
  * `peer/ping` handler on both the WS endpoint and (for the no-transport refusal)
- * the HTTP RPC endpoint. A plain `RpcAction` literal (not `rpc_action(...)`) so
- * this module stays free of the runtime `action_rpc.ts` import — the same
- * frontend-safety discipline `heartbeat_action` / `cancel_action` follow; the
- * handler's input/output are already pinned by `peer_ping_handler`'s signature.
+ * the HTTP RPC endpoint. A plain `RpcAction` literal — the handler's
+ * input/output are already pinned by `peer_ping_handler`'s signature.
  * Usable directly in the spine's `RpcAction[]` full mount and the `Action[]`
  * protocol bundle alike.
  */

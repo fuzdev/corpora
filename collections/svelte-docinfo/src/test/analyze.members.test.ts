@@ -10,8 +10,8 @@
 
 import { test, assert, describe } from 'vitest';
 
-import type { ModuleJson } from '$lib/types.ts';
-import type { AnalyzeResultJson } from '$lib/analyze-core.ts';
+import type { ModuleJson } from '#lib/types.ts';
+import type { AnalyzeResultJson } from '#lib/analyze-core.ts';
 
 import { analyzeTestProject } from './test-module-helpers.ts';
 
@@ -156,7 +156,7 @@ export type T = {
 	test('`@default` documents class methods but never top-level functions', async () => {
 		// members only: `FunctionDeclarationJson` has no `defaultValue` (a
 		// top-level function has an implementation — nothing is "defaulted"),
-		// and `z.strictObject` would reject a leak at `ModuleJson.parse`
+		// and `v.strictObject` would reject a leak at `parseModuleJson`
 		const module = await analyzeFile(`export class C {
 	/** @default noop */
 	fn(): void {}

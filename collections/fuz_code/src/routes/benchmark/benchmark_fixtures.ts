@@ -1,7 +1,7 @@
-import Code from '$lib/Code.svelte';
-import CodeHighlight from '$lib/CodeHighlight.svelte';
+import Code from '#lib/Code.svelte';
+import CodeHighlight from '#lib/CodeHighlight.svelte';
 import type { BenchmarkedImplementation } from './benchmark_types.ts';
-import type { CodeSample } from '$lib/code_sample.ts';
+import type { CodeSample } from '#lib/code_sample.ts';
 
 /* eslint-disable no-console */
 

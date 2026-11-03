@@ -15,8 +15,8 @@
  * `{ok: true, request_context: null}`; resolved actor / account-only
  * contexts set `request_context` non-null. The test-harness escape hatch
  * (`TEST_CONTEXT_PRESET_KEY`) lives at each transport's wrapper
- * (`create_fuz_authorization_handler`, `create_ws_authorization_middleware`,
- * the HTTP RPC dispatcher) — see `request_context.test_context_preset.test.ts`
+ * (`run_authorization_phase`, which the route-spec handler and the WS upgrade
+ * share, and the HTTP RPC dispatcher) — see `request_context.test_context_preset.test.ts`
  * for that coverage.
  *
  * The torn-read 500 is unreachable from an integration test that
@@ -32,35 +32,35 @@
 
 import { describe, test, assert, vi, afterEach } from 'vitest';
 
-import { apply_authorization_phase } from '$lib/auth/request_context.ts';
+import { apply_authorization_phase, resolve_acting_actor } from '#lib/auth/request_context.ts';
 import {
 	query_account_by_id,
 	query_actor_by_id,
 	query_active_actors_by_account
-} from '$lib/auth/account_queries.ts';
-import { query_role_grant_find_active_for_actor } from '$lib/auth/role_grant_queries.ts';
+} from '#lib/auth/account_queries.ts';
+import { query_role_grant_find_active_for_actor } from '#lib/auth/role_grant_queries.ts';
 import {
 	ERROR_ACTOR_REQUIRED,
 	ERROR_ACTOR_NOT_ON_ACCOUNT,
 	ERROR_NO_ACTORS_ON_ACCOUNT,
 	ERROR_ACCOUNT_VANISHED
-} from '$lib/http/error_schemas.ts';
+} from '#lib/http/error_schemas.ts';
 import {
 	create_test_account,
 	create_test_actor,
 	create_test_role_grant
-} from '$lib/testing/entities.ts';
-import type { QueryDeps } from '$lib/db/query_deps.ts';
+} from '#lib/testing/entities.ts';
+import type { QueryDeps } from '#lib/db/query_deps.ts';
 
 const mock_deps: QueryDeps = { db: {} as any };
 
-vi.mock('$lib/auth/account_queries.js', () => ({
+vi.mock('#lib/auth/account_queries.ts', () => ({
 	query_account_by_id: vi.fn(),
 	query_actor_by_id: vi.fn(),
 	query_active_actors_by_account: vi.fn()
 }));
 
-vi.mock('$lib/auth/role_grant_queries.js', () => ({
+vi.mock('#lib/auth/role_grant_queries.ts', () => ({
 	query_role_grant_find_active_for_actor: vi.fn()
 }));
 
@@ -246,6 +246,12 @@ describe('apply_authorization_phase — needs_actor: true', () => {
 			status: 400,
 			body: { error: ERROR_ACTOR_NOT_ON_ACCOUNT }
 		});
+	});
+
+	test('resolve_acting_actor matches a supplied acting id whatever its case', async () => {
+		vi.mocked(query_active_actors_by_account).mockResolvedValue([actor, second_actor]);
+		const result = await resolve_acting_actor(mock_deps, ACCOUNT_ID, SECOND_ACTOR_ID.toUpperCase());
+		assert.deepStrictEqual(result, { ok: true, actor_id: SECOND_ACTOR_ID });
 	});
 
 	test('returns 500 account_vanished when query_account_by_id is null after resolve (torn read)', async () => {

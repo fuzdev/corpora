@@ -9,6 +9,8 @@
    */
   export type HighlightBaseLayerComponents = {
     Circle: Component<any>;
+    /** Draws `shadows`; the html layer has none, and lays a round `Rect` on each plane instead */
+    Path?: Component<any>;
     Line: Component<any>;
     Rect: Component<any>;
     Arc: Component<any>;
@@ -25,11 +27,13 @@
 
   let {
     Circle,
+    Path,
     Line,
     Rect,
     Arc,
     points = false,
     lines: linesProp = false,
+    shadows = false,
     area = false,
     bar = false,
     opacity,
@@ -48,6 +52,7 @@
         ...rest,
         points,
         lines: linesProp,
+        shadows,
         area,
         bar,
         opacity,
@@ -57,7 +62,7 @@
 </script>
 
 {#if c.highlightData}
-  {#if area}
+  {#if area && c.inPanel}
     {#if typeof area === 'function'}
       {@render area({ area: c.area })}
     {:else if c.ctx.radial}
@@ -82,7 +87,7 @@
     {/if}
   {/if}
 
-  {#if bar}
+  {#if bar && c.inPanel}
     {#if typeof bar === 'function'}
       {@render bar()}
     {:else}
@@ -117,6 +122,12 @@
     {/if}
   {/if}
 
+  {#if shadows && c.shadows.length}
+    {@const { r: _r, ...shadowProps } = typeof shadows === 'object' ? shadows : {}}
+    {@const HighlightShadows = c.ctx.isometric!.HighlightShadows}
+    <HighlightShadows {Path} {Rect} shadows={c.shadows} {opacity} props={shadowProps} />
+  {/if}
+
   {#if points}
     {#if typeof points === 'function'}
       {@render points({ points: c.points })}
@@ -137,6 +148,7 @@
           r={point.r ?? 4}
           strokeWidth={point.r ? 2 : 6}
           opacity={pointOpacity}
+          viewport={c.lift != null}
           {...extractLayerProps(points, 'lc-highlight-point')}
           onpointerdown={onPointClick &&
             ((e: PointerEvent) => {
@@ -186,6 +198,16 @@
       );
       stroke-width: 2;
       stroke-dasharray: 2 2;
+      pointer-events: none;
+    }
+
+    :global(:where(.lc-highlight-shadow)) {
+      --fill-color: color-mix(
+        in oklab,
+        var(--color-surface-content, currentColor) 20%,
+        transparent
+      );
+      --stroke-color: none;
       pointer-events: none;
     }
 

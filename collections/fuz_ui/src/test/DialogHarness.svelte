@@ -1,8 +1,8 @@
 <script lang="ts">
 	// Test harness: composes `DialogContent` inside a `Dialog` so the dialog
 	// context is set, forwarding props to each for `DialogContent` tests.
-	import Dialog from '$lib/Dialog.svelte';
-	import DialogContent from '$lib/DialogContent.svelte';
+	import Dialog from '#lib/Dialog.svelte';
+	import DialogContent from '#lib/DialogContent.svelte';
 
 	const {
 		dialog_props = {},

@@ -8,28 +8,25 @@ import {
 	check_calc_expression,
 	suggest_css_property,
 	load_css_properties,
-	interpret_css_literal,
-	generate_css_literal_simple,
 	has_modifiers,
 	has_extracted_modifiers,
 	try_resolve_literal,
 	suggest_modifier,
 	extract_and_validate_modifiers,
 	type ParsedCssLiteral,
-	type InterpretCssLiteralResult,
-	type CssLiteralOutput,
 	type LiteralResolutionResult,
 	type ExtractedModifiers,
 	type ModifierExtractionResult
-} from '$lib/css_literal.ts';
-import { escape_css_selector } from '$lib/css_class_generation.ts';
-import { type InterpreterDiagnostic } from '$lib/diagnostics.ts';
+} from '#lib/css_literal.ts';
+import { generate_classes_css } from '#lib/css_class_generation.ts';
+import { css_class_interpreters } from '#lib/css_class_interpreters.ts';
+import { type InterpreterDiagnostic } from '#lib/diagnostics.ts';
 import {
 	get_modifier,
 	parse_arbitrary_breakpoint,
 	parse_parameterized_state,
 	extract_balanced_parens
-} from '$lib/modifiers.ts';
+} from '#lib/modifiers.ts';
 
 // CSS properties loaded before tests run
 let css_properties: Set<string>;
@@ -46,25 +43,33 @@ interface ParseOkResult {
 interface ParseErrorResult {
 	error: InterpreterDiagnostic;
 }
-interface InterpretOkResult {
-	output: CssLiteralOutput;
-}
 
 // Specialized helpers using assert.ok for narrowing
 const assert_parse_ok = (result: ReturnType<typeof parse_css_literal>): ParseOkResult => {
 	assert.ok(result.ok, 'Expected parse result to be ok');
-	return result as ParseOkResult;
+	return result;
 };
 
 const assert_parse_error = (result: ReturnType<typeof parse_css_literal>): ParseErrorResult => {
 	assert.ok(!result.ok, 'Expected parse result to be error');
-	return result as ParseErrorResult;
+	return result;
 };
 
-const assert_interpret_ok = (result: InterpretCssLiteralResult): CssLiteralOutput => {
-	assert.ok(result.ok, 'Expected interpret result to be ok');
-	return (result as InterpretOkResult).output;
-};
+// the CSS a literal class generates, with any diagnostics
+const literal_css = (
+	class_name: string,
+	properties: Set<string> | null = css_properties
+): ReturnType<typeof generate_classes_css> =>
+	generate_classes_css({
+		class_names: [class_name],
+		class_definitions: {},
+		interpreters: css_class_interpreters,
+		css_properties: properties
+	});
+
+// a width bound as the media query it renders
+const to_media_query = (bound: ReturnType<typeof parse_arbitrary_breakpoint>): string | null =>
+	bound && `@media (width ${bound.bound === 'min' ? '>=' : '<'} ${bound.value})`;
 
 // Type aliases for modifier/literal result types
 interface ModOkResult {
@@ -82,13 +87,13 @@ interface LiteralErrorResult {
 // Helper to assert modifier extraction result is ok
 const assert_mod_ok = (result: ModifierExtractionResult): ModOkResult => {
 	assert.ok(result.ok, 'Expected modifier extraction to be ok');
-	return result as ModOkResult;
+	return result;
 };
 
 // Helper to assert literal resolution result is ok
 const assert_literal_ok = (result: LiteralResolutionResult): LiteralOkResult => {
 	assert.ok(result.ok, 'Expected literal resolution to be ok');
-	return result as LiteralOkResult;
+	return result;
 };
 
 // Helper to assert literal resolution result is not a literal (error with null)
@@ -263,7 +268,7 @@ describe('parse_arbitrary_breakpoint', () => {
 		['min-width(50rem)', '@media (width >= 50rem)'],
 		['max-width(100vw)', '@media (width < 100vw)']
 	] as const)('parse_arbitrary_breakpoint("%s") → %s', (input, expected) => {
-		assert.strictEqual(parse_arbitrary_breakpoint(input), expected);
+		assert.strictEqual(to_media_query(parse_arbitrary_breakpoint(input)), expected);
 	});
 
 	test.each([['sm'], ['md'], ['hover']])('parse_arbitrary_breakpoint("%s") → null', (input) => {
@@ -379,7 +384,7 @@ describe('parse_css_literal - with modifiers', () => {
 			parse_css_literal('min-width(800px):display:flex', css_properties)
 		);
 		if (!parsed.media) throw new Error('Expected media');
-		assert.strictEqual(parsed.media.css, '@media (width >= 800px)');
+		assert.strictEqual(parsed.media.css, '(width >= 800px)');
 	});
 
 	test('nth-child(2n+1):color:red (parameterized state)', () => {
@@ -456,133 +461,201 @@ describe('parse_css_literal - warnings', () => {
 	});
 });
 
-describe('interpret_css_literal', () => {
-	test('display:flex generates correct output', () => {
-		const result = interpret_css_literal('display:flex', 'display\\:flex', css_properties);
-		const output = assert_interpret_ok(result);
-		assert.strictEqual(output.declaration, 'display: flex;');
-		assert.strictEqual(output.selector, '.display\\:flex');
-		assert.isNull(output.media_wrapper);
-		assert.isNull(output.ancestor_wrapper);
+describe('literal class generation', () => {
+	test('display:flex', () => {
+		assert.include(literal_css('display:flex').css, '.display\\:flex { display: flex; }');
 	});
 
-	test('hover:opacity:80% includes pseudo-class in selector', () => {
-		const class_name = 'hover:opacity:80%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		assert.strictEqual(output.declaration, 'opacity: 80%;');
-		assert.include(output.selector, ':hover');
-	});
-
-	test('md:display:flex has media wrapper', () => {
-		const class_name = 'md:display:flex';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		if (!output.media_wrapper) throw new Error('Expected media_wrapper');
-		assert.include(output.media_wrapper, '@media');
-		assert.include(output.media_wrapper, '48rem');
-	});
-
-	test('dark:opacity:60% has ancestor wrapper', () => {
-		const class_name = 'dark:opacity:60%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		assert.strictEqual(output.ancestor_wrapper, ':root.dark');
-	});
-
-	test('before:content:"" includes pseudo-element in selector', () => {
-		const class_name = 'before:content:""';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		assert.include(output.selector, '::before');
-	});
-
-	test('md:dark:hover:before:opacity:80% has all components', () => {
-		const class_name = 'md:dark:hover:before:opacity:80%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		if (!output.media_wrapper) throw new Error('Expected media_wrapper');
-		if (!output.ancestor_wrapper) throw new Error('Expected ancestor_wrapper');
-		assert.include(output.selector, ':hover');
-		assert.include(output.selector, '::before');
-	});
-
-	test('returns error for invalid property', () => {
-		const class_name = 'dipslay:flex';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		assert.isFalse(result.ok);
+	test('hover:opacity:80% includes the pseudo-class in the selector', () => {
 		assert.include(
-			(result as { ok: false; error: { message: string } }).error.message,
-			'Unknown CSS property'
+			literal_css('hover:opacity:80%').css,
+			'.hover\\:opacity\\:80\\%:hover { opacity: 80%; }'
 		);
 	});
 
-	test('returns ok when css_properties is null (skip validation)', () => {
-		const class_name = 'unknown_property:value';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, null);
-		assert.isTrue(result.ok);
-	});
-});
-
-describe('generate_css_literal_simple', () => {
-	test('simple property:value', () => {
-		const result = interpret_css_literal('display:flex', 'display\\:flex', css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
-		assert.include(css, '.display\\:flex');
-		assert.include(css, 'display: flex;');
-		// Should not have wrappers
-		assert.notInclude(css, '@media');
-		assert.notInclude(css, ':root');
-	});
-
-	test('hover:opacity:80%', () => {
-		const class_name = 'hover:opacity:80%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
-		assert.include(css, ':hover');
-		assert.include(css, 'opacity: 80%;');
-	});
-
-	test('md:display:flex has media wrapper', () => {
-		const class_name = 'md:display:flex';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
+	test('md:display:flex has a media wrapper', () => {
+		const { css } = literal_css('md:display:flex');
 		assert.include(css, '@media (width >= 48rem)');
 		assert.include(css, 'display: flex;');
 	});
 
-	test('dark:opacity:60% has ancestor wrapper', () => {
-		const class_name = 'dark:opacity:60%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
-		assert.include(css, ':root.dark');
+	test('dark:opacity:60% has the color scheme prefix', () => {
+		const { css } = literal_css('dark:opacity:60%');
+		assert.include(css, ':where(:root.dark) .dark\\:opacity\\:60\\%');
 		assert.include(css, 'opacity: 60%;');
 	});
 
-	test('md:dark:hover:opacity:80% has nested structure', () => {
-		const class_name = 'md:dark:hover:opacity:80%';
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
+	test('before:content:"" includes the pseudo-element in the selector', () => {
+		assert.include(literal_css('before:content:""').css, '::before');
+	});
+
+	test('md:dark:hover:before:opacity:80% has all components', () => {
+		const { css } = literal_css('md:dark:hover:before:opacity:80%');
 		assert.include(css, '@media (width >= 48rem)');
-		assert.include(css, ':root.dark');
-		assert.include(css, ':hover');
-		assert.include(css, 'opacity: 80%;');
+		assert.include(css, ':where(:root.dark)');
+		assert.include(css, ':hover::before { opacity: 80%; }');
+	});
+
+	test('reports an invalid property', () => {
+		const result = literal_css('dipslay:flex');
+		assert.strictEqual(result.css, '');
+		assert.include(result.diagnostics[0]!.message, 'Unknown CSS property');
+	});
+
+	test('skips property validation when css_properties is null', () => {
+		assert.include(literal_css('unknown_property:value', null).css, 'unknown_property: value;');
+	});
+});
+
+describe('literal values that could escape their declaration', () => {
+	const UNCONTAINED = [
+		'width:calc(100%~-~2rem',
+		'content:"x',
+		'margin:{',
+		'font-family:"a',
+		'width:1px)',
+		'width:1px;',
+		'--x:{}',
+		'color:red!important!important',
+		'hover:content:"x',
+		'md:before:width:1px)'
+	];
+
+	// the CSS and diagnostics for one class, explicit or found implicitly
+	const generate = (
+		class_name: string,
+		explicit: boolean
+	): ReturnType<typeof generate_classes_css> =>
+		generate_classes_css({
+			class_names: [class_name],
+			class_definitions: {},
+			interpreters: css_class_interpreters,
+			css_properties,
+			explicit_classes: explicit ? new Set([class_name]) : null
+		});
+
+	test.each(UNCONTAINED)('parse_css_literal rejects %s', (class_name) => {
+		const { error } = assert_parse_error(parse_css_literal(class_name, css_properties));
+		assert.include(error.message, 'Uncontained CSS value');
+		assert.strictEqual(error.identifier, class_name);
+	});
+
+	test.each(UNCONTAINED)('explicit %s is an error and emits nothing', (class_name) => {
+		const result = generate(class_name, true);
+		assert.strictEqual(result.css, '');
+		assert.lengthOf(result.diagnostics, 1);
+		assert.strictEqual(result.diagnostics[0]!.level, 'error');
+		assert.strictEqual(result.diagnostics[0]!.identifier, class_name);
+		assert.include(result.diagnostics[0]!.message, 'Uncontained CSS value');
+	});
+
+	test.each(UNCONTAINED)('implicit %s is a warning and emits nothing', (class_name) => {
+		const result = generate(class_name, false);
+		assert.strictEqual(result.css, '');
+		assert.lengthOf(result.diagnostics, 1);
+		assert.strictEqual(result.diagnostics[0]!.level, 'warning');
+		assert.strictEqual(result.diagnostics[0]!.identifier, class_name);
+		assert.include(result.diagnostics[0]!.message, 'Uncontained CSS value');
+	});
+
+	test('a composed literal with an uncontained value is an error', () => {
+		const error = assert_literal_has_error(
+			try_resolve_literal('content:"x', css_properties, 'my_class')
+		);
+		assert.include(error.message, 'Uncontained CSS value');
+	});
+
+	test.each<[string, string]>([
+		['content:"x"', 'content: "x";'],
+		['content:";"', 'content: ";";'],
+		['before:content:"]"', 'content: "]";'],
+		['color:red!important', 'color: red !important;'],
+		['background:url(x)', 'background: url(x);'],
+		['width:calc(100%~-~2rem)', 'width: calc(100% - 2rem);'],
+		['grid-template-areas:"a~b"', 'grid-template-areas: "a b";']
+	])('a contained value still generates: %s', (class_name, declaration) => {
+		const result = generate(class_name, true);
+		assert.include(result.css, declaration);
+		assert.isFalse(result.diagnostics.some((d) => d.level === 'error'));
+	});
+});
+
+describe('literal names and modifier arguments that could escape their rule', () => {
+	// each class with the diagnostic message its rejection reports
+	const UNCONTAINED: Array<[string, string]> = [
+		['--a}*{color:red', 'Unknown CSS property "--a}*{color"'],
+		['--a/*:1', 'Unknown CSS property "--a/*"'],
+		['--x</style>:1', 'Unknown CSS property "--x</style>"'],
+		['--a;b:1', 'Unknown CSS property "--a;b"'],
+		['--:1', 'Unknown CSS property "--"'],
+		['nth-child("):color:red', 'Unknown modifier "nth-child(")"'],
+		['nth-child(2n+1/*):color:red', 'Unknown modifier "nth-child(2n+1/*)"'],
+		['nth-child(1</style>):color:red', 'Unknown modifier "nth-child(1</style>)"'],
+		['nth-last-of-type(1;x):color:red', 'Unknown modifier "nth-last-of-type(1;x)"'],
+		['nth-of-type(1;x):color:red', 'Unknown modifier "nth-of-type(1;x)"'],
+		['nth-last-child("x):color:red', 'Unknown modifier "nth-last-child("x)"'],
+		['min-width(1px"):color:red', 'Unknown modifier "min-width(1px")"'],
+		['min-width(1px/*):color:red', 'Unknown modifier "min-width(1px/*)"'],
+		['max-width(1px{):color:red', 'Unknown modifier "max-width(1px{)"']
+	];
+
+	// the CSS and diagnostics for one class, explicit or found implicitly
+	const generate = (
+		class_name: string,
+		explicit: boolean,
+		properties: Set<string> | null = css_properties
+	): ReturnType<typeof generate_classes_css> =>
+		generate_classes_css({
+			class_names: [class_name],
+			class_definitions: {},
+			interpreters: css_class_interpreters,
+			css_properties: properties,
+			explicit_classes: explicit ? new Set([class_name]) : null
+		});
+
+	test.each(UNCONTAINED)('parse_css_literal rejects %s', (class_name, message) => {
+		const { error } = assert_parse_error(parse_css_literal(class_name, css_properties));
+		assert.strictEqual(error.message, message);
+		assert.strictEqual(error.identifier, class_name);
+	});
+
+	test.each(UNCONTAINED)('explicit %s is an error and emits nothing', (class_name, message) => {
+		const result = generate(class_name, true);
+		assert.strictEqual(result.css, '');
+		assert.lengthOf(result.diagnostics, 1);
+		assert.strictEqual(result.diagnostics[0]!.level, 'error');
+		assert.strictEqual(result.diagnostics[0]!.message, message);
+	});
+
+	test.each(UNCONTAINED)('implicit %s is a warning and emits nothing', (class_name, message) => {
+		const result = generate(class_name, false);
+		assert.strictEqual(result.css, '');
+		assert.lengthOf(result.diagnostics, 1);
+		assert.strictEqual(result.diagnostics[0]!.level, 'warning');
+		assert.strictEqual(result.diagnostics[0]!.message, message);
+	});
+
+	test.each(['a}*{color:red', 'a/*:1', 'a</style>:1'])(
+		'with no property set, %s is still rejected',
+		(class_name) => {
+			const result = generate(class_name, true, null);
+			assert.strictEqual(result.css, '');
+			assert.include(result.diagnostics[0]!.message, 'Unknown CSS property');
+		}
+	);
+
+	test.each<[string, string]>([
+		['--flow_margin:0', '--flow_margin: 0;'],
+		['--aé:1', '--aé: 1;'],
+		['--Δx:1', '--Δx: 1;'],
+		['--button_shadow:none', '--button_shadow: none;'],
+		['nth-child(2n+1):color:red', ':nth-child(2n+1) { color: red; }'],
+		['nth-child(-n+3):color:red', ':nth-child(-n+3) { color: red; }'],
+		['min-width(calc(100vw~-~20px)):color:red', '@media (width >= calc(100vw - 20px))']
+	])('a contained name or argument still generates: %s', (class_name, expected) => {
+		const result = generate(class_name, true);
+		assert.include(result.css, expected);
+		assert.lengthOf(result.diagnostics, 0);
 	});
 });
 
@@ -631,15 +704,12 @@ describe('parse_css_literal - max breakpoints', () => {
 	});
 });
 
-describe('generate_css_literal_simple - max breakpoints', () => {
+describe('literal class generation - max breakpoints', () => {
 	test.each([
 		['max-sm:display:none', '@media (width < 40rem)', 'display: none;'],
 		['max-lg:opacity:50%', '@media (width < 64rem)', 'opacity: 50%;']
 	] as const)('%s generates correct media query', (class_name, expected_media, expected_decl) => {
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
+		const { css } = literal_css(class_name);
 		assert.include(css, expected_media);
 		assert.include(css, expected_decl);
 	});
@@ -658,15 +728,12 @@ describe('parse_css_literal - !important with modifiers', () => {
 	});
 });
 
-describe('generate_css_literal_simple - !important', () => {
+describe('literal class generation - !important', () => {
 	test.each([
 		['display:flex!important', 'display: flex !important;', null],
 		['hover:color:red!important', 'color: red !important;', ':hover']
 	] as const)('%s renders correctly', (class_name, expected_decl, expected_selector) => {
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
+		const { css } = literal_css(class_name);
 		assert.include(css, expected_decl);
 		if (expected_selector) assert.include(css, expected_selector);
 	});
@@ -685,15 +752,12 @@ describe('parse_css_literal - Unicode values', () => {
 	});
 });
 
-describe('generate_css_literal_simple - Unicode', () => {
+describe('literal class generation - Unicode', () => {
 	test.each([
 		['content:"→"', 'content: "→";', null],
 		['before:content:"✓"', 'content: "✓";', '::before']
 	] as const)('%s renders correctly', (class_name, expected_decl, expected_selector) => {
-		const escaped = escape_css_selector(class_name);
-		const result = interpret_css_literal(class_name, escaped, css_properties);
-		const output = assert_interpret_ok(result);
-		const css = generate_css_literal_simple(output);
+		const { css } = literal_css(class_name);
 		assert.include(css, expected_decl);
 		if (expected_selector) assert.include(css, expected_selector);
 	});
@@ -858,7 +922,6 @@ describe('parse_arbitrary_breakpoint - edge cases', () => {
 		['min-width()', 'empty value'],
 		['min-width(px)', 'no leading digit'],
 		['min-width(rem)', 'unit without number'],
-		['min-width(.5rem)', 'decimal without leading zero'],
 		['min-width(-100px)', 'negative value'],
 		['min-width(800px', 'unclosed paren'],
 		['min-width)', 'missing opening paren'],
@@ -868,15 +931,69 @@ describe('parse_arbitrary_breakpoint - edge cases', () => {
 		['max-width(vh)', 'max-width without number'],
 		['min-width(calc(100vw)', 'unbalanced calc'],
 		['min-width(800px)extra', 'trailing characters'],
-		['min-width(var(--breakpoint))', 'var() not supported in media queries']
+		['min-width(var(--breakpoint))', 'var() not supported in media queries'],
+		['min-width(800)', 'unitless number'],
+		['min-width(100%)', 'percentage'],
+		['min-width(48rme)', 'unknown unit'],
+		['min-width(48PX)', 'uppercase unit'],
+		['min-width(1e3px)', 'exponent'],
+		['min-width(1px~2px)', 'two lengths'],
+		['min-width(~800px)', 'leading space'],
+		['min-width(calc(1px+2px))', 'calc without spaces around +'],
+		['min-width(calc(1px~+2px))', 'calc without a space after +'],
+		['min-width(calc(1px-~2px))', 'calc without a space before -'],
+		['min-width(calc(1px~-(2px)))', 'calc without a space before a paren'],
+		['min-width(calc(1px~"x"))', 'quoted string'],
+		["min-width(calc(1px~'x'))", 'single-quoted string'],
+		['min-width(calc(50%~+~2rem))', 'percentage in calc'],
+		['min-width(calc(1px~+~2))', 'length plus number'],
+		['min-width(calc(1px~*~1px))', 'length times length'],
+		['min-width(calc(1px~/~2px))', 'division by a length'],
+		['min-width(calc(1px~/~0))', 'division by zero'],
+		['min-width(calc(1cqw/calc(0.0)))', 'division by a zero calc()'],
+		['min-width(calc(10rem/(0)))', 'division by a parenthesized zero'],
+		['min-width(calc(10rem/(1~-~1)))', 'division by a sum that is zero'],
+		['min-width(calc(10rem/(2~*~0)))', 'division by a product that is zero'],
+		['min-width(max(50vw~/~calc(min(0))))', 'division by a min() that is zero'],
+		['min-width(calc(10rem/clamp(0,~-1,~0)))', 'division by a clamp() that is zero'],
+		[
+			'min-width(calc(10rem/0.0000000000000000000000000000000000000000000001))',
+			'division by a number that is zero at single precision'
+		],
+		[
+			'min-width(calc(10rem/(0.1~+~0.2~-~0.3)))',
+			'division by a sum that is zero at single precision'
+		],
+		['min-width(calc(10rem/min(0,~1)))', 'division by a min() of several arguments that is zero'],
+		[
+			'min-width(calc(10rem/(0.00000000000000000000001*0.00000000000000000000001)))',
+			'division by a product that is zero at single precision'
+		],
+		[
+			'min-width(calc(10rem/(0.00000000000000000000001/100000000000000000000000)))',
+			'division by a quotient that is zero at single precision'
+		],
+		['min-width(calc(2~*~3))', 'number, not a length'],
+		['min-width(calc())', 'empty calc'],
+		['min-width(calc(1px,~2px))', 'calc with two arguments'],
+		['min-width(clamp(1px,~2px))', 'clamp with two arguments'],
+		['min-width(max(1px,,2px))', 'empty argument'],
+		['min-width(min(0,~1px))', 'number among lengths'],
+		['min-width(min(1px,~2))', 'length among numbers'],
+		['min-width(calc~(1px))', 'space before the paren'],
+		['min-width(attr(x))', 'unknown function'],
+		['min-width(env(safe-area-inset-left))', 'env() not supported in media queries']
 	] as const)('%s returns null for %s', (input, _desc) => {
 		assert.isNull(parse_arbitrary_breakpoint(input));
 	});
 
-	// Valid simple cases - value must start with a digit
+	// Valid simple cases - a length with a known unit, or a unitless zero
 	test.each([
 		['min-width(0)', '@media (width >= 0)', 'zero value'],
-		['min-width(100%)', '@media (width >= 100%)', 'percentage'],
+		['min-width(1.5em)', '@media (width >= 1.5em)', 'decimal'],
+		['min-width(.5rem)', '@media (width >= .5rem)', 'decimal without leading zero'],
+		['min-width(40ch)', '@media (width >= 40ch)', 'ch units'],
+		['min-width(48dvw)', '@media (width >= 48dvw)', 'dynamic viewport units'],
 		['min-width(800px)', '@media (width >= 800px)', 'pixels'],
 		['min-width(50rem)', '@media (width >= 50rem)', 'rem units'],
 		['min-width(100vw)', '@media (width >= 100vw)', 'viewport units'],
@@ -884,17 +1001,31 @@ describe('parse_arbitrary_breakpoint - edge cases', () => {
 		['max-width(50em)', '@media (width < 50em)', 'max-width em units'],
 		['max-width(600px)', '@media (width < 600px)', 'max-width pixels']
 	] as const)('%s → %s (%s)', (input, expected, _desc) => {
-		assert.strictEqual(parse_arbitrary_breakpoint(input), expected);
+		assert.strictEqual(to_media_query(parse_arbitrary_breakpoint(input)), expected);
 	});
 
-	// Nested parentheses - calc, clamp, min, max, env
+	// Nested parentheses - calc, clamp, min, max
 	test.each([
 		[
 			'min-width(calc(100vw - 200px))',
 			'@media (width >= calc(100vw - 200px))',
 			'calc with subtraction'
 		],
-		['min-width(calc(50% + 2rem))', '@media (width >= calc(50% + 2rem))', 'calc with addition'],
+		['min-width(calc(50vw + 2rem))', '@media (width >= calc(50vw + 2rem))', 'calc with addition'],
+		['min-width(calc(2~*~1px))', '@media (width >= calc(2 * 1px))', 'calc with a product'],
+		['min-width(calc(10rem/2))', '@media (width >= calc(10rem/2))', 'calc with a quotient'],
+		[
+			'min-width(calc(10rem/(3~-~1)))',
+			'@media (width >= calc(10rem/(3 - 1)))',
+			'calc with a quotient by a nonzero sum'
+		],
+		['min-width(calc(1px)~)', '@media (width >= calc(1px) )', 'trailing space'],
+		[
+			'min-width(calc((1px~+~2px)~*~2))',
+			'@media (width >= calc((1px + 2px) * 2))',
+			'calc with a parenthesized sum'
+		],
+		['min-width(calc(1px~-~-2px))', '@media (width >= calc(1px - -2px))', 'signed operand'],
 		[
 			'min-width(clamp(300px, 50vw, 800px))',
 			'@media (width >= clamp(300px, 50vw, 800px))',
@@ -902,19 +1033,14 @@ describe('parse_arbitrary_breakpoint - edge cases', () => {
 		],
 		['min-width(min(100vw, 1200px))', '@media (width >= min(100vw, 1200px))', 'min function'],
 		['min-width(max(300px, 20vw))', '@media (width >= max(300px, 20vw))', 'max function'],
-		['max-width(calc(100% - 4rem))', '@media (width < calc(100% - 4rem))', 'max-width with calc'],
+		['max-width(calc(100vw - 4rem))', '@media (width < calc(100vw - 4rem))', 'max-width with calc'],
 		[
 			'min-width(calc(min(100vw, 1200px) - 2rem))',
 			'@media (width >= calc(min(100vw, 1200px) - 2rem))',
 			'nested functions'
-		],
-		[
-			'min-width(env(safe-area-inset-left))',
-			'@media (width >= env(safe-area-inset-left))',
-			'env function'
 		]
 	] as const)('%s → %s (%s)', (input, expected, _desc) => {
-		assert.strictEqual(parse_arbitrary_breakpoint(input), expected);
+		assert.strictEqual(to_media_query(parse_arbitrary_breakpoint(input)), expected);
 	});
 });
 
@@ -927,7 +1053,11 @@ describe('parse_parameterized_state - edge cases', () => {
 		['nth-of-type(odd)', ':nth-of-type(odd)', 'odd keyword'],
 		['nth-last-of-type(3n+1)', ':nth-last-of-type(3n+1)', 'nth-last-of-type with formula'],
 		['nth-child(3n-1)', ':nth-child(3n-1)', 'negative offset'],
-		['nth-child(5)', ':nth-child(5)', 'simple number']
+		['nth-child(5)', ':nth-child(5)', 'simple number'],
+		['nth-child(+5)', ':nth-child(+5)', 'signed number'],
+		['nth-child(-2n-1)', ':nth-child(-2n-1)', 'negative step and offset'],
+		['nth-child(+n+3)', ':nth-child(+n+3)', 'signed n'],
+		['nth-of-type(3n)', ':nth-of-type(3n)', 'step only']
 	] as const)('%s → css: %s (%s)', (input, expected_css, _desc) => {
 		const result = parse_parameterized_state(input);
 		assert.isNotNull(result);
@@ -939,7 +1069,16 @@ describe('parse_parameterized_state - edge cases', () => {
 		['nth-child()', 'empty formula'],
 		['nth-child', 'missing parens'],
 		['child(2n)', 'missing nth- prefix'],
-		['nth(2n)', 'incomplete pattern']
+		['nth(2n)', 'incomplete pattern'],
+		['nth-child(foo)', 'not An+B'],
+		['nth-child(1a)', 'unknown unit'],
+		['nth-child(2n1)', 'offset without a sign'],
+		['nth-child(n+)', 'sign without an offset'],
+		['nth-child(--1)', 'two signs'],
+		['nth-child(1-2n)', 'offset before the step'],
+		['nth-child(2n+-1)', 'two signs on the offset'],
+		['nth-child(ODD)', 'uppercase keyword'],
+		['nth-child(2n~+~1)', 'spaced']
 	] as const)('%s returns null for %s', (input, _desc) => {
 		assert.isNull(parse_parameterized_state(input));
 	});

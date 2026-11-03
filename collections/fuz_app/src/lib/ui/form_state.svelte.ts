@@ -5,16 +5,28 @@
  * `attempted` state (set on submit attempt). Errors show after a field is blurred or
  * after a submit attempt, avoiding premature validation while the user is still typing.
  *
- * The `FormState.form` attachment also handles Enter key advancing
- * between focusable elements.
+ * The `FormState.form` attachment also handles the Enter key: in an input
+ * followed by another input it moves focus to that input (past any button
+ * between), and in the last input it submits the form (`requestSubmit`) —
+ * so Enter in a login form's password field logs in, even when the form's
+ * button is `type="button"`, as `PendingButton` is. Hidden inputs don't count, and an Enter that commits
+ * IME composition is left alone.
+ *
+ * While a submit is in flight, make the fields `readonly` rather than `disabled`
+ * (and the button `aria-disabled`, guarding the handler against re-entry) —
+ * disabling the focused element drops focus to `<body>`. Enter still advances
+ * through and submits from `readonly` inputs.
+ *
+ * The type parameter names the form's fields, so `focus`, `show`, `touch`,
+ * and `is_touched` reject a misspelled field at compile time.
  *
  * All trackable inputs must have a `name` attribute — an error is thrown in dev
  * if an input without `name` loses focus.
  *
  * @example
  * ```svelte
- * <script>
- *   const form_state = new FormState();
+ * <script lang="ts">
+ *   const form_state = new FormState<'username'>();
  *   let username = $state.raw('');
  *   const username_valid = $derived(Username.safeParse(username).success);
  *   const can_submit = $derived(username.trim() && username_valid);
@@ -46,11 +58,12 @@ import { DEV } from 'esm-env';
 import { on } from 'svelte/events';
 import { SvelteSet } from 'svelte/reactivity';
 
-const FOCUSABLE_SELECTOR = 'input:not(:disabled), button:not(:disabled)';
+/** Inputs Enter moves between — disabled and hidden ones are skipped. */
+const ENTER_INPUT_SELECTOR = 'input:not(:disabled):not([type=hidden])';
 
 const FORM_INPUT_SELECTOR = 'input, textarea, select';
 
-export class FormState {
+export class FormState<TField extends string = string> {
 	readonly #touched: SvelteSet<string> = new SvelteSet();
 	#form: HTMLFormElement | null = null;
 	#attempted = $state.raw(false);
@@ -63,8 +76,9 @@ export class FormState {
 	}
 
 	/**
-	 * Creates a form attachment that handles Enter key advancing between
-	 * focusable elements and tracks field touched state via delegated `focusout`.
+	 * Creates a form attachment that handles the Enter key (advance focus to
+	 * the next input, or submit from the last one) and tracks field touched
+	 * state via delegated `focusout`.
 	 *
 	 * Fields are identified by their `name` attribute.
 	 *
@@ -79,14 +93,26 @@ export class FormState {
 			this.#form = form;
 			const keydown_cleanup = on(form, 'keydown', (e) => {
 				if (e.key !== 'Enter') return;
+				// an IME composing text commits it with Enter — not a submit; Safari
+				// reports that Enter with `isComposing` false but `keyCode` 229 — the
+				// deprecated field is the only signal there
+				// eslint-disable-next-line @typescript-eslint/no-deprecated
+				if (e.isComposing || e.keyCode === 229) return;
 				if (!(e.target instanceof HTMLInputElement)) return;
 
-				const elements = Array.from(form.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
-				const index = elements.indexOf(e.target);
+				const inputs = Array.from(form.querySelectorAll<HTMLInputElement>(ENTER_INPUT_SELECTOR));
+				const index = inputs.indexOf(e.target);
 				if (index < 0) return;
 
 				e.preventDefault();
-				elements[(index + 1) % elements.length]!.focus();
+				// advance to the next input, past any button between (a show-password
+				// toggle, say); the last input submits instead
+				const next_input = inputs[index + 1];
+				if (next_input) {
+					next_input.focus();
+				} else {
+					form.requestSubmit();
+				}
 			});
 			const focusout_cleanup = on(form, 'focusout', (e) => {
 				const target = e.target;
@@ -113,7 +139,7 @@ export class FormState {
 	/**
 	 * Whether a field has been blurred at least once.
 	 */
-	is_touched(field: string): boolean {
+	is_touched(field: TField): boolean {
 		return this.#touched.has(field);
 	}
 
@@ -121,7 +147,7 @@ export class FormState {
 	 * Whether to show validation errors for a field.
 	 * Returns `true` if the field has been blurred or a submit attempt was made.
 	 */
-	show(field: string): boolean {
+	show(field: TField): boolean {
 		return this.#touched.has(field) || this.#attempted;
 	}
 
@@ -130,14 +156,14 @@ export class FormState {
 	 *
 	 * @mutates `this`
 	 */
-	touch(field: string): void {
+	touch(field: TField): void {
 		this.#touched.add(field);
 	}
 
 	/**
 	 * Focuses the named input within the form.
 	 */
-	focus(field: string): void {
+	focus(field: TField): void {
 		if (DEV && !this.#form) {
 			console.warn('FormState: focus() called before form() attachment is active.');
 			return;
@@ -151,7 +177,7 @@ export class FormState {
 			);
 			return;
 		}
-		el?.focus({ focusVisible: true } as FocusOptions);
+		el?.focus({ focusVisible: true });
 	}
 
 	/**

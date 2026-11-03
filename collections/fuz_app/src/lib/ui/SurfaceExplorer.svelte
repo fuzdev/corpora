@@ -3,7 +3,9 @@
 	 * Read-only `AppSurface` renderer. Tables routes, middleware, environment
 	 * variables, events, and diagnostics. Routes can be filtered by auth type
 	 * and expanded to dump `params` / `query` / `input` / `output` / `errors`
-	 * schemas as JSON. Pure presentational — `AdminSurface` handles the fetch.
+	 * schemas as JSON — each expandable row's first cell is a disclosure
+	 * `<button aria-expanded>`, so expanding works from the keyboard. Pure
+	 * presentational — `AdminSurface` handles the fetch.
 	 *
 	 * @module
 	 */
@@ -13,6 +15,7 @@
 	import type { AppSurface, AppSurfaceRoute, AppSurfaceDiagnostic } from '../http/surface.ts';
 	import { surface_auth_summary, format_route_key } from '../http/surface_query.ts';
 	import {
+		is_credential_gated_auth,
 		is_keeper_auth,
 		is_plain_authenticated_auth,
 		is_public_auth,
@@ -22,7 +25,7 @@
 
 	const { surface }: { surface: AppSurface } = $props();
 
-	const auth_types = ['all', 'none', 'authenticated', 'role', 'keeper'] as const;
+	const auth_types = ['all', 'none', 'authenticated', 'role', 'credential', 'keeper'] as const;
 
 	let auth_filter: (typeof auth_types)[number] = $state.raw('all');
 	let expanded_route: string | null = $state.raw(null);
@@ -49,6 +52,8 @@
 				return is_plain_authenticated_auth(auth);
 			case 'role':
 				return is_role_auth(auth);
+			case 'credential':
+				return is_credential_gated_auth(auth) && !is_keeper_auth(auth);
 			case 'keeper':
 				return is_keeper_auth(auth);
 		}
@@ -78,47 +83,76 @@
 		expanded_ws_method = expanded_ws_method === key ? null : key;
 	};
 
-	const format_auth = (auth: RouteAuth): string => {
-		if (is_public_auth(auth)) return 'none';
-		if (is_keeper_auth(auth)) return 'keeper';
-		if (is_role_auth(auth)) return `role:${auth.roles!.join('|')}`;
-		if (is_plain_authenticated_auth(auth)) return 'authenticated';
-		return 'other';
-	};
-
-	const auth_chip_class = (auth: RouteAuth): string => {
-		if (is_public_auth(auth)) return 'chip color_b';
-		if (is_keeper_auth(auth)) return 'chip color_c';
-		if (is_role_auth(auth)) return 'chip color_d';
-		if (is_plain_authenticated_auth(auth)) return 'chip color_a';
-		return 'chip';
+	// one classification gives an auth chip both its label and its color
+	const to_auth_chip = (auth: RouteAuth): { label: string; class: string } => {
+		if (is_public_auth(auth)) return { label: 'none', class: 'chip palette_b' };
+		if (is_keeper_auth(auth)) return { label: 'keeper', class: 'chip palette_c' };
+		if (is_role_auth(auth))
+			return { label: `role:${auth.roles!.join('|')}`, class: 'chip palette_d' };
+		if (is_credential_gated_auth(auth)) {
+			return {
+				label: `credential:${auth.credential_types!.join('|')}`,
+				class: 'chip palette_e'
+			};
+		}
+		if (is_plain_authenticated_auth(auth))
+			return { label: 'authenticated', class: 'chip palette_a' };
+		return { label: 'other', class: 'chip' };
 	};
 
 	const role_count = $derived(Array.from(summary.role.values()).reduce((sum, n) => sum + n, 0));
+	const credential_count = $derived(
+		Array.from(summary.credential.values()).reduce((sum, n) => sum + n, 0)
+	);
 </script>
+
+{#snippet auth_chip(auth: RouteAuth)}
+	{@const chip = to_auth_chip(auth)}
+	<span class={chip.class}>{chip.label}</span>
+{/snippet}
+
+{#snippet expander(expanded: boolean, label: string, toggle: () => void)}
+	<button
+		type="button"
+		class="icon_button plain"
+		aria-expanded={expanded}
+		aria-label={label}
+		onclick={toggle}
+	>
+		{expanded ? '▾' : '▸'}
+	</button>
+{/snippet}
 
 <section>
 	<div class="row" style:gap="var(--space_md)" style:flex-wrap="wrap" style:align-items="center">
 		<span class="chip">{surface.routes.length} routes</span>
-		{#if summary.none > 0}<span class="chip color_b">{summary.none} public</span>{/if}
-		{#if summary.authenticated > 0}<span class="chip color_a"
-				>{summary.authenticated} authenticated</span
-			>{/if}
-		{#if role_count > 0}<span class="chip color_d">{role_count} role</span>{/if}
-		{#if summary.keeper > 0}<span class="chip color_c">{summary.keeper} keeper</span>{/if}
+		{#if summary.none > 0}<span class="chip palette_b">{summary.none} public</span>{/if}
+		{#if summary.authenticated > 0}
+			<span class="chip palette_a">{summary.authenticated} authenticated</span>
+		{/if}
+		{#if role_count > 0}<span class="chip palette_d">{role_count} role</span>{/if}
+		{#if credential_count > 0}
+			<span class="chip palette_e">{credential_count} credential-gated</span>
+		{/if}
+		{#if summary.keeper > 0}<span class="chip palette_c">{summary.keeper} keeper</span>{/if}
 		<span class="chip">{surface.middleware.length} middleware</span>
 		{#if rpc_method_count > 0}<span class="chip">{rpc_method_count} rpc methods</span>{/if}
 		{#if ws_method_count > 0}<span class="chip">{ws_method_count} ws methods</span>{/if}
 		{#if surface.env.length}<span class="chip">{surface.env.length} env</span>{/if}
 		{#if surface.events.length}<span class="chip">{surface.events.length} events</span>{/if}
-		{#if surface.diagnostics.length}{@const warnings = surface.diagnostics.filter(
+		{#if surface.diagnostics.length}
+			{@const warnings = surface.diagnostics.filter(
 				(d: AppSurfaceDiagnostic) => d.level === 'warning'
-			)}{#if warnings.length}<span class="chip color_e"
-					>{warnings.length} warning{warnings.length === 1 ? '' : 's'}</span
-				>{/if}{/if}
+			)}
+			{#if warnings.length}
+				<span class="chip palette_e">
+					{warnings.length} warning{warnings.length === 1 ? '' : 's'}
+				</span>
+			{/if}
+		{/if}
 	</div>
 
-	<h3>routes</h3>
+	<h3>Routes</h3>
 	<div class="mb_sm">
 		<label>
 			<div class="title">auth filter</div>
@@ -146,10 +180,15 @@
 				<tbody>
 					{#each filtered_routes as route (format_route_key(route))}
 						{@const key = format_route_key(route)}
-						<tr onclick={() => toggle_route(key)} style:cursor="pointer">
-							<td><code>{route.method}</code></td>
+						<tr>
+							<td>
+								{@render expander(expanded_route === key, `${key} details`, () =>
+									toggle_route(key)
+								)}
+								<code>{route.method}</code>
+							</td>
 							<td><code>{route.path}</code></td>
-							<td><span class={auth_chip_class(route.auth)}>{format_auth(route.auth)}</span></td>
+							<td>{@render auth_chip(route.auth)}</td>
 							<td class="text_50">{route.applicable_middleware.length}</td>
 							<td class="text_50">{route.description}</td>
 						</tr>
@@ -203,7 +242,7 @@
 		</div>
 	{/if}
 
-	<h3>middleware</h3>
+	<h3>Middleware</h3>
 	{#if surface.middleware.length === 0}
 		<p class="text_50">no middleware</p>
 	{:else}
@@ -221,9 +260,9 @@
 						<tr>
 							<td><code>{mw.name}</code></td>
 							<td><code>{mw.path}</code></td>
-							<td class="text_50"
-								>{mw.error_schemas ? Object.keys(mw.error_schemas).join(', ') : '-'}</td
-							>
+							<td class="text_50">
+								{mw.error_schemas ? Object.keys(mw.error_schemas).join(', ') : '-'}
+							</td>
 						</tr>
 					{/each}
 				</tbody>
@@ -232,7 +271,7 @@
 	{/if}
 
 	{#if surface.env.length}
-		<h3>environment</h3>
+		<h3>Environment</h3>
 		<div style:overflow-x="auto">
 			<table>
 				<thead>
@@ -260,7 +299,7 @@
 	{/if}
 
 	{#if surface.events.length}
-		<h3>events</h3>
+		<h3>Events</h3>
 		<div style:overflow-x="auto">
 			<table>
 				<thead>
@@ -273,18 +312,23 @@
 				</thead>
 				<tbody>
 					{#each surface.events as event (event.method)}
-						<tr onclick={() => toggle_event(event.method)} style:cursor="pointer">
-							<td><code>{event.method}</code></td>
+						<tr>
+							<td>
+								{@render expander(expanded_event === event.method, `${event.method} params`, () =>
+									toggle_event(event.method)
+								)}
+								<code>{event.method}</code>
+							</td>
 							<td class="text_50">{event.description}</td>
 							<td>{event.channel ?? '-'}</td>
 							<td>
 								<!-- TODO fix the `as any` cast -->
 								{#if event.params_schema}
-									<code
-										>{Object.keys(
+									<code>
+										{Object.keys(
 											(event.params_schema as any).properties ?? event.params_schema
-										).join(', ')}</code
-									>
+										).join(', ')}
+									</code>
 								{:else}
 									<span class="text_50">none</span>
 								{/if}
@@ -304,7 +348,7 @@
 	{/if}
 
 	{#if surface.rpc_endpoints.length}
-		<h3>rpc endpoints</h3>
+		<h3>RPC Endpoints</h3>
 		{#each surface.rpc_endpoints as endpoint (endpoint.path)}
 			<div class="row" style:gap="var(--space_sm)" style:align-items="center">
 				<code>{endpoint.path}</code>
@@ -327,10 +371,15 @@
 						<tbody>
 							{#each endpoint.methods as method (method.name)}
 								{@const key = `${endpoint.path}|${method.name}`}
-								<tr onclick={() => toggle_rpc_method(key)} style:cursor="pointer">
-									<td><code>{method.name}</code></td>
+								<tr>
 									<td>
-										<span class={auth_chip_class(method.auth)}>{format_auth(method.auth)}</span>
+										{@render expander(expanded_rpc_method === key, `${method.name} schemas`, () =>
+											toggle_rpc_method(key)
+										)}
+										<code>{method.name}</code>
+									</td>
+									<td>
+										{@render auth_chip(method.auth)}
 									</td>
 									<td>{method.side_effects ? 'yes' : 'no'}</td>
 									<td class="text_50">{method.rate_limit_key ?? '-'}</td>
@@ -365,7 +414,7 @@
 	{/if}
 
 	{#if surface.ws_endpoints.length}
-		<h3>websocket endpoints</h3>
+		<h3>WebSocket Endpoints</h3>
 		{#each surface.ws_endpoints as endpoint (endpoint.path)}
 			<div
 				class="row"
@@ -376,10 +425,10 @@
 				<code>{endpoint.path}</code>
 				<span class="chip">{endpoint.methods.length} methods</span>
 				{#each endpoint.required_roles as role (role)}
-					<span class="chip color_d">role:{role}</span>
+					<span class="chip palette_d">role:{role}</span>
 				{/each}
 				{#each endpoint.allowed_origins as origin (origin)}
-					<span class="chip color_b"><code>{origin}</code></span>
+					<span class="chip palette_b"><code>{origin}</code></span>
 				{/each}
 			</div>
 			{#if endpoint.methods.length === 0}
@@ -400,12 +449,17 @@
 						<tbody>
 							{#each endpoint.methods as method (method.name)}
 								{@const key = `${endpoint.path}|${method.name}`}
-								<tr onclick={() => toggle_ws_method(key)} style:cursor="pointer">
-									<td><code>{method.name}</code></td>
+								<tr>
+									<td>
+										{@render expander(expanded_ws_method === key, `${method.name} schemas`, () =>
+											toggle_ws_method(key)
+										)}
+										<code>{method.name}</code>
+									</td>
 									<td><span class="chip">{method.kind}</span></td>
 									<td>
 										{#if method.auth}
-											<span class={auth_chip_class(method.auth)}>{format_auth(method.auth)}</span>
+											{@render auth_chip(method.auth)}
 										{:else}
 											<span class="text_50">—</span>
 										{/if}
@@ -443,7 +497,7 @@
 	{/if}
 
 	{#if surface.diagnostics.length}
-		<h3>diagnostics</h3>
+		<h3>Diagnostics</h3>
 		<div style:overflow-x="auto">
 			<table>
 				<thead>
@@ -457,8 +511,9 @@
 				<tbody>
 					{#each surface.diagnostics as d, i (i)}
 						<tr>
-							<td><span class={d.level === 'warning' ? 'chip color_e' : 'chip'}>{d.level}</span></td
-							>
+							<td>
+								<span class={d.level === 'warning' ? 'chip palette_e' : 'chip'}>{d.level}</span>
+							</td>
 							<td><code>{d.category}</code></td>
 							<td>{d.message}</td>
 							<td class="text_50">{d.source ?? '-'}</td>

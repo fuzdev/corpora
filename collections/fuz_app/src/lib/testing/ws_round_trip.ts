@@ -10,30 +10,29 @@ import './assert_dev_env.ts';
  * token id), and exposes a `connect()` factory returning a `WsClient`
  * per connection.
  *
- * Three layers are exported:
+ * Two layers are exported:
  *
  *   - **Primitives** (`create_fake_ws`, `create_fake_hono_context`,
  *     `create_stub_upgrade`, `MinimalActionEnvironment`,
  *     `dispatch_ws_message`) — used by fuz_app's own dispatcher tests
  *     and by consumers wiring tight one-off tests.
- *   - **Harness** (`create_ws_test_harness`, `keeper_identity`) — the
- *     high-level driver. Give it specs + handlers, get back
- *     `{transport, connect()}`. `connect()` is async and resolves after
+ *   - **Harness** (`create_ws_test_harness`) — the high-level driver.
+ *     Give it specs + handlers, get back
+ *     `{registry, connect()}`. `connect()` is async and resolves after
  *     `on_socket_open` completes, so broadcasts sent immediately after
  *     `await harness.connect()` reach the client. Returns a `WsClient`
  *     (shared interface — see `transports/ws_client.ts`); the same
  *     interface is implemented by `transports/ws_transport.ts` for
  *     cross-process tests.
- *   - **Broadcast wiring** — `build_broadcast_api` for wiring a typed
- *     broadcast API against the harness's transport. Wire-frame types
- *     + predicates (`is_notification`, `is_response_for`,
- *     `JsonrpcNotificationFrame`, ...) live in `transports/ws_client.ts`
- *     so both in-process and cross-process drivers reference one source.
  *
- * Hono's wire upgrade is skipped — the Node test runtime has no
- * `@hono/node-ws` adapter — but the full dispatch path is exercised
+ * Wire-frame types + predicates (`is_notification`, `is_response_for`,
+ * `JsonrpcNotificationFrame`, ...) live in `transports/ws_client.ts` so
+ * both in-process and cross-process drivers reference one source.
+ *
+ * Hono's wire upgrade is skipped — there is no server, so no runtime
+ * adapter — but the full dispatch path is exercised
  * (per-action auth, input validation, `ctx.notify` back to the
- * originating socket, broadcast via `BackendWebsocketTransport`, and
+ * originating socket, broadcast via `ConnectionRegistry`, and
  * close-on-revoke).
  *
  * @module
@@ -48,25 +47,22 @@ import {
 	type WSEvents
 } from 'hono/ws';
 import { Logger } from '@fuzdev/fuz_util/log.ts';
-import { create_uuid, type Uuid } from '@fuzdev/fuz_util/id.ts';
+import { create_uuid, type Uuid } from '../primitive_schemas.ts';
 
 import type { ActionSpecUnion } from '../actions/action_spec.ts';
 import type { Action } from '../actions/action_types.ts';
-import { ActionDispatcher } from '../actions/action_dispatcher.ts';
 import type { ActionEventEnvironment } from '../actions/action_event_types.ts';
-import { create_broadcast_api } from '../actions/broadcast_api.ts';
 import { register_action_ws, type RegisterActionWsOptions } from '../actions/register_action_ws.ts';
 import { create_stub_db } from './stubs.ts';
-import { BackendWebsocketTransport } from '../actions/transports_ws_backend.ts';
+import { ConnectionRegistry } from '../actions/connection_registry.ts';
 import { REQUEST_CONTEXT_KEY, type RequestContext } from '../auth/request_context.ts';
-import { ROLE_KEEPER } from '../auth/role_schema.ts';
 import {
-	ACCOUNT_ID_KEY,
-	AUTH_API_TOKEN_ID_KEY,
-	CREDENTIAL_TYPE_KEY,
-	TEST_CONTEXT_PRESET_KEY,
-	type CredentialType
+	RESOLVED_AUTH_KEY,
+	TEST_CONTEXT_PRESET,
+	TEST_CONTEXT_PRESET_KEY
 } from '../hono_context.ts';
+import { create_test_resolved_auth } from './resolved_auth.ts';
+import type { BuiltinCredentialType } from '../auth/credential_type_schema.ts';
 import { create_jsonrpc_request } from '../http/jsonrpc_helpers.ts';
 import { create_test_account, create_test_actor, create_test_role_grant } from './entities.ts';
 import {
@@ -85,42 +81,94 @@ import {
 // ---------------------------------------------------------------------
 
 /**
+ * The runtime socket behind a `FakeWs` — what `WSContext.raw` exposes, shaped
+ * like Node's `ws`: a `bufferedAmount` the outbound writer reads for
+ * backpressure, and a `terminate` it cuts a stalled socket with.
+ */
+export interface FakeWsSocket {
+	/**
+	 * Bytes "handed to the socket and not yet written". Grows by each sent
+	 * frame's UTF-8 length while `stalled`; set it (e.g. to `0`) to model the
+	 * client reading.
+	 */
+	bufferedAmount: number;
+	/** While `true`, sent frames stay in `bufferedAmount` — a client that is not reading. */
+	stalled: boolean;
+	/** Whether `terminate` was called — the socket was cut with no close frame. */
+	terminated: boolean;
+	/** Cut the socket. Records `terminated` and empties `bufferedAmount`. */
+	terminate: () => void;
+}
+
+/**
  * A `WSContext` paired with capture arrays. Use `sends` to assert on
- * outgoing frames; use `closes` to assert on revocation / close.
+ * outgoing frames; use `closes` to assert on revocation / close; use
+ * `socket` to model a client that stopped reading and to assert on a cut.
  */
 export interface FakeWs {
 	ws: WSContext;
 	sends: Array<string>;
 	closes: Array<{ code?: number; reason?: string }>;
+	/** The fake runtime socket (`ws.raw`). */
+	socket: FakeWsSocket;
 }
+
+/** Options for `create_fake_ws`. */
+export interface CreateFakeWsOptions {
+	/** Start with the client not reading (`FakeWsSocket.stalled`). */
+	stalled?: boolean;
+}
+
+const fake_ws_text_encoder = new TextEncoder();
 
 /**
  * Build a real `WSContext` backed by in-memory `send`/`close` capture.
  * Parsing of outgoing frames is left to the caller — `sends` holds the
  * raw strings as the dispatcher wrote them.
+ *
+ * `readyState` reads `1` (open) until the socket is closed (`2`) or
+ * terminated (`3`).
  */
-export const create_fake_ws = (): FakeWs => {
+export const create_fake_ws = (options?: CreateFakeWsOptions): FakeWs => {
 	const sends: Array<string> = [];
 	const closes: Array<{ code?: number; reason?: string }> = [];
+	const socket: FakeWsSocket = {
+		bufferedAmount: 0,
+		stalled: options?.stalled ?? false,
+		terminated: false,
+		terminate: () => {
+			socket.terminated = true;
+			socket.bufferedAmount = 0;
+		}
+	};
 	const init: WSContextInit = {
 		send: (data) => {
-			sends.push(typeof data === 'string' ? data : '<binary>');
+			const text = typeof data === 'string' ? data : '<binary>';
+			sends.push(text);
+			if (socket.stalled) socket.bufferedAmount += fake_ws_text_encoder.encode(text).byteLength;
 		},
 		close: (code, reason) => {
 			closes.push({ code, reason });
+			// a close frame is a few bytes behind whatever is still unwritten
+			if (socket.stalled) socket.bufferedAmount += 2;
 		},
-		readyState: 1
+		raw: socket,
+		get readyState() {
+			return socket.terminated ? 3 : closes.length > 0 ? 2 : 1;
+		}
 	};
-	return { ws: new WSContext(init), sends, closes };
+	return { ws: new WSContext(init), sends, closes, socket };
 };
 
 /** Options for `create_fake_hono_context`. */
 export interface FakeHonoContextOptions {
-	credential_type: CredentialType;
+	credential_type: BuiltinCredentialType;
 	/** A single role to grant via `create_test_request_context`. */
 	role?: string;
-	auth_session_id?: string | null;
-	api_token_id?: string | null;
+	/** The raw session token a `session` credential carries. Default `'s1'`. */
+	auth_session_id?: string;
+	/** The `api_token` credential's token id. Default a fresh uuid. */
+	api_token_id?: string;
 	/**
 	 * Override the `RequestContext` outright (for multi-role or custom
 	 * account/actor fixtures). Takes precedence over `role`.
@@ -129,48 +177,95 @@ export interface FakeHonoContextOptions {
 }
 
 /**
- * Build a fake Hono `Context` exposing the auth keys the dispatcher
- * reads via `c.get(...)`. Only `.get()` is populated — no other Hono
+ * Build a fake Hono `Context` exposing the auth values the dispatcher
+ * reads via `c.get(...)` — the `ResolvedAuth` the production auth middleware
+ * sets (its session hash the key a session connection is registered under)
+ * and a preset `RequestContext`. Only `.get()` is populated — no other Hono
  * context surface is simulated.
  */
 export const create_fake_hono_context = (opts: FakeHonoContextOptions): Context => {
 	const request_context = opts.request_context ?? build_simple_request_context(opts.role);
+	const auth_session_id =
+		opts.credential_type === 'session' ? (opts.auth_session_id ?? 's1') : null;
 	const vars: Record<string, unknown> = {
-		[ACCOUNT_ID_KEY]: request_context.account.id,
 		[REQUEST_CONTEXT_KEY]: request_context,
-		[CREDENTIAL_TYPE_KEY]: opts.credential_type,
-		auth_session_id: opts.auth_session_id ?? (opts.credential_type === 'session' ? 's1' : null),
-		[AUTH_API_TOKEN_ID_KEY]: opts.api_token_id ?? null,
-		[TEST_CONTEXT_PRESET_KEY]: true
+		[RESOLVED_AUTH_KEY]: create_test_resolved_auth({
+			credential_type: opts.credential_type,
+			account_id: request_context.account.id,
+			session_id: auth_session_id ?? undefined,
+			api_token_id: opts.api_token_id
+		}),
+		auth_session_id,
+		[TEST_CONTEXT_PRESET_KEY]: TEST_CONTEXT_PRESET
 	};
 	return {
 		get: (key: string) => vars[key]
 	} as unknown as Context;
 };
 
-/** The return of `create_stub_upgrade` — fake `upgradeWebSocket` + factory capture. */
+/** One upgrade that reached a `create_stub_upgrade` route. */
+export interface StubUpgradeRecord {
+	/**
+	 * The real Hono `Context` the request carried through the app's
+	 * middleware chain — session, request context, client IP, and every
+	 * other value the middleware set.
+	 */
+	c: Context;
+	/** The events factory of the endpoint the upgrade reached. */
+	create_events: (c: Context) => WSEvents | Promise<WSEvents>;
+}
+
+/** The return of `create_stub_upgrade` — fake `upgradeWebSocket` + factory and upgrade capture. */
 export interface StubUpgrade {
 	upgradeWebSocket: UpgradeWebSocket;
+	/**
+	 * The events factory of the most recently mounted endpoint, for tests
+	 * that build events from a hand-made context. Throws when no endpoint
+	 * was mounted.
+	 */
 	get_create_events: () => (c: Context) => WSEvents | Promise<WSEvents>;
+	/**
+	 * Every upgrade request that reached a stub route, in arrival order —
+	 * what `app.request(path, {headers: {upgrade: 'websocket', ...}})`
+	 * leaves behind once the app's middleware passed it. Build the socket's
+	 * events with `record.create_events(record.c)`.
+	 */
+	upgrades: ReadonlyArray<StubUpgradeRecord>;
 }
 
 /**
- * Build a fake `upgradeWebSocket` that captures the `createEvents`
- * callback. The returned middleware is inert — tests drive
- * `createEvents` directly.
+ * Build a fake `upgradeWebSocket` that stands in for a runtime adapter's.
+ *
+ * Like the real adapters, the middleware it returns passes a request
+ * without an `Upgrade: websocket` header to `next()`. An upgrade request
+ * is recorded in `upgrades` — its real `Context` and the endpoint's events
+ * factory — and answered `200` with no body (a `Response` cannot carry the
+ * `101` an adapter answers). No socket is opened: tests drive the recorded
+ * factory, so an upgrade sent through `app.request` exercises the app's
+ * whole middleware chain — origin, session or bearer, client IP — before
+ * the dispatcher sees it.
  */
 export const create_stub_upgrade = (): StubUpgrade => {
 	let captured: ((c: Context) => WSEvents | Promise<WSEvents>) | null = null;
-	const upgradeWebSocket = ((createEvents: (c: Context) => WSEvents | Promise<WSEvents>) => {
-		captured = createEvents;
-		return async (_c: Context, next: () => Promise<void>) => next();
+	const upgrades: Array<StubUpgradeRecord> = [];
+	const upgradeWebSocket = ((create_events: (c: Context) => WSEvents | Promise<WSEvents>) => {
+		captured = create_events;
+		return async (c: Context, next: () => Promise<void>) => {
+			if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') {
+				await next();
+				return;
+			}
+			upgrades.push({ c, create_events });
+			return new Response(null, { status: 200 });
+		};
 	}) as unknown as UpgradeWebSocket;
 	return {
 		upgradeWebSocket,
 		get_create_events: () => {
 			if (!captured) throw new Error('upgradeWebSocket was not called');
 			return captured;
-		}
+		},
+		upgrades
 	};
 };
 
@@ -217,11 +312,15 @@ export interface WsConnectIdentity {
 	/** Account id for the connection. Defaults to a fresh uuid per call. */
 	account_id?: Uuid;
 	/** Credential type. Defaults to `'session'`. Keeper actions require `'daemon_token'`. */
-	credential_type?: CredentialType;
-	/** Session id (any string). Defaults to a fresh uuid. Hashed by the dispatcher. */
+	credential_type?: BuiltinCredentialType;
+	/**
+	 * Session id (any string). Defaults to a fresh uuid. The connection is
+	 * registered under `hash_session_token(session_id)`, the hash the request
+	 * context middleware would have resolved.
+	 */
 	session_id?: string;
-	/** Api token id; set for bearer connections, null otherwise. */
-	api_token_id?: string | null;
+	/** Api token id of an `api_token` connection. Defaults to a fresh uuid; ignored for other credentials. */
+	api_token_id?: string;
 	/** Roles to grant via active role_grants. Pass `[ROLE_KEEPER]` for keeper actions. */
 	roles?: Array<string>;
 }
@@ -235,14 +334,14 @@ export interface CreateWsTestHarnessOptions {
 	 * alongside consumer-specific actions.
 	 */
 	actions: ReadonlyArray<Action>;
-	/** Pass a pre-created transport to share with a broadcast API. */
-	transport?: BackendWebsocketTransport;
+	/** Pass a pre-created registry to share with a broadcast API. */
+	registry?: ConnectionRegistry;
 	/**
-	 * Threaded through to `register_action_ws`. Defaults to `false` in tests —
-	 * fake timers + receive-silence detection need explicit opt-in and per-
-	 * test tuning to avoid spurious closes.
+	 * Threaded through to `register_action_ws`. Defaults to `null` (off) in
+	 * tests — fake timers + receive-silence detection need explicit opt-in and
+	 * per-test tuning to avoid spurious closes.
 	 */
-	heartbeat?: RegisterActionWsOptions['heartbeat'];
+	receive_timeout?: RegisterActionWsOptions['receive_timeout'];
 	/** Optional logger. Defaults to a silent `[ws-test]` logger. */
 	log?: Logger;
 	/** Threaded straight through to `register_action_ws`. */
@@ -252,8 +351,7 @@ export interface CreateWsTestHarnessOptions {
 	/**
 	 * Optional responder for **server-initiated** requests, applied to every
 	 * `connect()`. Purely additive (and unexercised until the TS server
-	 * transport gains server-initiated requests — the deferred
-	 * `BackendWebsocketTransport.send()` convergence): with it set, an
+	 * gains server-initiated requests): with it set, an
 	 * inbound server→client request is answered rather than surfaced as a
 	 * message; without it, behavior is unchanged. Mirrors the cross-process
 	 * `create_ws_transport` seam so suite bodies share one shape.
@@ -261,15 +359,13 @@ export interface CreateWsTestHarnessOptions {
 	on_request?: WsRequestResponder;
 }
 
-/** A harness instance — transport handle + connection factory. */
+/** A harness instance — registry handle + connection factory. */
 export interface WsTestHarness {
-	transport: BackendWebsocketTransport;
+	registry: ConnectionRegistry;
 	/**
 	 * Open a mock connection. Resolves after `on_socket_open` (and the
-	 * transport's `register_ws`) completes, so broadcasts issued
-	 * immediately after the `await` reach the connection. Earlier
-	 * revisions returned synchronously and required a `settle_open()`
-	 * microtask drain — no longer necessary.
+	 * registry's `register_ws`) completes, so broadcasts issued
+	 * immediately after the `await` reach the connection.
 	 *
 	 * Returns the shared `WsClient` interface — same surface the
 	 * cross-process driver in `transports/ws_transport.ts` implements,
@@ -353,8 +449,8 @@ const build_simple_request_context = (role?: string): RequestContext => ({
 export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsTestHarness => {
 	const {
 		actions,
-		transport = new BackendWebsocketTransport(),
-		heartbeat = false,
+		registry = new ConnectionRegistry(),
+		receive_timeout = null,
 		log = new Logger('[ws-test]', { level: 'off' }),
 		on_socket_open,
 		on_socket_close,
@@ -377,13 +473,23 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 		path: '/test/ws',
 		app: stub_app,
 		upgradeWebSocket: stub.upgradeWebSocket,
+		// the harness drives the captured events factory directly, so the
+		// route's guards — origin first — never run
+		allowed_origins: [],
 		actions,
 		db: stub_db,
-		transport,
-		heartbeat,
+		registry,
+		// the harness drives the dispatcher against a stub db — no revocation
+		// handler runs here, so there is no closer to reach this registry
+		connection_closer: null,
+		receive_timeout,
 		log,
 		on_socket_open,
-		on_socket_close
+		on_socket_close,
+		// the harness drives per-message dispatch, not throttling — the
+		// assembled-app tests cover the limiters `create_app_server` threads
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null
 	});
 
 	const events_factory = stub.get_create_events();
@@ -392,16 +498,21 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 		const account_id = identity.account_id ?? create_uuid();
 		const credential_type = identity.credential_type ?? 'session';
 		const session_id = identity.session_id ?? create_uuid();
-		const api_token_id = identity.api_token_id ?? null;
 		const roles = identity.roles ?? [];
 
 		const ctx_store = new Map<string, unknown>([
-			[ACCOUNT_ID_KEY, account_id],
 			[REQUEST_CONTEXT_KEY, build_multi_role_request_context(account_id, roles)],
-			[CREDENTIAL_TYPE_KEY, credential_type],
+			[
+				RESOLVED_AUTH_KEY,
+				create_test_resolved_auth({
+					credential_type,
+					account_id,
+					session_id,
+					api_token_id: identity.api_token_id
+				})
+			],
 			['auth_session_id', session_id],
-			[AUTH_API_TOKEN_ID_KEY, api_token_id],
-			[TEST_CONTEXT_PRESET_KEY, true]
+			[TEST_CONTEXT_PRESET_KEY, TEST_CONTEXT_PRESET]
 		]);
 		const fake_c = {
 			get: (key: string) => ctx_store.get(key)
@@ -421,6 +532,8 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 		// test closed the socket.
 		const close_waiters: Array<() => void> = [];
 		let is_closed = false;
+		let close_code: number | null = null;
+		let close_reason: string | null = null;
 
 		// Captured in `ws.close` below; `client.close(...)` returns it so
 		// tests can await async `on_socket_close` cleanup.
@@ -438,6 +551,8 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 			close: (code, reason) => {
 				if (is_closed) return;
 				is_closed = true;
+				close_code = code ?? 1000;
+				close_reason = reason ?? '';
 				for (const resolve of close_waiters.splice(0)) resolve();
 				const close_event = new Event('close') as CloseEvent;
 				Object.defineProperties(close_event, {
@@ -455,7 +570,7 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 
 		// Resolve the (possibly async) events factory and fire onOpen
 		// before returning the client. Awaiting the hook chain here
-		// means the transport has registered the connection and any
+		// means the registry has registered the connection and any
 		// `on_socket_open` bootstrap (sending an initial snapshot,
 		// populating per-connection state) has completed by the time
 		// the caller's `await harness.connect(...)` resolves.
@@ -535,6 +650,12 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 				if (!is_closed) ws.close(code, reason);
 				if (close_pending) await close_pending;
 			},
+			get close_code() {
+				return close_code;
+			},
+			get close_reason() {
+				return close_reason;
+			},
 			wait_for: wait_for_impl,
 			wait_for_close: (timeout_ms = WS_CLIENT_DEFAULT_TIMEOUT_MS): Promise<boolean> => {
 				if (is_closed) return Promise.resolve(true);
@@ -554,48 +675,5 @@ export const create_ws_test_harness = (options: CreateWsTestHarnessOptions): WsT
 		};
 	};
 
-	return { transport, connect };
-};
-
-/** Convenience: default identity for keeper-authenticated connections. */
-export const keeper_identity = (): WsConnectIdentity => ({
-	credential_type: 'daemon_token',
-	roles: [ROLE_KEEPER]
-});
-
-// ---------------------------------------------------------------------
-// Broadcast wiring — for tests that assert on server-initiated
-// notification fan-out. `build_broadcast_api` mirrors how consumer
-// `backend_actions_api.ts` composes the real stack (peer + transport
-// registered + `create_broadcast_api`); the helper exists so each test
-// doesn't re-spell that boilerplate.
-// ---------------------------------------------------------------------
-
-const make_peer = (): ActionDispatcher =>
-	new ActionDispatcher({ environment: new MinimalActionEnvironment([]) });
-
-/**
- * Wire a typed broadcast API against the harness's transport, matching
- * how a consumer's real backend composes the stack. Returns the typed
- * API so tests can call `.zap_run_created(...)` / `.workspace_changed(...)`
- * etc. directly.
- *
- * ```ts
- * const harness = create_ws_test_harness({actions});
- * const broadcast = build_broadcast_api<MyBackendActionsApi>({
- *   harness,
- *   specs: my_broadcast_action_specs,
- * });
- * const client = await harness.connect(keeper_identity());
- * await broadcast.zap_run_created({run_id: '...', ...});
- * await client.wait_for(is_notification('zap_run_created'));
- * ```
- */
-export const build_broadcast_api = <TApi extends object>(options: {
-	harness: WsTestHarness;
-	specs: ReadonlyArray<ActionSpecUnion>;
-}): TApi => {
-	const peer = make_peer();
-	peer.transports.register_transport(options.harness.transport);
-	return create_broadcast_api<TApi>({ peer, specs: options.specs });
+	return { registry, connect };
 };

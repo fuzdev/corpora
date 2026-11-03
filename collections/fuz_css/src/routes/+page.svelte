@@ -8,6 +8,7 @@
 	import { logo_fuz_css } from '@fuzdev/fuz_ui/logos.ts';
 
 	import Introduction from './Introduction.svelte';
+	import KitchenSink from './KitchenSink.svelte';
 	import { MAIN_HEADER_MARGIN_TOP } from './constants.ts';
 
 	const site = site_context.get();
@@ -27,7 +28,19 @@
 		</div>
 	</section>
 	<section>
-		<Card href={resolve('/docs')}>docs{#snippet icon()}🪴{/snippet}</Card>
+		<Card href={resolve('/docs')} icon="🪴">docs</Card>
+	</section>
+	<section class="width_atmost_md width:100% px_md">
+		<h2>Semantic defaults</h2>
+		<p>
+			This is plain semantic HTML with almost no classes: every element below takes its look from
+			the defaults, with only the built-in conventions and two rows to lay out the controls. Pick a
+			theme in the <a href={resolve('/docs/themes')}>themes</a> docs, or drag a knob in the
+			<a href="{resolve('/docs/themes')}#Theme-editor">theme editor</a>, and it all follows.
+		</p>
+		<div class="panel p_lg">
+			<KitchenSink />
+		</div>
 	</section>
 	<section class="width_atmost_sm p_sm border_radius_md shadow_xs text-align:center">
 		fuz_css is part of the Fuz stack, <br /> see

@@ -1,12 +1,10 @@
 // @slop Claude Opus 4
 
-import { z } from 'zod';
 import { create_context } from '@fuzdev/fuz_ui/context_helpers.ts';
 import { page } from '$app/state';
-import { create_uuid, Uuid } from '@fuzdev/fuz_util/id.ts';
-import { get_datetime_now } from '@fuzdev/fuz_util/datetime.ts';
+import { create_uuid, get_datetime_now, type Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { Cell, type CellOptions } from '$lib/cell.svelte.ts';
+import { Cell, type CellOptions } from '#lib/cell.svelte.ts';
 import { ProjectsJson } from './projects_schema.ts';
 import { Project } from './project.svelte.ts';
 import { Page } from './page.svelte.ts';
@@ -16,8 +14,9 @@ import { ProjectViewmodel } from './project_viewmodel.svelte.ts';
 import { PageViewmodel } from './page_viewmodel.svelte.ts';
 import { DomainViewmodel } from './domain_viewmodel.svelte.ts';
 import { RepoViewmodel } from './repo_viewmodel.svelte.ts';
-import { HANDLED } from '$lib/cell_helpers.ts';
-import { get_unique_name } from '$lib/helpers.ts';
+import { HANDLED } from '#lib/cell_helpers.ts';
+import { parse_url_param_uuid } from '#lib/nav.ts';
+import { get_unique_name } from '#lib/helpers.ts';
 import { create_sample_projects as create_example_projects } from './example_projects.ts';
 
 export const projects_context = create_context<Projects>();
@@ -62,10 +61,8 @@ export class Projects extends Cell<typeof ProjectsJson> {
 		this.current_project?.domains.find((d) => d.id === this.current_domain_id) || null
 	);
 
-	readonly current_repo_id = $derived.by(() => {
-		const repo_id = this.page_matches.params.repo_id;
-		return repo_id ? Uuid.parse(repo_id) : null;
-	});
+	// an invalid `repo_id` param means no repo, not a throw inside `$derived`
+	readonly current_repo_id = $derived(parse_url_param_uuid(this.page_matches.params.repo_id));
 
 	readonly current_repo = $derived.by(() => {
 		return this.current_project?.repos.find((r) => r.id === this.current_repo_id) || null;
@@ -171,7 +168,6 @@ export class Projects extends Cell<typeof ProjectsJson> {
 	 * Sets the current project id.
 	 */
 	set_current_project(project_id: Uuid | null): void {
-		console.log(`set_current_project`, project_id);
 		this.current_project_id = project_id;
 	}
 
@@ -179,7 +175,6 @@ export class Projects extends Cell<typeof ProjectsJson> {
 	 * Sets the current page id.
 	 */
 	set_current_page(page_id: Uuid | null): void {
-		console.log(`set_current_page`, page_id);
 		this.current_page_id = page_id;
 	}
 
@@ -187,7 +182,6 @@ export class Projects extends Cell<typeof ProjectsJson> {
 	 * Sets the current domain id.
 	 */
 	set_current_domain(domain_id: Uuid | null): void {
-		console.log(`set_current_domain`, domain_id);
 		this.current_domain_id = domain_id;
 	}
 
@@ -337,5 +331,3 @@ export class Projects extends Cell<typeof ProjectsJson> {
 		}
 	}
 }
-
-export const ProjectsSchema = z.instanceof(Projects);

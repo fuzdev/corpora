@@ -34,8 +34,10 @@
     Rule,
     x = false,
     y = false,
+    z = false,
     xTicks,
     yTicks,
+    zTicks,
     bandAlign = 'center',
     radialY = 'circle',
     stroke,
@@ -53,8 +55,10 @@
       ({
         x,
         y,
+        z,
         xTicks,
         yTicks,
+        zTicks,
         bandAlign,
         radialY,
         stroke,
@@ -165,7 +169,9 @@
       {#if isScaleBand(c.ctx.yScale) && bandAlign === 'between' && c.yTickVals.length}
         {#if c.ctx.radial}
           <Circle
-            r={c.ctx.yScale(c.yTickVals[c.yTickVals.length - 1])! + c.ctx.yScale.step() + c.yBandOffset}
+            r={c.ctx.yScale(c.yTickVals[c.yTickVals.length - 1])! +
+              c.ctx.yScale.step() +
+              c.yBandOffset}
             {stroke}
             {motion}
             {...splineProps}
@@ -173,7 +179,9 @@
           />
         {:else}
           {@const yEnd =
-            c.ctx.yScale(c.yTickVals[c.yTickVals.length - 1])! + c.ctx.yScale.step() + c.yBandOffset}
+            c.ctx.yScale(c.yTickVals[c.yTickVals.length - 1])! +
+            c.ctx.yScale.step() +
+            c.yBandOffset}
           <Line
             x1={c.ctx.xRange[0]}
             y1={yEnd}
@@ -188,6 +196,22 @@
       {/if}
     </Group>
   {/if}
+
+  {#if z && c.ctx.isometric}
+    {@const GridWalls = c.ctx.isometric.GridWalls}
+    <GridWalls
+      {Group}
+      {Line}
+      grid={c}
+      {x}
+      {y}
+      {z}
+      {stroke}
+      lineClass={classes.line}
+      {transitionIn}
+      {transitionInParams}
+    />
+  {/if}
 </Group>
 
 <style>
@@ -199,6 +223,7 @@
         .lc-grid-x-radial-line,
         .lc-grid-y-rule,
         .lc-grid-y-end-rule,
+        .lc-grid-z-rule,
         .lc-grid-y-radial-line
       )
     ) {

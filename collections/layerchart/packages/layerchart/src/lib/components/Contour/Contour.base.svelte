@@ -18,8 +18,9 @@
   import { interpolateYlGnBu } from 'd3-scale-chromatic';
   import { max, min } from 'd3-array';
 
-  import { accessor as resolveAccessor, chartDataArray, type Accessor } from '$lib/utils/common.js';
+  import { accessor as resolveAccessor, type Accessor } from '$lib/utils/common.js';
   import { getChartContext } from '$lib/contexts/chart.js';
+  import { getMarkData } from '$lib/contexts/facet.js';
   import { getGeoContext } from '$lib/contexts/geo.js';
   import {
     blurGridIgnoringNaN,
@@ -28,8 +29,11 @@
     resolveRasterBounds,
   } from '$lib/utils/index.js';
   import { interpolateGrid } from '$lib/utils/rasterInterpolate.js';
+  import { isScaleOrdinal } from '$lib/utils/scales.svelte.js';
+  import { resolveDataProp } from '$lib/utils/dataProp.js';
 
   const ctx = getChartContext();
+  const markData = getMarkData();
   const geo = getGeoContext();
 
   let {
@@ -49,6 +53,7 @@
     thresholds = 10,
     blur: blurRadius = 0,
     smooth = true,
+    z,
     fill,
     fillOpacity,
     stroke,
@@ -95,9 +100,7 @@
     if (!ctx.width || !ctx.height) return new Float64Array(0);
 
     if (isGridMode) {
-      return dataProp instanceof Float64Array
-        ? dataProp
-        : Float64Array.from(dataProp as number[]);
+      return dataProp instanceof Float64Array ? dataProp : Float64Array.from(dataProp as number[]);
     }
 
     if (typeof valueProp === 'function' && valueProp.length >= 2) {
@@ -117,7 +120,7 @@
       return grid;
     }
 
-    const chartData = dataProp ? (dataProp as any[]) : chartDataArray(ctx.data);
+    const chartData = markData(dataProp);
     if (!chartData || chartData.length === 0) return new Float64Array(0);
 
     const xAcc = xProp ? resolveAccessor(xProp) : ctx.x;
@@ -205,20 +208,38 @@
     );
   });
 
+  /** Each band's `[start, end]` height for `Path`'s `z`, standing on the band below */
+  const bandHeights = $derived.by(() => {
+    if (z == null) return null;
+    const heights = contourData.map((contour) => resolveDataProp(z, contour, ctx.zScale, 0));
+    return heights.map((top, i) => [i > 0 ? heights[i - 1] : 0, top] as [number, number]);
+  });
+
+  /** Unfilled bands with no `stroke` of their own are lines in the bands' colours */
+  const coloredLines = $derived(fill === 'none' && stroke == null);
+
   const colorScale = $derived.by(() => {
-    if (fill) return null;
+    if (fill && !coloredLines) return null;
     const minValue = min(contourData, (d) => d.value) ?? 0;
     const maxValue = max(contourData, (d) => d.value) ?? 1;
-    if (ctx.cScale) {
+    // Not an ordinal scale — `cScale` defaults to a `series` color lookup, which can't ramp
+    if (ctx.cScale && !isScaleOrdinal(ctx.cScale)) {
       const scale = ctx.cScale.copy();
       return ctx.props.cDomain ? scale : scale.domain([minValue, maxValue]);
     }
     return scaleSequential([minValue, maxValue], interpolateYlGnBu);
   });
 
-  function getContourFill(contour: { value: number }) {
-    if (fill) return fill;
+  function getContourColor(contour: { value: number }) {
     return colorScale ? String(colorScale(contour.value)) : 'steelblue';
+  }
+
+  function getContourFill(contour: { value: number }) {
+    return fill ?? getContourColor(contour);
+  }
+
+  function getContourStroke(contour: { value: number }) {
+    return coloredLines ? getContourColor(contour) : stroke;
   }
 </script>
 
@@ -227,9 +248,10 @@
     {#each contourData as contour, i (i)}
       <Path
         pathData={pathGenerator(contour) ?? ''}
+        z={bandHeights?.[i]}
         fill={getContourFill(contour)}
         {fillOpacity}
-        {stroke}
+        stroke={getContourStroke(contour)}
         {strokeWidth}
         class={cls('lc-contour-band', className)}
       />

@@ -1,36 +1,36 @@
 /**
- * Tests for backend_role_grant_queries.ts - Role grant create, revoke, and role checks.
+ * Tests for `role_grant_queries.ts` — role grant create, revoke, and role checks
+ * (active-grant reads go through the test-side `query_role_grant_has_role`).
  *
  * @module
  */
 
 import { assert, test } from 'vitest';
 
-import { ROLE_KEEPER, ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import { query_purge_account } from '$lib/auth/account_queries.ts';
+import { ROLE_KEEPER, ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import { query_purge_account } from '#lib/auth/account_queries.ts';
 import {
 	query_create_role_grant,
 	query_revoke_role_grant,
+	query_role_grant_by_id,
 	query_role_grant_find_active_for_actor,
-	query_role_grant_has_role,
-	query_role_grant_list_for_actor,
 	query_role_grant_find_account_id_for_role,
-	query_role_grant_revoke_role,
 	query_role_grant_revoke_for_scope,
 	query_account_has_active_global_role,
-	query_count_active_accounts_with_global_role,
+	query_count_active_accounts_with_global_role_for_update,
 	query_account_has_global_role
-} from '$lib/auth/role_grant_queries.ts';
-import { query_role_grant_offer_create } from '$lib/auth/role_grant_offer_queries.ts';
-import { create_uuid, type Uuid } from '@fuzdev/fuz_util/id.ts';
-import type { Db } from '$lib/db/db.ts';
+} from '#lib/auth/role_grant_queries.ts';
+import { query_role_grant_offer_create } from '#lib/auth/role_grant_offer_queries.ts';
+import { create_uuid, type Uuid } from '#lib/primitive_schemas.ts';
+import type { Db } from '#lib/db/db.ts';
 import {
 	create_test_account_with_actor,
 	create_test_extra_actor,
 	soft_delete_test_actor
-} from '$lib/testing/db_entities.ts';
+} from '#lib/testing/db_entities.ts';
 
 import { describe_db } from '../db_fixture.ts';
+import { query_role_grant_has_role } from './auth_test_queries.ts';
 
 /** Per-test convenience: returns just the ids the assertions care about. */
 const create_test_actor = async (
@@ -144,36 +144,6 @@ describe_db('RoleGrantQueries', (get_db) => {
 		assert.strictEqual(active[0]!.role, ROLE_KEEPER);
 	});
 
-	test('list_for_actor returns all role_grants including revoked', async () => {
-		const db = get_db();
-		const deps = { db };
-		const { actor_id } = await create_test_actor(db, 'judy');
-		await query_create_role_grant(deps, { actor_id, role: ROLE_KEEPER, granted_by: null });
-		const revokable = await query_create_role_grant(deps, {
-			actor_id,
-			role: ROLE_ADMIN,
-			granted_by: null
-		});
-		await query_revoke_role_grant(deps, revokable.id, actor_id, null);
-
-		const all = await query_role_grant_list_for_actor(deps, actor_id);
-		assert.strictEqual(all.length, 2);
-	});
-
-	test('revoke_role revokes the active role_grant for a role', async () => {
-		const db = get_db();
-		const deps = { db };
-		const { actor_id } = await create_test_actor(db, 'karen');
-		await query_create_role_grant(deps, { actor_id, role: ROLE_ADMIN, granted_by: null });
-		await query_create_role_grant(deps, { actor_id, role: ROLE_KEEPER, granted_by: null });
-
-		const result = await query_role_grant_revoke_role(deps, actor_id, ROLE_ADMIN, null);
-		assert.strictEqual(result.revoked.length, 1);
-		assert.strictEqual(result.revoked[0]?.role, ROLE_ADMIN);
-		assert.strictEqual(await query_role_grant_has_role(deps, actor_id, ROLE_ADMIN), false);
-		assert.strictEqual(await query_role_grant_has_role(deps, actor_id, ROLE_KEEPER), true);
-	});
-
 	test('grant is idempotent — second grant returns existing role_grant', async () => {
 		const db = get_db();
 		const deps = { db };
@@ -230,6 +200,111 @@ describe_db('RoleGrantQueries', (get_db) => {
 		assert.strictEqual(await query_role_grant_has_role(deps, actor_id, ROLE_ADMIN), true);
 	});
 
+	test('grant over an expired unrevoked row revokes it and inserts a fresh grant', async () => {
+		const db = get_db();
+		const deps = { db };
+		const { actor_id } = await create_test_actor(db, 'expired_regrant');
+		const expired = await query_create_role_grant(deps, {
+			actor_id,
+			role: ROLE_ADMIN,
+			expires_at: new Date(Date.now() - 60_000),
+			granted_by: null
+		});
+		assert.strictEqual(await query_role_grant_has_role(deps, actor_id, ROLE_ADMIN), false);
+		const fresh = await query_create_role_grant(deps, {
+			actor_id,
+			role: ROLE_ADMIN,
+			granted_by: null
+		});
+		assert.notStrictEqual(fresh.id, expired.id);
+		assert.strictEqual(fresh.revoked_at, null);
+		assert.strictEqual(fresh.expires_at, null);
+		assert.strictEqual(await query_role_grant_has_role(deps, actor_id, ROLE_ADMIN), true);
+		const old = await query_role_grant_by_id(deps, expired.id);
+		assert.ok(old);
+		assert.ok(old.revoked_at);
+		assert.strictEqual(old.revoked_by, null);
+		assert.strictEqual(old.revoked_reason, 'expired');
+	});
+
+	test('grant over an unexpired row with an expiry returns the same row', async () => {
+		const db = get_db();
+		const deps = { db };
+		const { actor_id } = await create_test_actor(db, 'unexpired_regrant');
+		const first = await query_create_role_grant(deps, {
+			actor_id,
+			role: ROLE_ADMIN,
+			expires_at: new Date(Date.now() + 60 * 60 * 1000),
+			granted_by: null
+		});
+		const second = await query_create_role_grant(deps, {
+			actor_id,
+			role: ROLE_ADMIN,
+			granted_by: null
+		});
+		assert.strictEqual(second.id, first.id);
+		assert.strictEqual(second.revoked_at, null);
+	});
+
+	test('the expired-row revoke touches only its own (role, scope) slot', async () => {
+		const db = get_db();
+		const deps = { db };
+		const { actor_id } = await create_test_actor(db, 'expired_scoped_regrant');
+		const scope_a = create_uuid();
+		const scope_b = create_uuid();
+		const past = new Date(Date.now() - 60_000);
+		// every row is expired, so only the scope clauses can spare a neighbor
+		const global = await query_create_role_grant(deps, {
+			actor_id,
+			role: 'teacher',
+			expires_at: past,
+			granted_by: null
+		});
+		const expired_a = await query_create_role_grant(deps, {
+			actor_id,
+			role: 'teacher',
+			scope_kind: 'class',
+			scope_id: scope_a,
+			expires_at: past,
+			granted_by: null
+		});
+		const expired_b = await query_create_role_grant(deps, {
+			actor_id,
+			role: 'teacher',
+			scope_kind: 'class',
+			scope_id: scope_b,
+			expires_at: past,
+			granted_by: null
+		});
+		const is_unrevoked = async (id: Uuid): Promise<boolean> => {
+			const row = await query_role_grant_by_id(deps, id);
+			assert.ok(row);
+			return row.revoked_at === null;
+		};
+
+		const fresh_a = await query_create_role_grant(deps, {
+			actor_id,
+			role: 'teacher',
+			scope_kind: 'class',
+			scope_id: scope_a,
+			granted_by: null
+		});
+		assert.notStrictEqual(fresh_a.id, expired_a.id);
+		assert.strictEqual(await is_unrevoked(expired_a.id), false);
+		assert.strictEqual(await is_unrevoked(global.id), true, 'a scoped re-grant spares the global');
+		assert.strictEqual(await is_unrevoked(expired_b.id), true, 'and the other scope');
+
+		// the reverse: a global re-grant spares the expired scoped row
+		const fresh_global = await query_create_role_grant(deps, {
+			actor_id,
+			role: 'teacher',
+			granted_by: null
+		});
+		assert.notStrictEqual(fresh_global.id, global.id);
+		assert.strictEqual(await is_unrevoked(global.id), false);
+		assert.strictEqual(await is_unrevoked(expired_b.id), true, 'a global re-grant spares a scope');
+	});
+
 	test('grant allows different roles for same actor', async () => {
 		const db = get_db();
 		const deps = { db };
@@ -257,7 +332,7 @@ describe_db('RoleGrantQueries', (get_db) => {
 
 		await query_purge_account(deps, account_id);
 
-		const role_grants = await query_role_grant_list_for_actor(deps, actor_id);
+		const role_grants = await db.query(`SELECT id FROM role_grant WHERE actor_id = $1`, [actor_id]);
 		assert.strictEqual(role_grants.length, 0);
 	});
 
@@ -558,104 +633,6 @@ describe_db('RoleGrantQueries', (get_db) => {
 			[global_offer_id]
 		);
 		assert.strictEqual(global_check[0]!.superseded_at, null);
-	});
-
-	test('revoke_role supersedes pending offers across every scope, leaving other roles alone', async () => {
-		const db = get_db();
-		const deps = { db };
-		const { actor_id, account_id } = await create_test_actor(db, 'revoke_role_scopes_actor');
-		const { actor_id: grantor_actor } = await create_test_actor(db, 'revoke_role_scopes_grantor');
-		const classroom_x = create_uuid();
-		const classroom_y = create_uuid();
-
-		// Two active scoped student role_grants (one per classroom).
-		await query_create_role_grant(deps, {
-			actor_id,
-			role: 'classroom_student',
-			scope_kind: 'classroom',
-			scope_id: classroom_x,
-			granted_by: null
-		});
-		await query_create_role_grant(deps, {
-			actor_id,
-			role: 'classroom_student',
-			scope_kind: 'classroom',
-			scope_id: classroom_y,
-			granted_by: null
-		});
-
-		// Pending classroom_student offers in each classroom — these must all
-		// be superseded by revoke_role.
-		const expires_at = new Date(Date.now() + 60 * 60 * 1000);
-		const { id: student_x_offer } = await query_role_grant_offer_create(
-			{ db },
-			{
-				from_actor_id: grantor_actor,
-				to_account_id: account_id,
-				role: 'classroom_student',
-				scope_kind: 'classroom',
-				scope_id: classroom_x,
-				expires_at
-			}
-		);
-		const { id: student_y_offer } = await query_role_grant_offer_create(
-			{ db },
-			{
-				from_actor_id: grantor_actor,
-				to_account_id: account_id,
-				role: 'classroom_student',
-				scope_kind: 'classroom',
-				scope_id: classroom_y,
-				expires_at
-			}
-		);
-
-		// Distractor: a pending classroom_teacher offer for the same actor/scope.
-		// Different role → must be untouched.
-		const { id: teacher_offer_id } = await query_role_grant_offer_create(
-			{ db },
-			{
-				from_actor_id: grantor_actor,
-				to_account_id: account_id,
-				role: 'classroom_teacher',
-				scope_kind: 'classroom',
-				scope_id: classroom_x,
-				expires_at
-			}
-		);
-
-		const result = await query_role_grant_revoke_role(deps, actor_id, 'classroom_student', null);
-		assert.strictEqual(result.revoked.length, 2);
-
-		// Both classroom_student offers are superseded.
-		const student_states = await db.query<{ id: string; superseded_at: string | null }>(
-			`SELECT id, superseded_at FROM role_grant_offer WHERE id = ANY($1)`,
-			[[student_x_offer, student_y_offer]]
-		);
-		assert.strictEqual(student_states.length, 2);
-		for (const row of student_states) {
-			assert.ok(row.superseded_at, `offer ${row.id} should be superseded`);
-		}
-
-		// from_account_id is populated for every superseded row via CTE join —
-		// direct guard so a broken join fails here before any downstream
-		// notification test.
-		const grantor_account_rows = await db.query<{ account_id: string }>(
-			`SELECT account_id FROM actor WHERE id = $1`,
-			[grantor_actor]
-		);
-		const expected_grantor_account = grantor_account_rows[0]!.account_id;
-		assert.strictEqual(result.superseded_offers.length, 2);
-		for (const sibling of result.superseded_offers) {
-			assert.strictEqual(sibling.from_account_id, expected_grantor_account);
-		}
-
-		// The classroom_teacher distractor is untouched.
-		const teacher_state = await db.query<{ superseded_at: string | null }>(
-			`SELECT superseded_at FROM role_grant_offer WHERE id = $1`,
-			[teacher_offer_id]
-		);
-		assert.strictEqual(teacher_state[0]!.superseded_at, null);
 	});
 
 	// -- revoke_for_scope (parent-scope cascade) ----------------------------
@@ -1032,7 +1009,10 @@ describe_db('RoleGrantQueries', (get_db) => {
 		await soft_delete_test_actor(db, a2_extra);
 
 		// Only account 1 counts; account 2's admin grant is on a tombstone.
-		assert.strictEqual(await query_count_active_accounts_with_global_role(deps, ROLE_ADMIN), 1);
+		assert.strictEqual(
+			await query_count_active_accounts_with_global_role_for_update(deps, ROLE_ADMIN),
+			1
+		);
 		assert.strictEqual(
 			await query_account_has_active_global_role(deps, a1.account_id, ROLE_ADMIN),
 			true
@@ -1048,7 +1028,10 @@ describe_db('RoleGrantQueries', (get_db) => {
 			role: ROLE_ADMIN,
 			granted_by: null
 		});
-		assert.strictEqual(await query_count_active_accounts_with_global_role(deps, ROLE_ADMIN), 2);
+		assert.strictEqual(
+			await query_count_active_accounts_with_global_role_for_update(deps, ROLE_ADMIN),
+			2
+		);
 	});
 
 	test('tombstoned keeper actor is excluded from resolution but not the removability guard', async () => {
@@ -1073,6 +1056,32 @@ describe_db('RoleGrantQueries', (get_db) => {
 		assert.strictEqual(
 			await query_role_grant_find_account_id_for_role(deps, ROLE_KEEPER),
 			k.account_id
+		);
+	});
+
+	test('a scoped keeper grant does not resolve the keeper account', async () => {
+		const db = get_db();
+		const deps = { db };
+		const scoped = await create_test_actor(db, 'scoped_keeper');
+		await query_create_role_grant(deps, {
+			actor_id: scoped.actor_id,
+			role: ROLE_KEEPER,
+			scope_kind: 'class',
+			scope_id: create_uuid(),
+			granted_by: null
+		});
+		assert.strictEqual(await query_role_grant_find_account_id_for_role(deps, ROLE_KEEPER), null);
+
+		// Control: the global keeper resolves even with the scoped row present.
+		const keeper = await create_test_actor(db, 'global_keeper');
+		await query_create_role_grant(deps, {
+			actor_id: keeper.actor_id,
+			role: ROLE_KEEPER,
+			granted_by: null
+		});
+		assert.strictEqual(
+			await query_role_grant_find_account_id_for_role(deps, ROLE_KEEPER),
+			keeper.account_id
 		);
 	});
 });

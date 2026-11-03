@@ -1,6 +1,6 @@
 import { test, assert, describe } from 'vitest';
 
-import { create_csp_directives } from '$lib/csp.ts';
+import { create_csp_directives } from '#lib/csp.ts';
 import { src } from './csp_test_helpers.ts';
 
 const A = src('a.fuz.dev');

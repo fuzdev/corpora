@@ -1,6 +1,7 @@
 import { onDestroy } from 'svelte';
 import { DEV } from 'esm-env';
 
+import { copy_lexed_syntax } from './lexer.ts';
 import type { SyntaxStyler } from './syntax_styler.ts';
 import { HighlightManager, supports_css_highlight_api } from './highlight_manager.ts';
 
@@ -50,12 +51,13 @@ export class RangeHighlighting {
 	);
 
 	// lex once per (text, lang) change -- memoized so unrelated reactivity doesn't
-	// trigger a full re-lex (`! safe bc of `highlighting_disabled`)
+	// trigger a full re-lex (`! safe bc of `highlighting_disabled`); copied, since the
+	// effect reads it after other instances may have lexed
 	readonly #range_lexed = $derived.by(() => {
 		if (!this.#manager || !this.#is_enabled() || this.highlighting_disabled) return null;
 		const text = this.#options.text();
 		if (!text) return null;
-		return this.#options.syntax_styler().lex(text, this.#options.lang()!);
+		return copy_lexed_syntax(this.#options.syntax_styler().lex(text, this.#options.lang()!));
 	});
 
 	constructor(options: RangeHighlightingOptions) {

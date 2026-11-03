@@ -31,7 +31,7 @@
 ::highlight(token_heading_punctuation),
 .token_tag_punctuation,
 ::highlight(token_tag_punctuation) {
-	color: var(--color_a_50);
+	color: var(--palette_a_50);
 }
 
 .token_comment,
@@ -44,7 +44,7 @@
 ::highlight(token_blockquote),
 .token_blockquote_punctuation,
 ::highlight(token_blockquote_punctuation) {
-	color: var(--color_b_50);
+	color: var(--palette_b_50);
 }
 
 .token_builtin,
@@ -53,7 +53,7 @@
 ::highlight(token_class_name),
 .token_number,
 ::highlight(token_number) {
-	color: var(--color_j_50);
+	color: var(--palette_j_50);
 }
 
 .token_attr_value,
@@ -68,7 +68,7 @@
 ::highlight(token_inline_code),
 .token_code_punctuation,
 ::highlight(token_code_punctuation) {
-	color: var(--color_h_50);
+	color: var(--palette_h_50);
 }
 
 /* attr_equals must be after attr_value */
@@ -87,12 +87,12 @@
 ::highlight(token_important),
 .token_variable,
 ::highlight(token_variable) {
-	color: var(--color_e_50);
+	color: var(--palette_e_50);
 }
 
 .token_atrule,
 ::highlight(token_atrule) {
-	color: var(--color_f_50);
+	color: var(--palette_f_50);
 }
 
 .token_attr_name,
@@ -109,7 +109,7 @@
 ::highlight(token_link_text),
 .token_link_punctuation,
 ::highlight(token_link_punctuation) {
-	color: var(--color_i_50);
+	color: var(--palette_i_50);
 }
 
 .token_special_keyword,
@@ -118,14 +118,14 @@
 ::highlight(token_namespace),
 .token_rule,
 ::highlight(token_rule) {
-	color: var(--color_g_50);
+	color: var(--palette_g_50);
 }
 
 .token_at_keyword,
 ::highlight(token_at_keyword),
 .token_url,
 ::highlight(token_url) {
-	color: var(--color_d_50);
+	color: var(--palette_d_50);
 }
 
 .token_url,

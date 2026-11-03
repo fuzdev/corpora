@@ -2,7 +2,7 @@
  * Integration tests for session and token limit enforcement.
  *
  * Verifies that `max_sessions` evicts oldest sessions on login and
- * `max_tokens` evicts oldest tokens on creation, using a real PGlite
+ * `max_tokens` evicts oldest tokens on creation, using a real
  * database via `create_test_app`. Session verification and token creation
  * go through the RPC endpoint; `/login` remains REST.
  *
@@ -11,39 +11,28 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_account_route_specs } from '$lib/auth/account_routes.ts';
-import { create_account_actions } from '$lib/auth/account_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_account_route_specs } from '#lib/auth/account_routes.ts';
+import { create_account_actions } from '#lib/auth/account_actions.ts';
 import {
 	account_verify_action_spec,
 	account_token_create_action_spec
-} from '$lib/auth/account_action_specs.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import { DEFAULT_TEST_PASSWORD } from '$lib/testing/test_credentials.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { find_auth_route } from '$lib/testing/integration_helpers.ts';
-import { rpc_call_for_spec, rpc_call_non_browser } from '$lib/testing/rpc_helpers.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import type { Db } from '$lib/db/db.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import { prefix_route_specs, type RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/auth/account_action_specs.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { create_test_request_headers } from '#lib/testing/test_origin.ts';
+import { DEFAULT_TEST_PASSWORD } from '#lib/testing/test_credentials.ts';
+import { find_auth_route } from '#lib/testing/integration_helpers.ts';
+import { rpc_call_for_spec, rpc_call_non_browser } from '#lib/testing/rpc_helpers.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import { prefix_route_specs, type RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const { cookie_name } = session_options;
 
 const RPC_PATH = '/api/rpc';
-
-const init_schema = async (db: Db): Promise<void> => {
-	await run_migrations(db, [auth_migration_ns]);
-};
-const factory = create_pglite_factory(init_schema);
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
 
 /**
  * Build a `create_route_specs` factory that passes custom limits
@@ -64,6 +53,8 @@ const create_route_factory =
 			})
 		),
 		...create_rpc_endpoint({
+			action_ip_rate_limiter: null,
+			action_account_rate_limiter: null,
 			path: RPC_PATH,
 			actions: create_account_actions(ctx.deps, { max_tokens: limits.max_tokens }),
 			log: ctx.deps.log
@@ -85,11 +76,9 @@ describe_db('session_token_limits', (get_db) => {
 			const login = async (): Promise<string> => {
 				const res = await test_app.app.request(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: test_app.backend.account.username,
 						password: DEFAULT_TEST_PASSWORD
@@ -152,11 +141,9 @@ describe_db('session_token_limits', (get_db) => {
 
 			const res = await test_app.app.request(login_route.path, {
 				method: 'POST',
-				headers: {
-					host: 'localhost',
-					origin: 'http://localhost:5173',
+				headers: create_test_request_headers({
 					'content-type': 'application/json'
-				},
+				}),
 				body: JSON.stringify({
 					username: test_app.backend.account.username,
 					password: DEFAULT_TEST_PASSWORD
@@ -204,11 +191,9 @@ describe_db('session_token_limits', (get_db) => {
 
 			const res = await test_app.app.request(login_route.path, {
 				method: 'POST',
-				headers: {
-					host: 'localhost',
-					origin: 'http://localhost:5173',
+				headers: create_test_request_headers({
 					'content-type': 'application/json'
-				},
+				}),
 				body: JSON.stringify({
 					username: test_app.backend.account.username,
 					password: DEFAULT_TEST_PASSWORD
@@ -257,11 +242,9 @@ describe_db('session_token_limits', (get_db) => {
 			for (let i = 0; i < 5; i++) {
 				const res = await test_app.app.request(login_route.path, {
 					method: 'POST',
-					headers: {
-						host: 'localhost',
-						origin: 'http://localhost:5173',
+					headers: create_test_request_headers({
 						'content-type': 'application/json'
-					},
+					}),
 					body: JSON.stringify({
 						username: test_app.backend.account.username,
 						password: DEFAULT_TEST_PASSWORD

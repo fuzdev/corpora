@@ -27,10 +27,10 @@ import '../assert_dev_env.ts';
  * non-sensitive — see the design doc); the WS upgrade itself still
  * authenticates, so the suite drives it over the keeper's session.
  *
- * Gated on `capabilities.peer_request` — `true` only for the Rust spine
- * (server-initiated requests landed Rust-first canonical); the TS family
- * skips until its server transport's request path lands (deferred twin-impl
- * convergence). Cross-process only: `create_ws_transport` needs a real bound
+ * Gated on `capabilities.peer_request`, which a backend declares once it
+ * mounts `peer/ping` on a WS endpoint and the HTTP RPC endpoint — the TS
+ * spine binaries (`ConnectionRegistry.request_connection`) and the
+ * Rust spine both do. Cross-process only: `create_ws_transport` needs a real bound
  * socket, so wire it from a `*.cross.test.ts`.
  *
  * @module
@@ -39,7 +39,6 @@ import '../assert_dev_env.ts';
 import { assert, describe } from 'vitest';
 
 import { rpc_call } from '../rpc_helpers.ts';
-import { create_ws_transport } from '../transports/ws_transport.ts';
 import {
 	is_response_for,
 	type JsonrpcErrorResponseFrame,
@@ -49,34 +48,40 @@ import {
 } from '../transports/ws_client.ts';
 import { create_jsonrpc_request, is_jsonrpc_request } from '../../http/jsonrpc_helpers.ts';
 import { type BackendCapabilities, test_if } from './capabilities.ts';
-import type { SetupTest } from './setup.ts';
+import type { SetupTest, TestFixture } from './setup.ts';
+import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
+import { open_session_ws, type WsEndpointTarget } from './ws_endpoint.ts';
 
-/** JSON-RPC endpoint path — matches the spine's `/api/rpc` (and the forge's). */
-const RPC_PATH = '/api/rpc';
+// The wire literals below are deliberate independent copies of the
+// producers' constants (`actions/peer_ping.ts` on TS, `REASON_PEER_*` /
+// `PEER_PING_METHOD` on Rust) — parity by test, not codegen. The harness
+// asserts the bytes on the wire, so importing the producer would make a
+// renamed-value regression invisible on both sides at once. Names track the
+// producers'.
 
 /** Wire method (both directions). Mirrors the Rust `PEER_PING_METHOD`. */
 const PEER_PING_METHOD = 'peer/ping';
 
-// Stable `data.reason` discriminators — the cross-impl wire contract, kept
-// as an independent TS-side copy of the Rust `REASON_PEER_*` constants
-// (parity by test, not codegen).
+/** Stable `data.reason` discriminators — the cross-impl wire contract. */
 const REASON_PEER_TIMEOUT = 'peer_timeout';
-const REASON_PEER_INVALID_REPLY = 'peer_ping_invalid_reply';
+const REASON_PEER_PING_INVALID_REPLY = 'peer_ping_invalid_reply';
 const REASON_PEER_NO_TRANSPORT = 'peer_no_transport';
+
+/**
+ * The server-side deadline of the per-connection isolation case — generous,
+ * so the forged reply and the barrier behind it land inside it under load.
+ */
+const ISOLATION_DEADLINE_MS = 5000;
 
 /** A reply payload that satisfies the Rust `PingResponse` shape. */
 const valid_reply = (nonce: number) => ({ nonce, protocol_version: 1 });
 
-/** Configuration for {@link describe_peer_ping_ws_tests}. */
-export interface PeerPingWsTestOptions {
+/** Configuration for `describe_peer_ping_ws_tests`. */
+export interface PeerPingWsTestOptions extends WsEndpointTarget {
 	/** Per-test fixture producer (`default_cross_process_setup(handle, ...)`). */
 	readonly setup_test: SetupTest;
 	/** Backend capability flags; every case gates on `capabilities.peer_request`. */
 	readonly capabilities: BackendCapabilities;
-	/** Base URL the backend is reachable at (e.g. `http://localhost:1177`). */
-	readonly base_url: string;
-	/** WebSocket endpoint path on the backend (e.g. `/api/ws`). */
-	readonly ws_path: string;
 }
 
 /**
@@ -87,24 +92,13 @@ export interface PeerPingWsTestOptions {
  * the HTTP no-transport path). Gated on `capabilities.peer_request`.
  */
 export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): void => {
-	const { setup_test, capabilities, base_url, ws_path } = options;
+	const { setup_test, capabilities } = options;
 
 	// -- shared helpers -------------------------------------------------------
 
-	/** Open a WS transport for a session cookie, with an optional responder. */
-	const open_ws = (
-		cookie: string | undefined,
-		on_request?: WsRequestResponder
-	): Promise<WsClient> => {
-		assert.ok(cookie, 'expected a session cookie for the WS upgrade');
-		return create_ws_transport({
-			base_url,
-			ws_path,
-			cookies: [cookie],
-			origin: base_url,
-			on_request
-		});
-	};
+	/** Open a WS transport on the fixture's session, with an optional responder. */
+	const open_ws = (fixture: TestFixture, on_request?: WsRequestResponder): Promise<WsClient> =>
+		open_session_ws(options, fixture, { admitted: false, on_request });
 
 	/** A responder that echoes a valid `PingResponse` for every `peer/ping`. */
 	const echo_responder: WsRequestResponder = (req) => {
@@ -143,7 +137,7 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 			'a client peer/ping round-trips: server pings back, validates the echo, returns it',
 			async () => {
 				const fixture = await setup_test();
-				const ws = await open_ws(fixture.create_session_headers().cookie, echo_responder);
+				const ws = await open_ws(fixture, echo_responder);
 				try {
 					const result = await ws.request<{ nonce: number; protocol_version: number }>(
 						1,
@@ -165,7 +159,7 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 			async () => {
 				const fixture = await setup_test();
 				// Responder swallows the ping (returns nothing) — the half-open peer.
-				const ws = await open_ws(fixture.create_session_headers().cookie, () => undefined);
+				const ws = await open_ws(fixture, () => undefined);
 				try {
 					// Short server-side deadline so the negative runs fast.
 					const frame = await ping_raw(ws, 2, { nonce: 1, timeout_ms: 300 });
@@ -184,13 +178,35 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 				const fixture = await setup_test();
 				// Reply that fails `PingResponse` validation (nonce wrong type,
 				// protocol_version missing).
-				const ws = await open_ws(fixture.create_session_headers().cookie, () => ({
+				const ws = await open_ws(fixture, () => ({
 					result: { nonce: 'not-a-number' }
 				}));
 				try {
 					const frame = await ping_raw(ws, 3, { nonce: 1, timeout_ms: 2000 });
 					assert.ok('error' in frame, 'a malformed reply must error, not return garbage');
-					assert.strictEqual(error_reason(frame), REASON_PEER_INVALID_REPLY);
+					assert.strictEqual(error_reason(frame), REASON_PEER_PING_INVALID_REPLY);
+				} finally {
+					await ws.close();
+				}
+			}
+		);
+
+		// A newer client may add reply fields: both spines read the reply
+		// forward-compatibly (serde's default / `safe_parse_dropping_unknown_keys`)
+		// and return only the declared shape.
+		test_if(
+			capabilities.peer_request,
+			'a reply with an undeclared key is accepted and the key is dropped',
+			async () => {
+				const fixture = await setup_test();
+				const ws = await open_ws(fixture, (req) => {
+					const nonce = (req.params as { nonce?: number } | undefined)?.nonce ?? 0;
+					return { result: { ...valid_reply(nonce), added_later: true } };
+				});
+				try {
+					const frame = await ping_raw(ws, 6, { nonce: 5, timeout_ms: 2000 });
+					assert.ok('result' in frame, `expected success, got ${JSON.stringify(frame)}`);
+					assert.deepStrictEqual(frame.result, valid_reply(5));
 				} finally {
 					await ws.close();
 				}
@@ -202,7 +218,7 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 			'a client JSON-RPC error reply surfaces as the action error (ClientError forwarded)',
 			async () => {
 				const fixture = await setup_test();
-				const ws = await open_ws(fixture.create_session_headers().cookie, () => ({
+				const ws = await open_ws(fixture, () => ({
 					error: { code: -32603, message: 'client refused', data: { reason: 'client_says_no' } }
 				}));
 				try {
@@ -221,7 +237,7 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 			'an unsolicited response is dropped: it resolves nothing and the socket survives',
 			async () => {
 				const fixture = await setup_test();
-				const ws = await open_ws(fixture.create_session_headers().cookie, echo_responder);
+				const ws = await open_ws(fixture, echo_responder);
 				try {
 					// Inject a reply for an id the server never issued on this socket.
 					await ws.send({ jsonrpc: '2.0', id: 's999999', result: valid_reply(7) });
@@ -248,12 +264,26 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 				// A has NO responder, so the inbound server-initiated request is
 				// surfaced as a message A can observe (to learn its server id);
 				// A never answers it.
-				const ws_a = await open_ws(fixture.create_session_headers().cookie);
-				const ws_b = await open_ws(fixture.create_session_headers().cookie, echo_responder);
+				const ws_a = await open_ws(fixture);
+				const ws_b = await open_ws(fixture, echo_responder);
 				try {
-					// A invokes peer/ping with a short server-side deadline; don't
-					// await yet — observe the server→client request first.
-					const ping_promise = ping_raw(ws_a, 6, { nonce: 1, timeout_ms: 1200 });
+					// A invokes peer/ping; don't await yet — observe the
+					// server→client request first. The deadline is long enough
+					// that B's forged reply below is processed well inside it,
+					// so A's timeout can only come from isolation.
+					const ping_promise = ping_raw(ws_a, 6, {
+						nonce: 1,
+						timeout_ms: ISOLATION_DEADLINE_MS
+					});
+					let a_answered = false;
+					void ping_promise.then(
+						() => {
+							a_answered = true;
+						},
+						// a failure elsewhere closes the socket under this wait; that case's
+						// own error is the one to report
+						() => {}
+					);
 
 					// The server-initiated request A received (id "sN", nonce 1).
 					const inbound = await ws_a.wait_for(
@@ -269,10 +299,26 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 						id: inbound.id,
 						result: valid_reply(inbound.params.nonce)
 					});
+					// The barrier: a round-trip on B the server answers only after
+					// reading the forged reply ahead of it on the same socket, so
+					// once it lands the forged reply has been processed.
+					const barrier = await ws_b.request<{ nonce: number }>(
+						7,
+						PEER_PING_METHOD,
+						{ nonce: 7 },
+						8000
+					);
+					assert.strictEqual(barrier.nonce, 7);
+					const answered_before_barrier = a_answered;
 
 					const frame = await ping_promise;
 					assert.ok('error' in frame, "B's cross-connection reply must not resolve A's request");
 					assert.strictEqual(error_reason(frame), REASON_PEER_TIMEOUT);
+					assert.ok(
+						!answered_before_barrier,
+						`A's ${ISOLATION_DEADLINE_MS}ms deadline ran out before B's forged reply was ` +
+							'processed, so the timeout proves nothing about isolation'
+					);
 				} finally {
 					await ws_a.close();
 					await ws_b.close();
@@ -287,7 +333,7 @@ export const describe_peer_ping_ws_tests = (options: PeerPingWsTestOptions): voi
 				const fixture = await setup_test();
 				const res = await rpc_call({
 					app: fixture.transport,
-					path: RPC_PATH,
+					path: SPINE_RPC_PATH,
 					method: PEER_PING_METHOD,
 					params: { nonce: 1 },
 					headers: fixture.create_session_headers()

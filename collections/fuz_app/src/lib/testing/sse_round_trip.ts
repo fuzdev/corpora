@@ -32,7 +32,7 @@ import {
 	type TestApp,
 	type TestAccount
 } from './app_server.ts';
-import { create_pglite_factory, type DbFactory } from './db.ts';
+import { create_default_db_factory, type DbFactory } from './db.ts';
 import { find_route_spec, pick_auth_headers } from './integration_helpers.ts';
 import {
 	rpc_call,
@@ -41,7 +41,7 @@ import {
 	type RpcEndpointsSuiteOption
 } from './rpc_helpers.ts';
 import { run_migrations } from '../db/migrate.ts';
-import { auth_migration_ns } from '../auth/migrations.ts';
+import { AUTH_MIGRATION_NS } from '../auth/migrations.ts';
 import type { Db } from '../db/db.ts';
 import { account_session_revoke_all_action_spec } from '../auth/account_action_specs.ts';
 import { create_sse_frame_reader } from './transports/sse_frame_reader.ts';
@@ -63,8 +63,9 @@ export interface SseRouteTestSpec {
 	event_specs?: Array<EventSpec>;
 	/**
 	 * Whether to assert the stream closes after `session_revoke_all`.
-	 * Default `true`. Set `false` for endpoints that don't wire a close-on-revoke
-	 * guard (leaves a TODO to fix, rather than silently passing).
+	 * Default `true`. Set `false` for endpoints whose registry no revocation
+	 * reaches — neither joined to the backend's closer nor guarded (leaves a
+	 * TODO to fix, rather than silently passing).
 	 */
 	assert_closes_on_revoke?: boolean;
 }
@@ -77,13 +78,15 @@ export interface SseRouteTestOptions {
 	create_route_specs: (ctx: AppServerContext) => Array<RouteSpec>;
 	/** Optional overrides for `AppServerOptions`. */
 	app_options?: SuiteAppOptions;
-	/** Database factories to run tests against. Default: pglite only. */
+	/** Database factories to run tests against. Default: the default factory (`create_default_db_factory`) only. */
 	db_factories?: Array<DbFactory>;
 	/**
 	 * Backend audit event callback — threaded to `create_test_app_server`.
-	 * Use to wire a close-on-revoke guard for consumer SSE registries
-	 * (e.g., via `create_sse_auth_guard`) so `session_revoke_all` actually
-	 * closes the tested streams.
+	 * Use to wire a close-on-revoke guard for consumer SSE registries (e.g.
+	 * `create_revocation_guard(create_sse_connection_closer(registry, role), log)`)
+	 * so `session_revoke_all` closes the tested streams — not needed for a
+	 * registry the route joined to `ctx.deps.connection_closer`, which the
+	 * revoking handler closes itself.
 	 */
 	on_audit_event?: (event: AuditLogEvent) => void;
 	/**
@@ -176,9 +179,9 @@ export const describe_sse_route_tests = (options: SseRouteTestOptions): void => 
 	const rpc_path = require_rpc_endpoint_path(rpc_endpoints_for_setup);
 
 	const init_schema = async (db: Db): Promise<void> => {
-		await run_migrations(db, [auth_migration_ns]);
+		await run_migrations(db, [AUTH_MIGRATION_NS]);
 	};
-	const factories = options.db_factories ?? [create_pglite_factory(init_schema)];
+	const factories = options.db_factories ?? [create_default_db_factory(init_schema)];
 
 	for (const factory of factories) {
 		const describe_fn = factory.skip ? describe.skip : describe;

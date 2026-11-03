@@ -13,13 +13,15 @@ import '../assert_dev_env.ts';
  * pinned here on both backends:
  *
  * - **`GET /api/account/status`** — NO query schema: a duplicated `acting`
- *   reads first-wins (the persona resolves), unknown keys are ignored, and an
- *   anonymous caller with junk query hears 401, never a query 400.
+ *   reads first-wins (the persona resolves), a malformed `acting` answers
+ *   account-only (never a default-actor resolve), unknown keys are ignored,
+ *   and an anonymous caller with junk query hears 401, never a query 400.
  * - **the JSON-RPC GET endpoint** — `method` / `id` / `params` read
  *   first-wins; a duplicated `method` must dispatch the first one on every
  *   backend (a last-wins reader dispatches a different method per backend on
- *   the same request).
- * - **`GET /api/facts/:hash`** (gated on `capabilities.fact_serving`) —
+ *   the same request). Every response the GET handler writes — a dispatched
+ *   answer and its own query refusal alike — is `Cache-Control: no-store`.
+ * - **`GET /api/facts/:hash`** (gated on `capabilities.fact_serving_admin_hash`) —
  *   strict query schema: unknown keys and a malformed `acting` are 400
  *   `invalid_query_params` even for an anonymous caller (query precedes the
  *   401 guard), while a duplicated `acting` takes the first occurrence.
@@ -29,9 +31,6 @@ import '../assert_dev_env.ts';
  * `serve_fact_route.db.test.ts`); this suite is the cross-impl gate, so it is
  * cross-process only — like `login_security.ts` and `testing_backdoor.ts`.
  *
- * `$lib`-free by contract (relative specifiers only), like the sibling
- * cross-backend suites.
- *
  * @module
  */
 
@@ -40,18 +39,23 @@ import { describe, test, assert } from 'vitest';
 import { account_verify_action_spec } from '../../auth/account_action_specs.ts';
 import { ERROR_INVALID_QUERY_PARAMS } from '../../http/error_schemas.ts';
 import { test_if } from './capabilities.ts';
-import type { RpcPathCrossSuiteOptions } from './setup.ts';
-import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
+import type { RpcPathCapabilityGatedCrossSuiteOptions } from './setup.ts';
+import { SPINE_ACCOUNT_STATUS_PATH, SPINE_RPC_PATH } from './spine_surface_constants.ts';
 
 /**
- * Options for the query-shape parity suite. The standard RPC-dispatched
- * cross-suite shape (`setup_test` / `capabilities` / `rpc_path`); aliases the
- * shared `RpcPathCrossSuiteOptions` rather than minting a duplicate.
+ * Options for the query-shape parity suite. The standard capability-gating
+ * RPC-dispatched cross-suite shape (`setup_test` / `capabilities` /
+ * `rpc_path`); aliases the shared `RpcPathCapabilityGatedCrossSuiteOptions`
+ * rather than minting a duplicate.
  */
-export type QueryShapeCrossTestOptions = RpcPathCrossSuiteOptions;
+export type QueryShapeCrossTestOptions = RpcPathCapabilityGatedCrossSuiteOptions;
 
-/** The status route every spine serves (bundled into the account family). */
-const STATUS_PATH = '/api/account/status';
+/**
+ * The `Cache-Control` every RPC `GET` response carries — the value of
+ * `actions/action_rpc.ts`'s `RPC_GET_CACHE_CONTROL` and the Rust spine's,
+ * spelled out so this suite imports no server module.
+ */
+const RPC_GET_CACHE_CONTROL_EXPECTED = 'no-store';
 
 /** A well-formed blake3 hash that references no stored fact. */
 const MISSING_HASH = `blake3:${'a'.repeat(64)}`;
@@ -72,12 +76,41 @@ export const describe_query_shape_cross_tests = (options: QueryShapeCrossTestOpt
 				// derived-serde extractor would 400 before the handler ran.
 				const nil = '00000000-0000-0000-0000-000000000000';
 				const res = await fixture.transport(
-					`${STATUS_PATH}?acting=${fixture.actor.id}&acting=${nil}`,
+					`${SPINE_ACCOUNT_STATUS_PATH}?acting=${fixture.actor.id}&acting=${nil}`,
 					{ method: 'GET', headers: fixture.create_session_headers() }
 				);
 				assert.strictEqual(res.status, 200);
 				const body = (await res.json()) as { actor: { id: string } | null };
 				assert.strictEqual(body.actor?.id, fixture.actor.id, 'first acting occurrence must win');
+			}
+		);
+
+		test_if(
+			capabilities.account_status,
+			'status: a malformed acting is a missing persona, not a default-actor resolve',
+			async () => {
+				const fixture = await setup_test();
+				// The keeper has one actor: an omitted selector resolves it, while a
+				// malformed one answers account-only.
+				const omitted = await fixture.transport(SPINE_ACCOUNT_STATUS_PATH, {
+					method: 'GET',
+					headers: fixture.create_session_headers()
+				});
+				assert.strictEqual(omitted.status, 200);
+				const omitted_body = (await omitted.json()) as { actor: { id: string } | null };
+				assert.strictEqual(omitted_body.actor?.id, fixture.actor.id);
+				for (const raw of ['not-a-uuid', '', `"${fixture.actor.id}"`]) {
+					const res = await fixture.transport(
+						`${SPINE_ACCOUNT_STATUS_PATH}?acting=${encodeURIComponent(raw)}`,
+						{
+							method: 'GET',
+							headers: fixture.create_session_headers()
+						}
+					);
+					assert.strictEqual(res.status, 200, raw);
+					const body = (await res.json()) as { actor: { id: string } | null };
+					assert.strictEqual(body.actor, null, raw);
+				}
 			}
 		);
 
@@ -90,9 +123,9 @@ export const describe_query_shape_cross_tests = (options: QueryShapeCrossTestOpt
 				// The status route has no query schema — an anonymous prober with a
 				// junk query must hear the same 401 as a clean one (a pre-handler
 				// query reject here is a backend fingerprint).
-				const dup = await anon(`${STATUS_PATH}?acting=a&acting=b`, { method: 'GET' });
+				const dup = await anon(`${SPINE_ACCOUNT_STATUS_PATH}?acting=a&acting=b`, { method: 'GET' });
 				assert.strictEqual(dup.status, 401);
-				const unknown = await anon(`${STATUS_PATH}?foo=1&bar=2`, { method: 'GET' });
+				const unknown = await anon(`${SPINE_ACCOUNT_STATUS_PATH}?foo=1&bar=2`, { method: 'GET' });
 				assert.strictEqual(unknown.status, 401);
 			}
 		);
@@ -102,7 +135,7 @@ export const describe_query_shape_cross_tests = (options: QueryShapeCrossTestOpt
 			'status: unknown query keys are ignored for an authed caller (no strict schema)',
 			async () => {
 				const fixture = await setup_test();
-				const res = await fixture.transport(`${STATUS_PATH}?foo=1`, {
+				const res = await fixture.transport(`${SPINE_ACCOUNT_STATUS_PATH}?foo=1`, {
 					method: 'GET',
 					headers: fixture.create_session_headers()
 				});
@@ -120,13 +153,32 @@ export const describe_query_shape_cross_tests = (options: QueryShapeCrossTestOpt
 				{ method: 'GET', headers: fixture.create_session_headers() }
 			);
 			assert.strictEqual(res.status, 200);
+			assert.strictEqual(
+				res.headers.get('cache-control'),
+				RPC_GET_CACHE_CONTROL_EXPECTED,
+				'a GET read is no-store'
+			);
 			const body = (await res.json()) as { id: unknown; result?: unknown };
 			assert.strictEqual(body.id, 7, 'first id occurrence must win');
 			assert.ok(body.result !== undefined, 'first method occurrence must dispatch');
 		});
 
+		test('rpc GET: the handler refusal is no-store too', async () => {
+			const fixture = await setup_test();
+			const res = await fixture.transport(`${rpc_path}?id=1`, {
+				method: 'GET',
+				headers: fixture.create_session_headers()
+			});
+			assert.strictEqual(res.status, 400);
+			assert.strictEqual(
+				res.headers.get('cache-control'),
+				RPC_GET_CACHE_CONTROL_EXPECTED,
+				'a missing-method refusal is no-store'
+			);
+		});
+
 		test_if(
-			capabilities.fact_serving,
+			capabilities.fact_serving_admin_hash,
 			'bare-hash facts: unknown query key → 400 invalid_query_params, even anonymous',
 			async () => {
 				const fixture = await setup_test();
@@ -151,7 +203,7 @@ export const describe_query_shape_cross_tests = (options: QueryShapeCrossTestOpt
 		);
 
 		test_if(
-			capabilities.fact_serving,
+			capabilities.fact_serving_admin_hash,
 			'bare-hash facts: duplicated acting takes the first occurrence; malformed acting → 400',
 			async () => {
 				const fixture = await setup_test();

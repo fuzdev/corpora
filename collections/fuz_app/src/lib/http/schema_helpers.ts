@@ -11,6 +11,7 @@
 import { z } from 'zod';
 
 import type { RouteAuth } from './auth_shape.ts';
+import type { RouteMethod } from './route_spec.ts';
 import {
 	derive_error_schemas,
 	type RateLimitKey,
@@ -35,6 +36,137 @@ export const is_null_schema = (schema: z.ZodType): boolean => schema instanceof 
  * and the dispatcher maps absent params to `undefined` for these specs.
  */
 export const is_void_schema = (schema: z.ZodType): boolean => schema instanceof z.ZodVoid;
+
+/**
+ * Normalize the raw `params` of a `z.void()` input: an absent `params`, an
+ * empty object, and the `null` a GET `?params=null` parses to are all the
+ * no-arg call (`undefined`); anything else passes through for `z.void()` to
+ * refuse.
+ *
+ * JSON-RPC 2.0 lets a parameterless call omit `params`, and an empty by-name
+ * structure carries no parameters, so refusing `{}` would only break clients
+ * that send it for a parameterless call. Arrays — `[]` included — are not
+ * normalized: RPC params are by-name only. The Rust spine's
+ * `require_void_params` accepts the same shapes. Receiving ends reach it
+ * through `to_input_params`.
+ *
+ * @param raw_params - the request's `params` as parsed off the wire
+ * @returns `undefined` for an empty shape, else `raw_params` unchanged
+ */
+export const to_void_params = (raw_params: unknown): unknown => {
+	if (raw_params === undefined || raw_params === null) return undefined;
+	if (
+		typeof raw_params === 'object' &&
+		!Array.isArray(raw_params) &&
+		Object.keys(raw_params).length === 0
+	) {
+		return undefined;
+	}
+	return raw_params;
+};
+
+/**
+ * Normalize the raw `params` of an RPC call for `input` to validate: for a
+ * `z.void()` input, `to_void_params`; for any other input, an absent or
+ * `null` `params` reads as `{}`, so an all-optional object input accepts a
+ * call that omits them. Every receiving end — the server dispatch
+ * (`perform_action`) and a peer receiving a request or notification
+ * (`ActionDispatcher`) — reads params through this, so a peer is never
+ * stricter than the server.
+ *
+ * @param input - the action's input schema
+ * @param raw_params - the call's `params` as parsed off the wire
+ * @returns the value to run `input.safeParse` on
+ */
+export const to_input_params = (input: z.ZodType, raw_params: unknown): unknown =>
+	is_void_schema(input) ? to_void_params(raw_params) : (raw_params ?? {});
+
+/**
+ * Check whether a parsed JSON value holds an own `__proto__` key in any
+ * object, at any depth — what the dispatcher refuses in a request's `params`
+ * (`ERROR_PARAMS_PROTO_KEY`).
+ *
+ * `JSON.parse` defines `"__proto__"` as an ordinary own key, but the first
+ * plain assignment that copies it (`target[key] = value`, as any shallow copy
+ * or merge loop does) hits the prototype setter instead, so stored JSON
+ * carrying one is a prototype-pollution sink for whoever reads it back. An
+ * own `constructor` or `prototype` key is inert on a plain object and is not
+ * checked.
+ *
+ * Walks with an explicit stack rather than recursion: `JSON.parse` accepts
+ * nesting deep enough to overflow the call stack, and the walk is linear in
+ * the value's nodes, which the request body limit bounds. The Rust spine's
+ * `fuz_http::json_has_own_proto_key` is the twin.
+ *
+ * @param value - a value as `JSON.parse` produced it
+ * @returns whether any object in `value` has an own `__proto__` key
+ */
+export const json_has_own_proto_key = (value: unknown): boolean => {
+	const stack: Array<unknown> = [value];
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (typeof current !== 'object' || current === null) continue;
+		if (Array.isArray(current)) {
+			for (const item of current) stack.push(item);
+			continue;
+		}
+		if (Object.hasOwn(current, '__proto__')) return true;
+		for (const item of Object.values(current)) stack.push(item);
+	}
+	return false;
+};
+
+/**
+ * `schema.safeParse(value)`, except that keys the schema doesn't declare are
+ * dropped rather than refused — the forward-compatible read of a payload a
+ * remote authored.
+ *
+ * Output schemas are strict so the server's DEV output validation catches a
+ * handler leaking fields it shouldn't. The receiving side, though, is often
+ * older than the remote it talks to — a deploy lands before open tabs reload
+ * — and a remote that adds a field is making a compatible change. So when
+ * every issue is an unrecognized key, those keys are stripped from a copy of
+ * `value` and it's parsed again; any other issue (a wrong type, a missing
+ * field, `null` where a value is required) still fails. `value` itself is
+ * never mutated. This matches serde's default on the Rust spine, which
+ * ignores unknown fields. Keys nested in a `z.union` branch surface as a
+ * union issue and aren't stripped; a `z.discriminatedUnion` reports its
+ * matched branch's issues directly, so those are.
+ *
+ * Used for a response's `result` (`ActionEvent`) and for a peer's reply to a
+ * server-initiated request (`peer/ping`).
+ *
+ * @param schema - the declared shape
+ * @param value - the remote-authored payload
+ * @returns the parse result, with undeclared keys dropped on success
+ */
+export const safe_parse_dropping_unknown_keys = <T extends z.ZodType>(
+	schema: T,
+	value: unknown
+): z.ZodSafeParseResult<z.output<T>> => {
+	const parsed = schema.safeParse(value);
+	if (parsed.success) return parsed;
+	const { issues } = parsed.error;
+	if (!issues.every((issue) => issue.code === 'unrecognized_keys')) return parsed;
+	const stripped = structuredClone(value);
+	for (const issue of issues) {
+		const target = get_at_path(stripped, issue.path);
+		if (typeof target !== 'object' || target === null) return parsed;
+		for (const key of issue.keys) {
+			Reflect.deleteProperty(target, key);
+		}
+	}
+	return schema.safeParse(stripped);
+};
+
+const get_at_path = (value: unknown, path: ReadonlyArray<PropertyKey>): unknown => {
+	let current = value;
+	for (const segment of path) {
+		if (typeof current !== 'object' || current === null) return undefined;
+		current = (current as Record<PropertyKey, unknown>)[segment];
+	}
+	return current;
+};
 
 /**
  * Check if a schema is a strict object (`z.strictObject()`).
@@ -97,17 +229,51 @@ export const middleware_applies = (mw_path: string, route_path: string): boolean
 };
 
 /**
+ * Check if two middleware path patterns can match a common route path — the
+ * pattern-against-pattern form of `middleware_applies`, over the same
+ * grammar (`*`, an exact path, or a `/prefix/*` that also matches `/prefix`).
+ *
+ * @param a - one Hono-style pattern
+ * @param b - the other
+ */
+export const middleware_paths_overlap = (a: string, b: string): boolean => {
+	if (a === '*' || b === '*') return true;
+	// a `/prefix/*` pattern's shortest match is the bare `/prefix` (`/*` → ``)
+	const base = (pattern: string): string =>
+		pattern.endsWith('/*') ? pattern.slice(0, -2) : pattern;
+	return middleware_applies(a, base(b)) || middleware_applies(b, base(a));
+};
+
+/**
+ * Check if a middleware layer runs on a route path: its `path` pattern
+ * applies (`middleware_applies`) and none of its `carve_outs` does.
+ *
+ * @param spec - the layer's `path` and optional `carve_outs`
+ * @param route_path - the route path to check
+ */
+export const middleware_spec_applies = (
+	spec: {
+		readonly path: string;
+		readonly carve_outs?: ReadonlyArray<{ readonly path: string }> | null;
+	},
+	route_path: string
+): boolean =>
+	middleware_applies(spec.path, route_path) &&
+	!(spec.carve_outs ?? []).some((carve_out) => middleware_applies(carve_out.path, route_path));
+
+/**
  * Merge auto-derived, middleware, and explicit error schemas for a route spec.
  *
  * Merge order: derived -> middleware -> explicit route errors.
  * Later layers override earlier ones for the same status code.
  *
- * @param spec - the route spec (needs `auth`, `input`, `params`, `rate_limit`, `errors`)
+ * @param spec - the route spec (reads `method`, `auth`, `input`, `params`, `query`, `rate_limit`, `errors`)
  * @param middleware_errors - errors contributed by middleware whose path matches the route
  * @returns merged error schemas, or `null` if empty
  */
 export const merge_error_schemas = (
 	spec: {
+		method: RouteMethod;
 		auth: RouteAuth;
 		input: z.ZodType;
 		params?: z.ZodObject;
@@ -122,7 +288,8 @@ export const merge_error_schemas = (
 		has_input: !is_null_schema(spec.input),
 		has_params: !!spec.params,
 		has_query: !!spec.query,
-		rate_limit: spec.rate_limit
+		rate_limit: spec.rate_limit,
+		checks_content_type: spec.method === 'POST'
 	});
 	const merged = { ...derived, ...middleware_errors, ...spec.errors };
 	return Object.keys(merged).length > 0 ? merged : null;

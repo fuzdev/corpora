@@ -1,8 +1,15 @@
 import { test, assert } from 'vitest';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 
-import { default_variables } from '$lib/variables.ts';
-import { StyleVariable } from '$lib/variable.ts';
-import { PALETTE_CHROMA_MULTIPLIERS } from '$lib/ramps.ts';
+import { default_variables } from '#lib/variables.ts';
+import { INTERNAL_VARIABLE_NAME_MATCHER, StyleVariable } from '#lib/variable.ts';
+import {
+	PALETTE_CHROMA_MULTIPLIERS,
+	to_chroma_shape_name,
+	to_lightness_stop_name,
+	to_palette_chroma_name
+} from '#lib/ramps.ts';
+import { theme_knobs } from '#lib/knobs.ts';
 import {
 	palette_variants,
 	intent_variants,
@@ -16,16 +23,71 @@ import {
 	border_width_variants,
 	icon_size_variants,
 	shadow_size_variants,
-	shadow_variant_prefixes
-} from '$lib/variable_data.ts';
+	shadow_variant_prefixes,
+	BORDER_RADII,
+	FONT_SIZES,
+	TYPE_SCALE_RATIO
+} from '#lib/variable_data.ts';
 
 test('all variables pass schema validation', () => {
 	for (const v of default_variables) {
-		const result = StyleVariable.safeParse(v);
+		// a theme can't name an intermediate (see below), so its shape is
+		// checked under the public spelling
+		const internal = INTERNAL_VARIABLE_NAME_MATCHER.test(v.name);
+		const result = s.parse(StyleVariable, internal ? { ...v, name: v.name.slice(1) } : v);
 		assert.isTrue(
-			result.success,
-			`variable "${v.name}" failed validation: ${JSON.stringify(result.error?.issues)}`
+			result.ok,
+			`variable "${v.name}" failed validation: ${result.ok ? '' : JSON.stringify(result.issues)}`
 		);
+	}
+});
+
+test('the internal variables are exactly the ramp intermediates', () => {
+	const internal = default_variables
+		.map((v) => v.name)
+		.filter((name) => INTERNAL_VARIABLE_NAME_MATCHER.test(name));
+	const expected = [
+		...(['palette', 'shade', 'text'] as const).flatMap((family) =>
+			numeric_scale_variants.slice(1, -1).map((stop) => `_${family}_lightness_${stop}`)
+		),
+		...numeric_scale_variants.flatMap((stop) => [
+			`_chroma_shape_${stop}`,
+			`_palette_chroma_${stop}`
+		])
+	];
+	assert.sameMembers(internal, expected);
+	// the name helpers build the same spellings, keeping the endpoints public
+	assert.sameMembers(
+		[
+			...(['palette', 'shade', 'text'] as const).flatMap((family) =>
+				numeric_scale_variants.map((stop) => to_lightness_stop_name(family, stop))
+			),
+			...numeric_scale_variants.flatMap((stop) => [
+				to_chroma_shape_name(stop),
+				to_palette_chroma_name(stop)
+			])
+		],
+		[
+			...expected,
+			...(['palette', 'shade', 'text'] as const).flatMap((family) => [
+				`${family}_lightness_00`,
+				`${family}_lightness_100`
+			])
+		]
+	);
+});
+
+test('a theme can carry no intermediate', () => {
+	// the defaults' own declarations included - the derived data carries them
+	for (const v of default_variables) {
+		if (!INTERNAL_VARIABLE_NAME_MATCHER.test(v.name)) continue;
+		assert.isFalse(s.parse(StyleVariable, v).ok, v.name);
+	}
+});
+
+test('no theme knob is an intermediate', () => {
+	for (const knob of theme_knobs) {
+		assert.notMatch(knob.name, INTERNAL_VARIABLE_NAME_MATCHER, knob.name);
 	}
 });
 
@@ -37,6 +99,15 @@ test('variables have no duplicates', () => {
 			`variable "${v.name}" is duplicated in \`default_variables\``
 		);
 		names.add(v.name);
+	}
+});
+
+test('every var() reference names a declared variable', () => {
+	const names = new Set(default_variables.map((v) => v.name));
+	for (const v of default_variables) {
+		for (const match of `${v.base ?? ''} ${v.dark ?? ''}`.matchAll(/var\(\s*--([\w-]+)/g)) {
+			assert.isTrue(names.has(match[1]!), `${v.name} references --${match[1]}`);
+		}
 	}
 });
 
@@ -57,22 +128,21 @@ test('the loop-built families cover every variant list', () => {
 			...numeric_scale_variants.map((stop) => `${intent}_${stop}`)
 		]),
 		...numeric_scale_variants.flatMap((stop) => [
-			`chroma_shape_${stop}`,
-			`palette_chroma_${stop}`,
+			`_chroma_shape_${stop}`,
+			`_palette_chroma_${stop}`,
 			`shade_${stop}`,
 			`text_${stop}`,
 			`darken_${stop}`,
 			`lighten_${stop}`,
-			`fg_${stop}`,
-			`bg_${stop}`,
+			`ink_${stop}`,
+			`paper_${stop}`,
 			`border_color_${stop}`,
 			`shadow_alpha_${stop}`
 		]),
-		...(['palette', 'shade', 'text'] as const).flatMap((family) =>
-			['00', '100', 'curve', ...numeric_scale_variants.slice(1, -1)].map(
-				(stop) => `${family}_lightness_${stop}`
-			)
-		),
+		...(['palette', 'shade', 'text'] as const).flatMap((family) => [
+			...['00', '100', 'curve'].map((stop) => `${family}_lightness_${stop}`),
+			...numeric_scale_variants.slice(1, -1).map((stop) => `_${family}_lightness_${stop}`)
+		]),
 		...font_size_variants.map((size) => `font_size_${size}`),
 		...line_height_variants.map((size) => `line_height_${size}`),
 		...space_variants.map((size) => `space_${size}`),
@@ -96,13 +166,13 @@ test('per-slot chroma multiplier defaults pin the numeric twin', () => {
 	for (const letter of palette_variants) {
 		const v = by_name.get(`palette_${letter}_chroma_scale`);
 		assert(v, `palette_${letter}_chroma_scale is declared`);
-		assert.strictEqual(v.light, String(PALETTE_CHROMA_MULTIPLIERS[letter]), v.name);
+		assert.strictEqual(v.base, String(PALETTE_CHROMA_MULTIPLIERS[letter]), v.name);
 		assert.isUndefined(v.dark, `${v.name} is scheme-agnostic`);
 	}
 	for (const intent of intent_variants) {
 		const v = by_name.get(`${intent}_chroma_scale`);
 		assert(v, `${intent}_chroma_scale is declared`);
-		assert.strictEqual(v.light, '1', v.name);
+		assert.strictEqual(v.base, '1', v.name);
 	}
 });
 
@@ -115,6 +185,45 @@ test('intent hue defaults agree with palette_glosses bindings', () => {
 		if (!gloss.binding) continue;
 		const v = by_name.get(`hue_${gloss.binding}`);
 		assert(v, `hue_${gloss.binding} is declared`);
-		assert.strictEqual(v.light, `var(--hue_${letter})`, v.name);
+		assert.strictEqual(v.base, `var(--hue_${letter})`, v.name);
 	}
+});
+
+test('font sizes follow the size scale, and above md the type scale ratio, matching the fitted table', () => {
+	const by_name = new Map(default_variables.map((v) => [v.name, v]));
+	assert.strictEqual(by_name.get('type_scale_ratio')?.base, String(TYPE_SCALE_RATIO));
+	assert.strictEqual(by_name.get('font_size_scale')?.base, '1');
+	const base = font_size_variants.indexOf('md');
+	for (const [i, size] of font_size_variants.entries()) {
+		const light = by_name.get(`font_size_${size}`)?.base;
+		const step = i - base;
+		if (step > 0) {
+			assert.strictEqual(
+				light,
+				`calc(${FONT_SIZES.md}rem * var(--font_size_scale) * pow(var(--type_scale_ratio), ${step}))`
+			);
+			// the numeric twin can't drift from what the derived default computes
+			assert.strictEqual(
+				(FONT_SIZES.md * TYPE_SCALE_RATIO ** step).toFixed(2),
+				FONT_SIZES[size].toFixed(2),
+				`font_size_${size}`
+			);
+		} else {
+			// body and smaller text take the size scale only, out of the ratio's reach
+			assert.strictEqual(light, `calc(${FONT_SIZES[size]}rem * var(--font_size_scale))`);
+		}
+	}
+});
+
+test('border radii scale per tier over a floor, and controls read their own radius', () => {
+	const by_name = new Map(default_variables.map((v) => [v.name, v]));
+	// a length, since `max()` can't compare a unitless 0 against the rem tiers
+	assert.strictEqual(by_name.get('border_radius_min')?.base, '0rem');
+	for (const size of border_radius_variants) {
+		assert.strictEqual(
+			by_name.get(`border_radius_${size}`)?.base,
+			`max(var(--border_radius_min), calc(${BORDER_RADII[size]}rem * var(--radius_scale)))`
+		);
+	}
+	assert.strictEqual(by_name.get('control_radius')?.base, 'var(--border_radius_sm)');
 });

@@ -12,7 +12,7 @@
 import { test, assert, describe } from 'vitest';
 import { join } from 'node:path';
 
-import { loadFile, globFiles, deriveIncludePatterns } from '$lib/files.ts';
+import { loadFile, globFiles, deriveIncludePatterns } from '#lib/files.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -99,6 +99,29 @@ describe('globFiles', () => {
 				assert.ok(files.some((f) => f.id.endsWith('foo.ts')));
 				assert.ok(files.some((f) => f.id.endsWith('bar.ts')));
 				assert.ok(files.some((f) => f.id.endsWith('baz.ts')));
+			}
+		);
+	});
+
+	test('returns files in compareStrings order across include groups', async () => {
+		await withTestProject(
+			{
+				'src/routes/a.ts': 'export const a = 1;',
+				'src/lib/z/b.ts': 'export const b = 2;',
+				'src/lib/Z.ts': 'export const z = 3;',
+				'src/lib/a.ts': 'export const a = 4;'
+			},
+			async (projectRoot) => {
+				// the routes group is globbed first, but sorting spans every group
+				const files = await globFiles({
+					projectRoot,
+					include: ['src/routes/**/*.ts', 'src/lib/**/*.ts']
+				});
+
+				assert.deepStrictEqual(
+					files.map((f) => f.id.slice(projectRoot.length + 1)),
+					['src/lib/a.ts', 'src/lib/Z.ts', 'src/lib/z/b.ts', 'src/routes/a.ts']
+				);
 			}
 		);
 	});
@@ -228,7 +251,7 @@ describe('globFiles', () => {
 		});
 	});
 
-	// Trip-wire: `globFiles` uses `map_concurrent` with `MAX_FILE_CONCURRENCY = 100`.
+	// Trip-wire: `globFiles` uses `mapConcurrent` with `MAX_FILE_CONCURRENCY = 100`.
 	// A previous unbounded `Promise.all` could trip `EMFILE` on large projects;
 	// the bound prevents that. This test just verifies the bound doesn't break
 	// loading more than 100 files.
@@ -320,11 +343,11 @@ describe('globFiles baseline exclusions', () => {
 describe('deriveIncludePatterns', () => {
 	test('builds one glob per source path', () => {
 		assert.deepStrictEqual(deriveIncludePatterns(['packages/foo']), [
-			'packages/foo/**/*.{ts,js,svelte,css,json}'
+			'packages/foo/**/*.{ts,mts,tsx,js,mjs,jsx,svelte,css,json}'
 		]);
 		assert.deepStrictEqual(deriveIncludePatterns(['src/lib', 'src/routes']), [
-			'src/lib/**/*.{ts,js,svelte,css,json}',
-			'src/routes/**/*.{ts,js,svelte,css,json}'
+			'src/lib/**/*.{ts,mts,tsx,js,mjs,jsx,svelte,css,json}',
+			'src/routes/**/*.{ts,mts,tsx,js,mjs,jsx,svelte,css,json}'
 		]);
 	});
 
@@ -336,6 +359,8 @@ describe('deriveIncludePatterns', () => {
 		// a leading slash would make tinyglobby treat the pattern as absolute
 		// from the filesystem root — `sourcePaths: ['']` (or a normalized `'.'`)
 		// must glob the project root instead
-		assert.deepStrictEqual(deriveIncludePatterns(['']), ['**/*.{ts,js,svelte,css,json}']);
+		assert.deepStrictEqual(deriveIncludePatterns(['']), [
+			'**/*.{ts,mts,tsx,js,mjs,jsx,svelte,css,json}'
+		]);
 	});
 });

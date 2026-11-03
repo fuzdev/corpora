@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
 import LineChart from '../charts/LineChart/LineChart.svelte';
+import TooltipLockHarness from '$lib/tests/TooltipLockHarness.svelte';
+import TooltipFacetHarness from '$lib/tests/TooltipFacetHarness.svelte';
 
 const data = [
   { date: 0, value: 10 },
@@ -21,15 +23,77 @@ const baseProps = {
 };
 
 /** Dispatch pointer events to trigger the tooltip on a given element */
-function triggerTooltip(el: Element, position?: { clientX: number; clientY: number }) {
+function triggerTooltip(
+  el: Element,
+  position?: { clientX: number; clientY: number },
+  pointerType?: string
+) {
   const rect = el.getBoundingClientRect();
   const eventInit = {
     bubbles: true,
     clientX: position?.clientX ?? rect.x + rect.width / 2,
     clientY: position?.clientY ?? rect.y + rect.height / 2,
+    pointerType,
   };
   el.dispatchEvent(new PointerEvent('pointerenter', eventInit));
   el.dispatchEvent(new PointerEvent('pointermove', eventInit));
+}
+
+/**
+ * Trigger the tooltip and wait for `assertion` to pass, re-dispatching the pointer events on
+ * every poll.
+ *
+ * Test files share a single browser, and therefore a single real cursor.  When a chart mounts
+ * underneath that cursor the browser fires its own `pointerenter`, which shows the tooltip at the
+ * cursor position instead of the position under test.  Under load that real event can arrive after
+ * the synthetic ones, so re-dispatching keeps the tooltip at the position being asserted.
+ */
+async function waitForTooltip(
+  el: Element,
+  position: { clientX: number; clientY: number } | undefined,
+  assertion: () => void,
+  pointerType?: string
+) {
+  await vi.waitFor(() => {
+    triggerTooltip(el, position, pointerType);
+    assertion();
+  });
+}
+
+/**
+ * The tooltip root is portaled to `document.body`, outside the render container, so a root whose
+ * fade transition outlives its test would be the first match in the body.  Clear any leftovers
+ * before each test and read the most recently portaled root.
+ */
+beforeEach(() => {
+  document.body.querySelectorAll('.lc-tooltip-root').forEach((el) => el.remove());
+});
+
+function getTooltipRoot(target: ParentNode = document.body) {
+  const roots = target.querySelectorAll<HTMLElement>('.lc-tooltip-root');
+  return roots.length ? roots[roots.length - 1] : null;
+}
+
+/**
+ * Pinch-zoom shrinks and pans the visible viewport inside the layout viewport, which
+ * `innerWidth` / `innerHeight` don't reflect.  Stubbed, since a test can't pinch.
+ *
+ * `rect` is relative to the layout viewport, which is where Chromium keeps `scrollX` / `scrollY`.
+ */
+function stubVisualViewport(rect: { left: number; top: number; width: number; height: number }) {
+  const visualViewport = Object.assign(new EventTarget(), {
+    offsetLeft: rect.left,
+    offsetTop: rect.top,
+    pageLeft: window.scrollX + rect.left,
+    pageTop: window.scrollY + rect.top,
+    width: rect.width,
+    height: rect.height,
+  });
+  vi.stubGlobal('visualViewport', visualViewport);
+  onTestFinished(() => {
+    vi.unstubAllGlobals();
+  });
+  return visualViewport;
 }
 
 describe('Tooltip', () => {
@@ -41,11 +105,9 @@ describe('Tooltip', () => {
 
       const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
       await expect.element(tooltipCtx).toBeInTheDocument();
-      triggerTooltip(tooltipCtx);
-
-      await vi.waitFor(() => {
+      await waitForTooltip(tooltipCtx, undefined, () => {
         // Tooltip root should be portaled to body (outside the chart container)
-        const tooltipInBody = document.body.querySelector('.lc-tooltip-root');
+        const tooltipInBody = getTooltipRoot();
         expect(tooltipInBody).not.toBeNull();
 
         // Should use fixed positioning when portaled
@@ -64,11 +126,9 @@ describe('Tooltip', () => {
 
       const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
       await expect.element(tooltipCtx).toBeInTheDocument();
-      triggerTooltip(tooltipCtx);
-
-      await vi.waitFor(() => {
+      await waitForTooltip(tooltipCtx, undefined, () => {
         // Tooltip root should be inside the chart container
-        const tooltipInContainer = container.querySelector('.lc-tooltip-root');
+        const tooltipInContainer = getTooltipRoot(container);
         expect(tooltipInContainer).not.toBeNull();
 
         // Should use absolute positioning when not portaled
@@ -93,10 +153,8 @@ describe('Tooltip', () => {
 
         const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
         await expect.element(tooltipCtx).toBeInTheDocument();
-        triggerTooltip(tooltipCtx);
-
-        await vi.waitFor(() => {
-          const tooltipInTarget = portalTarget.querySelector('.lc-tooltip-root');
+        await waitForTooltip(tooltipCtx, undefined, () => {
+          const tooltipInTarget = getTooltipRoot(portalTarget);
           expect(tooltipInTarget).not.toBeNull();
         });
       } finally {
@@ -111,10 +169,8 @@ describe('Tooltip', () => {
 
       const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
       await expect.element(tooltipCtx).toBeInTheDocument();
-      triggerTooltip(tooltipCtx);
-
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root');
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        const tooltipRoot = getTooltipRoot();
         expect(tooltipRoot).not.toBeNull();
 
         // Should contain tooltip content (items from default tooltip)
@@ -130,10 +186,8 @@ describe('Tooltip', () => {
 
       const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
       await expect.element(tooltipCtx).toBeInTheDocument();
-      triggerTooltip(tooltipCtx);
-
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        const tooltipRoot = getTooltipRoot()!;
         expect(tooltipRoot).not.toBeNull();
 
         // Should have valid pixel positions (not NaN or empty)
@@ -156,22 +210,21 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the right edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.right - 5,
-        clientY: ctxRect.top + ctxRect.height / 2,
-      });
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.right - 5, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
-
-        const tooltipLeft = parseFloat(tooltipRoot.style.left);
-        // Tooltip should be positioned to the LEFT of the pointer (flipped),
-        // so its left edge should be less than the pointer position
-        expect(tooltipLeft).toBeLessThan(ctxRect.right - 5);
-        // And specifically, the tooltip's right edge should not exceed the container
-        expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(ctxRect.right + 1);
-      });
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          // Tooltip should be positioned to the LEFT of the pointer (flipped),
+          // so its left edge should be less than the pointer position
+          expect(tooltipLeft).toBeLessThan(ctxRect.right - 5);
+          // And specifically, the tooltip's right edge should not exceed the container
+          expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(ctxRect.right + 1);
+        }
+      );
     });
 
     it('should flip tooltip right when pointer is near the left edge', async () => {
@@ -187,20 +240,19 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the left edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.left + 5,
-        clientY: ctxRect.top + ctxRect.height / 2,
-      });
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + 5, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
-
-        const tooltipLeft = parseFloat(tooltipRoot.style.left);
-        // Tooltip should be positioned to the RIGHT of the pointer (flipped),
-        // so its left edge should be >= the container's left edge
-        expect(tooltipLeft).toBeGreaterThanOrEqual(ctxRect.left - 1);
-      });
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          // Tooltip should be positioned to the RIGHT of the pointer (flipped),
+          // so its left edge should be >= the container's left edge
+          expect(tooltipLeft).toBeGreaterThanOrEqual(ctxRect.left - 1);
+        }
+      );
     });
 
     it('should flip tooltip up when pointer is near the bottom edge', async () => {
@@ -213,20 +265,19 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the bottom edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.left + ctxRect.width / 2,
-        clientY: ctxRect.bottom - 5,
-      });
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.bottom - 5 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
-
-        const tooltipTop = parseFloat(tooltipRoot.style.top);
-        // Tooltip should be positioned ABOVE the pointer (flipped),
-        // so its bottom edge should not exceed the container
-        expect(tooltipTop + tooltipRoot.offsetHeight).toBeLessThanOrEqual(ctxRect.bottom + 1);
-      });
+          const tooltipTop = parseFloat(tooltipRoot.style.top);
+          // Tooltip should be positioned ABOVE the pointer (flipped),
+          // so its bottom edge should not exceed the container
+          expect(tooltipTop + tooltipRoot.offsetHeight).toBeLessThanOrEqual(ctxRect.bottom + 1);
+        }
+      );
     });
 
     it('should flip tooltip down when pointer is near the top edge', async () => {
@@ -242,19 +293,151 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the top edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.left + ctxRect.width / 2,
-        clientY: ctxRect.top + 5,
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + 5 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipTop = parseFloat(tooltipRoot.style.top);
+          // Tooltip should be positioned BELOW the pointer (flipped),
+          // so its top edge should be >= the container's top
+          expect(tooltipTop).toBeGreaterThanOrEqual(ctxRect.top - 1);
+        }
+      );
+    });
+
+    /**
+     * A start-aligned tooltip that doesn't fit on the right flips to the left of the pointer, but
+     * nothing checked the left edge after the flip, so a tooltip wider than about half the chart
+     * opened past it.
+     */
+    it.each([
+      { portal: true, label: 'portaled' },
+      { portal: false, label: 'inline' },
+    ])('should keep a flipped tooltip inside the left edge ($label)', async ({ portal }) => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { portal, props: { root: { style: 'width: 300px' } } } } },
+        },
       });
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      // Too close to the right edge to fit on the right, and to the left edge once flipped
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRect = getTooltipRoot(portal ? document.body : container)!.getBoundingClientRect(); // prettier-ignore
+          expect(tooltipRect.left).toBeGreaterThanOrEqual(ctxRect.left - 1);
+          expect(tooltipRect.right).toBeLessThanOrEqual(ctxRect.left + 400);
+        }
+      );
+    });
+
+    it('should keep a flipped tooltip inside the top edge', async () => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { props: { root: { style: 'height: 220px' } } } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRect = getTooltipRoot()!.getBoundingClientRect();
+          expect(tooltipRect.top).toBeGreaterThanOrEqual(ctxRect.top - 1);
+        }
+      );
+    });
+    it('should stay within the visible viewport when pinch-zoomed', async () => {
+      const { container } = render(LineChart, { props: baseProps });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+
+      // Zoomed into the left part of the page, its right edge partway across the chart
+      const visibleRight = ctxRect.left + ctxRect.width / 2;
+      stubVisualViewport({ left: 0, top: 0, width: visibleRight, height: window.innerHeight });
+
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: visibleRight - 10, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(visibleRight + 1);
+        }
+      );
+    });
+
+    it('should stay on screen when wider than the chart', async () => {
+      // A narrow chart near the right edge of the screen (ex. a phone), with room to its left
+      document.body.style.paddingLeft = '200px';
+      onTestFinished(() => {
+        document.body.style.paddingLeft = '';
+      });
+
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          width: 200,
+          props: { tooltip: { root: { props: { root: { style: 'width: 300px' } } } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+
+      const visibleRight = ctxRect.right + 20;
+      stubVisualViewport({ left: 0, top: 0, width: visibleRight, height: window.innerHeight });
+
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.right - 5, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+          expect(tooltipRoot.offsetWidth).toBe(300);
+
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          expect(tooltipLeft).toBeGreaterThanOrEqual(-1);
+          expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(visibleRight + 1);
+        }
+      );
+    });
+
+    it('should stay beside a chart that is scrolled out of view', async () => {
+      const { container } = render(LineChart, { props: baseProps });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+
+      // Scrolled well past the chart (ex. one driven by a chart group)
+      stubVisualViewport({ left: 0, top: ctxRect.bottom + 500, width: 400, height: 400 });
+
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        const tooltipRoot = getTooltipRoot()!;
         expect(tooltipRoot).not.toBeNull();
 
         const tooltipTop = parseFloat(tooltipRoot.style.top);
-        // Tooltip should be positioned BELOW the pointer (flipped),
-        // so its top edge should be >= the container's top
-        expect(tooltipTop).toBeGreaterThanOrEqual(ctxRect.top - 1);
+        expect(tooltipTop + tooltipRoot.offsetHeight).toBeLessThanOrEqual(ctxRect.bottom + 1);
       });
     });
   });
@@ -273,18 +456,81 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the right edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.right - 5,
-        clientY: ctxRect.top + ctxRect.height / 2,
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.right - 5, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          // Tooltip should not overflow the right side of the viewport
+          expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(window.innerWidth + 1);
+        }
+      );
+    });
+
+    it('should stay within the visible viewport when pinch-zoomed', async () => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { contained: 'window' as const } } },
+        },
       });
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
 
-        const tooltipLeft = parseFloat(tooltipRoot.style.left);
-        // Tooltip should not overflow the right side of the viewport
-        expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(window.innerWidth + 1);
+      // Zoomed into the left part of the page, its right edge partway across the chart
+      const visibleRight = ctxRect.left + ctxRect.width / 2;
+      stubVisualViewport({ left: 0, top: 0, width: visibleRight, height: window.innerHeight });
+
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: visibleRight - 10, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          expect(tooltipLeft + tooltipRoot.offsetWidth).toBeLessThanOrEqual(visibleRight + 1);
+        }
+      );
+    });
+
+    it('should follow a pinch without the portal', async () => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { contained: 'window' as const, portal: false } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+
+      const visualViewport = stubVisualViewport({
+        left: 0,
+        top: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + 20 };
+      await waitForTooltip(tooltipCtx, pointer, () => {
+        expect(getTooltipRoot(container)).not.toBeNull();
+      });
+
+      // Zoom in until the visible right edge is just past the pointer, with no pointer event
+      const visibleRight = pointer.clientX + 20;
+      visualViewport.width = visibleRight;
+      visualViewport.dispatchEvent(new Event('resize'));
+
+      await vi.waitFor(() => {
+        const tooltipRect = getTooltipRoot(container)!.getBoundingClientRect();
+        expect(tooltipRect.right).toBeLessThanOrEqual(visibleRight + 1);
       });
     });
 
@@ -301,19 +547,52 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the bottom edge of the container
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.left + ctxRect.width / 2,
-        clientY: ctxRect.bottom - 5,
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.bottom - 5 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipTop = parseFloat(tooltipRoot.style.top);
+          // Tooltip should not overflow the bottom of the viewport
+          expect(tooltipTop + tooltipRoot.offsetHeight).toBeLessThanOrEqual(window.innerHeight + 1);
+        }
+      );
+    });
+
+    it('should keep a flipped tooltip inside the left side of the viewport', async () => {
+      // Pointer near the chart's left edge, with a tooltip too wide to fit on its right in the
+      // viewport, and on its left once flipped
+      const pointerOffset = 30;
+      const width = window.innerWidth - pointerOffset;
+
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: {
+            tooltip: {
+              root: {
+                contained: 'window' as const,
+                props: { root: { style: `width: ${width}px` } },
+              },
+            },
+          },
+        },
       });
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
 
-        const tooltipTop = parseFloat(tooltipRoot.style.top);
-        // Tooltip should not overflow the bottom of the viewport
-        expect(tooltipTop + tooltipRoot.offsetHeight).toBeLessThanOrEqual(window.innerHeight + 1);
-      });
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.left + pointerOffset, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRect = getTooltipRoot()!.getBoundingClientRect();
+          expect(tooltipRect.left).toBeGreaterThanOrEqual(-1);
+        }
+      );
     });
   });
 
@@ -331,22 +610,307 @@ describe('Tooltip', () => {
 
       const ctxRect = tooltipCtx.getBoundingClientRect();
       // Trigger near the right edge — tooltip should NOT flip
-      triggerTooltip(tooltipCtx, {
-        clientX: ctxRect.right - 5,
-        clientY: ctxRect.top + ctxRect.height / 2,
+      await waitForTooltip(
+        tooltipCtx,
+        { clientX: ctxRect.right - 5, clientY: ctxRect.top + ctxRect.height / 2 },
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const tooltipLeft = parseFloat(tooltipRoot.style.left);
+          // With default anchor='top-left', tooltip is placed to the right of pointer.
+          // Since contained=false, the tooltip left should be near/past the pointer x
+          // (i.e., it doesn't flip like contained="container" would)
+          const pointerViewportX = ctxRect.right - 5;
+          expect(tooltipLeft).toBeGreaterThanOrEqual(pointerViewportX - 1);
+        }
+      );
+    });
+  });
+
+  describe('locked', () => {
+    /** Dispatch the boundary events of a tap.  On touch the pointer leaves before `click` fires. */
+    function tap(el: Element) {
+      const rect = el.getBoundingClientRect();
+      const eventInit = {
+        bubbles: true,
+        clientX: rect.x + rect.width / 2,
+        clientY: rect.y + rect.height / 2,
+      };
+      el.dispatchEvent(new PointerEvent('pointerenter', eventInit));
+      el.dispatchEvent(new PointerEvent('pointerleave', eventInit));
+      el.dispatchEvent(new MouseEvent('click', eventInit));
+    }
+
+    /**
+     * `pointerleave` schedules a hide, then `click` locks the tooltip.  The scheduled hide used to
+     * clear the data regardless, leaving the tooltip locked and empty, and the root `onclick`
+     * (which needs data) could no longer unlock it.
+     */
+    it('should keep a tooltip pinned by a tap, and hide it once unpinned', async () => {
+      const { container } = render(TooltipLockHarness, { props: { data } });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      const lockedEl = container.querySelector('.locked') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        expect(getTooltipRoot()).not.toBeNull();
       });
 
-      await vi.waitFor(() => {
-        const tooltipRoot = document.body.querySelector('.lc-tooltip-root') as HTMLElement;
-        expect(tooltipRoot).not.toBeNull();
+      tap(tooltipCtx);
+      await expect.element(lockedEl).toHaveTextContent('true');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(getTooltipRoot(), 'should stay visible while pinned').not.toBeNull();
 
-        const tooltipLeft = parseFloat(tooltipRoot.style.left);
-        // With default anchor='top-left', tooltip is placed to the right of pointer.
-        // Since contained=false, the tooltip left should be near/past the pointer x
-        // (i.e., it doesn't flip like contained="container" would)
-        const pointerViewportX = ctxRect.right - 5;
-        expect(tooltipLeft).toBeGreaterThanOrEqual(pointerViewportX - 1);
+      // The pointer has already left when `click` unpins it, so nothing else would hide it
+      tap(tooltipCtx);
+      await expect.element(lockedEl).toHaveTextContent('false');
+      await vi.waitFor(() => expect(getTooltipRoot()).toBeNull());
+    });
+
+    it('should hide once unlocked if the pointer left while locked', async () => {
+      const { container, rerender } = render(TooltipLockHarness, { props: { data } });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      const lockedEl = container.querySelector('.locked') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        expect(getTooltipRoot()).not.toBeNull();
       });
+
+      // Click while hovering (mouse), then leave
+      tooltipCtx.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await expect.element(lockedEl).toHaveTextContent('true');
+      tooltipCtx.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(getTooltipRoot(), 'should stay visible while locked').not.toBeNull();
+
+      // Unlocked from outside the chart
+      rerender({ locked: false });
+      await vi.waitFor(() => expect(getTooltipRoot()).toBeNull());
+    });
+  });
+
+  describe('touch', () => {
+    /**
+     * WebKit (every iOS browser) measures client coordinates from the visual viewport, and moves
+     * `scrollX` / `scrollY` with it, while `position: fixed` stays on the layout viewport.
+     */
+    it('should stay over the finger when pinch-zoomed in WebKit', async () => {
+      const { container } = render(LineChart, { props: baseProps });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+
+      // Zoomed in and panned 30px right and 20px down within the layout viewport
+      const pan = { x: 30, y: 20 };
+      stubVisualViewport({
+        left: pan.x,
+        top: pan.y,
+        width: window.innerWidth - pan.x,
+        height: window.innerHeight - pan.y,
+      });
+      vi.stubGlobal('scrollX', window.scrollX + pan.x);
+      vi.stubGlobal('scrollY', window.scrollY + pan.y);
+
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.bottom - 20 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          // Placed in layout viewport coordinates, so offset by the pan from the client position
+          const top = parseFloat(tooltipRoot.style.top);
+          const left = parseFloat(tooltipRoot.style.left);
+          expect(top + tooltipRoot.offsetHeight).toBeCloseTo(pointer.clientY + pan.y - 32, 0);
+          expect(left + tooltipRoot.offsetWidth / 2).toBeCloseTo(pointer.clientX + pan.x, 0);
+        },
+        'touch'
+      );
+    });
+
+    it.each(['touch', 'pen'])('should sit centered above a %s', async (pointerType) => {
+      const { container } = render(LineChart, { props: baseProps });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.bottom - 20 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const top = parseFloat(tooltipRoot.style.top);
+          const left = parseFloat(tooltipRoot.style.left);
+          expect(top + tooltipRoot.offsetHeight).toBeCloseTo(pointer.clientY - 32, 0);
+          expect(left + tooltipRoot.offsetWidth / 2).toBeCloseTo(pointer.clientX, 0);
+        },
+        pointerType
+      );
+    });
+
+    it('should rise above the chart rather than flip under a finger near the top', async () => {
+      // Room above the chart, so only the container (not the viewport) would force a flip
+      document.body.style.paddingTop = '200px';
+      onTestFinished(() => {
+        document.body.style.paddingTop = '';
+      });
+
+      const { container } = render(LineChart, { props: baseProps });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + 5 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const top = parseFloat(tooltipRoot.style.top);
+          expect(top + tooltipRoot.offsetHeight).toBeCloseTo(pointer.clientY - 32, 0);
+        },
+        'touch'
+      );
+    });
+
+    it('should rise above the chart with `contained="window"`', async () => {
+      // Room above the chart, so only the viewport would force a flip
+      document.body.style.paddingTop = '200px';
+      onTestFinished(() => {
+        document.body.style.paddingTop = '';
+      });
+
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { contained: 'window' as const } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 2, clientY: ctxRect.top + 5 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          const top = parseFloat(tooltipRoot.style.top);
+          const left = parseFloat(tooltipRoot.style.left);
+          expect(top + tooltipRoot.offsetHeight).toBeCloseTo(pointer.clientY - 32, 0);
+          expect(left + tooltipRoot.offsetWidth / 2).toBeCloseTo(pointer.clientX, 0);
+        },
+        'touch'
+      );
+    });
+
+    it('should rise above the chart for each `facetAll` panel', async () => {
+      document.body.style.paddingTop = '200px';
+      onTestFinished(() => {
+        document.body.style.paddingTop = '';
+      });
+
+      // Every panel peaks at the middle date, so each point there sits at the top of its panel
+      const facetData = ['A', 'B'].flatMap((region) =>
+        [10, 50, 100, 50, 10].map((value, date) => ({ date, value, region }))
+      );
+      const { container } = render(TooltipFacetHarness, { props: { data: facetData } });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      // The middle of the first panel
+      const pointer = { clientX: ctxRect.left + ctxRect.width / 4, clientY: ctxRect.top + 20 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const roots = [...document.body.querySelectorAll<HTMLElement>('.lc-tooltip-root')];
+          expect(roots).toHaveLength(2);
+          for (const root of roots) {
+            expect(parseFloat(root.style.top) + root.offsetHeight).toBeLessThan(ctxRect.top);
+          }
+        },
+        'touch'
+      );
+    });
+
+    it('should keep an explicit `anchor`', async () => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { anchor: 'top-left' as const } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+
+      const ctxRect = tooltipCtx.getBoundingClientRect();
+      const pointer = { clientX: ctxRect.left + 20, clientY: ctxRect.top + 20 };
+      await waitForTooltip(
+        tooltipCtx,
+        pointer,
+        () => {
+          const tooltipRoot = getTooltipRoot()!;
+          expect(tooltipRoot).not.toBeNull();
+
+          expect(parseFloat(tooltipRoot.style.top)).toBeCloseTo(pointer.clientY + 10, 0);
+          expect(parseFloat(tooltipRoot.style.left)).toBeCloseTo(pointer.clientX + 10, 0);
+        },
+        'touch'
+      );
+    });
+  });
+
+  describe('pointerEvents', () => {
+    /**
+     * With `pointerEvents` enabled the tooltip can be hovered, which sets
+     * `isHoveringTooltipContent` and makes the hide timer `TooltipContext` already scheduled a
+     * no-op.  Nothing else re-arms that timer, so leaving the tooltip anywhere other than back
+     * over the hit area used to strand it on screen indefinitely.
+     */
+    it('should hide after the pointer leaves an interactive tooltip', async () => {
+      const { container } = render(LineChart, {
+        props: {
+          ...baseProps,
+          props: { tooltip: { root: { pointerEvents: true } } },
+        },
+      });
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      await waitForTooltip(tooltipCtx, undefined, () => {
+        expect(getTooltipRoot()).not.toBeNull();
+      });
+
+      const tooltipRoot = getTooltipRoot()!;
+
+      // Move off the plot and onto the tooltip, which blocks the pending hide
+      tooltipCtx.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+      tooltipRoot.dispatchEvent(new PointerEvent('pointerenter', { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(getTooltipRoot(), 'should stay visible while hovered').not.toBeNull();
+
+      // Leaving the tooltip has to re-arm it
+      tooltipRoot.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+      await vi.waitFor(() => expect(getTooltipRoot()).toBeNull());
     });
   });
 });

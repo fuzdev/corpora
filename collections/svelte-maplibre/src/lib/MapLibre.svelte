@@ -2,13 +2,14 @@
   import { flush } from '$lib/flush.js';
   import { Box, createMapContext, setLayerEvent } from './context.svelte.js';
   import { getViewportHash, parseViewportHash } from './hash.js';
-  import maplibre, {
-    type CenterZoomBearing,
-    type LayerSpecification,
-    type LngLatBoundsLike,
-    type LngLatLike,
-    type SourceSpecification,
-    type FitBoundsOptions,
+  import * as maplibregl from 'maplibre-gl';
+  import type {
+    CenterZoomBearing,
+    LayerSpecification,
+    LngLatBoundsLike,
+    LngLatLike,
+    SourceSpecification,
+    FitBoundsOptions,
   } from 'maplibre-gl';
   import compare from 'just-compare';
   import 'maplibre-gl/dist/maplibre-gl.css';
@@ -46,6 +47,11 @@
     bounds?: LngLatBoundsLike | undefined;
     fitBoundsOptions?: FitBoundsOptions;
     projection?: maplibregl.ProjectionSpecification | undefined;
+    /** How many zoom levels past a source's `maxzoom` to overscale its tiles. Below that, tiles are
+     * split instead, which improves labeling at high zoom. Pass `null` to overscale at every zoom
+     * level, restoring the behavior from before MapLibre 6. Only applied when the map is created.
+     * @default 4 */
+    zoomLevelsToOverscale?: number | null;
     /** Set to true to track the map viewport in the URL hash. If the URL hash is set, that overrides initial viewport settings. */
     hash?: boolean;
     /** Update the URL when the hash changes, if `hash` is true.
@@ -69,7 +75,7 @@
     locale?: any;
     interactive?: boolean;
     /** Set false to hide the default attribution control, so you can add your own. */
-    attributionControl?: false | maplibre.AttributionControlOptions;
+    attributionControl?: false | maplibregl.AttributionControlOptions;
     /** Set true to require hitting ⌘/Ctrl while scrolling to zoom. Or use two fingers on phones. */
     cooperativeGestures?: boolean;
     /** Set to true if you want to export the map as an image */
@@ -102,13 +108,13 @@
     oncontextmenu?: (e: maplibregl.MapMouseEvent) => void;
     onmovestart?: (e: MapMoveEvent) => void;
     onmoveend?: (e: MapMoveEvent) => void;
-    onzoomstart?: (e: maplibregl.MapLibreZoomEvent) => void;
-    onzoom?: (e: maplibregl.MapLibreZoomEvent) => void;
-    onzoomend?: (e: maplibregl.MapLibreZoomEvent) => void;
-    onpitch?: (e: maplibregl.MapLibreEvent<MouseEvent | TouchEvent | undefined>) => void;
-    onrotate?: (e: maplibregl.MapLibreEvent<MouseEvent | TouchEvent | undefined>) => void;
+    onzoomstart?: (e: maplibregl.MapMovementEvent) => void;
+    onzoom?: (e: maplibregl.MapMovementEvent) => void;
+    onzoomend?: (e: maplibregl.MapMovementEvent) => void;
+    onpitch?: (e: maplibregl.MapMovementEvent) => void;
+    onrotate?: (e: maplibregl.MapMovementEvent) => void;
     onwheel?: (e: maplibregl.MapWheelEvent) => void;
-    ondata?: (e: maplibregl.MapDataEvent) => void;
+    ondata?: (e: maplibregl.MapSourceDataEvent | maplibregl.MapStyleDataEvent) => void;
     onstyleload?: (e: StyleLoadEvent) => void;
     onstyledata?: (e: maplibregl.MapStyleDataEvent) => void;
     onidle?: (e: maplibregl.MapLibreEvent) => void;
@@ -129,6 +135,7 @@
     fitBoundsOptions = {},
     hash = false,
     projection = undefined,
+    zoomLevelsToOverscale,
     updateHash = (url) => {
       window.history.replaceState(window.history.state, '', url);
     },
@@ -242,9 +249,9 @@
   let sourcesToReAddAfterStyleChange: Record<string, SourceSpecification> | undefined =
     $state(undefined);
 
-  function handleError(event: ErrorEvent) {
+  function handleError(event: ErrorEvent | maplibregl.ErrorEvent) {
     if (onerror) {
-      onerror(event);
+      onerror(event as Partial<ErrorEvent>);
     } else if (event.error.name !== 'AbortError') {
       // If there's no error handler, just log it to match the default behavior from MapLibre.
       // But skip AbortError since that's a normal thing that happens inside certain sources,
@@ -256,35 +263,49 @@
   function createMap(element: HTMLDivElement) {
     onHashChange();
 
-    map = mapContext.map = new maplibre.Map(
-      flush({
-        container: element,
-        style,
-        locale,
-        center,
-        zoom,
-        pitch,
-        bearing,
-        bearingSnap,
-        minZoom,
-        maxZoom,
-        minPitch,
-        maxPitch,
-        renderWorldCopies,
-        dragPan,
-        dragRotate,
-        pitchWithRotate,
-        antialias,
-        interactive,
-        preserveDrawingBuffer,
-        maxBounds,
-        bounds,
-        attributionControl,
-        transformRequest,
-        cooperativeGestures,
-        aroundCenter,
-      })
-    );
+    try {
+      map = mapContext.map = new maplibregl.Map({
+        ...flush({
+          container: element,
+          style,
+          locale,
+          center,
+          zoom,
+          pitch,
+          bearing,
+          bearingSnap,
+          minZoom,
+          maxZoom,
+          minPitch,
+          maxPitch,
+          renderWorldCopies,
+          dragPan,
+          dragRotate,
+          pitchWithRotate,
+          antialias,
+          interactive,
+          preserveDrawingBuffer,
+          maxBounds,
+          bounds,
+          attributionControl,
+          transformRequest,
+          cooperativeGestures,
+          aroundCenter,
+        }),
+        // MapLibre tells "absent" (overscale 4 levels) apart from an explicit `undefined`
+        // (overscale everything), and `flush` drops both, so this is applied outside it.
+        ...(zoomLevelsToOverscale === undefined
+          ? {}
+          : { zoomLevelsToOverscale: zoomLevelsToOverscale ?? undefined }),
+      });
+    } catch (e) {
+      // This is the only error we expect the constructor to throw
+      if (e instanceof maplibregl.GPUInitializationError) {
+        handleError(new ErrorEvent('GPUInitializationError', { error: e }));
+        return;
+      }
+      throw e;
+    }
 
     map.on('load', (e) => {
       e.target.getContainer().setAttribute('data-testid', 'map');
@@ -510,6 +531,16 @@
     }
   }
 </script>
+
+<!-- @component
+Create a MapLibre map. Put all other components of this library inside this component's children.
+
+This component makes the map context. Sources, layers, markers, popups and controls inside it use this context to find the map. The children render only after the map is created, and they receive `map`, `loaded`, `loadedImages`, and `allImagesLoaded`.
+
+`center`, `zoom`, `pitch`, `bearing`, and `bounds` are bindable. The component updates them when the map stops moving, and it moves the map when you change them. `map`, `mapContainer`, and `loaded` are also bindable. Most other options, such as `minZoom`, `maxZoom`, `interactive`, and `transformRequest`, are applied only when the map is created.
+
+When `style` changes, the component keeps the sources and layers that you added and adds them again after the new style loads. It also loads `images` again. Set `hash` to keep the viewport in the URL hash. Set `standardControls` to add the navigation, geolocate, fullscreen, and scale controls.
+-->
 
 <svelte:window onhashchange={onHashChange} />
 

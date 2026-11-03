@@ -8,16 +8,21 @@ import '../assert_dev_env.ts';
  * the `cross_backend/*` suites (and the cross-impl bench) can drive it the
  * same way they drive the Rust spine. This module owns the runtime-neutral
  * orchestration — stale-daemon check, daemon-info write, serve, post-serve
- * WS attach, graceful drain shutdown — and delegates the runtime-boundary
+ * WS attach, graceful shutdown — and delegates the runtime-boundary
  * primitives (HTTP serve, WS upgrade construction, signals, pid, exit) to a
- * {@link TestingServerAdapter}. The two shipped adapters are
- * `testing/cross_backend/testing_server_node.ts` (`@hono/node-server` + `@hono/node-ws`) and
- * `testing/cross_backend/testing_server_deno.ts` (`Deno.serve` + `hono/deno`).
+ * `TestingServerAdapter`. The shipped adapters are
+ * `testing/cross_backend/testing_server_node.ts` (`@hono/node-server` + `@hono/node-ws`),
+ * `testing/cross_backend/testing_server_deno.ts` (`Deno.serve` + `@hono/deno`), and
+ * `testing/cross_backend/testing_server_bun.ts` (`Bun.serve` + `@hono/bun`).
  *
- * The app itself — routes, RPC, DB, `_testing_reset`, optional WS mount —
- * is the caller's {@link StartTestingServerOptions.build_app} seam, so this
- * core stays domain-free. fuz_app's own `testing_spine_server` passes a
- * no-domain build; consumers (zzz, fuz_forge) pass their domain build.
+ * The app itself — routes, RPC, DB, `_testing_reset`, WS endpoints — is the
+ * caller's `StartTestingServerOptions.build_app` seam, so this core
+ * stays domain-free. WebSocket endpoints mount through `create_app_server`'s
+ * `ws_endpoints`: `build_app` asks its context to prepare the runtime's
+ * upgrade helper and passes the resulting factory as
+ * `create_upgrade_websocket`; the core attaches it to the server once
+ * `serve` returns (Node's `injectWebSocket`). fuz_app's own `testing_spine_server` passes a
+ * no-domain build; consumers (fuz_forge) pass their domain build.
  *
  * **NEVER ships in a release.** This module lives under `cross_backend/` and
  * opens with `import '../assert_dev_env.ts';`, which throws on
@@ -32,16 +37,17 @@ import type { Context, Hono } from 'hono';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { Logger, type Logger as LoggerType } from '@fuzdev/fuz_util/log.ts';
 
-import { write_daemon_info, read_daemon_info, is_daemon_running } from '../../cli/daemon.ts';
+import { write_daemon_info, read_daemon_info, is_daemon_running } from '../daemon_info.ts';
 import type { RuntimeDeps } from '../../runtime/deps.ts';
 
 /**
  * Adapter-built handle to a bound HTTP server.
  *
- * `shutdown` stops accepting new connections and drains in-flight ones.
- * `native` is an adapter-specific server reference — used by Node's
- * `@hono/node-ws` `injectWebSocket(server)` post-serve hook; Deno leaves it
- * unset.
+ * `shutdown` stops accepting new connections at once and settles when the
+ * in-flight ones have drained — the core starts it, closes the app (which
+ * ends live WebSockets), then awaits it. `native` is an adapter-specific
+ * server reference — used by Node's `@hono/node-ws` `injectWebSocket(server)`
+ * post-serve hook.
  */
 export interface ServeHandle {
 	shutdown: () => Promise<void>;
@@ -49,23 +55,48 @@ export interface ServeHandle {
 	native?: unknown;
 }
 
+/** Options for `TestingServerAdapter.prepare_websocket`. */
+export interface PrepareWebsocketOptions {
+	/**
+	 * Largest inbound WebSocket message, in bytes — pass the largest
+	 * `WsEndpointSpec.max_message_bytes` of the mounted endpoints; a smaller
+	 * value refuses messages the endpoint would accept. Node and Bun take twice
+	 * it as their frame cap (`ws`'s `maxPayload`, Bun's `maxPayloadLength`):
+	 * past its cap `ws` closes with no reason and Bun drops the socket without a
+	 * close frame, so the headroom leaves a message just over the limit to the
+	 * per-message check `register_action_ws` makes, while a grossly oversized
+	 * one is still refused before it is buffered whole. Deno ignores it — its
+	 * upgrade takes no frame cap — leaving that per-message check alone. Every
+	 * runtime closes a message just over the limit with
+	 * `WS_CLOSE_MESSAGE_TOO_BIG`. The default sits far below `ws`'s own 100 MiB
+	 * and Bun's 16 MiB, so a build raising an endpoint's cap must pass it here
+	 * too.
+	 *
+	 * @default DEFAULT_WS_MAX_MESSAGE_BYTES
+	 */
+	max_message_bytes?: number;
+}
+
 /**
  * Result of an adapter's WS preparation step.
  *
- * `upgrade_websocket` is the Hono `UpgradeWebSocket` closure the caller's
- * WS mount uses to register the endpoint. `attach_to_server` runs after
- * `serve()` returns a {@link ServeHandle} — Node uses it for
- * `injectWebSocket(server)`; Deno leaves it undefined.
+ * `create_upgrade_websocket` is the factory a build passes to
+ * `create_app_server` as `AppServerOptions.create_upgrade_websocket`.
+ * `attach_to_server` runs after `serve()` returns a `ServeHandle` —
+ * Node uses it for `injectWebSocket(server)`, and it does nothing when the
+ * factory was never called (no `ws_endpoints`); Deno and Bun leave it
+ * undefined.
  */
 export interface PreparedWebsocket {
-	upgrade_websocket: UpgradeWebSocket;
+	create_upgrade_websocket: (app: Hono) => UpgradeWebSocket;
 	attach_to_server?: (handle: ServeHandle) => void;
 }
 
 /**
  * Runtime adapter contract for the test-binary entry. Each adapter
- * (`testing/cross_backend/testing_server_node.ts`, `testing/cross_backend/testing_server_deno.ts`) implements this and
- * hands the shape to {@link start_testing_server}.
+ * (`testing/cross_backend/testing_server_node.ts`, `testing/cross_backend/testing_server_deno.ts`,
+ * `testing/cross_backend/testing_server_bun.ts`) implements this and hands the shape to
+ * `start_testing_server`.
  */
 export interface TestingServerAdapter {
 	/** Human-readable runtime label for log output (e.g. `"Node"`, `"Deno"`). */
@@ -74,9 +105,9 @@ export interface TestingServerAdapter {
 	runtime: RuntimeDeps;
 	/** Extract the raw TCP connection IP from a Hono context. */
 	get_connection_ip: (c: Context) => string | undefined;
-	/** Build the WS upgrade closure after the caller's `build_app` returns the app. */
-	prepare_websocket: (app: Hono) => PreparedWebsocket;
-	/** Bind `app.fetch` to `port` on `hostname`; return a {@link ServeHandle}. */
+	/** Prepare the runtime's WS upgrade helper and its post-serve attach step. */
+	prepare_websocket: (options?: PrepareWebsocketOptions) => PreparedWebsocket;
+	/** Bind `app.fetch` to `port` on `hostname`; return a `ServeHandle`. */
 	serve: (options: { fetch: Hono['fetch']; port: number; hostname: string }) => ServeHandle;
 	/** Current process pid (for `daemon.json`). */
 	pid: number;
@@ -86,30 +117,38 @@ export interface TestingServerAdapter {
 	exit: (code: number) => never;
 }
 
-/**
- * The assembled app a {@link StartTestingServerOptions.build_app} seam
- * returns.
- *
- * `mount_websocket` is invoked by the core after the app exists and the
- * adapter prepared the WS upgrade closure — the closure mounts the WS
- * endpoint(s) (e.g. via `register_ws_endpoint`) and wires any
- * audit-revocation guards. Omit it for an HTTP-only binary.
- */
-export interface BuiltTestingApp {
-	/** The assembled Hono app (HTTP routes + RPC already mounted). */
-	app: Hono;
-	/** Tear down backend(s) + DB + any rotation on graceful shutdown. */
-	close: () => Promise<void>;
-	/** Mount WS endpoint(s) given the runtime-prepared upgrade closure. */
-	mount_websocket?: (upgrade_websocket: UpgradeWebSocket) => void;
+/** What the core hands a `StartTestingServerOptions.build_app` seam. */
+export interface BuildTestingAppContext {
+	/**
+	 * Prepare the runtime adapter's WS upgrade helper and return the factory
+	 * to pass to `create_app_server` as `create_upgrade_websocket`. The core
+	 * runs the adapter's attach step once the server is bound, so a build
+	 * that mounts `ws_endpoints` needs nothing else. An HTTP-only build
+	 * doesn't call it. Call it at most once per build: the Node adapter
+	 * attaches one upgrade listener per preparation, and two would race on
+	 * the shared socket.
+	 */
+	prepare_websocket: (options?: PrepareWebsocketOptions) => (app: Hono) => UpgradeWebSocket;
 }
 
-/** Options for {@link start_testing_server}. */
+/** The assembled app a `StartTestingServerOptions.build_app` seam returns. */
+export interface BuiltTestingApp {
+	/** The assembled Hono app (HTTP routes, RPC, and WS endpoints already mounted). */
+	app: Hono;
+	/**
+	 * Tear down backend(s) + DB + any rotation on graceful shutdown. Called
+	 * after the listener stops accepting connections and before its drain is
+	 * awaited, so it must end live WebSockets (`AppServer.close` does).
+	 */
+	close: () => Promise<void>;
+}
+
+/** Options for `start_testing_server`. */
 export interface StartTestingServerOptions {
 	/** Runtime-boundary adapter (Node or Deno). */
 	adapter: TestingServerAdapter;
 	/**
-	 * Daemon-info namespace — the `cli/daemon` key the `daemon.json` is
+	 * Daemon-info namespace — the app name the `daemon.json` is
 	 * written under (e.g. `'fuz_app_spine'`). The cross-process harness
 	 * reads the daemon token from the rotation file, not this; `daemon.json`
 	 * is for stale-process detection + parity with production daemon
@@ -125,10 +164,9 @@ export interface StartTestingServerOptions {
 	/**
 	 * Build the app. Closes over the entry's runtime + connection-IP getter
 	 * + password deps + resolved config — so this core never touches the
-	 * domain. Returns the assembled app, a `close` teardown, and an optional
-	 * `mount_websocket` hook.
+	 * domain. Returns the assembled app and a `close` teardown.
 	 */
-	build_app: () => Promise<BuiltTestingApp>;
+	build_app: (context: BuildTestingAppContext) => Promise<BuiltTestingApp>;
 	/** Optional logger; defaults to a `[daemon_name]`-namespaced `Logger`. */
 	log?: LoggerType;
 }
@@ -151,9 +189,9 @@ export const is_loopback_host = (host: string): boolean => {
  * Boot a test-mode server using the supplied runtime adapter.
  *
  * Mirrors a production `start_server` at the surface level — stale-daemon
- * check, daemon-info write, bind, graceful drain — but the app is the
- * caller's no-domain (or domain) {@link StartTestingServerOptions.build_app}
- * and the runtime boundary is the {@link TestingServerAdapter}. Refuses any
+ * check, daemon-info write, bind, graceful shutdown — but the app is the
+ * caller's no-domain (or domain) `StartTestingServerOptions.build_app`
+ * and the runtime boundary is the `TestingServerAdapter`. Refuses any
  * non-loopback bind host (the test binary must stay on loopback — see
  * `is_loopback_host`).
  */
@@ -179,13 +217,14 @@ export const start_testing_server = async (options: StartTestingServerOptions): 
 		}
 	}
 
-	const built = await build_app();
-
-	let ws: PreparedWebsocket | undefined;
-	if (built.mount_websocket) {
-		ws = adapter.prepare_websocket(built.app);
-		built.mount_websocket(ws.upgrade_websocket);
-	}
+	const prepared_websockets: Array<PreparedWebsocket> = [];
+	const built = await build_app({
+		prepare_websocket: (ws_options) => {
+			const prepared = adapter.prepare_websocket(ws_options);
+			prepared_websockets.push(prepared);
+			return prepared.create_upgrade_websocket;
+		}
+	});
 
 	await write_daemon_info(runtime, daemon_name, {
 		version: 1,
@@ -197,7 +236,7 @@ export const start_testing_server = async (options: StartTestingServerOptions): 
 
 	log.info(`Listening on http://${host}:${port} (${adapter.runtime_label}, test mode)`);
 	const server = adapter.serve({ fetch: built.app.fetch, port, hostname: host });
-	ws?.attach_to_server?.(server);
+	for (const prepared of prepared_websockets) prepared.attach_to_server?.(server);
 
 	let shutting_down = false;
 	const shutdown = async (): Promise<void> => {
@@ -205,11 +244,16 @@ export const start_testing_server = async (options: StartTestingServerOptions): 
 		shutting_down = true;
 		log.info('shutting down...');
 		try {
-			// Drain HTTP first (stop accepting + let in-flight requests finish)
-			// before tearing down the backend, so a request still draining
-			// never hits a closed DB.
-			await server.shutdown();
+			// Stop accepting first so no new request reaches a closed DB, but
+			// don't await the drain yet: live WebSockets hold it open until
+			// `built.close()` ends them (`AppServer.close`), so awaiting it
+			// first would wait on sockets nothing is closing. A request already
+			// in flight when the signal lands may still see the backend close
+			// under it — acceptable for a test binary, where shutdown follows
+			// the suite.
+			const drained = server.shutdown();
 			await built.close();
+			await drained;
 		} catch (error) {
 			log.error('shutdown error:', error);
 		}

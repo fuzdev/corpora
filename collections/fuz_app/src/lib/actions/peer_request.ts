@@ -7,7 +7,7 @@
  * isolation guarantee), id allocation (`s{n}`-namespaced so a client's own
  * request ids can't collide), the per-request deadline, and the per-connection
  * in-flight cap. It deliberately does **not** touch the socket — the caller
- * (`BackendWebsocketTransport.request_connection`) does the send and threads the
+ * (`ConnectionRegistry.request_connection`) does the send and threads the
  * reply back via `resolve`. This mirrors the Rust `fuz_realtime::peer` split
  * (the `PendingPeerRequests` registry vs the transport that composes it), and
  * keeps the registry pure data so it unit-tests without a live socket.
@@ -16,7 +16,7 @@
  */
 
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 
 import type {
 	JsonrpcErrorObject,
@@ -30,16 +30,17 @@ import { is_jsonrpc_error_response } from '../http/jsonrpc_helpers.ts';
 
 /**
  * Default deadline (ms) for a server→client peer request before it resolves
- * `timeout`. Twin of the Rust spine's `DEFAULT_PEER_TIMEOUT`.
+ * `timeout`. Twin of the Rust spine's `DEFAULT_PEER_REQUEST_TIMEOUT`.
  */
 export const DEFAULT_PEER_REQUEST_TIMEOUT = 10_000;
 
 /**
  * Per-connection cap on concurrent in-flight server→client requests. A caller
  * past it gets `too_many_in_flight` instead of growing the pending map
- * unbounded. Twin of the Rust spine's `DEFAULT_MAX_OUTBOUND_PEER_REQUESTS_PER_CONN`.
+ * unbounded. Twin of the Rust spine's
+ * `DEFAULT_MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION`.
  */
-export const MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION = 256;
+export const DEFAULT_MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION = 256;
 
 /**
  * Why a server→client peer request did not yield a client success reply.
@@ -94,7 +95,7 @@ interface PendingPeerRequest {
 
 /** Options for `PendingPeerRequests`. */
 export interface PendingPeerRequestsOptions {
-	/** Per-connection in-flight cap. Defaults to `MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION`. */
+	/** Per-connection in-flight cap. Defaults to `DEFAULT_MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION`. */
 	max_in_flight_per_connection?: number;
 	/** Default per-request deadline (ms). Defaults to `DEFAULT_PEER_REQUEST_TIMEOUT`. */
 	default_timeout_ms?: number;
@@ -124,7 +125,7 @@ export class PendingPeerRequests {
 
 	constructor(options?: PendingPeerRequestsOptions) {
 		this.#max_in_flight =
-			options?.max_in_flight_per_connection ?? MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION;
+			options?.max_in_flight_per_connection ?? DEFAULT_MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION;
 		this.#default_timeout_ms = options?.default_timeout_ms ?? DEFAULT_PEER_REQUEST_TIMEOUT;
 	}
 

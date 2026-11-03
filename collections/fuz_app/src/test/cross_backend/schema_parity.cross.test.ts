@@ -4,8 +4,9 @@
  * fuz_app ships the canonical TS spine and the Rust spine is its twin;
  * the cross-backend suites already prove their wire behavior converges. This
  * gate proves their **database schema** converges too: it spawns both the TS
- * spine (Node + PGlite) and the Rust `testing_spine_stub` (real Postgres) via
- * the dual-spawn `global_setup_schema_parity.ts`, captures each backend's live
+ * spine (Node) and the Rust `testing_spine_stub`, each over its own database
+ * on one real Postgres server, via the dual-spawn
+ * `global_setup_schema_parity.ts`, captures each backend's live
  * schema over the `_testing_schema_snapshot` RPC (TS introspects via
  * `query_schema_snapshot`, Rust via `fuz_db::query_schema_snapshot`), and
  * asserts **full** structural equality — failing loud with the specific drift.
@@ -18,38 +19,37 @@
  * the visiones cutover break.
  *
  * Both backends migrate the same namespaces (auth + `fuz_cell` +
- * `fuz_cell_history` + `fuz_facts`), so there are no excluded tables. The
+ * `fuz_facts`), so there are no excluded tables. The
  * snapshot now captures `CREATE TYPE ... AS ENUM` types, so a `cell_visibility`
  * label-set / ordering drift is a gated fact here, not invisible.
  *
  * Runs under the dual-spawn `cross_backend_parity` project, which it shares
  * with the action-manifest parity gate (`action_manifest_parity.cross.test.ts`)
  * — one TS-spine + Rust-stub spawn serves both. Opt-in (behind
- * `FUZ_TEST_CROSS_BACKEND=1`); the Rust side needs a Postgres the stub can
- * reach — `npm run test:cross:parity` rebuilds the stub + creates its DB by
- * default.
+ * `FUZ_TEST_CROSS_BACKEND=1`); both sides need a Postgres they can reach —
+ * index definitions are compared as the engine renders them, so the TS spine
+ * runs on Postgres here too, not on its in-memory default.
+ * `npm run test:cross:parity` rebuilds the stub, creates both databases, and
+ * empties the TS spine's before each run.
  *
  * @module
  */
 
-import { inject, describe, test } from 'vitest';
+import { describe, test } from 'vitest';
 
+import { inject_parity_handles } from '#lib/testing/cross_backend/provided_context.ts';
 import {
 	capture_schema_snapshot,
-	capture_migration_tracker,
-	reconstruct_bootstrapped_handle
-} from '$lib/testing/cross_backend/setup.ts';
+	capture_migration_tracker
+} from '#lib/testing/cross_backend/setup.ts';
 import {
 	assert_schema_snapshots_equal,
 	assert_migration_trackers_equal
-} from '$lib/testing/schema_parity.ts';
-
-import './cross_test_types.ts';
+} from '#lib/testing/schema_parity.ts';
 
 describe('cross-backend schema parity', () => {
 	test('TS spine (node) and Rust spine_stub schemas match', async () => {
-		const ts = reconstruct_bootstrapped_handle(inject('parity_handle_a'));
-		const rust = reconstruct_bootstrapped_handle(inject('parity_handle_b'));
+		const { a: ts, b: rust } = inject_parity_handles();
 		const [ts_snapshot, rust_snapshot] = await Promise.all([
 			capture_schema_snapshot(ts),
 			capture_schema_snapshot(rust)
@@ -67,8 +67,7 @@ describe('cross-backend schema parity', () => {
 	// cutover and that the snapshot gate (which excludes `schema_version`)
 	// could not see.
 	test('TS spine (node) and Rust spine_stub record identical migration identity', async () => {
-		const ts = reconstruct_bootstrapped_handle(inject('parity_handle_a'));
-		const rust = reconstruct_bootstrapped_handle(inject('parity_handle_b'));
+		const { a: ts, b: rust } = inject_parity_handles();
 		const [ts_tracker, rust_tracker] = await Promise.all([
 			capture_migration_tracker(ts),
 			capture_migration_tracker(rust)

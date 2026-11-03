@@ -4,7 +4,7 @@
 import { vi } from 'vitest';
 
 import { create_shared_core_tests } from './contextmenu_test_core.ts';
-import ContextmenuRoot from '$lib/ContextmenuRoot.svelte';
+import ContextmenuRoot from '#lib/ContextmenuRoot.svelte';
 
 // ResizeObserver is not currently available in jsdom
 class ResizeObserverMock {

@@ -1,16 +1,11 @@
 <script>
-	import hljs from 'highlight.js';
 	import examples from './_examples.js';
 	import examplesSsr from './_examples_ssr.js';
-	import hljsDefineSvelte from '../_modules/hljsDefineSvelte.js';
-
-	hljs.registerLanguage('svelte', hljsDefineSvelte);
-
-	hljsDefineSvelte(hljs);
+	import hljs from '../_modules/hljs.js';
 
 	const codeExample = `<scr${''}ipt>
 	// The library provides a main wrapper component
-	// and a bunch empty layout components...
+	// and a bunch of empty layout components...
 	import { LayerCake, Svg, Html, Canvas } from 'layercake';
 
 	// ...that you fill with your own chart components,
@@ -93,12 +88,19 @@
 		</p>
 
 		<p>
-			Read the <a href="guide">guide</a>, try the
+			Read the <a href="/guide">guide</a>, try the
 			<a href="https://github.com/mhkeller/layercake-template" target="_blank" rel="noreferrer"
 				>starter template</a
 			>
-			or check out the <a href="components">example components</a>. See the examples below and even
+			or check out the <a href="/components">example components</a>. See the examples below and even
 			edit them live. Here's a sample of what the code looks like:
+		</p>
+
+		<p>
+			Looking for the version 10 examples that used the store API? They're at the
+			<a href="https://mhkeller.github.io/layercake-v10" target="_blank" rel="noreferrer"
+				>v10 documentation archive</a
+			>.
 		</p>
 	</div>
 

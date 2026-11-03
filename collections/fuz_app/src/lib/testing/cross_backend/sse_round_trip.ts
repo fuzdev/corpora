@@ -12,7 +12,7 @@ import '../assert_dev_env.ts';
  * (`describe_standard_cross_process_tests`) omits SSE by design, so consumers
  * call this alongside it (paralleling `describe_cross_process_ws_tests`).
  *
- * Four cases, mirroring the in-process SSE self-test against fuz_app's
+ * Its cases follow the in-process SSE self-test against fuz_app's
  * standard audit-log stream:
  *
  * 1. **connects** — the stream opens and emits the `: connected` comment.
@@ -24,22 +24,33 @@ import '../assert_dev_env.ts';
  *    stream opens so `create_account`'s own audit events (invite / signup /
  *    login / token) don't land on it.
  * 3. **close-on-revoke, account-wide** (gated on `rpc_path`) — the subscriber's
- *    *own* sessions are revoked (`account_session_revoke_all`), so the
- *    `session_revoke_all` event targets the keeper and the audit guard drops
- *    the live stream via the account-wide `close_for_account` path. Asserted
- *    via `SseTransport.wait_for_close`.
+ *    *own* sessions are revoked (`account_session_revoke_all`), which closes
+ *    every stream of the account once the revoke commits (the handler's
+ *    close, repeated by the audit guard on the `session_revoke_all` row).
+ *    Asserted via `SseTransport.wait_for_close`.
  * 4. **close-on-revoke, session-scoped** (gated on `rpc_path`) — the
  *    subscriber's *own* single session is revoked (`account_session_revoke`),
- *    so the `session_revoke` event drops the stream via the session-hash-scoped
- *    `close_for_session` path (the distinct primitive cases 2–3 don't reach).
+ *    which closes only the stream registered under that session's hash (the
+ *    distinct close cases 2–3 don't reach).
+ * 5. **close on account delete** (gated on `rpc_path` and
+ *    `capabilities.account_lifecycle`) — the keeper soft-deletes a second
+ *    admin whose stream is open; the delete revokes its credentials and
+ *    closes its stream.
+ * 6. **close on the other account-wide revocations** (gated on `rpc_path`;
+ *    purge also on `capabilities.account_lifecycle`) — `admin_token_revoke_all`,
+ *    `POST /logout`, `POST /password`, and `account_purge` of a second admin
+ *    each close its stream — the rows `create_account_revocations` shares with
+ *    the WS suite.
+ * 7. **per-session cap** — one stream past `max_per_scope` on one session
+ *    closes the oldest (evict-oldest, no final frame) and leaves every other
+ *    stream open. Needs no RPC: the cap runs inside the subscribe itself.
  *
- * The close-on-revoke matrix is layered: cases 3–4 exercise the account-wide
- * and session-scoped paths cross-process; the remaining union events
- * (`token_revoke_all` / `logout` / `password_change`, all account-wide; and
- * `role_grant_revoke`, role-matched) are covered by the spine's `fuz_realtime`
- * SSE-registry unit tests and the in-process guard self-test, so a cross-process
- * `token_revoke_all`-with-zero-tokens case (which may emit no audit row) stays
- * out to keep the spawned-backend suite non-flaky.
+ * The close-on-revoke matrix is layered: cases 3–6 exercise the account-wide
+ * and session-scoped paths cross-process; `token_revoke` (token-scoped — the
+ * stock stream admits sessions only, so its bearer close is covered on the
+ * WebSocket by `describe_cross_process_ws_tests`) and `role_grant_revoke`
+ * (role-matched) are covered by the spine's `fuz_realtime` SSE-registry unit
+ * tests and the in-process guard self-test.
  *
  * Gated on `capabilities.sse` — backends without an end-to-end SSE stream
  * skip (the cases still surface as `.skip` in the report). Cross-process
@@ -56,18 +67,29 @@ import {
 	account_session_revoke_action_spec,
 	account_session_revoke_all_action_spec
 } from '../../auth/account_action_specs.ts';
-import { admin_session_revoke_all_action_spec } from '../../auth/admin_action_specs.ts';
-import { audit_log_event_specs } from '../../realtime/sse_auth_guard.ts';
+import {
+	account_delete_action_spec,
+	admin_session_revoke_all_action_spec
+} from '../../auth/admin_action_specs.ts';
+import { ROLE_ADMIN } from '../../auth/role_schema.ts';
+import {
+	AUDIT_LOG_SSE_MAX_PER_SCOPE,
+	audit_log_event_specs
+} from '../../realtime/audit_log_sse.ts';
 import { SSE_CONNECTED_COMMENT } from '../../realtime/sse_constants.ts';
-import { create_sse_transport } from '../transports/sse_transport.ts';
+import { create_sse_transport, type SseTransport } from '../transports/sse_transport.ts';
 import { create_rpc_post_init } from '../rpc_helpers.ts';
+import { DEFAULT_TEST_PASSWORD } from '../test_credentials.ts';
 import { type BackendCapabilities, test_if } from './capabilities.ts';
+import { create_account_revocations } from './revocation_drivers.ts';
 import type { SetupTest } from './setup.ts';
+import {
+	SPINE_ACCOUNT_LOGOUT_PATH,
+	SPINE_ACCOUNT_PASSWORD_PATH,
+	SPINE_SSE_PATH
+} from './spine_surface_constants.ts';
 
-/** Default audit-log SSE stream path — the standard fuz_app `/api/admin/audit/stream`. */
-const DEFAULT_SSE_PATH = '/api/admin/audit/stream';
-
-/** Configuration for {@link describe_cross_process_sse_tests}. */
+/** Configuration for `describe_cross_process_sse_tests`. */
 export interface CrossProcessSseTestOptions {
 	/**
 	 * Per-test fixture producer (`default_cross_process_setup(handle)`). Each
@@ -93,6 +115,17 @@ export interface CrossProcessSseTestOptions {
 	readonly rpc_path?: string;
 	/** Origin for the stream request. Defaults to `base_url`. */
 	readonly origin?: string;
+	/**
+	 * The backend's per-session audit-stream cap, which the cap case opens one
+	 * stream past. Defaults to `AUDIT_LOG_SSE_MAX_PER_SCOPE`, the cap both
+	 * spines apply unless overridden; `null` (a backend with the cap disabled)
+	 * skips the case.
+	 */
+	readonly max_per_scope?: number | null;
+	/** REST logout route path, for the logout close case. Default `/api/account/logout`. */
+	readonly logout_path?: string;
+	/** REST password-change route path, for its close case. Default `/api/account/password`. */
+	readonly password_path?: string;
 }
 
 /**
@@ -120,13 +153,25 @@ const assert_audit_data_frame = (frame: string): void => {
 };
 
 /**
- * Register the cross-process SSE round-trip suite. Up to four cases over a
+ * Register the cross-process SSE round-trip suite. Its cases run over a
  * real streaming `fetch`: connected-comment, audit data frame, account-wide
- * close-on-revoke, and session-scoped close-on-revoke.
+ * close-on-revoke, session-scoped close-on-revoke, close on account delete,
+ * close on admin token revoke-all, logout, password change and purge, and the
+ * per-session cap.
  */
 export const describe_cross_process_sse_tests = (options: CrossProcessSseTestOptions): void => {
-	const { setup_test, capabilities, base_url, rpc_path, origin } = options;
-	const sse_path = options.sse_path ?? DEFAULT_SSE_PATH;
+	const {
+		setup_test,
+		capabilities,
+		base_url,
+		rpc_path,
+		origin,
+		logout_path = SPINE_ACCOUNT_LOGOUT_PATH,
+		password_path = SPINE_ACCOUNT_PASSWORD_PATH
+	} = options;
+	const sse_path = options.sse_path ?? SPINE_SSE_PATH;
+	const max_per_scope =
+		options.max_per_scope === undefined ? AUDIT_LOG_SSE_MAX_PER_SCOPE : options.max_per_scope;
 
 	describe('cross-process sse', () => {
 		test_if(capabilities.sse, 'connects and emits the connected comment', async () => {
@@ -194,8 +239,9 @@ export const describe_cross_process_sse_tests = (options: CrossProcessSseTestOpt
 			}
 		);
 
-		// Revoke the subscriber's OWN sessions → `session_revoke_all` targets the
-		// keeper, so the audit guard closes the live stream.
+		// Revoke the subscriber's OWN sessions → the handler closes the keeper's
+		// streams once the revoke commits (the audit guard repeats the close on
+		// the `session_revoke_all` row).
 		test_if(
 			capabilities.sse && rpc_path !== undefined,
 			'stream closes when the subscriber sessions are revoked',
@@ -232,14 +278,13 @@ export const describe_cross_process_sse_tests = (options: CrossProcessSseTestOpt
 		);
 
 		// Single `session_revoke` of the subscriber's OWN session → the
-		// session-hash-scoped close path (`close_for_session` / the TS guard's
-		// `close_by_identity(session_id)`). The keeper holds exactly one session,
-		// so revoking it by its blake3 hash drops the stream opened under it.
-		// This is the close-on-revoke path the account-wide cases above don't
-		// exercise; the remaining union events (`token_revoke_all` / `logout` /
-		// `password_change`) share the account-wide `close_for_account` path the
-		// `session_revoke_all` case already covers, and `role_grant_revoke`'s
-		// role-matched path is covered by `fuz_realtime`'s SSE registry unit tests.
+		// session-hash-scoped close (the Rust registry's
+		// `ConnectionCloseTarget::Session` close, the TS registry's
+		// `close_by_identity(session_hash)`). The keeper holds
+		// exactly one session, so revoking it by its blake3 hash drops the stream
+		// opened under it. This is the close-on-revoke path the account-wide case
+		// above doesn't exercise; `role_grant_revoke`'s role-matched close is
+		// covered by `fuz_realtime`'s SSE registry unit tests.
 		test_if(
 			capabilities.sse && rpc_path !== undefined,
 			'stream closes on a single session_revoke of the subscriber session',
@@ -288,6 +333,126 @@ export const describe_cross_process_sse_tests = (options: CrossProcessSseTestOpt
 					assert.ok(closed, 'stream did not close within 2s after session_revoke');
 				} finally {
 					await sse.close();
+				}
+			}
+		);
+
+		// A soft-deleted account's credentials stop authenticating, and a stream
+		// never rechecks its own — so the delete must close it. The keeper
+		// deletes a second admin whose stream is open; the keeper's own admin
+		// grant keeps the delete clear of the last-admin guard.
+		test_if(
+			capabilities.sse && capabilities.account_lifecycle && rpc_path !== undefined,
+			'stream closes when the subscriber account is deleted',
+			async () => {
+				const fixture = await setup_test();
+				const target = await fixture.create_account({
+					username: 'sse_delete_target',
+					roles: [ROLE_ADMIN]
+				});
+				const cookie = target.create_session_headers().cookie;
+				assert.ok(cookie, 'expected a session cookie for the target account');
+				const sse = await create_sse_transport({ base_url, sse_path, cookies: [cookie], origin });
+				try {
+					const first = await sse.read_frame();
+					assert.strictEqual(
+						first + '\n\n',
+						SSE_CONNECTED_COMMENT,
+						'first frame must be the connected comment'
+					);
+					const res = await fixture.transport(
+						rpc_path!,
+						create_rpc_post_init(account_delete_action_spec.method, {
+							account_id: target.account.id
+						})
+					);
+					assert.strictEqual(res.status, 200, `account_delete RPC failed (status=${res.status})`);
+					const closed = await sse.wait_for_close(2000);
+					assert.ok(closed, 'stream did not close within 2s after account_delete');
+				} finally {
+					await sse.close();
+				}
+			}
+		);
+
+		// The account-wide revocations past session revoke-all and delete
+		// (`revocation_drivers.ts`, shared with the WS suite) each close the
+		// target admin's stream. Without `rpc_path` the rows still register, as
+		// skipped cases, and never run — so the empty path is never sent.
+		const revocations = create_account_revocations({
+			capabilities,
+			rpc_path: rpc_path ?? '',
+			logout_path,
+			password_path
+		});
+		for (const { label, slug, gate, revoke } of revocations) {
+			test_if(
+				capabilities.sse && gate && rpc_path !== undefined,
+				`stream closes on ${label} of the subscriber account`,
+				async () => {
+					const fixture = await setup_test();
+					const target = await fixture.create_account({
+						username: `sse_revoke_${slug}`,
+						password_value: DEFAULT_TEST_PASSWORD,
+						roles: [ROLE_ADMIN]
+					});
+					const cookie = target.create_session_headers().cookie;
+					assert.ok(cookie, 'expected a session cookie for the target account');
+					const sse = await create_sse_transport({ base_url, sse_path, cookies: [cookie], origin });
+					try {
+						const first = await sse.read_frame();
+						assert.strictEqual(
+							first + '\n\n',
+							SSE_CONNECTED_COMMENT,
+							'first frame must be the connected comment'
+						);
+						await revoke(fixture, target);
+						const closed = await sse.wait_for_close(2000);
+						assert.ok(closed, `stream did not close within 2s after ${label}`);
+					} finally {
+						await sse.close();
+					}
+				}
+			);
+		}
+
+		// One stream past the cap on one session → the oldest closes, the newest
+		// stays open. Opened in sequence, each awaited to its connect comment, so
+		// the server registered them in order and "oldest" is stream 0 on both
+		// spines. The evicted stream ends with no final frame, so a browser
+		// `EventSource` would reconnect — this asserts the server side only.
+		test_if(
+			capabilities.sse && max_per_scope !== null,
+			'one stream past the per-session cap closes the oldest',
+			async () => {
+				const fixture = await setup_test();
+				const cookies = fixture.transport.cookies();
+				const streams: Array<SseTransport> = [];
+				try {
+					for (let i = 0; i <= max_per_scope!; i++) {
+						const sse = await create_sse_transport({ base_url, sse_path, cookies, origin });
+						streams.push(sse);
+						const first = await sse.read_frame();
+						assert.strictEqual(
+							first + '\n\n',
+							SSE_CONNECTED_COMMENT,
+							`stream ${i}: first frame must be the connected comment`
+						);
+					}
+					const [oldest, ...survivors] = streams;
+					const closed = await oldest!.wait_for_close(2000);
+					assert.ok(closed, 'the oldest stream did not close within 2s of the cap overflow');
+					// only the oldest — every later stream on the session stays open
+					const survivors_closed = await Promise.all(
+						survivors.map((sse) => sse.wait_for_close(200))
+					);
+					assert.deepStrictEqual(
+						survivors_closed,
+						survivors.map(() => false),
+						'only the oldest stream may close; the rest of the session stays open'
+					);
+				} finally {
+					await Promise.all(streams.map((sse) => sse.close()));
 				}
 			}
 		);

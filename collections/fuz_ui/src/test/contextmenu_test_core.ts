@@ -6,7 +6,7 @@
 import { describe, test, assert, afterEach } from 'vitest';
 import { flushSync } from 'svelte';
 
-import { contextmenu_attachment } from '$lib/contextmenu_state.svelte.ts';
+import { contextmenu_attachment } from '#lib/contextmenu_state.svelte.ts';
 import {
 	unmount_component,
 	create_contextmenu_event,

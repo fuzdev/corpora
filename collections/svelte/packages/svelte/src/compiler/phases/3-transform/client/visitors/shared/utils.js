@@ -1,6 +1,7 @@
 /** @import { AssignmentExpression, Expression, Identifier, MemberExpression, SequenceExpression, Literal, Super, UpdateExpression, ExpressionStatement } from 'estree' */
 /** @import { AST } from '#compiler' */
 /** @import { ComponentClientTransformState, ComponentContext, Context } from '../../types' */
+/** @import { ExpressionMetadata } from '../../../../nodes.js' */
 import { walk } from 'zimmerframe';
 import { object } from '../../../../../utils/ast.js';
 import * as b from '#compiler/builders';
@@ -8,18 +9,17 @@ import { sanitize_template_string } from '../../../../../utils/sanitize_template
 import { regex_is_valid_identifier } from '../../../../patterns.js';
 import is_reference from 'is-reference';
 import { dev, is_ignored, locator, component_name } from '../../../../../state.js';
-import { build_getter, is_state_source } from '../../utils.js';
-import { ExpressionMetadata } from '../../../../nodes.js';
+import { async_thunk, build_getter, is_state_source } from '../../utils.js';
 
 /**
  * A utility for extracting complex expressions (such as call expressions)
  * from templates and replacing them with `$0`, `$1` etc
  */
 export class Memoizer {
-	/** @type {Array<{ id: Identifier, expression: Expression }>} */
+	/** @type {Array<{ id: Identifier, expression: Expression, metadata: ExpressionMetadata }>} */
 	#sync = [];
 
-	/** @type {Array<{ id: Identifier, expression: Expression }>} */
+	/** @type {Array<{ id: Identifier, expression: Expression, metadata: ExpressionMetadata }>} */
 	#async = [];
 
 	/** @type {Set<Expression>} */
@@ -43,7 +43,7 @@ export class Memoizer {
 
 		const id = b.id('#'); // filled in later
 
-		(metadata.has_await ? this.#async : this.#sync).push({ id, expression });
+		(metadata.has_await ? this.#async : this.#sync).push({ id, expression, metadata });
 
 		return id;
 	}
@@ -84,7 +84,7 @@ export class Memoizer {
 		if (this.#async.length === 0) return;
 		// use `b.arrow` rather than `b.thunk` so that deferred async/template effects
 		// always read live bindings rather than a possibly stale snapshot.
-		return b.array(this.#async.map((memo) => b.arrow([], memo.expression, true)));
+		return b.array(this.#async.map((memo) => async_thunk(memo.expression, memo.metadata)));
 	}
 
 	sync_values() {

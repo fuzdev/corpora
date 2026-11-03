@@ -13,14 +13,18 @@
  * delivery is pull-only via `subscribe()` — the consumer plumbs their
  * `FrontendWebsocketClient` / `ActionDispatcher` receiver to `apply_notification`.
  *
- * Holds six `AsyncSlot`s — one per RPC verb. The cache `#offers` lives on
- * the class (multiple ops write into it via `#merge_offers` /
- * `#remove_offer`); the `create` slot is typed `AsyncSlot<RoleGrantOfferJson>`
- * so `submit_create` can return the new offer via the slot's
- * supersession-safe `data` path, but the other slots' `data` is unused
- * (no single op owns the cache). Method names use the `submit_*` prefix
- * to avoid slot-name collisions; the `history` view stayed natural by
- * naming the fetch slot `list_history`.
+ * Holds one slot per RPC verb: `AsyncSlot`s for `list`, `list_history` and
+ * `create`, and `KeyedAsyncSlot`s keyed by offer id for the per-row verbs
+ * `accept`, `decline` and `retract`, so each row carries its own pending
+ * state and error. The cache `#offers` lives on the class (multiple ops
+ * write into it via `#merge_offers` / `#remove_offer`); the `create` slot is
+ * typed `AsyncSlot<RoleGrantOfferJson>` so `submit_create` can return the
+ * new offer via the slot's supersession-safe `data` path, but the other
+ * slots' `data` is unused (no single op owns the cache). Each terminal verb
+ * stamps the offer it answers into the cache, so `history` shows it whether
+ * or not its WS notification arrives. Method names use the `submit_*`
+ * prefix to avoid slot-name collisions; the `history` view stayed natural
+ * by naming the fetch slot `list_history`.
  *
  * @module
  */
@@ -28,7 +32,26 @@
 import { create_context } from '@fuzdev/fuz_ui/context_helpers.ts';
 
 import { AsyncSlot } from './async_slot.svelte.ts';
+import { KeyedAsyncSlot } from './keyed_async_slot.svelte.ts';
+import { is_iso8601_seconds_live } from '../timestamp.ts';
+import type { Uuid } from '../primitive_schemas.ts';
 import type { RoleGrantOfferJson } from '../auth/role_grant_offer_schema.ts';
+import {
+	GRANT_SCOPE_PAIRED_MESSAGE,
+	is_grant_scope_paired,
+	type RoleGrantOfferAcceptInput,
+	type RoleGrantOfferAcceptOutput,
+	type RoleGrantOfferCreateInput,
+	type RoleGrantOfferCreateOutput,
+	type RoleGrantOfferDeclineInput,
+	type RoleGrantOfferDeclineOutput,
+	type RoleGrantOfferHistoryInput,
+	type RoleGrantOfferHistoryOutput,
+	type RoleGrantOfferListInput,
+	type RoleGrantOfferListOutput,
+	type RoleGrantOfferRetractInput,
+	type RoleGrantOfferRetractOutput
+} from '../auth/role_grant_offer_action_specs.ts';
 import {
 	ROLE_GRANT_OFFER_ACCEPTED_NOTIFICATION_METHOD,
 	ROLE_GRANT_OFFER_DECLINED_NOTIFICATION_METHOD,
@@ -37,6 +60,25 @@ import {
 	ROLE_GRANT_OFFER_SUPERSEDE_NOTIFICATION_METHOD,
 	ROLE_GRANT_REVOKE_NOTIFICATION_METHOD
 } from '../auth/role_grant_offer_notifications.ts';
+
+/**
+ * The scope of an offer: global (both absent / `null`) or scoped (both set).
+ * `scope_kind` and `scope_id` are paired on the wire — a lone `scope_id` is an
+ * `invalid_params` refusal — so the pair is one union rather than two optional
+ * fields.
+ */
+export type RoleGrantOfferScope =
+	{ scope_kind?: null; scope_id?: null } | { scope_kind: string; scope_id: Uuid };
+
+/**
+ * Params for `submit_create` — `RoleGrantOfferCreateInput` with its scope as
+ * the paired `RoleGrantOfferScope`, so a lone `scope_id` is a type error.
+ */
+export type RoleGrantOfferCreateParams = Omit<
+	RoleGrantOfferCreateInput,
+	'scope_kind' | 'scope_id'
+> &
+	RoleGrantOfferScope;
 
 /**
  * Svelte context for `RoleGrantOffersState`.
@@ -49,28 +91,17 @@ export const role_grant_offers_state_context = create_context<RoleGrantOffersSta
  * Narrow RPC surface consumed by `RoleGrantOffersState`. Consumers adapt their
  * typed client (e.g. a `create_rpc_client` Proxy) to this shape — the state
  * class stays decoupled from the client's `Result` return type so tests can
- * inject plain-function stubs.
+ * inject plain-function stubs. Each method takes its action's input as one
+ * params object and returns its output, both typed from the action specs, so
+ * the typed throwing client's methods bridge with no casts.
  */
 export interface RoleGrantOffersRpc {
-	list: () => Promise<{ offers: Array<RoleGrantOfferJson> }>;
-	history: (options?: {
-		limit?: number;
-		offset?: number;
-	}) => Promise<{ offers: Array<RoleGrantOfferJson> }>;
-	create: (params: {
-		to_account_id: string;
-		to_actor_id?: string | null;
-		role: string;
-		scope_id?: string | null;
-		message?: string | null;
-	}) => Promise<{ offer: RoleGrantOfferJson }>;
-	accept: (offer_id: string) => Promise<{
-		role_grant_id: string;
-		offer: RoleGrantOfferJson;
-		superseded_offer_ids: Array<string>;
-	}>;
-	decline: (offer_id: string, reason?: string | null) => Promise<{ ok: true }>;
-	retract: (offer_id: string) => Promise<{ ok: true }>;
+	list: (params?: RoleGrantOfferListInput) => Promise<RoleGrantOfferListOutput>;
+	history: (params?: RoleGrantOfferHistoryInput) => Promise<RoleGrantOfferHistoryOutput>;
+	create: (params: RoleGrantOfferCreateInput) => Promise<RoleGrantOfferCreateOutput>;
+	accept: (params: RoleGrantOfferAcceptInput) => Promise<RoleGrantOfferAcceptOutput>;
+	decline: (params: RoleGrantOfferDeclineInput) => Promise<RoleGrantOfferDeclineOutput>;
+	retract: (params: RoleGrantOfferRetractInput) => Promise<RoleGrantOfferRetractOutput>;
 }
 
 /** Narrow WS notification envelope — method + params, matching `JsonrpcNotification`. */
@@ -109,9 +140,12 @@ export class RoleGrantOffersState {
 	readonly list = new AsyncSlot<void>();
 	readonly list_history = new AsyncSlot<void>();
 	readonly create = new AsyncSlot<RoleGrantOfferJson>();
-	readonly accept = new AsyncSlot<void>();
-	readonly decline = new AsyncSlot<void>();
-	readonly retract = new AsyncSlot<void>();
+	/** Per-offer accept, keyed by offer id. */
+	readonly accept = new KeyedAsyncSlot<string>();
+	/** Per-offer decline, keyed by offer id. */
+	readonly decline = new KeyedAsyncSlot<string>();
+	/** Per-offer retract, keyed by offer id. */
+	readonly retract = new KeyedAsyncSlot<string>();
 
 	#offers: Map<string, RoleGrantOfferJson> = $state.raw(new Map());
 
@@ -124,7 +158,9 @@ export class RoleGrantOffersState {
 		for (const o of this.#offers.values()) {
 			if (o.to_account_id !== account_id) continue;
 			if (is_terminal(o)) continue;
-			if (Date.parse(o.expires_at) <= now) continue;
+			// end-of-second rule, so the inbox never hides an offer the server's
+			// raw-column `expires_at > NOW()` gate would still accept
+			if (!is_iso8601_seconds_live(o.expires_at, now)) continue;
 			rows.push(o);
 		}
 		rows.sort((a, b) => Date.parse(a.expires_at) - Date.parse(b.expires_at));
@@ -140,7 +176,8 @@ export class RoleGrantOffersState {
 		for (const o of this.#offers.values()) {
 			if (o.from_actor_id !== actor_id) continue;
 			if (is_terminal(o)) continue;
-			if (Date.parse(o.expires_at) <= now) continue;
+			// end-of-second comparison, see `incoming`
+			if (!is_iso8601_seconds_live(o.expires_at, now)) continue;
 			rows.push(o);
 		}
 		rows.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
@@ -183,16 +220,15 @@ export class RoleGrantOffersState {
 	 *
 	 * `to_actor_id` (optional) narrows the offer to a specific actor on
 	 * `to_account_id`; omit / null for the account-grain default (any actor
-	 * on the recipient account may accept).
+	 * on the recipient account may accept). A scoped offer passes `scope_kind`
+	 * and `scope_id` together; an unpaired scope (reachable from untyped
+	 * callers) fails with `GRANT_SCOPE_PAIRED_MESSAGE` without an RPC.
 	 */
-	async submit_create(params: {
-		to_account_id: string;
-		to_actor_id?: string | null;
-		role: string;
-		scope_id?: string | null;
-		message?: string | null;
-	}): Promise<RoleGrantOfferJson | undefined> {
+	async submit_create(params: RoleGrantOfferCreateParams): Promise<RoleGrantOfferJson | undefined> {
 		return this.create.run(async () => {
+			if (!is_grant_scope_paired(params)) {
+				throw new Error(GRANT_SCOPE_PAIRED_MESSAGE);
+			}
 			const { offer } = await this.#rpc.create(params);
 			this.#merge_offers([offer]);
 			return offer;
@@ -200,9 +236,9 @@ export class RoleGrantOffersState {
 	}
 
 	/** Accept an offer; stamps it terminal in the cache and drops any siblings the server superseded. */
-	async submit_accept(offer_id: string): Promise<void> {
-		await this.accept.run(async () => {
-			const result = await this.#rpc.accept(offer_id);
+	async submit_accept(offer_id: Uuid): Promise<void> {
+		await this.accept.run(offer_id, async () => {
+			const result = await this.#rpc.accept({ offer_id });
 			this.#merge_offers([result.offer]);
 			// siblings are authoritatively superseded server-side; the
 			// corresponding WS notifications will also arrive, but dropping
@@ -213,17 +249,19 @@ export class RoleGrantOffersState {
 		});
 	}
 
-	async submit_decline(offer_id: string, reason?: string | null): Promise<void> {
-		await this.decline.run(async () => {
-			await this.#rpc.decline(offer_id, reason);
-			this.#remove_offer(offer_id);
+	/** Decline an offer; stamps the declined offer the server returns into the cache. */
+	async submit_decline(offer_id: Uuid, reason?: string | null): Promise<void> {
+		await this.decline.run(offer_id, async () => {
+			const { offer } = await this.#rpc.decline({ offer_id, reason });
+			this.#merge_offers([offer]);
 		});
 	}
 
-	async submit_retract(offer_id: string): Promise<void> {
-		await this.retract.run(async () => {
-			await this.#rpc.retract(offer_id);
-			this.#remove_offer(offer_id);
+	/** Retract an offer; stamps the retracted offer the server returns into the cache. */
+	async submit_retract(offer_id: Uuid): Promise<void> {
+		await this.retract.run(offer_id, async () => {
+			const { offer } = await this.#rpc.retract({ offer_id });
+			this.#merge_offers([offer]);
 		});
 	}
 
@@ -253,7 +291,7 @@ export class RoleGrantOffersState {
 			case ROLE_GRANT_OFFER_SUPERSEDE_NOTIFICATION_METHOD: {
 				const params = notification.params;
 				if (!params || typeof params !== 'object' || !('offer' in params)) return;
-				const offer = (params as { offer: unknown }).offer;
+				const offer = params.offer;
 				if (!is_role_grant_offer_like(offer)) return;
 				this.#merge_offers([offer]);
 				return;
@@ -279,9 +317,16 @@ export class RoleGrantOffersState {
 		this.#offers = new Map();
 	}
 
+	/**
+	 * Merge offers into the cache by id. A terminal offer is never replaced by
+	 * a pending one — offers only move forward, so a late notification or seed
+	 * can't revive one a verb already stamped terminal.
+	 */
 	#merge_offers(offers: ReadonlyArray<RoleGrantOfferJson>): void {
 		const next = new Map(this.#offers);
 		for (const offer of offers) {
+			const known = next.get(offer.id);
+			if (known && is_terminal(known) && !is_terminal(offer)) continue;
 			next.set(offer.id, offer);
 		}
 		this.#offers = next;

@@ -1,6 +1,5 @@
-import type { CrossRuntimeReport } from "./benchmark_data.ts";
+import type { CrossRuntimeReport } from './benchmark_cross_runtime.ts';
 
-import json from "./benchmarks_cross_runtime.json" with { type: "json" };
+import json from './benchmarks_cross_runtime.json' with { type: 'json' };
 
-export const benchmarks_cross_runtime_json: CrossRuntimeReport =
-  json as CrossRuntimeReport;
+export const benchmarks_cross_runtime_json: CrossRuntimeReport = json as CrossRuntimeReport;

@@ -4,7 +4,7 @@
 	 *
 	 * Shows every offer involving the current account — recipient or grantor
 	 * — including terminal rows (accepted, declined, retracted, superseded,
-	 * expired). Backed by `role_grant_offer_history` (new RPC action); seeded
+	 * expired). Backed by the `role_grant_offer_history` RPC action; seeded
 	 * via `RoleGrantOffersState.fetch_history()`.
 	 *
 	 * Consumers plug in optional `format_actor` / `format_scope` callbacks
@@ -15,6 +15,7 @@
 	import Datatable from './Datatable.svelte';
 	import type { DatatableColumn } from './datatable.ts';
 	import { format_relative_time, format_datetime_local, truncate_uuid } from './ui_format.ts';
+	import { is_iso8601_seconds_live } from '../timestamp.ts';
 	import type { RoleGrantOfferJson } from '../auth/role_grant_offer_schema.ts';
 	import { format_scope_context, resolve_scope_label, type FormatScope } from './format_scope.ts';
 
@@ -40,28 +41,29 @@
 	const get_format_scope = format_scope_context.get();
 	const format_scope_from_context = $derived(get_format_scope());
 
-	const now = $state.raw(Date.now());
+	const now = Date.now();
 
 	const status_of = (offer: RoleGrantOfferJson): string => {
 		if (offer.accepted_at) return 'accepted';
 		if (offer.declined_at) return 'declined';
 		if (offer.retracted_at) return 'retracted';
 		if (offer.superseded_at) return 'superseded';
-		if (Date.parse(offer.expires_at) <= now) return 'expired';
+		// end-of-second comparison, see `RoleGrantOffersState.incoming`
+		if (!is_iso8601_seconds_live(offer.expires_at, now)) return 'expired';
 		return 'pending';
 	};
 
 	const status_chip_class = (status: string): string => {
 		switch (status) {
 			case 'accepted':
-				return 'chip color_b';
+				return 'chip palette_b';
 			case 'pending':
-				return 'chip color_a';
+				return 'chip palette_a';
 			case 'declined':
 			case 'retracted':
 			case 'superseded':
 			case 'expired':
-				return 'chip color_c';
+				return 'chip palette_c';
 			default:
 				return 'chip';
 		}
@@ -80,14 +82,14 @@
 </script>
 
 <section>
-	<h2>offer history</h2>
+	<h2>Offer History</h2>
 
 	{#if role_grant_offers.list_history.loading}
 		<p class="text_50">loading history...</p>
 	{:else if role_grant_offers.list_history.error}
 		<p class="color_c_50">{role_grant_offers.list_history.error}</p>
 	{:else}
-		<Datatable {columns} rows={role_grant_offers.history} height="400px" row_key="id">
+		<Datatable {columns} rows={role_grant_offers.history} row_key={(row) => row.id} height="400px">
 			{#snippet cell(column, row)}
 				{#if column.key === 'from_actor_id'}
 					{#if current_actor_id && row.from_actor_id === current_actor_id}

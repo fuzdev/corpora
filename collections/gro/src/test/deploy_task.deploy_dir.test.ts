@@ -1,8 +1,8 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join, resolve } from 'node:path';
 
-import { task as deploy_task } from '$lib/deploy.task.ts';
-import { GIT_DIRNAME } from '$lib/constants.ts';
+import { task as deploy_task } from '#lib/deploy.task.ts';
+import { GIT_DIRNAME } from '#lib/constants.ts';
 
 import {
 	create_mock_deploy_task_context,
@@ -27,12 +27,13 @@ vi.mock('@fuzdev/fuz_util/git.js', async (import_original) => {
 		git_current_branch_name: vi.fn(),
 		git_delete_local_branch: vi.fn(),
 		git_push_to_create: vi.fn(),
-		git_reset_branch_to_first_commit: vi.fn()
+		git_current_branch_first_commit_hash: vi.fn()
 	};
 });
 
 vi.mock('@fuzdev/fuz_util/process.js', () => ({
-	spawn: vi.fn()
+	spawn: vi.fn(),
+	spawn_out: vi.fn()
 }));
 
 vi.mock('node:fs/promises', () => ({

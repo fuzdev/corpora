@@ -9,18 +9,26 @@
  */
 
 import ts from 'typescript';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { assert } from 'vitest';
 
 import {
 	createSourceOptions,
 	type ModuleSourceOptions,
 	type SourceOptionsOverrides
-} from '$lib/source-config.ts';
-import { applyVirtualFiles, type VirtualFileEntry } from '$lib/typescript-program.ts';
-import { analyze } from '$lib/analyze.ts';
-import type { AnalyzeResultJson } from '$lib/analyze-core.ts';
-import { transformSvelteSource, type SvelteVirtualFile } from '$lib/svelte.ts';
-import type { SourceFileInfo } from '$lib/source.ts';
+} from '#lib/source-config.ts';
+import {
+	applyVirtualFiles,
+	buildRootFileNames,
+	loadTsconfig,
+	type VirtualFileEntry
+} from '#lib/typescript-program.ts';
+import { analyze, type AnalyzeOptions } from '#lib/analyze.ts';
+import type { AnalyzeResultJson } from '#lib/analyze-core.ts';
+import { analyzeSvelteModule, transformSvelteSource, type SvelteVirtualFile } from '#lib/svelte.ts';
+import type { SourceFileInfo } from '#lib/source.ts';
+import type { Diagnostic } from '#lib/diagnostics.ts';
+import type { ComponentDeclarationJson } from '#lib/types.ts';
 
 import { withTestProject } from './test-helpers.ts';
 
@@ -38,14 +46,18 @@ import { withTestProject } from './test-helpers.ts';
  * `analyze()` over `process.cwd()`-rooted ids with `testSourceOptions()`
  * instead — the tmpdir this creates has no reachable `node_modules`.
  */
-export const analyzeTestProject = (files: Record<string, string>): Promise<AnalyzeResultJson> =>
+export const analyzeTestProject = (
+	files: Record<string, string>,
+	options?: Pick<AnalyzeOptions, 'onDuplicates'>
+): Promise<AnalyzeResultJson> =>
 	withTestProject(files, (projectRoot) =>
 		analyze({
 			sourceFiles: Object.entries(files).map(([path, content]) => ({
 				id: join(projectRoot, path),
 				content
 			})),
-			sourceOptions: createSourceOptions(projectRoot)
+			sourceOptions: createSourceOptions(projectRoot),
+			...options
 		})
 	);
 
@@ -58,6 +70,78 @@ export const transformOrThrow = (sourceFile: SourceFileInfo): SvelteVirtualFile 
 		);
 	}
 	return result.virtual;
+};
+
+/** Ways `analyzeDoctored` departs from what a real analysis is handed. */
+export interface DoctoredAnalysisOptions {
+	/**
+	 * Rewrite the virtual's content, standing in for a svelte2tsx whose output
+	 * differs. Asserted to change it, so a doctor that stops matching fails
+	 * loudly instead of testing the undoctored virtual.
+	 */
+	content?: (content: string) => string;
+	/** Replace the virtual file wholesale, after `content` is applied. */
+	virtual?: (virtual: SvelteVirtualFile) => SvelteVirtualFile;
+	/** Wrap the checker `analyzeSvelteModule` is handed. */
+	checker?: (checker: ts.TypeChecker) => ts.TypeChecker;
+}
+
+/** What `analyzeDoctored` returns. */
+export interface DoctoredAnalysis {
+	/** The component declaration, or `undefined` when analysis returned no module. */
+	component: ComponentDeclarationJson | undefined;
+	diagnostics: Array<Diagnostic>;
+	/** The component's absolute id, what a diagnostic's `file` carries. */
+	id: string;
+	/** The virtual as svelte2tsx wrote it, before any doctoring. */
+	transformed: SvelteVirtualFile;
+}
+
+/**
+ * Analyze one component through `analyzeSvelteModule` directly, with its
+ * virtual and checker open to doctoring.
+ *
+ * For what the pipeline can't be made to produce: a svelte2tsx output shape
+ * that changed, a virtual built by hand, a checker that throws. The component
+ * is rooted in the repo (`src/lib/<name>.svelte`) so real packages resolve and
+ * its own props aren't judged external.
+ *
+ * @param name - the component name; nothing needs to exist at its path
+ * @param source - the Svelte source
+ */
+export const analyzeDoctored = (
+	name: string,
+	source: string,
+	doctors: DoctoredAnalysisOptions = {}
+): DoctoredAnalysis => {
+	const id = join(process.cwd(), `src/lib/${name}.svelte`);
+	const sourceFile = { id, content: source };
+	const transformed = transformOrThrow(sourceFile);
+	let virtual = transformed;
+	if (doctors.content) {
+		const content = doctors.content(transformed.content);
+		assert.notStrictEqual(content, transformed.content, 'expected the virtual to be doctored');
+		virtual = { ...virtual, content };
+	}
+	if (doctors.virtual) virtual = doctors.virtual(virtual);
+	const program = createCachedAnalysisProgram(new Map([[virtual.virtualPath, virtual]]));
+	const checker = program.getTypeChecker();
+	const diagnostics: Array<Diagnostic> = [];
+	const analysis = analyzeSvelteModule(
+		sourceFile,
+		`${name}.svelte`,
+		doctors.checker ? doctors.checker(checker) : checker,
+		createTestSourceOptions(dirname(id)),
+		diagnostics,
+		program,
+		virtual
+	);
+	return {
+		component: analysis?.declarations[0]?.declaration as ComponentDeclarationJson | undefined,
+		diagnostics,
+		id,
+		transformed
+	};
 };
 
 /** Default project root for tests. */
@@ -146,15 +230,15 @@ export const createVirtualFileProgram = (
 	const host = ts.createCompilerHost(compilerOptions);
 	applyVirtualFiles(host, fileMap);
 
-	return ts.createProgram([...fileMap.keys()], compilerOptions, host);
+	return ts.createProgram(buildRootFileNames([], [...fileMap.keys()]), compilerOptions, host);
 };
 
 // Cached tsconfig parse + parsed ASTs for `createCachedAnalysisProgram`
 
-let _cachedParsedConfig: { options: ts.CompilerOptions; fileNames: Array<string> } | undefined;
+let _cachedParsedConfig: ReturnType<typeof loadTsconfig> | undefined;
 /**
  * Parsed-AST cache keyed by file name. Safe because every program shares the
- * single `_cachedParsedConfig.options` object and repo files don't change
+ * single `_cachedParsedConfig.compilerOptions` object and repo files don't change
  * mid-run — the same reuse a language service gets from its document
  * registry. Virtuals are served by `applyVirtualFiles` layered above the
  * caching wrapper, so they never enter the cache.
@@ -177,16 +261,15 @@ const _sourceFileCache = new Map<string, ts.SourceFile>();
 export const createCachedAnalysisProgram = (
 	virtualFiles?: Map<string, VirtualFileEntry>
 ): ts.Program => {
-	if (!_cachedParsedConfig) {
-		const projectRoot = process.cwd();
-		const configPath = ts.findConfigFile(projectRoot, ts.sys.fileExists, 'tsconfig.json');
-		if (!configPath) throw new Error('No tsconfig.json found');
-		const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
-		_cachedParsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectRoot);
-	}
+	// the same parse the analysis paths use, so an unloadable `extends` chain
+	// throws here too instead of silently checking without the inherited options
+	_cachedParsedConfig ??= loadTsconfig({ projectRoot: process.cwd() });
 
-	const { options, fileNames } = _cachedParsedConfig;
-	const rootNames = virtualFiles?.size ? [...fileNames, ...virtualFiles.keys()] : fileNames;
+	const { compilerOptions: options, rootFileNames: fileNames } = _cachedParsedConfig;
+	// the same roots `createAnalysisProgram` builds, Svelte shims included
+	const rootNames = virtualFiles?.size
+		? buildRootFileNames(fileNames, [...virtualFiles.keys()])
+		: fileNames;
 
 	const host = ts.createCompilerHost(options);
 	const uncachedGetSourceFile = host.getSourceFile.bind(host);

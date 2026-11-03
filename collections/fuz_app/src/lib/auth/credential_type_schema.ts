@@ -6,16 +6,17 @@
  * Open-string registry on top so consumers can declare additional
  * credential types (e.g. `'sso_assertion'`, `'agent_token'`) without an
  * upstream release. `RoleSpec.required_credential_types` references
- * entries from this registry; v1 keeps the field informative-only
- * (consumed by `auth/middleware.ts` and the dispatcher). Mirrors the
+ * entries from this registry; v1 keeps the field informative-only —
+ * validated at construction, enforced nowhere; routes and actions gate
+ * with `auth.credential_types`. Mirrors the
  * open-registry pattern used for `RoleName`, `ScopeKindName`,
  * `GrantPathName`, and `AuditEventTypeName`.
  *
- * The Hono-side wire-validated `CredentialType` Zod enum (in
- * `hono_context.ts`) is the closed-set narrow type middleware sets on
- * the context; the constants below are the source of truth for those
- * three string values. Future builtin credential types added here
- * propagate to the wire enum by editing the import list.
+ * `BuiltinCredentialType` is the closed set middleware sets on the Hono
+ * context (`hono_context.ts`) and the audit log records — middleware only
+ * ever authenticates through a builtin. Consumer-declared types live in
+ * the registry `create_credential_type_schema` builds, consulted when
+ * validating `RoleSpec.required_credential_types`.
  *
  * @module
  */

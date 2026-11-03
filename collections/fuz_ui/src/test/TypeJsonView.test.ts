@@ -5,7 +5,7 @@ import { describe, test, assert, afterEach } from 'vitest';
 import { flushSync } from 'svelte';
 import type { TypeJson } from 'svelte-docinfo/types.js';
 
-import type { Library } from '$lib/library.svelte.ts';
+import type { Library } from '#lib/library.svelte.ts';
 import TypeJsonViewHarness from './TypeJsonViewHarness.svelte';
 import { mount_component, unmount_component } from './test_helpers.ts';
 import { fake_library } from './library_test_helpers.ts';

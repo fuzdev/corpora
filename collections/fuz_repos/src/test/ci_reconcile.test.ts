@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 
-import { reconcile_ci, repo_has_workflows } from '$lib/ci_reconcile.ts';
+import { reconcile_ci, repo_has_workflows } from '#lib/ci_reconcile.ts';
 
 describe('reconcile_ci', () => {
 	test('flags ci=true with no workflows as missing_ci', () => {
@@ -12,7 +12,6 @@ describe('reconcile_ci', () => {
 				repo_url: 'https://github.com/x/a',
 				ci: true,
 				has_workflows: false,
-				checkable: true,
 				archived: false
 			}
 		]);
@@ -28,7 +27,6 @@ describe('reconcile_ci', () => {
 				repo_url: 'https://github.com/x/b',
 				ci: false,
 				has_workflows: true,
-				checkable: true,
 				archived: false
 			}
 		]);
@@ -44,27 +42,12 @@ describe('reconcile_ci', () => {
 				repo_url: 'https://github.com/x/c',
 				ci: true,
 				has_workflows: true,
-				checkable: true,
 				archived: false
 			},
 			{
 				repo_url: 'https://github.com/x/d',
 				ci: false,
 				has_workflows: false,
-				checkable: true,
-				archived: false
-			}
-		]);
-		assert.equal(drift.length, 0);
-	});
-
-	test('skips repos that are not checked out locally', () => {
-		const drift = reconcile_ci([
-			{
-				repo_url: 'https://github.com/x/e',
-				ci: true,
-				has_workflows: false,
-				checkable: false,
 				archived: false
 			}
 		]);
@@ -77,14 +60,12 @@ describe('reconcile_ci', () => {
 				repo_url: 'https://github.com/x/f',
 				ci: true,
 				has_workflows: false,
-				checkable: true,
 				archived: true
 			},
 			{
 				repo_url: 'https://github.com/x/g',
 				ci: false,
 				has_workflows: true,
-				checkable: true,
 				archived: true
 			}
 		]);

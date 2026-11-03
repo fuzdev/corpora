@@ -1,10 +1,13 @@
 <script lang="ts">
 	/**
-	 * Admin dashboard — six summary panels (accounts, sessions, invites,
-	 * recent activity, security, system) fed by parallel `fetch()` calls
-	 * on mount. Consumes all four admin RPC contexts plus `auth_state_context`;
-	 * derives `role_counts`, `failed_logins`, and `role_grant_changes` from the
-	 * audit log slice.
+	 * Admin dashboard — summary panels (accounts, sessions, invites, recent
+	 * activity, security, system) fed by parallel `fetch()` calls on mount.
+	 * Consumes the admin RPC contexts plus `auth_state_context`. Recent
+	 * activity is the newest slice of the audit log; the security counts come
+	 * from their own queries (failed logins filtered server-side, role grant
+	 * changes from the role-grant history), each fetched up to
+	 * `AUDIT_LOG_LIST_LIMIT_MAX` rows and counted over the last 24 hours
+	 * (`SECURITY_WINDOW_HOURS`) — `N+` when the cap may cut the window off.
 	 *
 	 * @module
 	 */
@@ -18,7 +21,8 @@
 	import { AdminInvitesState, admin_invites_rpc_context } from './admin_invites_state.svelte.ts';
 	import { AuditLogState, audit_log_rpc_context } from './audit_log_state.svelte.ts';
 	import { AppSettingsState, app_settings_rpc_context } from './app_settings_state.svelte.ts';
-	import { format_relative_time, format_datetime_local } from './ui_format.ts';
+	import { AUDIT_LOG_LIST_LIMIT_MAX } from '../auth/admin_action_specs.ts';
+	import { format_relative_time, format_datetime_local, count_in_window } from './ui_format.ts';
 	import ConfirmButton from './ConfirmButton.svelte';
 
 	const auth_state = auth_state_context.get();
@@ -32,9 +36,13 @@
 	const sessions = new AdminSessionsState({ get_rpc: get_accounts_rpc });
 	const invites = new AdminInvitesState({ get_rpc: get_invites_rpc });
 	const audit_log = new AuditLogState({ get_rpc: get_audit_log_rpc });
+	// the security counts, each from a query of its own rather than the recent slice
+	const security_log = new AuditLogState({ get_rpc: get_audit_log_rpc });
 	const app_settings = new AppSettingsState({ get_rpc: get_app_settings_rpc });
 
-	// accounts - dynamic role breakdown
+	// accounts - dynamic role breakdown; display only, and scope-blind on purpose:
+	// an account counts under each role it holds at any scope, so a count is not
+	// "who has this role globally" (that's `has_global_role` over the row's grants)
 	const role_counts = $derived.by(() => {
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity
 		const counts = new Map<string, number>();
@@ -60,13 +68,22 @@
 
 	// audit log
 	const recent_events = $derived(audit_log.events.slice(0, 8));
-	const failed_logins = $derived(
-		audit_log.events.filter((e) => e.event_type === 'login' && e.outcome === 'failure')
+	const failed_logins = $derived(security_log.events);
+	const role_grant_changes = $derived(security_log.role_grant_history_events);
+	// the security counts cover this many hours back from when the rows arrive
+	const SECURITY_WINDOW_HOURS = 24;
+	const window_start = (): number => Date.now() - SECURITY_WINDOW_HOURS * 60 * 60 * 1000;
+	const failed_logins_in_window = $derived(
+		count_in_window(failed_logins, window_start(), AUDIT_LOG_LIST_LIMIT_MAX)
 	);
-	const role_grant_changes = $derived(
-		audit_log.events.filter(
-			(e) => e.event_type === 'role_grant_create' || e.event_type === 'role_grant_revoke'
-		)
+	const role_grant_changes_in_window = $derived(
+		count_in_window(role_grant_changes, window_start(), AUDIT_LOG_LIST_LIMIT_MAX)
+	);
+
+	// the security slots read as loading until their fetch starts on mount
+	const security_list_pending = $derived(security_log.list.initial || security_log.list.loading);
+	const role_grant_history_pending = $derived(
+		security_log.role_grant_history.initial || security_log.role_grant_history.loading
 	);
 
 	onMount(() => {
@@ -74,17 +91,31 @@
 			accounts.fetch(),
 			sessions.fetch(),
 			invites.fetch(),
-			audit_log.fetch({ limit: 30 }),
+			audit_log.fetch({ limit: 8 }),
+			security_log.fetch({
+				event_type: 'login',
+				outcome: 'failure',
+				limit: AUDIT_LOG_LIST_LIMIT_MAX
+			}),
+			security_log.fetch_role_grant_history(AUDIT_LOG_LIST_LIMIT_MAX),
 			app_settings.fetch()
 		]);
 	});
 </script>
 
+{#snippet open_signup_chip(open_signup: boolean)}
+	{#if open_signup}
+		<span class="chip palette_b">open</span>
+	{:else}
+		<span class="chip">invite-only</span>
+	{/if}
+{/snippet}
+
 <!-- TODO: panels will be user-draggable/rearrangeable, hardcoded order for now -->
 <div class="overview">
 	<section>
 		<div class="panel-header">
-			<h3>accounts</h3>
+			<h3>Accounts</h3>
 			<a href={resolve('/admin/accounts' as any)} class="text_50 font_size_sm">view all &rarr;</a>
 		</div>
 		{#if accounts.list.loading}
@@ -126,7 +157,7 @@
 
 	<section>
 		<div class="panel-header">
-			<h3>sessions</h3>
+			<h3>Sessions</h3>
 			<a href={resolve('/admin/sessions' as any)} class="text_50 font_size_sm">view all &rarr;</a>
 		</div>
 		{#if sessions.list.loading}
@@ -146,9 +177,9 @@
 				<div class="baseline-row gap_xs font_size_sm mt_sm">
 					<span class="text_50">newest session:</span>
 					<strong>{most_recent.username}</strong>
-					<span class="text_50" title={format_datetime_local(most_recent.created_at)}
-						>{format_relative_time(most_recent.created_at)}</span
-					>
+					<span class="text_50" title={format_datetime_local(most_recent.created_at)}>
+						{format_relative_time(most_recent.created_at)}
+					</span>
 				</div>
 			{/if}
 		{/if}
@@ -156,7 +187,7 @@
 
 	<section>
 		<div class="panel-header">
-			<h3>invites</h3>
+			<h3>Invites</h3>
 			<a href={resolve('/admin/invites' as any)} class="text_50 font_size_sm">view all &rarr;</a>
 		</div>
 		{#if invites.list.loading}
@@ -164,14 +195,12 @@
 		{:else if invites.list.error}
 			<p class="color_c_50">{invites.list.error}</p>
 		{:else}
-			<div class="baseline-row gap_sm">
-				<span class="text_50">public signup</span>
-				{#if app_settings.settings?.open_signup}
-					<span class="chip color_b">open</span>
-				{:else}
-					<span class="chip">closed</span>
-				{/if}
-			</div>
+			{#if app_settings.settings}
+				<div class="baseline-row gap_sm">
+					<span class="text_50">public signup</span>
+					{@render open_signup_chip(app_settings.settings.open_signup)}
+				</div>
+			{/if}
 			<div class="baseline-row gap_xs">
 				<strong class="font_size_lg">{invites.unclaimed_count}</strong>
 				<span class="text_50">unclaimed</span>
@@ -185,7 +214,7 @@
 						<li>
 							<span>{invite.email || invite.username || '—'}</span>
 							{#if invite.claimed_at}
-								<span class="chip font_size_sm color_b">claimed</span>
+								<span class="chip font_size_sm palette_b">claimed</span>
 							{:else}
 								<span class="chip font_size_sm">unclaimed</span>
 							{/if}
@@ -201,7 +230,7 @@
 
 	<section>
 		<div class="panel-header">
-			<h3>recent activity</h3>
+			<h3>Recent Activity</h3>
 			<a href={resolve('/admin/audit-log' as any)} class="text_50 font_size_sm">view all &rarr;</a>
 		</div>
 		{#if audit_log.list.loading}
@@ -214,12 +243,12 @@
 			<ul class="compact-list">
 				{#each recent_events as event (event.id)}
 					<li>
-						<span class="text_50 font_size_sm" title={format_datetime_local(event.created_at)}
-							>{format_relative_time(event.created_at)}</span
-						>
+						<span class="text_50 font_size_sm" title={format_datetime_local(event.created_at)}>
+							{format_relative_time(event.created_at)}
+						</span>
 						<code class="font_size_sm">{event.event_type}</code>
 						{#if event.outcome === 'failure'}
-							<span class="chip font_size_sm color_c">fail</span>
+							<span class="chip font_size_sm palette_c">fail</span>
 						{/if}
 					</li>
 				{/each}
@@ -229,31 +258,45 @@
 
 	<section>
 		<div class="panel-header">
-			<h3>security</h3>
+			<h3>Security</h3>
 			<a href={resolve('/admin/audit-log' as any)} class="text_50 font_size_sm">audit log &rarr;</a>
 		</div>
-		{#if audit_log.list.loading}
+		{#if security_list_pending}
 			<p class="text_50">loading...</p>
-		{:else if audit_log.list.error}
-			<p class="color_c_50">{audit_log.list.error}</p>
+		{:else if security_log.list.error}
+			<p class="color_c_50">{security_log.list.error}</p>
 		{:else}
 			<div class="baseline-row gap_xs">
-				<strong class="font_size_lg" class:color_c_50={failed_logins.length > 0}>
-					{failed_logins.length}
+				<strong class="font_size_lg" class:color_c_50={failed_logins_in_window.count > 0}>
+					{failed_logins_in_window.label}
 				</strong>
-				<span class="text_50">failed logins</span>
+				<span class="text_50">failed logins in the last {SECURITY_WINDOW_HOURS}h</span>
+				{#if failed_logins[0]}
+					<span
+						class="text_50 font_size_sm"
+						title={format_datetime_local(failed_logins[0].created_at)}
+					>
+						latest {format_relative_time(failed_logins[0].created_at)}
+					</span>
+				{/if}
 			</div>
+		{/if}
+		{#if role_grant_history_pending}
+			<p class="text_50">loading...</p>
+		{:else if security_log.role_grant_history.error}
+			<p class="color_c_50">{security_log.role_grant_history.error}</p>
+		{:else}
 			<div class="baseline-row gap_xs">
-				<strong class="font_size_lg">{role_grant_changes.length}</strong>
-				<span class="text_50">role_grant changes</span>
+				<strong class="font_size_lg">{role_grant_changes_in_window.label}</strong>
+				<span class="text_50">role_grant changes in the last {SECURITY_WINDOW_HOURS}h</span>
 			</div>
 			{#if role_grant_changes.length > 0}
 				<ul class="compact-list">
 					{#each role_grant_changes.slice(0, 4) as event (event.id)}
 						<li class="font_size_sm">
-							<span class="text_50" title={format_datetime_local(event.created_at)}
-								>{format_relative_time(event.created_at)}</span
-							>
+							<span class="text_50" title={format_datetime_local(event.created_at)}>
+								{format_relative_time(event.created_at)}
+							</span>
 							<code>{event.event_type === 'role_grant_create' ? 'grant' : 'revoke'}</code>
 							{#if event.metadata?.role}
 								<span class="chip font_size_sm">{event.metadata.role}</span>
@@ -267,21 +310,19 @@
 
 	<section>
 		<div class="panel-header">
-			<h3>system</h3>
+			<h3>System</h3>
 		</div>
 		{#if app_settings.list.loading}
 			<p class="text_50">loading...</p>
 		{:else if app_settings.list.error}
 			<p class="color_c_50">{app_settings.list.error}</p>
 		{:else}
-			<div class="baseline-row gap_sm">
-				<span class="text_50">public signup</span>
-				{#if app_settings.settings?.open_signup}
-					<span class="chip color_b">open</span>
-				{:else}
-					<span class="chip">invite-only</span>
-				{/if}
-			</div>
+			{#if app_settings.settings}
+				<div class="baseline-row gap_sm">
+					<span class="text_50">public signup</span>
+					{@render open_signup_chip(app_settings.settings.open_signup)}
+				</div>
+			{/if}
 			{#if app_settings.settings?.updated_at}
 				<div class="baseline-row gap_xs font_size_sm mt_xs">
 					<span class="text_50">last changed:</span>
@@ -309,7 +350,7 @@
 					label="log out"
 				>
 					{#snippet popover_button_content()}
-						<span class="p_md"> log out </span>
+						<span class="p_md">log out</span>
 					{/snippet}
 				</ConfirmButton>
 			</div>

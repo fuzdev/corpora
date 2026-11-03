@@ -4,13 +4,17 @@
  * @module
  */
 
-import { describe, assert, test } from 'vitest';
+import { describe, assert, test, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 
-import { ActionDispatcher } from '$lib/actions/action_dispatcher.ts';
-import { Transports, type Transport } from '$lib/actions/transports.ts';
-import type { ActionEventEnvironment } from '$lib/actions/action_event_types.ts';
-import type { ActionSpecUnion } from '$lib/actions/action_spec.ts';
+import { ActionDispatcher } from '#lib/actions/action_dispatcher.ts';
+import { Transports, type Transport } from '#lib/actions/transports.ts';
+import {
+	console_action_log,
+	resolve_action_log,
+	type ActionEventEnvironment
+} from '#lib/actions/action_event_types.ts';
+import type { ActionSpecUnion } from '#lib/actions/action_spec.ts';
 
 const ping_spec = {
 	method: 'ping',
@@ -34,6 +38,42 @@ const notify_spec = {
 	output: z.void(),
 	async: true,
 	description: 'Notification'
+} satisfies ActionSpecUnion;
+
+const void_request_spec = {
+	method: 'refresh',
+	kind: 'request_response',
+	initiator: 'backend',
+	auth: { account: 'none', actor: 'none' },
+	side_effects: false,
+	input: z.void(),
+	output: z.strictObject({ ok: z.literal(true) }),
+	async: true,
+	description: 'A parameterless backend-initiated request'
+} satisfies ActionSpecUnion;
+
+const void_notify_spec = {
+	method: 'things_reset',
+	kind: 'remote_notification',
+	initiator: 'backend',
+	auth: null,
+	side_effects: true,
+	input: z.void(),
+	output: z.void(),
+	async: true,
+	description: 'A parameterless notification'
+} satisfies ActionSpecUnion;
+
+const optional_input_spec = {
+	method: 'things_list',
+	kind: 'request_response',
+	initiator: 'backend',
+	auth: { account: 'none', actor: 'none' },
+	side_effects: false,
+	input: z.strictObject({ limit: z.number().optional() }),
+	output: z.strictObject({ ok: z.literal(true) }),
+	async: true,
+	description: 'A request whose input fields are all optional'
 } satisfies ActionSpecUnion;
 
 class TestEnvironment implements ActionEventEnvironment {
@@ -147,6 +187,88 @@ describe('ActionDispatcher', () => {
 		assert.ok(received);
 	});
 
+	test('receive reads absent, null, and {} params of a void request as the no-arg call', async () => {
+		const env = new TestEnvironment([void_request_spec]);
+		const inputs: Array<unknown> = [];
+		env.add_handler('refresh', 'receive_request', (event) => {
+			inputs.push(event.data.input);
+			return { ok: true };
+		});
+		const peer = new ActionDispatcher({ environment: env });
+
+		const shapes: Array<[string, Record<string, unknown>]> = [
+			['absent', {}],
+			['null', { params: null }],
+			['{}', { params: {} }]
+		];
+		for (const [label, params] of shapes) {
+			const result = await peer.receive({ jsonrpc: '2.0', method: 'refresh', id: 1, ...params });
+			assert.ok(result && 'result' in result, `${label}: ${JSON.stringify(result)}`);
+			assert.deepStrictEqual(result.result, { ok: true }, label);
+		}
+		assert.deepStrictEqual(inputs, [undefined, undefined, undefined]);
+	});
+
+	test('receive refuses non-empty params of a void request', async () => {
+		const env = new TestEnvironment([void_request_spec]);
+		let handled = false;
+		env.add_handler('refresh', 'receive_request', () => {
+			handled = true;
+			return { ok: true };
+		});
+		const peer = new ActionDispatcher({ environment: env });
+
+		for (const params of [{ extra: 1 }, []]) {
+			const result = await peer.receive({ jsonrpc: '2.0', method: 'refresh', id: 1, params });
+			assert.ok(result && 'error' in result, JSON.stringify(params));
+		}
+		assert.ok(!handled);
+	});
+
+	test('receive reads absent and null params of an all-optional input as {}', async () => {
+		const env = new TestEnvironment([optional_input_spec]);
+		const inputs: Array<unknown> = [];
+		env.add_handler('things_list', 'receive_request', (event) => {
+			inputs.push(event.data.input);
+			return { ok: true };
+		});
+		const peer = new ActionDispatcher({ environment: env });
+
+		for (const params of [{}, { params: null }, { params: { limit: 2 } }]) {
+			const result = await peer.receive({
+				jsonrpc: '2.0',
+				method: 'things_list',
+				id: 1,
+				...params
+			});
+			assert.ok(result && 'result' in result, JSON.stringify(result));
+		}
+		assert.deepStrictEqual(inputs, [{}, {}, { limit: 2 }]);
+
+		const strict = await peer.receive({
+			jsonrpc: '2.0',
+			method: 'things_list',
+			id: 1,
+			params: { extra: true }
+		});
+		assert.ok(strict && 'error' in strict, 'unknown keys are still refused');
+	});
+
+	test('receive reads {} params of a void notification as the no-arg call', async () => {
+		const env = new TestEnvironment([void_notify_spec]);
+		const inputs: Array<unknown> = [];
+		env.add_handler('things_reset', 'receive', (event) => {
+			inputs.push(event.data.input);
+		});
+		const peer = new ActionDispatcher({ environment: env });
+
+		for (const params of [{}, { params: null }, { params: {} }]) {
+			const result = await peer.receive({ jsonrpc: '2.0', method: 'things_reset', ...params });
+			assert.isNull(result);
+		}
+		assert.deepStrictEqual(inputs, [undefined, undefined, undefined]);
+	});
+
 	test('receive returns invalid_request for non-jsonrpc message', async () => {
 		const env = new TestEnvironment([]);
 		const peer = new ActionDispatcher({ environment: env });
@@ -190,5 +312,52 @@ describe('ActionDispatcher', () => {
 		await peer.send({ jsonrpc: '2.0', method: 'ping', id: 2 }, { queue: false });
 		assert.strictEqual(captured.length, 1);
 		assert.strictEqual(captured[0]!.options?.queue, false);
+	});
+});
+
+describe('ActionDispatcher diagnostics log', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	test('resolve_action_log falls back to console only when log is unset', () => {
+		const env = new TestEnvironment();
+		assert.strictEqual(resolve_action_log(env), console_action_log);
+		assert.isNull(resolve_action_log(Object.assign(env, { log: null })));
+	});
+
+	test('an unset log reports a notification that fails to parse via console.error', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const peer = new ActionDispatcher({ environment: new TestEnvironment([notify_spec]) });
+		await peer.receive({ jsonrpc: '2.0', method: 'thing_changed', params: { id: 1, extra: true } });
+		assert.strictEqual(error.mock.calls.length, 1);
+		assert.include(String(error.mock.calls[0]![0]), 'receive notification failed');
+	});
+
+	test('an unset log reports a throwing notification handler via console.error', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const env = new TestEnvironment([notify_spec]);
+		env.add_handler('thing_changed', 'receive', () => {
+			throw new Error('boom');
+		});
+		const peer = new ActionDispatcher({ environment: env });
+		await peer.receive({ jsonrpc: '2.0', method: 'thing_changed', params: { id: 'a' } });
+		assert.strictEqual(error.mock.calls.length, 1);
+		assert.deepInclude(error.mock.calls[0]![2], { message: 'boom' });
+	});
+
+	test('an unset log reports an unknown notification method via console.warn', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const peer = new ActionDispatcher({ environment: new TestEnvironment() });
+		await peer.receive({ jsonrpc: '2.0', method: 'nope', params: {} });
+		assert.strictEqual(warn.mock.calls.length, 1);
+	});
+
+	test('log: null silences the diagnostics', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const env = Object.assign(new TestEnvironment([notify_spec]), { log: null });
+		const peer = new ActionDispatcher({ environment: env });
+		await peer.receive({ jsonrpc: '2.0', method: 'thing_changed', params: { id: 1 } });
+		assert.strictEqual(error.mock.calls.length, 0);
 	});
 });

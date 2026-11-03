@@ -7,7 +7,7 @@
 	import TomeSectionHeader from '@fuzdev/fuz_ui/TomeSectionHeader.svelte';
 	import TomeSection from '@fuzdev/fuz_ui/TomeSection.svelte';
 
-	import SourceFileLink from '$routes/SourceFileLink.svelte';
+	import SourceFileLink from '#routes/SourceFileLink.svelte';
 
 	const LIBRARY_ITEM_NAME = 'semantic';
 
@@ -17,11 +17,10 @@
 <TomeContent {tome}>
 	<section>
 		<p>
-			fuz_css styles HTML elements in its <SourceFileLink path="style.css">
-				reset stylesheet
-			</SourceFileLink>, so semantic markup gets themed and color-scheme-aware styling automatically
-			- utility classes optional. The goal is to be accessible and attractive out of the box,
-			minimal yet extensible.
+			fuz_css styles HTML elements in its
+			<SourceFileLink path="style.css">reset stylesheet</SourceFileLink>, so semantic markup gets
+			themed and color-scheme-aware styling automatically - utility classes optional. The goal is to
+			be accessible and attractive out of the box, minimal yet extensible.
 		</p>
 	</section>
 
@@ -29,9 +28,10 @@
 		<TomeSectionHeader text="Layers and specificity" />
 		<p>
 			All opinionated styles live in the <code>fuz.base</code> cascade layer, so your unlayered
-			styles and the generated utility classes override them by layer order alone. The selectors are
-			additionally wrapped in <code>:where()</code>, giving them zero specificity, so overriding
-			stays effortless even from inside the fuz layers.
+			styles and the generated utility classes override them by layer order alone. Their selectors
+			are also wrapped in <code>:where()</code> for zero specificity, so overrides stay easy even
+			inside the fuz layers. The exceptions are the document-wide rules: <code>:root</code>,
+			<code>body</code>, <code>[hidden]</code>, and <code>::selection</code>.
 		</p>
 		<Code
 			lang="css"
@@ -43,7 +43,7 @@
 
 :where(button:not(.unstyled)) {
   background-color: var(--button_fill);
-  border-radius: var(--border_radius_sm);
+  border-radius: var(--border_radius, var(--control_radius));
 }`}
 		/>
 	</TomeSection>
@@ -52,9 +52,9 @@
 		<TomeSectionHeader text=".unstyled escape hatch" />
 		<p>
 			Add the <code>.unstyled</code>
-			<TomeLink slug="classes" hash="Builtin-classes">builtin class</TomeLink>
-			to opt out of decorative styling while keeping reset normalizations. Works for both decorative
-			containers and interactive elements like links, buttons, inputs, and summary.
+			<TomeLink slug="classes" hash="Builtin-classes">builtin class</TomeLink> to opt out of
+			decorative styling while keeping reset normalizations. Works for both decorative containers
+			and interactive elements like links, buttons, inputs, and summary.
 		</p>
 		<Code
 			lang="svelte"
@@ -93,9 +93,16 @@
 		/>
 		<p>
 			The <code>--flow_margin</code> variable is unset by default, falling back to
-			<code>var(--space_lg)</code>. Size composite classes like <code>.sm</code> and
-			<code>.lg</code> set <code>--flow_margin</code> to adjust vertical rhythm for all flow
+			<code>var(--space_lg)</code>. Size composite classes like <code>.sized_sm</code> and
+			<code>.sized_lg</code> set <code>--flow_margin</code> to adjust vertical rhythm for all flow
 			elements and headings.
+		</p>
+		<p>
+			Headings add a top margin too, a larger multiple of <code>--flow_margin</code>. A heading that
+			opens a padded or bordered box - <code>.panel</code>, <code>.pane</code>, <code>aside</code>,
+			<code>blockquote</code>, <code>fieldset</code>, <code>dialog</code>, <code>li</code>,
+			<code>td</code>, or <code>th</code> - drops it, so it sits on the box's padding instead of
+			stacking a gap on it.
 		</p>
 		<p>
 			For elements not in the flow list, use the <code>.mb_flow</code> and <code>.mt_flow</code>
@@ -116,7 +123,7 @@
 		<p>
 			The <code>.row</code> layout composite resets margins on its direct children. Flow margins
 			make less sense in horizontal flex layout - for spacing prefer gap utilities like
-			<code>.gap_md</code> and <code>var(--gap_sm)</code> instead.
+			<code>.gap_md</code> and <code>gap: var(--space_sm)</code> instead.
 		</p>
 		<Code
 			lang="css"
@@ -124,6 +131,46 @@
   margin: 0;
 }`}
 		/>
+	</TomeSection>
+
+	<TomeSection>
+		<TomeSectionHeader text="Interaction and ARIA states" />
+		<p>
+			Links and form controls show focus as an outline ring, and only the ring - focus adds no fill.
+			The ring follows <code>:focus-visible</code>, so keyboard focus and a click into a text field
+			or select show it, while a mouse click on a link, button, or checkbox doesn't leave it behind.
+		</p>
+		<p>The base styles read ARIA state attributes on the elements they apply to:</p>
+		<ul>
+			<li>
+				<code>aria-pressed="true"</code> on a <code>button</code>, or on any
+				<code>.selectable</code> or <code>.menuitem</code>, takes the <code>.selected</code> look,
+				and stays clickable like <code>.deselectable</code>
+			</li>
+			<li>
+				<code>aria-current</code> on a link (any value but <code>false</code>) takes the selected
+				link look
+			</li>
+			<li>
+				<code>aria-disabled="true"</code> on a button or form control takes the disabled look with
+				no hover or active states, but keeps its focus ring and pointer events, so it stays
+				reachable by keyboard and can explain why it's disabled; on a <code>.deselectable</code>
+				<code>.menuitem</code> or <code>.selectable</code>, it drops the pointer cursor
+			</li>
+			<li>
+				<code>aria-invalid="true"</code> on an <code>input</code>, <code>textarea</code>, or
+				<code>select</code> turns its border and focus ring negative
+			</li>
+		</ul>
+		<p>
+			Under forced colors (Windows High Contrast), the states painted only by a background are
+			restated in system colors: a checked radio, a range, and the edges of <code>.panel</code> and
+			<code>.pane</code> in the text color, and selection - selected and pressed buttons,
+			<code>.menuitem</code>, <code>.selectable</code> - as a <code>Highlight</code> border and
+			inner band that becomes a double <code>Highlight</code> ring when focused, while a focus ring
+			alone stays the text color. Labels keep the system's colors, and so do icons drawn in
+			<code>currentColor</code>. Selects get their native arrow back.
+		</p>
 	</TomeSection>
 
 	<TomeSection>

@@ -1,11 +1,14 @@
 import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
-import { estimate_token_count } from './helpers.ts';
+import { estimate_token_count_from_length } from './helpers.ts';
+import { joined_content_length } from './thread_helpers.ts';
 import { Cell, type CellOptions } from './cell.svelte.ts';
-import type { PartUnion } from './part.svelte.ts';
+import type { PartUnion, TextPart } from './part.svelte.ts';
 import type { Frontend } from './frontend.svelte.ts';
+import type { Thread } from './thread.svelte.ts';
 import { TurnJson } from './turn_types.ts';
+import { to_completion_truncation, type CompletionTruncation } from './response_helpers.ts';
 import type { CompletionRequest, CompletionResponse, CompletionRole } from './completion_types.ts';
 
 export interface TurnOptions extends CellOptions<typeof TurnJson> {}
@@ -21,6 +24,7 @@ export class Turn extends Cell<typeof TurnJson> {
 	request: CompletionRequest | undefined = $state.raw();
 	response: CompletionResponse | undefined = $state.raw();
 	error_message: string | undefined = $state.raw();
+	cancelled: boolean = $state.raw()!;
 
 	readonly parts: Array<PartUnion> = $derived(
 		this.part_ids
@@ -43,14 +47,23 @@ export class Turn extends Cell<typeof TurnJson> {
 			.filter((c) => c != null)
 			.join('\n\n');
 	}
-	set content(value: string | null | undefined) {
-		if (value != null && this.parts[0]) {
-			this.parts[0].content = value;
-		}
-	}
 
-	readonly length: number = $derived(this.content.length);
-	readonly token_count: number = $derived(estimate_token_count(this.content));
+	/**
+	 * The part completion output is written to — the first `TextPart` of an
+	 * assistant turn. `null` for other roles and for turns without a text part,
+	 * so completion output never writes through a `DiskfilePart` to disk.
+	 */
+	readonly completion_part: TextPart | null = $derived.by(() => {
+		if (this.role !== 'assistant') return null;
+		for (const part of this.parts) {
+			if (part.type === 'text') return part;
+		}
+		return null;
+	});
+
+	/** `content.length`, summed from the parts' lengths rather than by joining their content. */
+	readonly length: number = $derived(joined_content_length(this.parts.map((part) => part.length)));
+	readonly token_count: number = $derived(estimate_token_count_from_length(this.length));
 
 	readonly raw_content: string | null | undefined = $derived(this.parts[0]?.content);
 	readonly is_content_loaded: boolean = $derived(
@@ -60,12 +73,25 @@ export class Turn extends Cell<typeof TurnJson> {
 		this.parts.length === 0 || this.parts.every((part) => !part.content)
 	);
 
+	/**
+	 * True once the completion for this turn has ended — a final response arrived,
+	 * it failed, or it was cancelled. Late streaming chunks are ignored after this.
+	 */
+	readonly settled: boolean = $derived(!!this.response || !!this.error_message || this.cancelled);
+
+	/**
+	 * Why the final response was cut off — the output token limit or the
+	 * context window — or `null` when it finished. A truncated turn's content is
+	 * a partial reply.
+	 */
+	readonly truncation: CompletionTruncation | null = $derived(
+		to_completion_truncation(this.response)
+	);
+
+	readonly truncated: boolean = $derived(this.truncation !== null);
+
 	readonly pending: boolean = $derived(
-		this.role === 'assistant' &&
-			this.is_content_loaded &&
-			this.is_content_empty &&
-			!this.response &&
-			!this.error_message
+		this.role === 'assistant' && this.is_content_loaded && this.is_content_empty && !this.settled
 	);
 
 	constructor(options: TurnOptions) {
@@ -73,23 +99,60 @@ export class Turn extends Cell<typeof TurnJson> {
 		this.init();
 	}
 
-	set_part(part: PartUnion): void {
-		this.part_ids = [part.id];
+	/**
+	 * Appends streamed completion text to `completion_part`.
+	 * @param text - the chunk to append
+	 * @returns `false` if the turn has no `completion_part`, leaving it unchanged
+	 */
+	append_completion_text(text: string): boolean {
+		const part = this.completion_part;
+		if (!part) return false;
+		part.content += text;
+		return true;
 	}
 
-	add_part(part: PartUnion): void {
-		if (!this.part_ids.includes(part.id)) {
-			this.part_ids.push(part.id);
-		}
+	/**
+	 * Replaces the text of `completion_part` with a final completion response.
+	 * @param text - the full response text
+	 * @returns `false` if the turn has no `completion_part`, leaving it unchanged
+	 */
+	set_completion_text(text: string): boolean {
+		const part = this.completion_part;
+		if (!part) return false;
+		part.content = text;
+		return true;
 	}
 
+	/**
+	 * Removes a part from this turn, and from `app.parts` unless another turn
+	 * still references it. Removing the `completion_part` while its thread's
+	 * in-flight completion streams into this turn cancels that completion
+	 * first — its output has nowhere to go. An idle turn is left as is.
+	 *
+	 * @returns whether the turn had the part
+	 */
 	remove_part(part_id: Uuid): boolean {
 		const index = this.part_ids.indexOf(part_id);
-		if (index !== -1) {
-			this.part_ids.splice(index, 1);
-			return true;
+		if (index === -1) return false;
+		if (this.completion_part?.id === part_id) {
+			this.#get_thread()?.cancel_pending_turn(this);
 		}
-		return false;
+		this.part_ids.splice(index, 1);
+		this.app.parts.remove_unreferenced([part_id]);
+		return true;
+	}
+
+	/**
+	 * Cancels the completion streaming into this turn — through its thread when
+	 * it's the thread's pending turn, so the request is aborted too — settling
+	 * the turn so late chunks are ignored.
+	 */
+	cancel_completion(): void {
+		if (!this.#get_thread()?.cancel_pending_turn(this)) this.cancelled = true;
+	}
+
+	#get_thread(): Thread | undefined {
+		return this.thread_id ? this.app.threads.items.by_id.get(this.thread_id) : undefined;
 	}
 
 	// // A2A protocol serialization (commented out for now)
@@ -100,21 +163,6 @@ export class Turn extends Cell<typeof TurnJson> {
 	// 	};
 	// }
 }
-
-export const create_turn_from_part = (
-	part: PartUnion,
-	role: CompletionRole,
-	json: Partial<OmitStrict<TurnJson, 'role' | 'part_ids'>>
-): Turn => {
-	return new Turn({
-		app: part.app,
-		json: {
-			...json,
-			role,
-			part_ids: [part.id]
-		}
-	});
-};
 
 export const create_turn_from_text = (
 	content: string,
@@ -129,22 +177,6 @@ export const create_turn_from_text = (
 			...json,
 			role,
 			part_ids: [part.id]
-		}
-	});
-};
-
-export const create_turn_from_parts = (
-	parts: Array<PartUnion>,
-	role: CompletionRole,
-	json: Partial<OmitStrict<TurnJson, 'role' | 'part_ids'>>
-): Turn => {
-	if (parts.length === 0) throw new Error('create_turn_from_parts requires at least one part');
-	return new Turn({
-		app: parts[0]!.app, // guaranteed by length check above
-		json: {
-			...json,
-			role,
-			part_ids: parts.map((b) => b.id)
 		}
 	});
 };

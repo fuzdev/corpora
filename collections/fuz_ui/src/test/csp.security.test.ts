@@ -1,6 +1,6 @@
 import { test, assert, describe } from 'vitest';
 
-import { create_csp_directives, COLOR_SCHEME_SCRIPT_HASH } from '$lib/csp.ts';
+import { create_csp_directives, COLOR_SCHEME_SCRIPT_HASH } from '#lib/csp.ts';
 import { src } from './csp_test_helpers.ts';
 
 describe('default security posture — properties (decoupled from exact defaults)', () => {

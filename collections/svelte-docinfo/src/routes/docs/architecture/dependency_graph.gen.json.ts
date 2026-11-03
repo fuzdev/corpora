@@ -1,5 +1,5 @@
 import type { Gen } from '@fuzdev/gro/gen.ts';
-import { analyzeFromFiles } from '$lib/analyze.ts';
+import { analyzeFromFiles } from '#lib/analyze.ts';
 import { dirname, join } from 'node:path';
 
 import { compute_layout, type LayoutInput } from './graph_layout.ts';
@@ -10,7 +10,7 @@ export const gen: Gen = async ({ origin_id, log }) => {
 
 	const { modules } = await analyzeFromFiles({
 		projectRoot: project_root,
-		exclude: ['**/*.test.ts', '**/index.ts'],
+		exclude: (defaults) => [...defaults, '**/index.ts'],
 		log
 	});
 
@@ -28,5 +28,5 @@ export const gen: Gen = async ({ origin_id, log }) => {
 		`architecture layout: ${layout.nodes.length} nodes, ${layout.edges.length} edges, ${layout.layer_count} layers`
 	);
 
-	return JSON.stringify(layout);
+	return JSON.stringify(layout, null, '\t') + '\n';
 };

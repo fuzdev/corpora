@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
 import AreaChart from './AreaChart/AreaChart.svelte';
+import BarChart from './BarChart/BarChart.svelte';
 import LineChart from './LineChart/LineChart.svelte';
 import ScatterChart from './ScatterChart/ScatterChart.svelte';
 
@@ -83,7 +84,9 @@ describe('DefaultTooltip', () => {
         const labels = document.querySelectorAll('.lc-tooltip-item-label');
         expect(labels.length).toBe(4);
         const labelTexts = Array.from(labels).map((l) => l.textContent?.trim());
-        expect(labelTexts).toEqual(['apples', 'bananas', 'oranges', 'total']);
+        // Multi-series areas stack under the `auto` default, and a stacked tooltip lists its
+        // items top-down to match the layers on screen — so the series read in reverse
+        expect(labelTexts).toEqual(['oranges', 'bananas', 'apples', 'total']);
       });
     });
 
@@ -106,7 +109,8 @@ describe('DefaultTooltip', () => {
         const colors = Array.from(colorDots).map((dot) =>
           (dot as HTMLElement).style.getPropertyValue('--color')
         );
-        expect(colors).toEqual(['rgb(255, 0, 0)', 'rgb(0, 128, 0)', 'rgb(255, 165, 0)']);
+        // Reversed with the stack, as above
+        expect(colors).toEqual(['rgb(255, 165, 0)', 'rgb(0, 128, 0)', 'rgb(255, 0, 0)']);
       });
     });
 
@@ -207,6 +211,91 @@ describe('DefaultTooltip', () => {
         const labelTexts = Array.from(labels).map((l) => l.textContent?.trim());
         expect(labelTexts).toEqual(['apples', 'bananas', 'oranges', 'total']);
       });
+    });
+
+    it('should keep the declared order when a resolved stack is drawn by nothing', async () => {
+      // Several configured series resolve the layout to a stack, but lines decline an inferred
+      // one — so nothing is stacked, and there's no visual bottom-to-top order to match
+      const { container } = render(LineChart, {
+        data: timeSeriesData,
+        x: 'date',
+        y: 'apples',
+        series,
+        height: 300,
+        width: 400,
+      } as any);
+
+      const tooltipCtx = container.querySelector('.lc-tooltip-context') as HTMLElement;
+      await expect.element(tooltipCtx).toBeInTheDocument();
+      await dispatchAndWaitForTooltip(tooltipCtx);
+
+      await vi.waitFor(() => {
+        const labels = Array.from(document.querySelectorAll('.lc-tooltip-item-label')).map((l) =>
+          l.textContent?.trim()
+        );
+        expect(labels.slice(0, 3)).toEqual(['apples', 'bananas', 'oranges']);
+      });
+    });
+  });
+
+  describe('long data grouped and stacked', () => {
+    // `x1` sub-bands the baskets, `c` stacks the fruit within each — so a band holds several rows
+    // that the sub-band alone doesn't tell apart
+    const longData = [
+      { year: 2019, basket: 1, fruit: 'apples', value: 3840 },
+      { year: 2019, basket: 1, fruit: 'bananas', value: 1920 },
+      { year: 2019, basket: 2, fruit: 'cherries', value: 960 },
+      { year: 2019, basket: 2, fruit: 'grapes', value: 400 },
+      { year: 2018, basket: 1, fruit: 'apples', value: 1600 },
+      { year: 2018, basket: 1, fruit: 'bananas', value: 1440 },
+      { year: 2018, basket: 2, fruit: 'cherries', value: 960 },
+      { year: 2018, basket: 2, fruit: 'grapes', value: 400 },
+    ];
+
+    it('labels the rows by their `c` category, not the sub-band they share', async () => {
+      const { container } = render(BarChart, {
+        data: longData,
+        x: 'year',
+        x1: 'basket',
+        y: 'value',
+        c: 'fruit',
+        width: 400,
+        height: 300,
+      } as any);
+
+      const rect = container.querySelector('.lc-tooltip-rect');
+      await vi.waitFor(() => expect(rect).not.toBeNull());
+      await dispatchAndWaitForTooltip(rect!);
+
+      // Keyed by the sub-band alone, the two rows per basket collide — Svelte throws
+      // `each_key_duplicate` and the labels read `1, 1, 2, 2`
+      const labels = Array.from(document.querySelectorAll('.lc-tooltip-item-label')).map((el) =>
+        el.textContent?.trim()
+      );
+      expect(labels).toEqual(['apples', 'bananas', 'cherries', 'grapes', 'total']);
+    });
+
+    it('lists only the hovered panel’s rows when faceting', async () => {
+      const { container } = render(BarChart, {
+        data: longData,
+        fx: 'year',
+        x: 'basket',
+        y: 'value',
+        c: 'fruit',
+        width: 600,
+        height: 300,
+      } as any);
+
+      const rect = container.querySelector('.lc-tooltip-rect');
+      await vi.waitFor(() => expect(rect).not.toBeNull());
+      await dispatchAndWaitForTooltip(rect!);
+
+      // The same band exists in every panel, so an unscoped filter would list — and total —
+      // the other years' rows here too
+      const labels = Array.from(document.querySelectorAll('.lc-tooltip-item-label')).map((el) =>
+        el.textContent?.trim()
+      );
+      expect(labels.filter((l) => l !== 'total')).toHaveLength(2);
     });
   });
 

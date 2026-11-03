@@ -13,11 +13,11 @@
  */
 
 import { z } from 'zod';
-import { Uuid } from '@fuzdev/fuz_util/id.ts';
+import { Uuid, bounded_string } from '../primitive_schemas.ts';
 
 import { RoleName } from './role_schema.ts';
 
-/** Maximum length of the optional message attached to an offer. */
+/** Maximum length of the optional message attached to an offer, and of a decline reason, in UTF-16 code units. */
 export const ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX = 500;
 
 /** Default TTL for a newly created offer — 30 days. Matches GitHub org-invite expiry. */
@@ -66,6 +66,15 @@ export interface RoleGrantOffer {
 	 */
 	superseded_at: string | null;
 	resulting_role_grant_id: Uuid | null;
+	/**
+	 * When the expiry sweep audited this offer's `role_grant_offer_expire` —
+	 * the claim stamp `query_role_grant_offer_sweep_expired` sets in the same
+	 * transaction as the audit row, so each expiry is audited once. Not a
+	 * lifecycle state (an expired offer is still pending by the terminal
+	 * columns) and server-only: `to_role_grant_offer_json` drops it, and the
+	 * strict `RoleGrantOfferJson` would reject it. A re-offer clears it.
+	 */
+	expire_audited_at: string | null;
 }
 
 /**
@@ -128,9 +137,7 @@ export const RoleGrantOfferJson = z
 			description:
 				'Scope the offered role_grant applies to (e.g. a classroom id). `null` for global role_grants.'
 		}),
-		message: z
-			.string()
-			.max(ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX)
+		message: bounded_string({ max: ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX })
 			.nullable()
 			.meta({ description: 'Optional free-form note from the grantor.' }),
 		created_at: z.string().meta({ description: 'ISO timestamp when the offer was created.' }),
@@ -145,9 +152,7 @@ export const RoleGrantOfferJson = z
 			.string()
 			.nullable()
 			.meta({ description: 'ISO timestamp when the offer was declined.' }),
-		decline_reason: z
-			.string()
-			.max(ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX)
+		decline_reason: bounded_string({ max: ROLE_GRANT_OFFER_MESSAGE_LENGTH_MAX })
 			.nullable()
 			.meta({ description: 'Optional reason given on decline.' }),
 		retracted_at: z

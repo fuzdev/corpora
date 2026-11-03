@@ -1,29 +1,25 @@
+<!--
+@component
+
+Renders values as a small inline SVG line graph.
+
+Designed for comparable small multiples: pass a shared `max` so a set of
+sparklines renders at the same vertical scale instead of each stretching to fit.
+The stroke uses `currentColor`, so color it by setting `color` on the component or
+a parent (e.g. a fuz_css `color_*` class). Each point's stroke alpha scales with
+its value, from `alpha_floor` at 0 up to 1 at `max`, de-emphasizing quiet stretches.
+
+`scale` controls only the geometry: the nonlinear options compress the top of the
+range so small values stay legible under a large shared `max`, while the alpha
+fade keeps tracking the linear ratio so it still encodes true magnitude.
+
+@cssprop --sparkline_bg - background behind the line, a light wash of `currentColor` by default
+-->
 <script lang="ts">
 	import type { OmitStrict } from '@fuzdev/fuz_util/types.ts';
 	import type { SvelteHTMLElements } from 'svelte/elements';
 
 	import { sparkline_geometry, type SparklineScale } from './sparkline.ts';
-
-	/**
-	 * Renders values as a small inline SVG line graph.
-	 *
-	 * Designed for comparable small multiples: pass a shared `max` so a set of
-	 * sparklines renders at the same vertical scale instead of each stretching
-	 * to fit. The stroke uses `currentColor`, so color it by setting `color` on
-	 * the component or a parent (e.g. a fuz_css `color_*` class). Each point's
-	 * stroke alpha scales with its value, from `alpha_floor` at 0 up to 1 at
-	 * `max`, de-emphasizing quiet stretches.
-	 *
-	 * `scale` controls only the geometry: the nonlinear options compress the
-	 * top of the range so small values stay legible under a large shared
-	 * `max`, while the alpha fade keeps tracking the linear ratio so it still
-	 * encodes true magnitude.
-	 *
-	 * The background is a light wash of `currentColor`, overridable with the
-	 * `--sparkline_bg` custom property.
-	 *
-	 * @module
-	 */
 
 	const {
 		values,
@@ -125,7 +121,7 @@
 
 <style>
 	svg {
-		background: var(--sparkline_bg, color-mix(in hsl, currentColor 8%, transparent));
+		background: var(--sparkline_bg, color-mix(in oklab, currentColor 8%, transparent));
 		border-radius: var(--border_radius_xs);
 	}
 </style>

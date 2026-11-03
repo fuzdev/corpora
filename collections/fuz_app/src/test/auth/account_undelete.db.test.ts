@@ -10,43 +10,35 @@
 
 import { test, assert } from 'vitest';
 
-import { create_session_config } from '$lib/auth/session_cookie.ts';
-import { create_standard_rpc_actions } from '$lib/auth/standard_rpc_actions.ts';
+import { create_session_config } from '#lib/auth/session_cookie.ts';
+import { create_standard_rpc_actions } from '#lib/auth/standard_rpc_actions.ts';
 import {
 	account_delete_action_spec,
 	account_undelete_action_spec
-} from '$lib/auth/admin_action_specs.ts';
-import { account_verify_action_spec } from '$lib/auth/account_action_specs.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
+} from '#lib/auth/admin_action_specs.ts';
+import { account_verify_action_spec } from '#lib/auth/account_action_specs.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
 import {
 	ERROR_ACCOUNT_NOT_FOUND,
 	ERROR_INSUFFICIENT_PERMISSIONS
-} from '$lib/http/error_schemas.ts';
-import { create_rpc_endpoint } from '$lib/actions/action_rpc.ts';
-import { auth_migration_ns } from '$lib/auth/migrations.ts';
-import { create_test_app } from '$lib/testing/app_server.ts';
-import {
-	create_pglite_factory,
-	create_describe_db,
-	auth_integration_truncate_tables
-} from '$lib/testing/db.ts';
-import { run_migrations } from '$lib/db/migrate.ts';
-import { rpc_call_for_spec } from '$lib/testing/rpc_helpers.ts';
-import { install_audit_drift_guard } from '$lib/testing/audit_drift_guard.ts';
-import { query_account_by_id } from '$lib/auth/account_queries.ts';
-import type { AppServerContext } from '$lib/server/app_server_context.ts';
-import type { RouteSpec } from '$lib/http/route_spec.ts';
+} from '#lib/http/error_schemas.ts';
+import { create_rpc_endpoint } from '#lib/actions/action_rpc.ts';
+import { create_test_app } from '#lib/testing/app_server.ts';
+import { rpc_call_for_spec } from '#lib/testing/rpc_helpers.ts';
+import { install_audit_drift_guard } from '#lib/testing/audit_drift_guard.ts';
+import { query_account_by_id } from '#lib/auth/account_queries.ts';
+import type { AppServerContext } from '#lib/server/app_server_context.ts';
+import type { RouteSpec } from '#lib/http/route_spec.ts';
+
+import { describe_db } from '../auth_db_default.ts';
 
 const session_options = create_session_config('test_session');
 const RPC_PATH = '/api/rpc';
 
-const factory = create_pglite_factory(async (db) => {
-	await run_migrations(db, [auth_migration_ns]);
-});
-const describe_db = create_describe_db(factory, auth_integration_truncate_tables);
-
 const create_route_specs = (ctx: AppServerContext): Array<RouteSpec> =>
 	create_rpc_endpoint({
+		action_ip_rate_limiter: null,
+		action_account_rate_limiter: null,
 		path: RPC_PATH,
 		actions: create_standard_rpc_actions(ctx.deps),
 		log: ctx.deps.log

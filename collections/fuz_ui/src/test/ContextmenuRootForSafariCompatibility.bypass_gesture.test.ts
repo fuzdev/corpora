@@ -4,7 +4,7 @@
 import { describe, test, assert, beforeEach, afterEach, vi } from 'vitest';
 import { flushSync, tick } from 'svelte';
 
-import ContextmenuRootForSafariCompatibility from '$lib/ContextmenuRootForSafariCompatibility.svelte';
+import ContextmenuRootForSafariCompatibility from '#lib/ContextmenuRootForSafariCompatibility.svelte';
 import {
 	unmount_component,
 	create_touch_event,
@@ -18,7 +18,7 @@ import {
 import {
 	CONTEXTMENU_DEFAULT_LONGPRESS_DURATION,
 	CONTEXTMENU_DEFAULT_BYPASS_WINDOW
-} from '$lib/contextmenu_helpers.ts';
+} from '#lib/contextmenu_helpers.ts';
 
 // ResizeObserver is not currently available in jsdom
 class ResizeObserverMock {

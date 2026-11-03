@@ -1,11 +1,9 @@
 /**
  * Import resolver primitives for the analysis session.
  *
- * Exposes the `ImportResolver` token contract (`{resolve, identity}`) plus
+ * Exposes the `ImportResolver` token contract (`{resolve, identity, invalidate?}`) plus
  * building blocks the session uses inside its three-phase setFiles pipeline:
  *
- * - `ensureLexerReady` — one-time wasm init for `es-module-lexer`. Phase 1 is
- *   sync per-file; the session awaits this once before the loop starts.
  * - `lexImports` — sync specifier extraction from already-prepared content
  *   (raw TS/JS, or svelte2tsx virtual content for `.svelte` files).
  * - `createDefaultResolver` — the TS + tsconfig fallback used when neither
@@ -18,8 +16,9 @@
  *   wraps a bare function in an `ImportResolver`, synthesizing a throwaway
  *   identity unless a stable one is passed.
  *
- * @internal — subpath-importable for power users who want to drive resolution
- * outside the session, but not part of the stable barrel surface.
+ * `ImportResolver`, `ResolveImport`, `ResolveImportFn`, and
+ * `normalizeResolveImport` are on the main barrel; the lexing and
+ * default-resolver building blocks are subpath-only and not stable API.
  *
  * @see `session.ts` for the three-phase ingestion pipeline that consumes these
  * @see `loadTsconfig` in `typescript-program.ts` for producing the merged
@@ -32,7 +31,6 @@
 import { isBuiltin } from 'node:module';
 import { dirname, isAbsolute, resolve as resolvePath } from 'node:path';
 import ts from 'typescript';
-import { init as esModuleLexerInit, parse as esModuleLexerParse } from 'es-module-lexer';
 
 import { toPosixPath } from './paths.ts';
 
@@ -125,38 +123,71 @@ export const normalizeResolveImport = (
 	value === undefined ? undefined : typeof value === 'function' ? wrapResolveImport(value) : value;
 
 /**
- * Ensure `es-module-lexer`'s wasm runtime is initialized.
- *
- * Idempotent and cheap after the first call. The session awaits this once at
- * the top of `setFiles` so phase 1's per-file lex is purely synchronous.
- */
-export const ensureLexerReady = async (): Promise<void> => {
-	await esModuleLexerInit;
-};
-
-/**
  * Lex import specifiers from prepared content.
  *
- * Sync — caller must have awaited `ensureLexerReady` at least once before
- * invoking. For `.svelte` files, pass the svelte2tsx-transformed virtual
- * content, not the raw `.svelte` source (which isn't lex-able as JS/TS).
+ * Parses with TypeScript (`ts.createSourceFile`, no binding or checking)
+ * rather than lexing as JS, so TypeScript syntax a JS lexer misreads as a
+ * regex or comparison (`a! / b`, `Promise<Result<A, B>> => {}`) can't derail
+ * it, and every ES form is seen, including `export * as ns from` (which
+ * TypeScript's lighter `preProcessFile` scanner misses).
  *
- * Dynamic imports (`import(specifier)` with non-literal arg) are omitted.
+ * Collects, in source order: static imports and re-exports (type-only ones
+ * included: `import type`, inline `type` specifiers, `export type {...}
+ * from`, `export type * from`), `import x = require()`, module augmentations
+ * (`declare module '…'` in a module), and anywhere in the file, dynamic
+ * `import()` with a string literal and `import('…')` types. CommonJS
+ * `require()` calls and non-literal `import()` are omitted.
  *
- * @throws Error if lexing fails (malformed source). Callers should catch and
- *   emit `import_parse_failed`.
+ * For `.svelte` files, pass the svelte2tsx-transformed virtual content, not
+ * the raw `.svelte` source.
  *
  * @param content - prepared file content (TS/JS, or svelte2tsx virtual)
- * @param fileId - absolute file path (used for error messages)
- * @returns specifiers in declaration order
+ * @param path - the file's path, when its extension should pick the parse:
+ *   `.tsx` and `.jsx` content parses as TSX, since the TS parse reads JSX
+ *   markup as type assertions and can lose the imports inside it; any other
+ *   path, or none, parses as TS
+ * @returns specifiers in source order
  */
-export const lexImports = (content: string, fileId: string): Array<string> => {
-	const [imports] = esModuleLexerParse(content, fileId);
-	const specifiers: Array<string> = [];
-	for (const imp of imports) {
-		if (imp.n) specifiers.push(imp.n);
+export const lexImports = (content: string, path?: string): Array<string> => {
+	const sourceFile = ts.createSourceFile(
+		'lex.ts',
+		content,
+		ts.ScriptTarget.Latest,
+		false,
+		path !== undefined && /\.[jt]sx$/.test(path) ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+	);
+	const found: Array<{ pos: number; text: string }> = [];
+	const add = (node: ts.Node | undefined): void => {
+		if (node && ts.isStringLiteralLike(node)) found.push({ pos: node.pos, text: node.text });
+	};
+	const isModule = ts.isExternalModule(sourceFile);
+	for (const statement of sourceFile.statements) {
+		if (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) {
+			add(statement.moduleSpecifier);
+		} else if (
+			ts.isImportEqualsDeclaration(statement) &&
+			ts.isExternalModuleReference(statement.moduleReference)
+		) {
+			add(statement.moduleReference.expression);
+		} else if (isModule && ts.isModuleDeclaration(statement)) {
+			add(statement.name);
+		}
 	}
-	return specifiers;
+	// dynamic imports and import types can sit at any depth, so the full walk
+	// runs only when the text could contain one
+	if (content.includes('import(') || content.includes('import (')) {
+		const visit = (node: ts.Node): void => {
+			if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+				add(node.arguments[0]);
+			} else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+				add(node.argument.literal);
+			}
+			ts.forEachChild(node, visit);
+		};
+		visit(sourceFile);
+		found.sort((a, b) => a.pos - b.pos);
+	}
+	return found.map((f) => f.text);
 };
 
 /**

@@ -1,19 +1,20 @@
 /**
- * Tests for structured type extraction (`typeInfo` / `TypeJson`) and the
- * source-order prop emission that landed with it.
+ * Tests for structured type extraction (`typeInfo` / `TypeJson`) and
+ * source-order prop emission.
  *
  * Exercises the whole `analyze` pipeline: the absence contract (terminal roots
  * carry no `typeInfo`) and its type-alias-root exception, the module-object
  * terminal (`typeof import` classifies `other`, never a quoted-path
- * reference), alias preservation
- * through the optional-widening strip, the origin walk (flat-string member
- * order with nullish last, written sub-aliases as nested union nodes, the
- * null-bearing optional alias surviving), enum `{value, text}` pairs,
+ * reference), alias preservation through the optional-widening strip, the
+ * origin walk (nullish members last, written sub-aliases as nested union
+ * nodes, the null-bearing optional alias surviving; written member order is
+ * `analyze.type-info-union-order.test.ts`), enum `{value, text}` pairs,
  * reference/array linkability, the boolean collapse, checker-backed class
  * members, the depth cap on recursive aliases, the terminal-text size budget,
  * and the `compactReplacer`
  * round-trip for a literal `false` value (the one data-bearing `false` on the
- * wire). Round-2 shape: callable classification (named generic instantiations
+ * wire) and for literal values JSON can't carry (bigints, non-finite numbers).
+ * Round-2 shape: callable classification (named generic instantiations
  * as references, bare/aliased signatures and hybrids staying `function`),
  * structured tuple elements (the empty-tuple carve-out included), and
  * `returnTypeInfo` on functions, members, and overloads. Round-3 shape:
@@ -31,10 +32,11 @@
  */
 
 import { test, assert, describe } from 'vitest';
+import * as v from 'valibot';
 
-import { AnalyzeResultJson } from '$lib/analyze-core.ts';
-import { compactReplacer } from '$lib/declaration-helpers.ts';
-import { TypeJson, type ModuleJson } from '$lib/types.ts';
+import { parseAnalyzeResult } from '#lib/analyze-core.ts';
+import { compactReplacer } from '#lib/declaration-helpers.ts';
+import { TypeJson, type ModuleJson } from '#lib/types.ts';
 
 import { analyzeTestProject } from './test-module-helpers.ts';
 
@@ -159,7 +161,7 @@ export type O = {
 		assert.strictEqual(eager.typeSignature, 'typeof import("dep.ts")');
 		assert.strictEqual(eager.typeInfo, undefined);
 		// an array over one stays absent too — the terminal element doesn't
-		// qualify the container the way the old bogus reference node did
+		// qualify the container
 		const arr = entry.declarations.find((d) => d.name === 'arr');
 		assert(arr?.kind === 'variable');
 		assert.strictEqual(arr.typeSignature, 'typeof import("dep.ts")[]');
@@ -268,7 +270,7 @@ export const fn = (b?: number | 'a'): void => {
 		});
 	});
 
-	test('union members follow the flat string: written order, nullish last', async () => {
+	test('union members sink nullish last, like the flat string', async () => {
 		const module = await analyzeFile(
 			'src/lib/a.ts',
 			`export type O = {
@@ -281,8 +283,8 @@ export const fn = (b?: number | 'a'): void => {
 		const [a, b] = declaration.members;
 		assert(a?.kind === 'variable' && b?.kind === 'variable');
 		// the printer sinks null/undefined to the end of whatever it prints, so
-		// the flat strings read `"a" | null` and `string | number | null` — the
-		// tree matches them, not the written order
+		// the flat strings read `"a" | null` and `string | number | null`, and
+		// the tree sinks them too, keeping the rest in written order
 		assert.strictEqual(a.typeSignature, '"a" | null');
 		assert.deepStrictEqual(a.typeInfo, {
 			kind: 'union',
@@ -312,15 +314,14 @@ export type O = { a: A | number };`
 		assert(declaration?.kind === 'type', 'expected a type declaration');
 		const member = declaration.members[0];
 		assert(member?.kind === 'variable', 'expected a variable member');
-		// the checker's `origin` lists plain members before named sub-unions
-		// (written `A | number` prints `number | A`) — the tree matches the flat
-		// string, and `A` survives as a node where the normalized list would
-		// flatten it into its literals
+		// the checker's `origin` orders by internal type id (written `A | number`
+		// prints `number | A`), while the tree follows the written order — and
+		// `A` survives as a node where the normalized list would flatten it into
+		// its literals
 		assert.strictEqual(member.typeSignature, 'number | A');
 		assert.deepStrictEqual(member.typeInfo, {
 			kind: 'union',
 			members: [
-				{ kind: 'intrinsic', text: 'number' },
 				{
 					kind: 'union',
 					alias: 'A',
@@ -328,7 +329,8 @@ export type O = { a: A | number };`
 						{ kind: 'literal', value: 'a', text: '"a"' },
 						{ kind: 'literal', value: 'b', text: '"b"' }
 					]
-				}
+				},
+				{ kind: 'intrinsic', text: 'number' }
 			]
 		});
 	});
@@ -538,7 +540,7 @@ export class C {
 	test('an optional unconstrained type parameter keeps its bare name', async () => {
 		// the widened `E | undefined` has exactly one member after dropping
 		// `undefined`, which is taken directly — `getNonNullableType` can only
-		// answer `NonNullable<E>` for a bare type parameter and prints `E & {}`
+		// answer `NonNullable<E>` for a bare type parameter
 		const module = await analyzeFile(
 			'src/lib/a.ts',
 			`export interface I<E> {
@@ -563,13 +565,47 @@ export const f = <E,>(c?: E): void => {};`
 		assert(declaration?.kind === 'type', 'expected a type declaration');
 		assert.ok(declaration.typeInfo, 'expected typeInfo on the recursive alias');
 		// must be parseable — i.e., finite — and bottom out in a degraded text node
-		const parsed = TypeJson.parse(declaration.typeInfo);
+		const parsed = v.parse(TypeJson, declaration.typeInfo);
 		let node = parsed;
 		let depth = 0;
 		while (node.kind === 'union' || node.kind === 'array') {
 			node = node.kind === 'union' ? node.members.at(-1)! : node.element;
 			depth++;
 			assert.ok(depth < 20, 'expected the walk to terminate');
+		}
+	});
+
+	test('a recursive array or tuple alias at a parameter root terminates', async () => {
+		// each alias recurs through itself as an array or tuple element, so a
+		// root walk that descends into elements must stop at the alias; `D[]`
+		// is the control, where an interface breaks the cycle
+		const { modules, diagnostics } = await analyzeTestProject({
+			'src/lib/a.ts': `export type A = A[];
+export type B = readonly B[];
+export type C = [a: number, ...b: C[]];
+export interface D { a: D[] }
+export const fn1 = (a: A) => a;
+export const fn2 = (b: B) => b;
+export const fn3 = (c: C) => c;
+export const fn4 = (d: D[]) => d;`
+		});
+		assert.deepStrictEqual(
+			diagnostics.map((d) => d.kind),
+			[]
+		);
+		const module = modules[0];
+		assert.ok(module, 'expected a module');
+		for (const [name, type] of [
+			['fn1', 'A'],
+			['fn2', 'B'],
+			['fn3', 'C'],
+			['fn4', 'D[]']
+		] as const) {
+			const fn = module.declarations.find((d) => d.name === name);
+			assert(fn?.kind === 'function', `expected ${name} to be a function`);
+			assert.ok(!fn.partial, `expected ${name} to be complete`);
+			assert.strictEqual(fn.parameters[0]?.type, type);
+			assert.strictEqual(fn.returnType, type);
 		}
 	});
 
@@ -622,8 +658,77 @@ export const f = <E,>(c?: E): void => {};`
 
 		// `compactReplacer` strips `false` flag fields but must not strip the
 		// data-bearing literal `value` — the keyed exemption under test
-		const restored = AnalyzeResultJson.parse(JSON.parse(JSON.stringify(result, compactReplacer)));
+		const restored = parseAnalyzeResult(JSON.parse(JSON.stringify(result, compactReplacer)));
 		assert.deepStrictEqual(findMember(restored.modules).typeInfo, expected);
+	});
+
+	test('literal values JSON cannot carry are strings and survive the wire round-trip', async () => {
+		// a non-finite number has no JSON form, so as a number it would fail the
+		// boundary parse
+		const result = await analyzeTestProject({
+			'src/lib/a.ts': `export enum E {
+	A = 1 / 0,
+	B = -1 / 0,
+	C = 0 / 0,
+	D = 1
+}
+export type T = 1e999 | -1e999 | 1n | 2 | 'Infinity';
+export const a = 1e999;`
+		});
+		const findTypeInfo = (modules: Array<ModuleJson>, name: string) => {
+			const declaration = modules[0]?.declarations.find((d) => d.name === name);
+			assert(declaration?.kind === 'type', `expected a type declaration ${name}`);
+			return declaration.typeInfo;
+		};
+
+		const expected: TypeJson = {
+			kind: 'union',
+			alias: 'T',
+			members: [
+				{ kind: 'literal', value: 'Infinity', text: 'Infinity' },
+				{ kind: 'literal', value: '-Infinity', text: '-Infinity' },
+				{ kind: 'literal', value: '1n', text: '1n' },
+				{ kind: 'literal', value: 2, text: '2' },
+				{ kind: 'literal', value: 'Infinity', text: '"Infinity"' }
+			]
+		};
+		assert.deepStrictEqual(findTypeInfo(result.modules, 'T'), expected);
+
+		const variable = result.modules[0]?.declarations.find((d) => d.name === 'a');
+		assert(variable?.kind === 'variable', 'expected a variable declaration');
+		assert.strictEqual(variable.typeSignature, 'Infinity');
+
+		const json = JSON.stringify(result, compactReplacer);
+		assert.notInclude(json, 'null', 'a non-finite number would serialize as null');
+		const restored = parseAnalyzeResult(JSON.parse(json));
+		assert.deepStrictEqual(restored, result);
+	});
+
+	test('non-finite enum members carry the stringified value and the qualified name', async () => {
+		const module = await analyzeFile(
+			'src/lib/a.ts',
+			`enum E {
+	A = 1 / 0,
+	B = -1 / 0,
+	C = 0 / 0,
+	D = 1
+}
+export type O = { e?: E };`
+		);
+		const declaration = module.declarations[0];
+		assert(declaration?.kind === 'type', 'expected a type declaration');
+		const member = declaration.members[0];
+		assert(member?.kind === 'variable', 'expected a variable member');
+		assert.deepStrictEqual(member.typeInfo, {
+			kind: 'union',
+			alias: 'E',
+			members: [
+				{ kind: 'literal', value: 'Infinity', text: 'E.A' },
+				{ kind: 'literal', value: '-Infinity', text: 'E.B' },
+				{ kind: 'literal', value: 'NaN', text: 'E.C' },
+				{ kind: 'literal', value: 1, text: 'E.D' }
+			]
+		});
 	});
 
 	test('snippet parameter tuple elements carry typeInfo', async () => {

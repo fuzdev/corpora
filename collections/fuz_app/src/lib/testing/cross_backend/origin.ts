@@ -4,26 +4,22 @@ import '../assert_dev_env.ts';
  * Cross-backend parity suite for Origin verification.
  *
  * Origin checking is middleware that runs *before* the RPC dispatcher and
- * returns a flat REST `{error}` body — not a JSON-RPC envelope — so it
- * doesn't fit the envelope-shaped conformance-table runner. This dedicated
- * imperative suite drives raw transport calls instead, mirroring how the
- * in-process origin tests were already hand-rolled. Two cases:
+ * refuses only an `Origin` it doesn't allow. The case here needs a transport
+ * that sends no `Origin` at all (`fresh_transport({origin: null})`), so this
+ * is an imperative suite rather than a conformance-table row. The case:
  *
- * - **disallowed `Origin` → 403** `forbidden_origin`, refused before any
- *   handler runs (the allowlist rejects the cross-origin request even with
- *   a valid session cookie attached).
  * - **absent `Origin` → request passes** — non-browser / direct-access
  *   clients (curl, CLI, server-to-server) carry no `Origin` and must not be
  *   blocked; token auth is the control for those callers.
  *
- * Runs both legs via the shared `{setup_test, capabilities}` protocol: the
+ * A disallowed `Origin` → 403 `forbidden_origin`, on every transport, is
+ * pinned by the front-door table (`transport_composition.ts`).
+ *
+ * Runs both legs via the shared `setup_test` protocol: the
  * in-process leg (`auth/origin_parity.db.test.ts`, plain `gro test`) and the
- * cross-process leg (`cross_backend/origin.cross.test.ts`, the TS spine
+ * cross-process leg (`cross_backend/spine_suites.cross.test.ts`, the TS spine
  * binaries + Rust `testing_spine_stub` over real HTTP). Origin middleware is
  * on every spine, so the suite is ungated.
- *
- * `$lib`-free by contract (relative specifiers only), like the sibling
- * cross-backend suites.
  *
  * @module
  */
@@ -31,14 +27,15 @@ import '../assert_dev_env.ts';
 import { describe, test, assert } from 'vitest';
 
 import { account_verify_action_spec } from '../../auth/account_action_specs.ts';
-import { ERROR_FORBIDDEN_ORIGIN } from '../../http/error_schemas.ts';
 import type { RpcPathCrossSuiteOptions } from './setup.ts';
 import { SPINE_RPC_PATH } from './spine_surface_constants.ts';
 
 /**
  * Options for the origin parity suite. The standard RPC-dispatched
- * cross-suite shape (`setup_test` / `capabilities` / `rpc_path`); aliases
- * the shared `RpcPathCrossSuiteOptions` rather than minting a duplicate.
+ * cross-suite shape (`setup_test` / `rpc_path`); aliases the shared
+ * `RpcPathCrossSuiteOptions` rather than minting a duplicate. Origin
+ * middleware is on every spine, so no case is capability-gated and the flag
+ * bundle is not on the shape.
  */
 export type OriginCrossTestOptions = RpcPathCrossSuiteOptions;
 
@@ -51,25 +48,6 @@ export const describe_origin_cross_tests = (options: OriginCrossTestOptions): vo
 	const rpc_path = options.rpc_path ?? SPINE_RPC_PATH;
 
 	describe('origin verification parity', () => {
-		test('disallowed Origin → 403 forbidden_origin (refused before dispatch)', async () => {
-			const fixture = await setup_test();
-			// Keeper session cookie attached + a rogue Origin header (overrides
-			// the transport's default allowed Origin). The allowlist must reject
-			// before the dispatcher, returning a flat REST error body.
-			const res = await fixture.transport(rpc_path, {
-				method: 'POST',
-				headers: {
-					...fixture.create_session_headers(),
-					origin: 'http://evil.com',
-					'content-type': 'application/json'
-				},
-				body: verify_envelope('evil-origin')
-			});
-			assert.strictEqual(res.status, 403, 'disallowed Origin must be rejected with 403');
-			const body = (await res.json().catch(() => undefined)) as { error?: unknown } | undefined;
-			assert.strictEqual(body?.error, ERROR_FORBIDDEN_ORIGIN);
-		});
-
 		test('absent Origin → request passes (non-browser direct access)', async () => {
 			const fixture = await setup_test();
 			// `origin: null` so no Origin header is sent at all (a header omission

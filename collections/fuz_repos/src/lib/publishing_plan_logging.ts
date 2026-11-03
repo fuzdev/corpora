@@ -9,22 +9,36 @@
 import type { Logger } from '@fuzdev/fuz_util/log.ts';
 import { styleText as st } from 'node:util';
 
-import type {
-	PublishingPlan,
-	VersionChange,
-	DependencyUpdate,
-	VerboseData,
-	VerboseChangesetDetail,
-	VerboseIteration,
-	VerbosePropagationChain,
-	VerboseGraphSummary
+import {
+	version_change_kind,
+	type PublishingPlan,
+	type VersionChange,
+	type DependencyUpdate,
+	type VerboseData,
+	type VerboseChangesetDetail,
+	type VerbosePropagation,
+	type VerboseGraphSummary
 } from './publishing_plan.ts';
+import { to_updated_range, type VersionStrategy } from './version_utils.ts';
 
 export interface LogPlanOptions {
 	verbose?: boolean;
+	/**
+	 * The prefix strategy the release step rewrites unprefixed ranges with, so the diffs show
+	 * what it writes. `gitops_plan` and `gitops_validate` take no strategy and show the default.
+	 */
+	version_strategy?: VersionStrategy;
 }
 
 const SEPARATOR = '────────────────────────────────────────';
+
+/**
+ * Formats waves as one line each, numbered from 1: `1. a, b`.
+ *
+ * @param waves - the plan's waves, shallowest first
+ */
+export const format_waves = (waves: ReadonlyArray<ReadonlyArray<string>>): Array<string> =>
+	waves.map((wave, i) => `${i + 1}. ${wave.join(', ')}`);
 
 /**
  * Logs a section header with separators.
@@ -35,33 +49,39 @@ const log_section_header = (title: string, log: Logger): void => {
 	log.info(st('dim', SEPARATOR));
 };
 
-/**
- * Formats a dependency update as diff-style output.
- * Shows - old / + new for the dependency version.
- */
-const format_dep_diff = (dep_name: string, current: string, next: string): Array<string> => {
-	return [
-		st('red', `    - "${dep_name}": "${current}"`),
-		st('green', `    + "${dep_name}": "${next}"`)
-	];
-};
+/** The short label of a dependency section: `prod`, `peer`, or `dev`. */
+export const to_dependency_type_label = (
+	type: DependencyUpdate['type']
+): 'prod' | 'peer' | 'dev' =>
+	type === 'dependencies' ? 'prod' : type === 'peerDependencies' ? 'peer' : 'dev';
 
 /**
- * Gets dependency updates for a specific package, grouped by dependency name.
+ * Formats a package's dependency updates as diff-style lines, one `-`/`+` pair
+ * per entry, each section labeled. The `+` side is the range the release step
+ * writes (`to_updated_range`), its prefix kept.
+ *
+ * @param style - `color` for a publishing package, `dim` for one that doesn't republish
  */
-const get_updates_for_package = (
+const format_dependency_diffs = (
 	pkg_name: string,
-	dependency_updates: Array<DependencyUpdate>
-): Map<string, Array<DependencyUpdate>> => {
-	const updates: Map<string, Array<DependencyUpdate>> = new Map();
+	dependency_updates: Array<DependencyUpdate>,
+	strategy: VersionStrategy | undefined,
+	style: 'color' | 'dim'
+): Array<string> => {
+	const lines: Array<string> = [];
 	for (const update of dependency_updates) {
-		if (update.dependent_package === pkg_name) {
-			const dep_updates = updates.get(update.updated_dependency) || [];
-			dep_updates.push(update);
-			updates.set(update.updated_dependency, dep_updates);
-		}
+		if (update.dependent_package !== pkg_name) continue;
+		const name = update.updated_dependency;
+		const next = to_updated_range(update.current_version, update.new_version, strategy);
+		const label = st('dim', `  # ${to_dependency_type_label(update.type)}`);
+		const removed = `    - "${name}": "${update.current_version}"`;
+		const added = `    + "${name}": "${next}"`;
+		lines.push(
+			(style === 'color' ? st('red', removed) : st('dim', removed)) + label,
+			(style === 'color' ? st('green', added) : st('dim', added)) + label
+		);
 	}
-	return updates;
+	return lines;
 };
 
 /**
@@ -73,16 +93,19 @@ const log_version_change_with_diffs = (
 	total: number,
 	dependency_updates: Array<DependencyUpdate>,
 	breaking_cascades: Map<string, Array<string>>,
+	strategy: VersionStrategy | undefined,
 	log: Logger
 ): void => {
 	const breaking_indicator = change.breaking ? st('red', ' BREAKING') : '';
 	const position = st('dim', `[${index + 1}/${total}]`);
 
+	const kind = version_change_kind(change);
+
 	// Determine scenario label
 	let scenario_label = '';
-	if (change.needs_bump_escalation) {
+	if (kind === 'escalation') {
 		scenario_label = st('yellow', ` [${change.existing_bump} → ${change.required_bump}]`);
-	} else if (change.will_generate_changeset) {
+	} else if (kind === 'auto') {
 		scenario_label = st('cyan', ' [auto-changeset]');
 	}
 
@@ -93,7 +116,7 @@ const log_version_change_with_diffs = (
 	);
 
 	// Show escalation reason
-	if (change.needs_bump_escalation) {
+	if (kind === 'escalation') {
 		log.info(
 			st(
 				'dim',
@@ -103,7 +126,7 @@ const log_version_change_with_diffs = (
 	}
 
 	// Show trigger reason for auto-changesets
-	if (change.will_generate_changeset) {
+	if (kind === 'auto') {
 		// Find what triggered this
 		const triggers: Array<string> = [];
 		for (const [pkg, affected] of breaking_cascades) {
@@ -117,23 +140,21 @@ const log_version_change_with_diffs = (
 	}
 
 	// Show dependency diffs for this package
-	const pkg_updates = get_updates_for_package(change.package_name, dependency_updates);
-	if (pkg_updates.size > 0) {
-		for (const [dep_name, updates] of pkg_updates) {
-			if (updates.length === 0) continue;
-			const update = updates[0]!;
-			for (const line of format_dep_diff(dep_name, update.current_version, update.new_version)) {
-				log.info(line);
-			}
-		}
+	for (const line of format_dependency_diffs(
+		change.package_name,
+		dependency_updates,
+		strategy,
+		'color'
+	)) {
+		log.info(line);
 	}
 };
 
 /**
  * Logs a complete publishing plan to the console.
  *
- * Displays errors, publishing order, version changes grouped by scenario,
- * dependency-only updates, warnings, and a summary.
+ * Displays errors, the waves, version changes grouped by scenario,
+ * dependency-only updates, packages awaiting the registry, warnings, and a summary.
  */
 export const log_publishing_plan = (
 	plan: PublishingPlan,
@@ -141,12 +162,15 @@ export const log_publishing_plan = (
 	options: LogPlanOptions = {}
 ): void => {
 	const {
-		publishing_order,
+		waves,
 		version_changes,
 		dependency_updates,
 		breaking_cascades,
+		awaiting_registry,
+		never_published,
 		warnings,
 		info,
+		no_changes,
 		errors
 	} = plan;
 
@@ -159,33 +183,34 @@ export const log_publishing_plan = (
 		log.info('');
 	}
 
-	// Publishing order
-	if (publishing_order.length > 0) {
-		log.info(st('cyan', 'Publishing Order:'));
-		log.info(`  ${publishing_order.join(' → ')}`);
+	// Waves: each line publishes together, after the lines above it
+	if (waves.length > 0) {
+		log.info(st('cyan', 'Waves (each publishes together, after the ones above):'));
+		for (const line of format_waves(waves)) {
+			log.info(`  ${line}`);
+		}
 		log.info('');
 	}
 
 	// Version changes with diffs
 	if (version_changes.length > 0) {
-		// Sort by publishing order
-		const ordered_changes = [...version_changes].sort((a, b) => {
-			const idx_a = publishing_order.indexOf(a.package_name);
-			const idx_b = publishing_order.indexOf(b.package_name);
-			return idx_a - idx_b;
-		});
-
-		// Separate into groups for headers
-		const with_changesets = ordered_changes.filter(
-			(vc) => vc.has_changesets && !vc.needs_bump_escalation
+		// in wave order
+		const flat = waves.flat();
+		const ordered_changes = [...version_changes].sort(
+			(a, b) => flat.indexOf(a.package_name) - flat.indexOf(b.package_name)
 		);
-		const with_escalation = ordered_changes.filter((vc) => vc.needs_bump_escalation);
-		const with_auto_changesets = ordered_changes.filter((vc) => vc.will_generate_changeset);
+
+		// Separate into groups for headers; each change lands in exactly one
+		const with_changesets = ordered_changes.filter((vc) => version_change_kind(vc) === 'explicit');
+		const with_escalation = ordered_changes.filter(
+			(vc) => version_change_kind(vc) === 'escalation'
+		);
+		const with_auto_changesets = ordered_changes.filter((vc) => version_change_kind(vc) === 'auto');
 
 		// A single running counter across all groups so positions read 1..N with no
 		// gaps. (Numbering per-group index would make the first group skip the numbers
 		// that land in a later group, e.g. jump from `[9/12]` to `[11/12]`.)
-		const total = with_changesets.length + with_escalation.length + with_auto_changesets.length;
+		const total = ordered_changes.length;
 		let position = 0;
 		const log_change_group = (
 			title: string,
@@ -201,6 +226,7 @@ export const log_publishing_plan = (
 					total,
 					dependency_updates,
 					breaking_cascades,
+					options.version_strategy,
 					log
 				);
 			}
@@ -230,14 +256,23 @@ export const log_publishing_plan = (
 		log.info(st('dim', 'Dependency Updates (no republish):'));
 		for (const pkg of dep_only_packages) {
 			log.info(st('dim', `  ${pkg}:`));
-			const pkg_updates = get_updates_for_package(pkg, dependency_updates);
-			for (const [dep_name, updates] of pkg_updates) {
-				if (updates.length === 0) continue;
-				const update = updates[0]!;
-				// Use dim styling for non-publishing packages
-				log.info(st('dim', `    - "${dep_name}": "${update.current_version}"`));
-				log.info(st('dim', `    + "${dep_name}": "${update.new_version}"`));
+			for (const line of format_dependency_diffs(
+				pkg,
+				dependency_updates,
+				options.version_strategy,
+				'dim'
+			)) {
+				log.info(line);
 			}
+		}
+		log.info('');
+	}
+
+	// Released but not yet visible: their dependents wait on the registry
+	if (awaiting_registry.length > 0) {
+		log.warn(st('yellow', 'Awaiting the registry (still propagating, or not published):'));
+		for (const { name, version } of awaiting_registry) {
+			log.warn(`  ${name}@${version}`);
 		}
 		log.info('');
 	}
@@ -251,15 +286,24 @@ export const log_publishing_plan = (
 		log.info('');
 	}
 
-	// Info (packages with no changes)
-	if (info.length > 0) {
-		log.info(st('dim', `No changes: ${info.join(', ')}`));
+	// Info sentences, then the packages with nothing to publish (some may still take
+	// dependency-only updates above)
+	for (const line of info) {
+		log.info(st('dim', line));
+	}
+	if (no_changes.length > 0) {
+		log.info(st('dim', `Nothing to publish: ${no_changes.join(', ')}`));
+	}
+	if (never_published.length > 0) {
+		log.info(st('dim', `Never published, with nothing to publish: ${never_published.join(', ')}`));
+	}
+	if (info.length > 0 || no_changes.length > 0 || never_published.length > 0) {
 		log.info('');
 	}
 
 	// Summary
 	const major_count = version_changes.filter((vc) => vc.breaking).length;
-	const auto_count = version_changes.filter((vc) => vc.will_generate_changeset).length;
+	const auto_count = version_changes.filter((vc) => version_change_kind(vc) === 'auto').length;
 	log.info(st('cyan', 'Summary:'));
 	log.info(`  ${version_changes.length} packages to publish`);
 	if (auto_count > 0) {
@@ -293,8 +337,7 @@ const log_verbose = (data: VerboseData, log: Logger): void => {
 	log.info(''); // Blank line before verbose sections
 
 	log_verbose_changeset_details(data.changeset_details, log);
-	log_verbose_iteration_details(data.iterations, data.total_iterations, log);
-	log_verbose_propagation_chains(data.propagation_chains, log);
+	log_verbose_propagations(data.propagations, log);
 	log_verbose_graph_summary(data.graph_summary, log);
 };
 
@@ -312,7 +355,11 @@ const log_verbose_changeset_details = (
 	for (const pkg of details) {
 		log.info(st('dim', `${pkg.package_name}:`));
 		for (const file of pkg.files) {
-			const summary_text = file.summary ? `: "${file.summary}"` : '';
+			// the first line alone: a changeset body can run to paragraphs
+			const summary = file.summary.trim();
+			const first_line = summary.split('\n', 1)[0]!.trim();
+			const more = summary.includes('\n') ? ' …' : '';
+			const summary_text = first_line ? `: "${first_line}"${more}` : '';
 			log.info(st('dim', `  .changeset/${file.filename} (${file.bump_type})${summary_text}`));
 		}
 	}
@@ -320,91 +367,22 @@ const log_verbose_changeset_details = (
 };
 
 /**
- * Logs fixed-point iteration details.
+ * Logs each breaking package with the direct prod/peer dependents its publish
+ * rewrites, one branch per dependent. Transitive spread shows as later sources,
+ * since a dependent that republishes breaking is a source of its own.
  */
-const log_verbose_iteration_details = (
-	iterations: Array<VerboseIteration>,
-	total: number,
-	log: Logger
-): void => {
-	if (iterations.length === 0) return;
-
-	log_section_header('Fixed-Point Iteration', log);
-
-	for (const iter of iterations) {
-		if (iter.new_changes === 0 && iter.packages.length === 0) {
-			log.info(st('dim', `Iteration ${iter.iteration}:`));
-			log.info(st('dim', '  No new changes'));
-			continue;
-		}
-
-		log.info(st('dim', `Iteration ${iter.iteration}:`));
-		for (const pkg of iter.packages) {
-			const parts: Array<string> = [];
-
-			// Changeset info
-			if (pkg.changeset_count > 0) {
-				parts.push(`changesets=${pkg.changeset_count}`);
-				if (pkg.bump_from_changesets) {
-					parts.push(`bump=${pkg.bump_from_changesets}`);
-				}
-			} else {
-				parts.push('no changesets');
-			}
-
-			// Required bump from deps
-			if (pkg.required_bump && pkg.triggering_dep) {
-				parts.push(`required=${pkg.required_bump} (from ${pkg.triggering_dep})`);
-			}
-
-			// Action
-			if (pkg.action === 'auto_changeset') {
-				parts.push('→ auto-generate');
-			} else if (pkg.action === 'escalation') {
-				parts.push('→ escalation');
-			} else if (pkg.action === 'publish') {
-				// Regular publish, no special label needed
-			}
-
-			// Version
-			if (pkg.version_to) {
-				const breaking_label = pkg.is_breaking ? ' (BREAKING)' : '';
-				parts.push(`→ ${pkg.version_to}${breaking_label}`);
-			}
-
-			log.info(st('dim', `  ${pkg.name}: ${parts.join(', ')}`));
-		}
-
-		if (iter.new_changes > 0) {
-			log.info(st('dim', `  New changes: ${iter.new_changes}`));
-		}
-	}
-
-	log.info(st('dim', `Converged after ${total} iteration(s)`));
-	log.info('');
-};
-
-/**
- * Logs breaking change propagation chains as tree structure.
- */
-const log_verbose_propagation_chains = (
-	chains: Array<VerbosePropagationChain>,
-	log: Logger
-): void => {
-	if (chains.length === 0) return;
+const log_verbose_propagations = (propagations: Array<VerbosePropagation>, log: Logger): void => {
+	if (propagations.length === 0) return;
 
 	log_section_header('Breaking Change Propagation', log);
 
-	for (const chain of chains) {
-		log.info(st('dim', `${chain.source} (source)`));
+	for (const { source, dependents } of propagations) {
+		log.info(st('dim', `${source} (source)`));
 
-		for (let i = 0; i < chain.chain.length; i++) {
-			const item = chain.chain[i]!;
-			const indent = '   '.repeat(i);
-			const connector = '└─';
-			log.info(
-				st('dim', `${indent}${connector} ${item.pkg} (${item.dep_type} dep) → ${item.action}`)
-			);
+		for (let i = 0; i < dependents.length; i++) {
+			const item = dependents[i]!;
+			const connector = i === dependents.length - 1 ? '└─' : '├─';
+			log.info(st('dim', `${connector} ${item.pkg} (${item.dep_type} dep) → ${item.action}`));
 		}
 	}
 	log.info('');

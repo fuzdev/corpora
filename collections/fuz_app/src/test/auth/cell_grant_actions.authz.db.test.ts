@@ -12,6 +12,17 @@
  *   reports `still_admitted: false` when no other path remains.
  * - owner-as-principal and unknown-role are rejected.
  * - a role-shaped grant admits a holder of that role.
+ * - a cell whose `moderation` doesn't admit an audience refuses every grant —
+ *   owner and admin alike, actor- and role-shaped — after the manage gate.
+ * - a mounted `authorize_grant_create` runs only for a manager past the spine's
+ *   gates (a non-manager's 404 and an unknown role's 400 never reach it), for a
+ *   new grant and a level change alike; its refusal is 403
+ *   `cell_grant_not_authorized` with no grant row and no audit row.
+ * - a mounted `authorize_grant_revoke` is asked only when the caller neither
+ *   manages the cell nor holds the grant, for a role-shaped grant with a scope;
+ *   its allow revokes with a `steward: true` audit row, its refusal is the same
+ *   404 `cell_grant_not_found` as no callback, and a soft-deleted cell 404s
+ *   before it runs.
  *
  * Part of the focused first-pass checklist suite.
  *
@@ -20,24 +31,42 @@
 
 import { describe, test, assert } from 'vitest';
 
-import { cell_get_action_spec, ERROR_CELL_NOT_FOUND } from '$lib/auth/cell_action_specs.ts';
+import {
+	cell_create_action_spec,
+	cell_delete_action_spec,
+	cell_get_action_spec,
+	cell_update_action_spec,
+	ERROR_CELL_NOT_FOUND
+} from '#lib/auth/cell_action_specs.ts';
+import {
+	cell_field_set_action_spec,
+	type CellFieldName
+} from '#lib/auth/cell_field_action_specs.ts';
+import {
+	cell_item_insert_action_spec,
+	type CellItemPosition
+} from '#lib/auth/cell_item_action_specs.ts';
 import {
 	cell_grant_create_action_spec,
 	cell_grant_revoke_action_spec,
 	cell_grant_list_action_spec,
+	ERROR_CELL_GRANT_NOT_AUTHORIZED,
+	ERROR_CELL_GRANT_NOT_FOUND,
 	ERROR_CELL_GRANT_PRINCIPAL_IS_OWNER,
+	ERROR_CELL_GRANT_UNAPPROVED,
 	ERROR_CELL_GRANT_UNKNOWN_ROLE
-} from '$lib/auth/cell_grant_action_specs.ts';
-import { ROLE_ADMIN } from '$lib/auth/role_schema.ts';
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
-import type { TestApp, TestAccount } from '$lib/testing/app_server.ts';
-import {
-	create_cell_test_app,
-	create_cell,
-	call,
-	error_reason,
-	ROLE_MEMBER
-} from './cell_test_helpers.ts';
+} from '#lib/auth/cell_grant_action_specs.ts';
+import { ROLE_ADMIN } from '#lib/auth/role_schema.ts';
+import type { Uuid } from '#lib/primitive_schemas.ts';
+import type { TestApp, TestAccount } from '#lib/testing/app_server.ts';
+import type {
+	CellGrantCreateAuthorize,
+	CellGrantCreateAuthorizeInput,
+	CellGrantRevokeAuthorize,
+	CellGrantRevokeAuthorizeInput
+} from '#lib/auth/cell_grant_actions.ts';
+import { create_cell_test_app, create_cell, call, ROLE_MEMBER } from './cell_test_helpers.ts';
+import { error_reason } from './rpc_test_helpers.ts';
 import { describe_db } from '../cell_db_fixture.ts';
 
 const grant_actor = (
@@ -189,6 +218,122 @@ describe_db('cell_grant_actions authz', (get_db) => {
 			assert.ok(!after.ok);
 			assert.strictEqual(after.status, 404);
 		});
+
+		test('leaving a rejected cell is not still admitted by a remaining role grant', async () => {
+			const app = await create_cell_test_app(get_db);
+			const owner = await app.create_account({ username: 'sr_owner' });
+			const holder = await app.create_account({ username: 'sr_holder', roles: [ROLE_MEMBER] });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const v = await grant_actor(app, owner, id, 'viewer', holder.actor.id);
+			assert.ok(v.ok, JSON.stringify(v));
+			const r = await call(
+				app,
+				cell_grant_create_action_spec,
+				{ cell_id: id, level: 'viewer', principal: { kind: 'role', role: ROLE_MEMBER } },
+				owner.create_session_headers()
+			);
+			assert.ok(r.ok, JSON.stringify(r));
+			await get_db().query('UPDATE cell SET moderation = $2 WHERE id = $1', [id, 'rejected']);
+
+			const self_revoke = await call(
+				app,
+				cell_grant_revoke_action_spec,
+				{ grant_id: v.result.grant.id },
+				holder.create_session_headers()
+			);
+			assert.ok(self_revoke.ok, JSON.stringify(self_revoke));
+			assert.strictEqual(self_revoke.result.still_admitted, false);
+		});
+	});
+
+	describe('moderation gates the editor grant', () => {
+		test('an editor grant stops admitting writes once its cell is rejected', async () => {
+			const app = await create_cell_test_app(get_db);
+			const owner = await app.create_account({ username: 'mr_owner' });
+			const editor = await app.create_account({ username: 'mr_editor' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				visibility: 'public',
+				headers: owner.create_session_headers()
+			});
+			const other = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				visibility: 'public',
+				headers: editor.create_session_headers()
+			});
+			const e = await grant_actor(app, owner, id, 'editor', editor.actor.id);
+			assert.ok(e.ok, JSON.stringify(e));
+			const h = editor.create_session_headers();
+			const control = await call(app, cell_update_action_spec, { cell_id: id }, h);
+			assert.ok(control.ok, JSON.stringify(control));
+			await get_db().query('UPDATE cell SET moderation = $2 WHERE id = $1', [id, 'rejected']);
+
+			const results = [
+				await call(app, cell_update_action_spec, { cell_id: id }, h),
+				await call(
+					app,
+					cell_field_set_action_spec,
+					{ source_id: id, name: 'link' as CellFieldName, target_id: other.id },
+					h
+				),
+				await call(
+					app,
+					cell_item_insert_action_spec,
+					{ parent_id: id, child_id: other.id, position: 'a0' as CellItemPosition },
+					h
+				),
+				await call(app, cell_delete_action_spec, { cell_id: id }, h)
+			];
+			for (const r of results) {
+				assert.ok(!r.ok, JSON.stringify(r));
+				assert.strictEqual(r.status, 404);
+				assert.strictEqual(error_reason(r), ERROR_CELL_NOT_FOUND);
+			}
+			const by_owner = await call(
+				app,
+				cell_update_action_spec,
+				{ cell_id: id },
+				owner.create_session_headers()
+			);
+			assert.ok(by_owner.ok, 'the owner keeps the owner arm');
+		});
+
+		test("a steward's pre-rejection editor grant: cell_get admits, can_edit is false", async () => {
+			const app = await create_cell_test_app(get_db);
+			const root_owner = await app.create_account({ username: 'ms_root_owner' });
+			const author = await app.create_account({ username: 'ms_author' });
+			const root = await create_cell(app, {
+				kind: 'forum',
+				data: {},
+				visibility: 'public',
+				headers: root_owner.create_session_headers()
+			});
+			const post = await call(
+				app,
+				cell_create_action_spec,
+				{ kind: 'post', data: {}, parent_id: root.id, visibility: 'public' },
+				author.create_session_headers()
+			);
+			assert.ok(post.ok, JSON.stringify(post));
+			const post_id = post.result.cell.id;
+			const e = await grant_actor(app, author, post_id, 'editor', root_owner.actor.id);
+			assert.ok(e.ok, JSON.stringify(e));
+			await get_db().query('UPDATE cell SET moderation = $2 WHERE id = $1', [post_id, 'rejected']);
+
+			const h = root_owner.create_session_headers();
+			const got = await call(app, cell_get_action_spec, { id: post_id }, h);
+			assert.ok(got.ok, JSON.stringify(got));
+			assert.strictEqual(got.result.can_edit, false);
+			const write = await call(app, cell_update_action_spec, { cell_id: post_id }, h);
+			assert.ok(!write.ok, JSON.stringify(write));
+			assert.strictEqual(write.status, 404);
+		});
 	});
 
 	describe('principal validity', () => {
@@ -200,10 +345,14 @@ describe_db('cell_grant_actions authz', (get_db) => {
 				data: {},
 				headers: owner.create_session_headers()
 			});
-			const res = await grant_actor(app, owner, id, 'viewer', owner.actor.id);
-			assert.ok(!res.ok);
-			assert.strictEqual(res.status, 400);
-			assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_PRINCIPAL_IS_OWNER);
+			// an uppercased owner id is the owner too — `Uuid` lowercases it before
+			// the comparison against the stored `created_by`
+			for (const actor_id of [owner.actor.id, owner.actor.id.toUpperCase() as Uuid]) {
+				const res = await grant_actor(app, owner, id, 'viewer', actor_id);
+				assert.ok(!res.ok, actor_id);
+				assert.strictEqual(res.status, 400);
+				assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_PRINCIPAL_IS_OWNER, actor_id);
+			}
 		});
 
 		test('unknown role is rejected', async () => {
@@ -223,6 +372,64 @@ describe_db('cell_grant_actions authz', (get_db) => {
 			assert.ok(!res.ok);
 			assert.strictEqual(res.status, 400);
 			assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_UNKNOWN_ROLE);
+		});
+	});
+
+	describe('grant on an unapproved contribution', () => {
+		test('pending, rejected, and unknown markers refuse every grant after the manage gate', async () => {
+			const app = await create_cell_test_app(get_db);
+			const owner = await app.create_account({ username: 'm_owner' });
+			const admin = await app.create_account({ username: 'm_admin', roles: [ROLE_ADMIN] });
+			const stranger = await app.create_account({ username: 'm_stranger' });
+			const target = await app.create_account({ username: 'm_target' });
+			const { id } = await create_cell(app, {
+				kind: 'post',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const set_moderation = (moderation: string | null) =>
+				get_db().query('UPDATE cell SET moderation = $2 WHERE id = $1', [id, moderation]);
+			const grant_role = (granter: typeof owner) =>
+				call(
+					app,
+					cell_grant_create_action_spec,
+					{ cell_id: id, level: 'viewer', principal: { kind: 'role', role: ROLE_MEMBER } },
+					granter.create_session_headers()
+				);
+
+			for (const moderation of ['pending', 'rejected', 'unknown']) {
+				await set_moderation(moderation);
+				for (const granter of [owner, admin]) {
+					const actor_shaped = await grant_actor(app, granter, id, 'viewer', target.actor.id);
+					assert.ok(!actor_shaped.ok, moderation);
+					assert.strictEqual(actor_shaped.status, 403, moderation);
+					assert.strictEqual(error_reason(actor_shaped), ERROR_CELL_GRANT_UNAPPROVED);
+					const role_shaped = await grant_role(granter);
+					assert.ok(!role_shaped.ok, moderation);
+					assert.strictEqual(role_shaped.status, 403, moderation);
+					assert.strictEqual(error_reason(role_shaped), ERROR_CELL_GRANT_UNAPPROVED);
+				}
+				// A non-manager keeps the 404 mask — the refusal comes after it.
+				const masked = await grant_actor(app, stranger, id, 'viewer', target.actor.id);
+				assert.strictEqual(masked.status, 404, moderation);
+				assert.strictEqual(error_reason(masked), ERROR_CELL_NOT_FOUND);
+			}
+			const listed = await call(
+				app,
+				cell_grant_list_action_spec,
+				{ cell_id: id },
+				owner.create_session_headers()
+			);
+			assert.ok(listed.ok, JSON.stringify(listed));
+			assert.strictEqual(listed.result.grants.length, 0, 'no refused grant wrote a row');
+
+			for (const moderation of ['approved', null]) {
+				await set_moderation(moderation);
+				const actor_shaped = await grant_actor(app, owner, id, 'viewer', target.actor.id);
+				assert.ok(actor_shaped.ok, JSON.stringify(actor_shaped));
+				const role_shaped = await grant_role(admin);
+				assert.ok(role_shaped.ok, JSON.stringify(role_shaped));
+			}
 		});
 	});
 
@@ -248,6 +455,315 @@ describe_db('cell_grant_actions authz', (get_db) => {
 			const got = await call(app, cell_get_action_spec, { id }, member.create_session_headers());
 			assert.ok(got.ok, JSON.stringify(got));
 			assert.strictEqual(got.result.cell.id, id);
+		});
+	});
+
+	describe('authorize_grant_create', () => {
+		/** A grant authorizer answering `allow`, recording what it saw. */
+		const recording = (allow: boolean) => {
+			const seen: Array<CellGrantCreateAuthorizeInput> = [];
+			const authorize: CellGrantCreateAuthorize = (_auth, input) => {
+				seen.push(input);
+				return Promise.resolve(allow);
+			};
+			return { authorize, seen };
+		};
+
+		const count_rows = async (): Promise<{ grants: number; audits: number }> => {
+			const [grants] = await get_db().query<{ n: number }>(
+				'SELECT count(*)::int AS n FROM cell_grant'
+			);
+			const [audits] = await get_db().query<{ n: number }>(
+				`SELECT count(*)::int AS n FROM audit_log WHERE event_type = 'cell_grant_create'`
+			);
+			return { grants: grants!.n, audits: audits!.n };
+		};
+
+		test('it gates a manager after the spine gates, and a refusal writes nothing', async () => {
+			const deny = recording(false);
+			const app = await create_cell_test_app(get_db, [], {
+				authorize_grant_create: deny.authorize
+			});
+			const owner = await app.create_account({ username: 'ga_owner' });
+			const stranger = await app.create_account({ username: 'ga_stranger' });
+			const target = await app.create_account({ username: 'ga_target' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				visibility: 'public',
+				headers: owner.create_session_headers()
+			});
+			const before = await count_rows();
+
+			const masked = await grant_actor(app, stranger, id, 'viewer', target.actor.id);
+			assert.strictEqual(error_reason(masked), ERROR_CELL_NOT_FOUND);
+			const unknown_role = await call(
+				app,
+				cell_grant_create_action_spec,
+				{ cell_id: id, level: 'viewer', principal: { kind: 'role', role: 'nobody' } },
+				owner.create_session_headers()
+			);
+			assert.strictEqual(error_reason(unknown_role), ERROR_CELL_GRANT_UNKNOWN_ROLE);
+			assert.strictEqual(deny.seen.length, 0, 'the hook sees only managers past the gates');
+
+			const refused = await grant_actor(app, owner, id, 'viewer', target.actor.id);
+			assert.ok(!refused.ok);
+			assert.strictEqual(error_reason(refused), ERROR_CELL_GRANT_NOT_AUTHORIZED);
+			assert.deepStrictEqual(deny.seen, [
+				{
+					cell_id: id,
+					cell_created_by: owner.actor.id,
+					level: 'viewer',
+					principal: { kind: 'actor', actor_id: target.actor.id }
+				}
+			]);
+			assert.deepStrictEqual(await count_rows(), before, 'no grant and no audit row');
+		});
+
+		test('a level change goes through it, and an allow writes', async () => {
+			const allow = recording(true);
+			const app = await create_cell_test_app(get_db, [], {
+				authorize_grant_create: allow.authorize
+			});
+			const owner = await app.create_account({ username: 'gb_owner' });
+			const target = await app.create_account({ username: 'gb_target' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const first = await grant_actor(app, owner, id, 'viewer', target.actor.id);
+			assert.ok(first.ok, JSON.stringify(first));
+			const upserted = await grant_actor(app, owner, id, 'editor', target.actor.id);
+			assert.ok(upserted.ok, JSON.stringify(upserted));
+			assert.strictEqual(upserted.result.grant.level, 'editor');
+			assert.deepStrictEqual(
+				allow.seen.map((i) => i.level),
+				['viewer', 'editor']
+			);
+		});
+	});
+	describe('authorize_grant_revoke', () => {
+		/** A revoke authorizer answering `allow`, recording what it saw. */
+		const recording = (allow: boolean) => {
+			const seen: Array<CellGrantRevokeAuthorizeInput> = [];
+			const authorize: CellGrantRevokeAuthorize = (_auth, input) => {
+				seen.push(input);
+				return Promise.resolve(allow);
+			};
+			return { authorize, seen };
+		};
+
+		const SCOPE_ID = '44444444-4444-4444-8444-444444444444' as Uuid;
+
+		const grant = async (
+			app: TestApp,
+			owner: TestAccount,
+			cell_id: Uuid,
+			principal:
+				{ kind: 'actor'; actor_id: Uuid } | { kind: 'role'; role: string; scope_id?: Uuid | null }
+		): Promise<Uuid> => {
+			const res = await call(
+				app,
+				cell_grant_create_action_spec,
+				{ cell_id, level: 'viewer', principal },
+				owner.create_session_headers()
+			);
+			assert.ok(res.ok, JSON.stringify(res));
+			return res.result.grant.id;
+		};
+
+		const revoke = (app: TestApp, caller: TestAccount, grant_id: Uuid) =>
+			call(app, cell_grant_revoke_action_spec, { grant_id }, caller.create_session_headers());
+
+		const grant_exists = async (grant_id: Uuid): Promise<boolean> =>
+			(await get_db().query('SELECT 1 FROM cell_grant WHERE id = $1', [grant_id])).length > 0;
+
+		/** The `cell_grant_revoke` audit rows' metadata, oldest first. */
+		const revoke_audits = async (): Promise<Array<Record<string, unknown>>> =>
+			(
+				await get_db().query<{ metadata: Record<string, unknown> }>(
+					`SELECT metadata FROM audit_log WHERE event_type = 'cell_grant_revoke' ORDER BY seq`
+				)
+			).map((r) => r.metadata);
+
+		test('unmounted, a would-be steward gets the 404 mask', async () => {
+			const app = await create_cell_test_app(get_db);
+			const owner = await app.create_account({ username: 'rv_none_owner' });
+			const steward = await app.create_account({ username: 'rv_none_steward' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const grant_id = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const res = await revoke(app, steward, grant_id);
+			assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_NOT_FOUND);
+			assert.ok(await grant_exists(grant_id));
+		});
+
+		test('an allow revokes, audited `steward: true`, after asking with the grant', async () => {
+			const allow = recording(true);
+			const app = await create_cell_test_app(get_db, [], {
+				authorize_grant_revoke: allow.authorize
+			});
+			const owner = await app.create_account({ username: 'rv_allow_owner' });
+			const steward = await app.create_account({ username: 'rv_allow_steward' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const grant_id = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const res = await revoke(app, steward, grant_id);
+			assert.ok(res.ok, JSON.stringify(res));
+			assert.deepStrictEqual(res.result, { ok: true, still_admitted: false });
+			assert.ok(!(await grant_exists(grant_id)), 'the grant is gone');
+			assert.deepStrictEqual(allow.seen, [
+				{
+					grant_id,
+					cell_id: id,
+					cell_created_by: owner.actor.id,
+					role: ROLE_MEMBER,
+					scope_id: SCOPE_ID,
+					level: 'viewer'
+				}
+			]);
+			const audits = await revoke_audits();
+			assert.strictEqual(audits.length, 1);
+			assert.strictEqual(audits[0]!.steward, true);
+			assert.strictEqual(audits[0]!.grant_id, grant_id);
+			assert.ok(!('self' in audits[0]!));
+		});
+
+		test('a steward revoke deletes only the grant at the level the callback judged', async () => {
+			// stands in for a concurrent `cell_grant_create` upsert landing between
+			// the callback's read and the delete — it writes through the request's
+			// own handle, which a real callback must never do
+			const raced: CellGrantRevokeAuthorize = async (_auth, input, ctx) => {
+				await ctx.db.query(`UPDATE cell_grant SET level = 'editor' WHERE id = $1`, [
+					input.grant_id
+				]);
+				return true;
+			};
+			const app = await create_cell_test_app(get_db, [], { authorize_grant_revoke: raced });
+			const owner = await app.create_account({ username: 'rv_race_owner' });
+			const steward = await app.create_account({ username: 'rv_race_steward' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+			const grant_id = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const res = await revoke(app, steward, grant_id);
+			assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_NOT_FOUND);
+			assert.ok(await grant_exists(grant_id), 'the grant is kept');
+			assert.strictEqual((await revoke_audits()).length, 0, 'no audit row');
+			// the callback's UPDATE rode the request transaction, so the refusal
+			// rolled it back with everything else
+			const rows = await get_db().query<{ level: string }>(
+				'SELECT level FROM cell_grant WHERE id = $1',
+				[grant_id]
+			);
+			assert.strictEqual(rows[0]?.level, 'viewer', "the callback's level change rolled back");
+		});
+
+		test('a refusal is the 404 mask — no audit row, the grant kept', async () => {
+			const deny = recording(false);
+			const app = await create_cell_test_app(get_db, [], {
+				authorize_grant_revoke: deny.authorize
+			});
+			const owner = await app.create_account({ username: 'rv_deny_owner' });
+			const stranger = await app.create_account({ username: 'rv_deny_stranger' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				visibility: 'public',
+				headers: owner.create_session_headers()
+			});
+			const grant_id = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const res = await revoke(app, stranger, grant_id);
+			assert.ok(!res.ok);
+			assert.strictEqual(res.status, 404);
+			assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_NOT_FOUND);
+			assert.strictEqual(deny.seen.length, 1);
+			assert.ok(await grant_exists(grant_id), 'the grant is kept');
+			assert.deepStrictEqual(await revoke_audits(), [], 'no audit row');
+		});
+
+		test('fenced: actor-shaped, scopeless, manager, self, and deleted-cell revokes never ask', async () => {
+			const allow = recording(true);
+			const app = await create_cell_test_app(get_db, [], {
+				authorize_grant_revoke: allow.authorize
+			});
+			const owner = await app.create_account({ username: 'rv_fence_owner' });
+			const stranger = await app.create_account({ username: 'rv_fence_stranger' });
+			const holder = await app.create_account({ username: 'rv_fence_holder' });
+			const { id } = await create_cell(app, {
+				kind: 'note',
+				data: {},
+				headers: owner.create_session_headers()
+			});
+
+			const actor_shaped = await grant(app, owner, id, {
+				kind: 'actor',
+				actor_id: holder.actor.id
+			});
+			const scopeless = await grant(app, owner, id, { kind: 'role', role: ROLE_MEMBER });
+			for (const grant_id of [actor_shaped, scopeless]) {
+				const res = await revoke(app, stranger, grant_id);
+				assert.strictEqual(error_reason(res), ERROR_CELL_GRANT_NOT_FOUND);
+			}
+			assert.strictEqual(allow.seen.length, 0, 'neither grant shape reaches the callback');
+
+			// self-revoke and a manager's revoke take their own paths
+			const left = await revoke(app, holder, actor_shaped);
+			assert.ok(left.ok, JSON.stringify(left));
+			const scoped = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const managed = await revoke(app, owner, scoped);
+			assert.ok(managed.ok, JSON.stringify(managed));
+			assert.strictEqual(allow.seen.length, 0, 'a self-revoker and a manager never consult it');
+			const audits = await revoke_audits();
+			assert.strictEqual(audits.length, 2);
+			assert.strictEqual(audits[0]!.self, true);
+			for (const audit of audits) assert.ok(!('steward' in audit), JSON.stringify(audit));
+
+			// a soft-deleted cell 404s before the callback
+			const doomed = await grant(app, owner, id, {
+				kind: 'role',
+				role: ROLE_MEMBER,
+				scope_id: SCOPE_ID
+			});
+			const deleted = await call(
+				app,
+				cell_delete_action_spec,
+				{ cell_id: id },
+				owner.create_session_headers()
+			);
+			assert.ok(deleted.ok, JSON.stringify(deleted));
+			const gone = await revoke(app, stranger, doomed);
+			assert.strictEqual(error_reason(gone), ERROR_CELL_GRANT_NOT_FOUND);
+			assert.strictEqual(allow.seen.length, 0, 'a deleted cell never reaches the callback');
 		});
 	});
 });

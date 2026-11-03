@@ -2,26 +2,24 @@
 	import { LayerCake, Svg } from 'layercake';
 	import { scaleOrdinal, scaleBand } from 'd3-scale';
 
-	import ForceLayout from '../../_components/CirclePackForce.svelte';
+	import CirclePackForce from '../../_components/CirclePackForce.svelte';
 
 	import data from '../../_data/dots.json';
 
 	const xKey = 'category';
 	const rKey = 'value';
-	const zKey = 'category';
+	const cKey = 'category';
 
-	let groupBy = $state('true');
+	let groupByX = $state(true);
 
 	const seriesNameSet = new Set();
-	const seriesColors = ['#f0c', '#0cf', '#fc0'];
+	const seriesColors = ['#ff00cc', '#00ccff', '#ffcc00'];
 
 	data.forEach(d => {
-		seriesNameSet.add(d[zKey]);
+		seriesNameSet.add(d[cKey]);
 	});
 
-	/* --------------------------------------------
-	 * Convert this to an array so we can use it in our scales
-	 */
+	// Convert this to an array so we can use it in our scales
 	const seriesNames = [...seriesNameSet];
 
 	let manyBodyStrength = 3;
@@ -29,8 +27,8 @@
 </script>
 
 <div class="input-container">
-	<label><input type="radio" bind:group={groupBy} value="true" />GroupBy `true`</label>
-	<label><input type="radio" bind:group={groupBy} value="false" />GroupBy `false`</label>
+	<label><input type="radio" bind:group={groupByX} value={true} />groupByX true</label>
+	<label><input type="radio" bind:group={groupByX} value={false} />groupByX false</label>
 </div>
 
 <div class="chart-container">
@@ -38,27 +36,22 @@
 		{data}
 		x={xKey}
 		r={rKey}
-		z={zKey}
+		c={cKey}
 		xScale={scaleBand()}
 		xDomain={seriesNames}
 		rRange={[3, 12]}
-		zScale={scaleOrdinal()}
-		zDomain={seriesNames}
-		zRange={seriesColors}
+		cScale={scaleOrdinal()}
+		cDomain={seriesNames}
+		cRange={seriesColors}
 	>
 		<Svg>
-			<ForceLayout {manyBodyStrength} {xStrength} groupBy={JSON.parse(groupBy)} nodeStroke="#000" />
+			<CirclePackForce {manyBodyStrength} {xStrength} {groupByX} stroke="#000" />
 		</Svg>
 	</LayerCake>
 </div>
 
 <style>
-	/*
-		The wrapper div needs to have an explicit width and height in CSS.
-		It can also be a flexbox child or CSS grid element.
-		The point being it needs dimensions since the <LayerCake> element will
-		expand to fill it.
-	*/
+	/* Give the wrapper a width and height. LayerCake fills it. */
 	.chart-container {
 		width: 100%;
 		height: 250px;

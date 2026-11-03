@@ -1,8 +1,8 @@
 import { describe, test, assert } from 'vitest';
 
-import { SyntaxStyler } from '$lib/syntax_styler.ts';
-import { syntax_styler_global } from '$lib/syntax_styler_global.ts';
-import { syntax_events_to_tokens, validate_syntax_events, type SyntaxLang } from '$lib/lexer.ts';
+import { SyntaxStyler } from '#lib/syntax_styler.ts';
+import { syntax_styler_global } from '#lib/syntax_styler_global.ts';
+import { syntax_events_to_tokens, validate_syntax_events, type SyntaxLang } from '#lib/lexer.ts';
 
 describe('SyntaxStyler registry', () => {
 	test('has_lang reflects registration and aliases', () => {

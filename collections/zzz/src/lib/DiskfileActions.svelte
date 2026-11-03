@@ -7,9 +7,11 @@
 	import { frontend_context } from './frontend.svelte.ts';
 	import type { Diskfile } from './diskfile.svelte.ts';
 	import ClearRestoreButton from './ClearRestoreButton.svelte';
+	import ErrorMessage from './ErrorMessage.svelte';
 	import type { DiskfileEditorState } from './diskfile_editor_state.svelte.ts';
 	import { icon_delete, icon_paste } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
+	import Icon from './Icon.svelte';
+	import { delete_diskfile } from './diskfile_helpers.ts';
 
 	const {
 		diskfile,
@@ -28,7 +30,9 @@
 
 <!-- Content modification actions (copy, paste, clear) -->
 <div class="display:flex gap_xs">
-	<CopyToClipboard text={editor_state.current_content} class="plain" />
+	{#if editor_state.content_loaded}
+		<CopyToClipboard text={editor_state.current_content} class="plain" />
+	{/if}
 
 	{#if !readonly}
 		<PasteFromClipboard
@@ -37,7 +41,7 @@
 			}}
 			class="plain icon-button font_size_lg"
 		>
-			<Svg data={icon_paste} />
+			<Icon data={icon_paste} />
 		</PasteFromClipboard>
 
 		<ClearRestoreButton bind:value={editor_state.current_content} />
@@ -45,11 +49,11 @@
 
 	<!-- Delete button is always available -->
 	<ConfirmButton
-		onconfirm={() => app.diskfiles.delete(diskfile.path)}
+		onconfirm={() => delete_diskfile(app.diskfiles, diskfile)}
 		class="plain icon-button"
 		title="delete file"
 	>
-		<Svg data={icon_delete} />
+		<Icon data={icon_delete} />
 	</ConfirmButton>
 </div>
 
@@ -58,10 +62,21 @@
 		<button
 			class="flex:1 palette_f"
 			type="button"
-			disabled={!editor_state.has_changes}
+			disabled={!editor_state.can_save || editor_state.saving || editor_state.has_conflict}
+			title={editor_state.has_conflict
+				? 'changed on disk since you edited it — overwrite or reload above'
+				: undefined}
 			onclick={() => editor_state.save_changes()}
 		>
 			save changes
 		</button>
+	</div>
+{/if}
+
+{#if editor_state.save_error !== null}
+	<div class="mt_xs" transition:slide>
+		<ErrorMessage>
+			<small class="font_family_mono">save failed: {editor_state.save_error}</small>
+		</ErrorMessage>
 	</div>
 {/if}

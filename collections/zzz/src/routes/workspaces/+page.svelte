@@ -1,10 +1,14 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { frontend_context } from '$lib/frontend.svelte.ts';
-	import { DiskfileDirectoryPath } from '$lib/diskfile_types.ts';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import { frontend_context } from '#lib/frontend.svelte.ts';
+	import { DiskfileDirectoryPath } from '#lib/diskfile_types.ts';
+	import { parse_workspace_path, WORKSPACE_DEGRADED_NOTICE } from '#lib/workspace_helpers.ts';
 	import { icon_add, icon_delete, icon_directory, icon_workspace } from '@fuzdev/fuz_ui/icons.ts';
-	import Svg from '@fuzdev/fuz_ui/Svg.svelte';
-	import PageFooter from '$routes/PageFooter.svelte';
+	import Icon from '#lib/Icon.svelte';
+	import PageFooter from '#routes/PageFooter.svelte';
 
 	const app = frontend_context.get();
 
@@ -12,52 +16,94 @@
 	let opening = $state.raw(false);
 	let error_message: string | null = $state.raw(null);
 
+	/**
+	 * Open the workspace at `path` and activate it. Activates by the path the
+	 * daemon returns — it canonicalizes (`/a/./b/` → `/a/b/`, symlinks
+	 * resolved), so the input path may not match the stored workspace.
+	 *
+	 * @returns an error message, or `null` on success
+	 */
+	const open_and_activate = async (path: DiskfileDirectoryPath): Promise<string | null> => {
+		const result = await app.workspaces.open(path);
+		if (!result.ok) return result.error.message;
+		app.workspaces.activate(result.value.id);
+		return null;
+	};
+
 	// Auto-open/activate workspace from query param (e.g. from `zzz <dir>` CLI)
 	const workspace_param = $derived(page.url.searchParams.get('workspace'));
 
+	// Non-reactive: each param value is handled once, then stripped from the URL.
+	// Reset when the param clears so navigating to the same value again reopens.
+	let last_handled_param: string | null = null;
+
 	$effect(() => {
-		if (!workspace_param) return;
-		const normalized = workspace_param.endsWith('/') ? workspace_param : workspace_param + '/';
-		const path = DiskfileDirectoryPath.parse(normalized);
-		const existing = app.workspaces.get_by_path(path);
-		if (existing) {
-			app.workspaces.activate(existing.id);
-		} else {
-			void app.api.workspace_open({ path }).then((result) => {
-				if (result.ok) {
-					const ws = app.workspaces.get_by_path(path);
-					if (ws) app.workspaces.activate(ws.id);
-				}
-			});
+		const param = workspace_param;
+		if (param === null) {
+			last_handled_param = null;
+			return;
 		}
+		if (param === last_handled_param) return;
+		last_handled_param = param;
+		// untracked so workspace collection changes (a close, another open)
+		// never re-run this — which would reopen a just-closed workspace or
+		// steal the user's selection
+		untrack(() => void handle_workspace_param(param));
 	});
 
+	const handle_workspace_param = async (param: string): Promise<void> => {
+		// strip first so a reload never re-opens a workspace the user has since closed
+		void goto(resolve('/workspaces'), { replace: true, reset: false });
+
+		const parsed = parse_workspace_path(param);
+		if (!parsed.ok) {
+			error_message = `can't open workspace from URL: ${parsed.message}`;
+			return;
+		}
+		const existing = app.workspaces.get_by_path(parsed.path);
+		if (existing) {
+			app.workspaces.activate(existing.id);
+			return;
+		}
+		const error = await open_and_activate(parsed.path);
+		if (error !== null) error_message = error;
+	};
+
 	const handle_open = async (): Promise<void> => {
+		if (opening) return;
 		const raw = new_path.trim();
 		if (!raw) return;
 
-		opening = true;
 		error_message = null;
-
-		const path = DiskfileDirectoryPath.parse(raw.endsWith('/') ? raw : raw + '/');
-		const result = await app.api.workspace_open({ path });
-
-		if (result.ok) {
-			new_path = '';
-		} else {
-			error_message = result.error.message;
+		const parsed = parse_workspace_path(raw);
+		if (!parsed.ok) {
+			error_message = parsed.message;
+			return;
 		}
-		opening = false;
+
+		opening = true;
+		try {
+			const error = await open_and_activate(parsed.path);
+			if (error === null) {
+				new_path = '';
+			} else {
+				error_message = error;
+			}
+		} finally {
+			opening = false;
+		}
 	};
 
-	const handle_close = async (path: string): Promise<void> => {
-		await app.api.workspace_close({ path: DiskfileDirectoryPath.parse(path) });
+	const handle_close = async (path: DiskfileDirectoryPath): Promise<void> => {
+		error_message = null;
+		const result = await app.close_workspace(path);
+		if (!result.ok) error_message = `failed to close ${path}: ${result.error.message}`;
 	};
 </script>
 
 <div class="workspaces_page p_xl">
 	<header class="mb_xl">
-		<h1><Svg data={icon_workspace} /> Workspaces</h1>
+		<h1><Icon data={icon_workspace} /> Workspaces</h1>
 		<p class="text_50">
 			Directories the daemon is watching. Open a workspace to access its files and receive change
 			events.
@@ -66,7 +112,7 @@
 
 	<!-- open a workspace -->
 	<section class="box mb_xl">
-		<h2 class="mt_0"><Svg data={icon_add} /> Open Workspace</h2>
+		<h2 class="mt_0"><Icon data={icon_add} /> Open Workspace</h2>
 		<form
 			class="row gap_sm"
 			onsubmit={(e) => {
@@ -86,13 +132,13 @@
 			</button>
 		</form>
 		{#if error_message}
-			<p class="color_c_50 mt_sm">{error_message}</p>
+			<p class="color_c_60 mt_sm">{error_message}</p>
 		{/if}
 	</section>
 
 	<!-- list open workspaces -->
 	<section class="box">
-		<h2 class="mt_0"><Svg data={icon_directory} /> Open Workspaces</h2>
+		<h2 class="mt_0"><Icon data={icon_directory} /> Open Workspaces</h2>
 		{#if app.workspaces.items.by_id.size === 0}
 			<p class="text_50">
 				No workspaces open. Use the form above or run <code>zzz &lt;dir&gt;</code> to open one.
@@ -107,19 +153,22 @@
 							class:selected={workspace.id === app.workspaces.active_id}
 							onclick={() => app.workspaces.activate(workspace.id)}
 						>
-							<Svg data={icon_workspace} />
+							<Icon data={icon_workspace} />
 							<span class="flex:1">
 								<strong>{workspace.name}</strong>
 								<span class="text_50 font_size_sm font_family_mono ml_sm">{workspace.path}</span>
+								{#if workspace.watch_status === 'degraded'}
+									<small class="text_50 display:block">{WORKSPACE_DEGRADED_NOTICE}</small>
+								{/if}
 							</span>
 						</button>
 						<button
 							type="button"
-							class="icon-button compact plain"
+							class="icon-button sized_sm plain"
 							title="close workspace"
 							onclick={() => void handle_close(workspace.path)}
 						>
-							<Svg data={icon_delete} />
+							<Icon data={icon_delete} />
 						</button>
 					</li>
 				{/each}

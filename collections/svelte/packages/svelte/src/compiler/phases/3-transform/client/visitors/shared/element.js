@@ -1,6 +1,7 @@
 /** @import { Expression, Identifier, ObjectExpression } from 'estree' */
 /** @import { AST } from '#compiler' */
 /** @import { ComponentContext } from '../../types' */
+/** @import { ExpressionMetadata } from '../../../../nodes.js' */
 import { escape_html } from '../../../../../../escaping.js';
 import { normalize_attribute } from '../../../../../../utils.js';
 import { is_ignored } from '../../../../../state.js';
@@ -8,7 +9,6 @@ import { is_event_attribute } from '../../../../../utils/ast.js';
 import * as b from '#compiler/builders';
 import { build_class_directives_object, build_style_directives_object } from '../RegularElement.js';
 import { build_expression, build_template_chunk, Memoizer } from './utils.js';
-import { ExpressionMetadata } from '../../../../nodes.js';
 
 /**
  * @param {Array<AST.Attribute | AST.SpreadAttribute>} attributes
@@ -30,6 +30,7 @@ export function build_attribute_effect(
 ) {
 	/** @type {ObjectExpression['properties']} */
 	const values = [];
+	const is_select = element.type === 'RegularElement' && element.name === 'select';
 
 	const memoizer = new Memoizer();
 
@@ -48,7 +49,11 @@ export function build_attribute_effect(
 				context.state.init.push(b.var(id, value));
 				values.push(b.init(attribute.name, b.id(id)));
 			} else {
-				values.push(b.init(attribute.name, value));
+				const name =
+					is_select && normalize_attribute(attribute.name) === 'defaultValue'
+						? 'defaultValue'
+						: attribute.name;
+				values.push(b.init(name, value));
 			}
 		} else {
 			let value = /** @type {Expression} */ (context.visit(attribute));

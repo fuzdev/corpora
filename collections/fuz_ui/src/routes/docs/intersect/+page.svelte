@@ -1,14 +1,14 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import { intersect } from '$lib/intersect.svelte.ts';
-	import TomeContent from '$lib/TomeContent.svelte';
-	import TomeSection from '$lib/TomeSection.svelte';
-	import TomeSectionHeader from '$lib/TomeSectionHeader.svelte';
-	import MdnLink from '$lib/MdnLink.svelte';
-	import ModuleLink from '$lib/ModuleLink.svelte';
-	import DeclarationLink from '$lib/DeclarationLink.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import { intersect } from '#lib/intersect.svelte.ts';
+	import TomeContent from '#lib/TomeContent.svelte';
+	import TomeSection from '#lib/TomeSection.svelte';
+	import TomeSectionHeader from '#lib/TomeSectionHeader.svelte';
+	import MdnLink from '#lib/MdnLink.svelte';
+	import ModuleLink from '#lib/ModuleLink.svelte';
+	import DeclarationLink from '#lib/DeclarationLink.svelte';
 
 	const TOME_SLUG = 'intersect';
 	const tome = tome_get_by_slug(TOME_SLUG);
@@ -219,9 +219,8 @@
 		<TomeSectionHeader text="Configurable" />
 		<p>
 			Try different parameter combinations. Positive <code>count</code> values disconnect after N
-			cycles.
-			<code>0</code> disables observation. Negative or <code>undefined</code> never disconnects.
-			(the default)
+			cycles. <code>0</code> disables observation. Negative or <code>undefined</code> never
+			disconnects. (the default)
 		</p>
 		<div class="controls">
 			<label>

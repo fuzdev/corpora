@@ -1,5 +1,6 @@
 <script lang="ts" generics="DATA extends Feature = Feature">
-  import maplibre, { type LngLatLike, type PointLike } from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
+  import type { LngLatLike, PointLike } from 'maplibre-gl';
   import { onDestroy } from 'svelte';
   import type { Snippet } from 'svelte';
   import { Box, getMapContext, setLngLatContext, updatedMarkerContext } from './context.svelte.js';
@@ -9,10 +10,10 @@
 
   interface Props {
     /** The Marker instance which was added to the map */
-    marker?: maplibre.Marker | undefined;
+    marker?: maplibregl.Marker | undefined;
     lngLat: LngLatLike;
     class?: string | undefined;
-    anchor?: maplibre.PositionAnchor;
+    anchor?: maplibregl.PositionAnchor;
     /** Handle mouse events */
     draggable?: boolean;
     /** A GeoJSON Feature related to the point. This is only actually used to send an ID and set of properties along with
@@ -24,7 +25,7 @@
     rotation?: number;
     /** The opacity of the marker */
     opacity?: number;
-    children?: Snippet<[{ marker: maplibre.Marker }]>;
+    children?: Snippet<[{ marker: maplibregl.Marker }]>;
 
     ondrag?: (e: MarkerClickInfo<ClickInfoFeature>) => void;
     ondragstart?: (e: MarkerClickInfo<ClickInfoFeature>) => void;
@@ -70,7 +71,7 @@
 
   $effect.pre(() => {
     if (map && !marker.value) {
-      marker.value = new maplibre.Marker(
+      marker.value = new maplibregl.Marker(
         flush({
           draggable,
           rotation,
@@ -162,6 +163,14 @@
     eventCb?.(data);
   }
 </script>
+
+<!-- @component
+Show the standard MapLibre marker pin on the map at `lngLat`. Use `Marker` instead if you want to use your own HTML as the marker.
+
+Set `draggable` to let the user move the marker. `lngLat` is bindable, and it updates when the user drags the marker. `draggable`, `anchor`, and `class` are applied only when the marker is created. `lngLat`, `offset`, `rotation`, and `opacity` update the existing marker.
+
+The children render after the marker is created. Put a `Popup` inside the children to attach a popup to the marker.
+-->
 
 {#if marker.value}
   {@render children?.({ marker: marker.value })}

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getMapContext } from './context.svelte.js';
-  import maplibregl from 'maplibre-gl';
+  import * as maplibregl from 'maplibre-gl';
   import { onDestroy } from 'svelte';
 
   const { map, loaded } = $derived(getMapContext());
@@ -34,3 +34,9 @@
     }
   });
 </script>
+
+<!-- @component
+Add the MapLibre attribution control to the map. This control shows the attribution text for the map sources.
+
+Put it inside the `MapLibre` component. Use `customAttribution` to add your own text, and `compact` to show a compact control. The component uses the props only when it creates the control.
+-->

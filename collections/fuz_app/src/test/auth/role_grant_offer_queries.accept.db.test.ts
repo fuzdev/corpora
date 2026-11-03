@@ -1,9 +1,9 @@
 /**
  * Tests for `role_grant_offer_queries.ts` — `query_accept_offer` core paths.
  *
- * Covers the happy-path accept (role_grant insert + audit fan-out + has_role),
+ * Covers the happy-path accept (role_grant insert + audit fan-out + an active grant),
  * idempotent re-accept on race, the `already_terminal` rejection on
- * declined / retracted offers, and the recipient-mismatch IDOR guard
+ * declined / retracted offers and on a replay after the grant was revoked, and the recipient-mismatch IDOR guard
  * (404-over-403 with zero column mutation). Supersede semantics on accept
  * live in `role_grant_offer_queries.supersede.db.test.ts`.
  *
@@ -15,15 +15,14 @@ import { assert_rejects } from '@fuzdev/fuz_util/testing.ts';
 
 import {
 	query_role_grant_offer_decline,
-	query_role_grant_offer_find_pending,
 	query_accept_offer,
 	RoleGrantOfferAlreadyTerminalError,
 	RoleGrantOfferNotFoundError
-} from '$lib/auth/role_grant_offer_queries.ts';
-import { query_role_grant_has_role } from '$lib/auth/role_grant_queries.ts';
+} from '#lib/auth/role_grant_offer_queries.ts';
 
 import { describe_db } from '../db_fixture.ts';
 import { make_account, create_pending_offer } from './role_grant_offer_queries.fixtures.ts';
+import { query_role_grant_has_role, select_role_grant_offer } from './auth_test_queries.ts';
 
 describe_db('role_grant_offer_queries.accept', (get_db) => {
 	test('accept inserts role_grant + stamps resulting_role_grant_id + emits audit events', async () => {
@@ -70,7 +69,7 @@ describe_db('role_grant_offer_queries.accept', (get_db) => {
 		assert.strictEqual(grant_metadata.role_grant_id, result.role_grant.id);
 		assert.strictEqual(grant_metadata.role, 'teacher');
 
-		// role_grant is active via has_role check.
+		// the role_grant reads back active
 		assert.strictEqual(await query_role_grant_has_role(deps, recipient.actor_id, 'teacher'), true);
 	});
 
@@ -102,6 +101,31 @@ describe_db('role_grant_offer_queries.accept', (get_db) => {
 		// Doc: "empty on the race-loser path". Pin so a refactor that
 		// re-emits the supersede side on retry surfaces here.
 		assert.strictEqual(second.superseded_offers.length, 0);
+	});
+
+	test('a replay after the grant is revoked throws already_terminal, not the revoked grant', async () => {
+		const db = get_db();
+		const deps = { db };
+		const grantor = await make_account(db, 'grantor_replay_revoked');
+		const recipient = await make_account(db, 'recipient_replay_revoked');
+
+		const offer = await create_pending_offer(db, grantor, recipient);
+		const first = await query_accept_offer(deps, {
+			offer_id: offer.id,
+			to_account_id: recipient.account_id,
+			actor_id: recipient.actor_id
+		});
+		await db.query('UPDATE role_grant SET revoked_at = NOW() WHERE id = $1', [first.role_grant.id]);
+
+		const err = await assert_rejects(() =>
+			query_accept_offer(deps, {
+				offer_id: offer.id,
+				to_account_id: recipient.account_id,
+				actor_id: recipient.actor_id
+			})
+		);
+		assert.ok(err instanceof RoleGrantOfferAlreadyTerminalError);
+		assert.strictEqual(await query_role_grant_has_role(deps, recipient.actor_id, 'teacher'), false);
 	});
 
 	test('accept throws already_terminal for declined / retracted offers', async () => {
@@ -141,8 +165,9 @@ describe_db('role_grant_offer_queries.accept', (get_db) => {
 		);
 		assert.ok(err instanceof RoleGrantOfferNotFoundError);
 		// offer is still pending — the wrong-recipient call must not accept it.
-		const still_pending = await query_role_grant_offer_find_pending(deps, offer.id);
+		const still_pending = await select_role_grant_offer(deps, offer.id);
 		assert.ok(still_pending);
+		assert.strictEqual(still_pending.accepted_at, null);
 
 		// Defense-in-depth for the 404-over-403 contract: zero columns mutated.
 		const rows = await db.query<{
@@ -197,7 +222,7 @@ describe_db('role_grant_offer_queries.accept', (get_db) => {
 		assert.ok(err.message.includes(offer.id));
 
 		// Offer must remain pending and untouched.
-		const still_pending = await query_role_grant_offer_find_pending(deps, offer.id);
+		const still_pending = await select_role_grant_offer(deps, offer.id);
 		assert.ok(still_pending);
 		assert.strictEqual(still_pending.accepted_at, null);
 		assert.strictEqual(still_pending.resulting_role_grant_id, null);

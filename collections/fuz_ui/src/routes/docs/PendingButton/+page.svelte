@@ -1,9 +1,9 @@
 <script lang="ts">
 	import Code from '@fuzdev/fuz_code/Code.svelte';
 
-	import { tome_get_by_slug } from '$lib/tome.ts';
-	import PendingButton from '$lib/PendingButton.svelte';
-	import TomeContent from '$lib/TomeContent.svelte';
+	import { tome_get_by_slug } from '#lib/tome.ts';
+	import PendingButton from '#lib/PendingButton.svelte';
+	import TomeContent from '#lib/TomeContent.svelte';
 
 	const TOME_SLUG = 'PendingButton';
 	const tome = tome_get_by_slug(TOME_SLUG);

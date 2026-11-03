@@ -10,6 +10,7 @@
 
 import { z } from 'zod';
 
+import { bounded_string } from '../primitive_schemas.ts';
 import { TokenScopeInput } from './token_scope.ts';
 import { TokenLifetimeInput } from './token_lifetime.ts';
 
@@ -63,6 +64,28 @@ export const SessionRevokeAllOutput = z.strictObject({
 export type SessionRevokeAllOutput = z.infer<typeof SessionRevokeAllOutput>;
 
 /**
+ * Maximum length of an API token's `name`, in UTF-16 code units (what
+ * `String.length` measures; enforced by `bounded_string`). The name is copied into the
+ * `token_create` audit row, so it is bounded where it enters. Same value as
+ * the Rust spine's `API_TOKEN_NAME_LENGTH_MAX`.
+ */
+export const API_TOKEN_NAME_LENGTH_MAX = 255;
+
+/**
+ * `error.data.reason` on any refusal of `account_token_create`'s `scope` —
+ * missing, `null`, an unknown `kind` or key, a malformed `methods`, an
+ * over-cap document. The field's declared `invalid_reason`.
+ */
+export const ERROR_TOKEN_SCOPE_INVALID = 'token_scope_invalid' as const;
+
+/**
+ * `error.data.reason` on any refusal of `account_token_create`'s `lifetime` —
+ * missing, `null`, an unknown `kind` or key, a `days` out of range. The
+ * field's declared `invalid_reason`.
+ */
+export const ERROR_TOKEN_LIFETIME_INVALID = 'token_lifetime_invalid' as const;
+
+/**
  * Input for `account_token_create`.
  *
  * `scope` is **required** — default-deny at mint. There is deliberately no
@@ -77,20 +100,24 @@ export type SessionRevokeAllOutput = z.infer<typeof SessionRevokeAllOutput>;
  * "deliberately eternal" (see `auth/token_lifetime.ts`).
  */
 export const TokenCreateInput = z.strictObject({
-	name: z
-		.string()
+	name: bounded_string({ max: API_TOKEN_NAME_LENGTH_MAX })
 		.default('CLI token')
-		.meta({ description: 'Human-friendly label; shown in the token list.' }),
+		.meta({
+			description: `Human-friendly label; shown in the token list. At most ${API_TOKEN_NAME_LENGTH_MAX} characters.`
+		}),
 	scope: TokenScopeInput.meta({
 		description:
 			"What the token may do. `{kind:'full'}` for full account authority, or " +
 			"`{kind:'methods',methods:[…]}` to narrow it to named RPC methods — a " +
-			'narrowed token is RPC-only and reaches no non-RPC surface.'
+			'narrowed token is RPC-only and reaches no non-RPC surface that reads ' +
+			'account data or carries authority.',
+		invalid_reason: ERROR_TOKEN_SCOPE_INVALID
 	}),
 	lifetime: TokenLifetimeInput.meta({
 		description:
 			"How long the token lives. `{kind:'eternal'}` never expires; " +
-			"`{kind:'ttl',days:N}` expires N days from mint."
+			"`{kind:'ttl',days:N}` expires N days from mint.",
+		invalid_reason: ERROR_TOKEN_LIFETIME_INVALID
 	})
 });
 export type TokenCreateInput = z.infer<typeof TokenCreateInput>;

@@ -1,14 +1,17 @@
-import type { Uuid } from '@fuzdev/fuz_util/id.ts';
+import type { Uuid } from '@fuzdev/fuz_app/primitive_schemas.ts';
 
 import type { Model } from './model.svelte.ts';
-import { Turn, create_turn_from_text, create_turn_from_part } from './turn.svelte.ts';
+import { Turn, create_turn_from_text } from './turn.svelte.ts';
 import { Cell, type CellOptions } from './cell.svelte.ts';
 import { ThreadJson } from './thread_types.ts';
-import { CompletionRequest, CompletionRole } from './completion_types.ts';
-import { render_messages_to_string, render_completion_messages } from './thread_helpers.ts';
-import type { PartUnion } from './part.svelte.ts';
-import { HANDLED } from './cell_helpers.ts';
-import { to_preview, estimate_token_count } from './helpers.ts';
+import { CompletionRequest } from './completion_types.ts';
+import {
+	render_messages_to_string,
+	render_messages_length,
+	render_completion_messages
+} from './thread_helpers.ts';
+import { create_collection_decoder } from './cell_helpers.ts';
+import { to_preview, estimate_token_count, estimate_token_count_from_length } from './helpers.ts';
 import { IndexedCollection } from './indexed_collection.svelte.ts';
 import type { TurnJson } from './turn_types.ts';
 
@@ -25,18 +28,41 @@ export class Thread extends Cell<typeof ThreadJson> {
 		this.app.models.find_by_name(this.model_name)
 	);
 
-	readonly turns: IndexedCollection<Turn> = new IndexedCollection();
+	readonly turns: IndexedCollection<Turn> = new IndexedCollection({
+		dispose_item: (turn) => turn.dispose()
+	});
 
 	enabled: boolean = $state.raw()!;
 
+	main_input: string = $state.raw()!;
+	readonly main_input_length: number = $derived(this.main_input.length);
+	readonly main_input_token_count: number = $derived(estimate_token_count(this.main_input));
+
+	/** The rendered conversation — built only when read (copying it, say), not per streamed chunk. */
 	readonly content: string = $derived(render_messages_to_string(this.turns.by_id.values()));
-	readonly length: number = $derived(this.content.length);
-	readonly token_count: number = $derived(estimate_token_count(this.content));
+
+	/**
+	 * `content.length`, summed from the turns' lengths so a streaming reply
+	 * recomputes only its own turn, not the whole thread's text.
+	 */
+	readonly length: number = $derived(render_messages_length(this.turns.by_id.values()));
+	readonly token_count: number = $derived(estimate_token_count_from_length(this.length));
 	readonly content_preview: string = $derived(to_preview(this.content));
+
+	/** The ids of the parts of every turn. */
+	get part_ids(): Array<Uuid> {
+		const part_ids: Array<Uuid> = [];
+		for (const turn of this.turns.by_id.values()) {
+			part_ids.push(...turn.part_ids);
+		}
+		return part_ids;
+	}
 
 	// Imperative handle for the in-flight completion_create call. Not reactive —
 	// UI state tracks `pending` below, which mirrors this controller's lifecycle.
 	#pending_controller: AbortController | null = null;
+	// The assistant turn receiving the in-flight completion, settled on cancel.
+	#pending_turn: Turn | null = null;
 
 	/**
 	 * Reactive flag: true while `send_message` has an in-flight `completion_create`.
@@ -46,19 +72,26 @@ export class Thread extends Cell<typeof ThreadJson> {
 	 */
 	pending: boolean = $state.raw(false);
 
+	/**
+	 * Whether `send_message` would send now: no send in flight, the model is
+	 * known, and its provider isn't reported unavailable (an unchecked provider
+	 * counts as available, as in `send_message`).
+	 */
+	readonly can_send: boolean = $derived.by(() => {
+		if (this.pending) return false;
+		const model = this.model;
+		if (!model) return false;
+		return this.app.lookup_provider_status(model.provider_name)?.available !== false;
+	});
+
 	constructor(options: ThreadOptions) {
 		super(ThreadJson, options);
 
 		this.decoders = {
-			turns: (items) => {
-				if (Array.isArray(items)) {
-					this.turns.clear();
-					for (const item_json of items) {
-						this.add_turn(item_json);
-					}
-				}
-				return HANDLED;
-			}
+			turns: create_collection_decoder(
+				() => this.#clear_turns(),
+				(json) => this.add_turn(new Turn({ app: this.app, json }))
+			)
 		};
 
 		this.init();
@@ -96,39 +129,44 @@ export class Thread extends Cell<typeof ThreadJson> {
 	}
 
 	/**
-	 * Create and add a system turn with the given content.
-	 */
-	add_system_turn(content: string): Turn {
-		const turn = create_turn_from_text(content, 'system', { thread_id: this.id }, this.app);
-		this.add_turn(turn);
-		return turn;
-	}
-
-	/**
-	 * Create and add a turn from a part.
-	 */
-	add_turn_from_part(part: PartUnion, role: CompletionRole): Turn {
-		const turn = create_turn_from_part(part, role, {
-			thread_id: this.id
-		});
-		this.add_turn(turn);
-		return turn;
-	}
-
-	/**
-	 * Remove all turns from this thread.
+	 * Remove and dispose all turns from this thread, cancelling any in-flight
+	 * completion first since its turn is going away, and remove the turns' parts
+	 * from `app.parts` unless another turn references them.
 	 */
 	remove_all_turns(): void {
+		const { part_ids } = this;
+		this.#clear_turns();
+		this.app.parts.remove_unreferenced(part_ids);
+	}
+
+	/**
+	 * Cancels any in-flight completion and disposes the thread's turns.
+	 * Their parts are left to whoever removes the thread (see `Threads.remove`),
+	 * since disposal also happens when a decoder replaces the collection.
+	 */
+	override dispose(): void {
+		this.#clear_turns();
+		super.dispose();
+	}
+
+	#clear_turns(): void {
+		this.cancel_pending();
 		this.turns.clear();
 	}
 
 	/**
 	 * Send a message to the AI and create corresponding turns.
-	 * Returns null if provider is unavailable (defensive check - UI should prevent this).
+	 * Returns null if a send is already in flight, or if the model or provider
+	 * is unavailable (defensive checks - UI should prevent these).
 	 */
 	async send_message(content: string): Promise<Turn | null> {
 		// TODO rethink this API with the completion request/response (see OpenAI/MCP/A2A)
 		// TODO maybe do this in the `completion_create: {send_request:` handler?
+
+		if (this.pending) {
+			console.warn('[thread.send_message] a send is already in flight, skipping send');
+			return null;
+		}
 
 		const model = this.model;
 		if (!model) {
@@ -169,6 +207,7 @@ export class Thread extends Cell<typeof ThreadJson> {
 		// into a `request_cancelled` JSON-RPC error.
 		const controller = new AbortController();
 		this.#pending_controller = controller;
+		this.#pending_turn = assistant_turn;
 		this.pending = true;
 		try {
 			await this.app.api.completion_create(
@@ -180,10 +219,10 @@ export class Thread extends Cell<typeof ThreadJson> {
 			);
 		} finally {
 			// Only clear if this is still the active controller — a concurrent
-			// send (shouldn't happen with current UI but cheap insurance) would
-			// have replaced it.
+			// send is guarded against above, but this is cheap insurance.
 			if (this.#pending_controller === controller) {
 				this.#pending_controller = null;
+				this.#pending_turn = null;
 				this.pending = false;
 			}
 		}
@@ -197,11 +236,30 @@ export class Thread extends Cell<typeof ThreadJson> {
 	 * nothing is pending — no-op. The frontend WS client rejects the pending
 	 * promise with `request_cancelled` and fires a `cancel` notification so the
 	 * server can stop its provider stream.
+	 *
+	 * The in-flight assistant turn is marked `cancelled` (unless it already
+	 * settled) so it stops showing as pending even if no content streamed in,
+	 * and any late streaming chunks are ignored.
 	 */
 	cancel_pending(): void {
+		const turn = this.#pending_turn;
+		if (turn && !turn.settled) turn.cancelled = true;
 		this.#pending_controller?.abort();
 		this.#pending_controller = null;
+		this.#pending_turn = null;
 		this.pending = false;
+	}
+
+	/**
+	 * Cancels the in-flight completion if it's the one streaming into `turn`
+	 * (see `cancel_pending`).
+	 *
+	 * @returns whether `turn` was the pending turn
+	 */
+	cancel_pending_turn(turn: Turn): boolean {
+		if (this.#pending_turn !== turn) return false;
+		this.cancel_pending();
+		return true;
 	}
 
 	switch_model(model_id: Uuid): void {

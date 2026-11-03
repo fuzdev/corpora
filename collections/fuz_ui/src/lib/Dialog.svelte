@@ -1,3 +1,19 @@
+<!--
+@component
+
+Renders a native `<dialog>` opened with `showModal()`, which puts it in the top
+layer. The top layer escapes ancestor stacking/overflow contexts (so no `Teleport`
+is needed), traps focus, makes the rest of the page inert, closes on Escape, and
+restores focus to the previously focused element on close -- all natively. The dim
+background is the native `::backdrop`.
+
+We render a full-viewport overlay inside the dialog rather than a content-sized
+box, to preserve the scrolling and `align="top"` behaviors. The content surface
+itself is the consumer's -- pair this with `DialogContent` for the default `.pane`
+card and gutter, or render your own surface in `children`.
+
+@cssprop --backdrop_color - color of the overlay behind the dialog's content, fuz_css's global token by default
+-->
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import type { SvelteHTMLElements } from 'svelte/elements';
@@ -5,21 +21,6 @@
 	import { swallow } from '@fuzdev/fuz_util/dom.ts';
 
 	import { dialog_context, type DialogContext, type DialogAlign } from './dialog.ts';
-
-	/**
-	 * This component renders a native `<dialog>` opened with `showModal()`, which
-	 * puts it in the top layer. The top layer escapes ancestor stacking/overflow
-	 * contexts (so no `Teleport` is needed), traps focus, makes the rest of the page
-	 * inert, closes on Escape, and restores focus to the previously focused element
-	 * on close -- all natively. The dim background is the native `::backdrop`.
-	 *
-	 * We render a full-viewport overlay inside the dialog rather than a content-sized
-	 * box, to preserve the scrolling and `align="top"` behaviors. The content
-	 * surface itself is the consumer's -- pair this with `DialogContent` for the
-	 * default `.pane` card and gutter, or render your own surface in `children`.
-	 *
-	 * @module
-	 */
 
 	const {
 		show = true,
@@ -176,7 +177,7 @@
 	.dialog {
 		--pane_shadow: var(--shadow_bottom_xl)
 			color-mix(
-				in hsl,
+				in oklab,
 				var(--shadow_color, var(--shadow_color_umbra)) var(--shadow_alpha_70),
 				transparent
 			);
@@ -196,9 +197,13 @@
 		overflow: auto;
 		overscroll-behavior: contain;
 	}
-	/* the native backdrop is the dim background; fade it in on open */
+	/* the native backdrop is the dim background; fade it in on open. It reads
+		fuz_css's `--backdrop_color` like a plain dialog's does, then its default
+		`--darken_60` for a variable set without it. Older browsers don't let
+		::backdrop inherit custom properties from the page, so the last fallback
+		is that value as a literal */
 	.dialog::backdrop {
-		background-color: var(--dialog_bg, var(--darken_60));
+		background-color: var(--backdrop_color, var(--darken_60, #000000a6));
 		transition: background-color var(--duration_2) ease;
 	}
 	@starting-style {

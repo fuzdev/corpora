@@ -17,8 +17,14 @@ export const ActionMethod = z.enum([
 	'session_load',
 	'filer_change',
 	'diskfile_update',
+	'diskfile_create',
 	'diskfile_delete',
 	'directory_create',
+	'media_finalize',
+	'transcription_create',
+	'transcription_progress',
+	'job_cancel',
+	'job_changed',
 	'completion_create',
 	'completion_progress',
 	'toggle_main_menu',
@@ -26,6 +32,7 @@ export const ActionMethod = z.enum([
 	'terminal_create',
 	'terminal_data_send',
 	'terminal_data',
+	'terminal_ack',
 	'terminal_resize',
 	'terminal_close',
 	'terminal_exited',
@@ -45,12 +52,17 @@ export const RequestResponseActionMethod = z.enum([
 	'ping',
 	'session_load',
 	'diskfile_update',
+	'diskfile_create',
 	'diskfile_delete',
 	'directory_create',
+	'media_finalize',
+	'transcription_create',
+	'job_cancel',
 	'completion_create',
 	'provider_load_status',
 	'terminal_create',
 	'terminal_data_send',
+	'terminal_ack',
 	'terminal_resize',
 	'terminal_close',
 	'workspace_open',
@@ -65,6 +77,8 @@ export type RequestResponseActionMethod = z.infer<typeof RequestResponseActionMe
 export const RemoteNotificationActionMethod = z.enum([
 	'cancel',
 	'filer_change',
+	'transcription_progress',
+	'job_changed',
 	'completion_progress',
 	'terminal_data',
 	'terminal_exited',
@@ -89,8 +103,14 @@ export const FrontendActionMethod = z.enum([
 	'session_load',
 	'filer_change',
 	'diskfile_update',
+	'diskfile_create',
 	'diskfile_delete',
 	'directory_create',
+	'media_finalize',
+	'transcription_create',
+	'transcription_progress',
+	'job_cancel',
+	'job_changed',
 	'completion_create',
 	'completion_progress',
 	'toggle_main_menu',
@@ -98,6 +118,7 @@ export const FrontendActionMethod = z.enum([
 	'terminal_create',
 	'terminal_data_send',
 	'terminal_data',
+	'terminal_ack',
 	'terminal_resize',
 	'terminal_close',
 	'terminal_exited',
@@ -119,14 +140,21 @@ export const BackendActionMethod = z.enum([
 	'session_load',
 	'filer_change',
 	'diskfile_update',
+	'diskfile_create',
 	'diskfile_delete',
 	'directory_create',
+	'media_finalize',
+	'transcription_create',
+	'transcription_progress',
+	'job_cancel',
+	'job_changed',
 	'completion_create',
 	'completion_progress',
 	'provider_load_status',
 	'terminal_create',
 	'terminal_data_send',
 	'terminal_data',
+	'terminal_ack',
 	'terminal_resize',
 	'terminal_close',
 	'terminal_exited',
@@ -150,12 +178,17 @@ export const BackendRequestResponseMethod = z.enum([
 	'ping',
 	'session_load',
 	'diskfile_update',
+	'diskfile_create',
 	'diskfile_delete',
 	'directory_create',
+	'media_finalize',
+	'transcription_create',
+	'job_cancel',
 	'completion_create',
 	'provider_load_status',
 	'terminal_create',
 	'terminal_data_send',
+	'terminal_ack',
 	'terminal_resize',
 	'terminal_close',
 	'workspace_open',
@@ -169,6 +202,8 @@ export type BackendRequestResponseMethod = z.infer<typeof BackendRequestResponse
  */
 export const BroadcastActionMethod = z.enum([
 	'filer_change',
+	'transcription_progress',
+	'job_changed',
 	'terminal_data',
 	'terminal_exited',
 	'workspace_changed'
@@ -185,7 +220,7 @@ export type BroadcastActionMethod = z.infer<typeof BroadcastActionMethod>;
  */
 export interface FrontendActionsApi {
 	heartbeat: (
-		input?: ActionInputs['heartbeat'],
+		input?: void,
 		options?: RpcClientCallOptions
 	) => Promise<Result<{ value: ActionOutputs['heartbeat'] }, { error: JsonrpcErrorObject }>>;
 	cancel: (
@@ -212,6 +247,10 @@ export interface FrontendActionsApi {
 		input: ActionInputs['diskfile_update'],
 		options?: RpcClientCallOptions
 	) => Promise<Result<{ value: ActionOutputs['diskfile_update'] }, { error: JsonrpcErrorObject }>>;
+	diskfile_create: (
+		input: ActionInputs['diskfile_create'],
+		options?: RpcClientCallOptions
+	) => Promise<Result<{ value: ActionOutputs['diskfile_create'] }, { error: JsonrpcErrorObject }>>;
 	diskfile_delete: (
 		input: ActionInputs['diskfile_delete'],
 		options?: RpcClientCallOptions
@@ -220,6 +259,30 @@ export interface FrontendActionsApi {
 		input: ActionInputs['directory_create'],
 		options?: RpcClientCallOptions
 	) => Promise<Result<{ value: ActionOutputs['directory_create'] }, { error: JsonrpcErrorObject }>>;
+	media_finalize: (
+		input: ActionInputs['media_finalize'],
+		options?: RpcClientCallOptions
+	) => Promise<Result<{ value: ActionOutputs['media_finalize'] }, { error: JsonrpcErrorObject }>>;
+	transcription_create: (
+		input: ActionInputs['transcription_create'],
+		options?: RpcClientCallOptions
+	) => Promise<
+		Result<{ value: ActionOutputs['transcription_create'] }, { error: JsonrpcErrorObject }>
+	>;
+	transcription_progress: (
+		input: ActionInputs['transcription_progress'],
+		options?: RpcClientCallOptions
+	) => Promise<
+		Result<{ value: ActionOutputs['transcription_progress'] }, { error: JsonrpcErrorObject }>
+	>;
+	job_cancel: (
+		input: ActionInputs['job_cancel'],
+		options?: RpcClientCallOptions
+	) => Promise<Result<{ value: ActionOutputs['job_cancel'] }, { error: JsonrpcErrorObject }>>;
+	job_changed: (
+		input: ActionInputs['job_changed'],
+		options?: RpcClientCallOptions
+	) => Promise<Result<{ value: ActionOutputs['job_changed'] }, { error: JsonrpcErrorObject }>>;
 	completion_create: (
 		input: ActionInputs['completion_create'],
 		options?: RpcClientCallOptions
@@ -253,6 +316,10 @@ export interface FrontendActionsApi {
 		input: ActionInputs['terminal_data'],
 		options?: RpcClientCallOptions
 	) => Promise<Result<{ value: ActionOutputs['terminal_data'] }, { error: JsonrpcErrorObject }>>;
+	terminal_ack: (
+		input: ActionInputs['terminal_ack'],
+		options?: RpcClientCallOptions
+	) => Promise<Result<{ value: ActionOutputs['terminal_ack'] }, { error: JsonrpcErrorObject }>>;
 	terminal_resize: (
 		input: ActionInputs['terminal_resize'],
 		options?: RpcClientCallOptions

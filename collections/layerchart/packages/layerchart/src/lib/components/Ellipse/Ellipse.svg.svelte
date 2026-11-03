@@ -1,8 +1,5 @@
 <script lang="ts" module>
-  export type {
-    EllipseProps,
-    EllipsePropsWithoutHTML,
-  } from './Ellipse.shared.svelte.js';
+  export type { EllipseProps, EllipsePropsWithoutHTML } from './Ellipse.shared.svelte.js';
 </script>
 
 <script lang="ts">
@@ -17,11 +14,13 @@
     cy,
     rx: rxProp,
     ry: ryProp,
+    rotate,
+    z,
     ...rest
   }: EllipseProps = $props();
 
   const c = new EllipseState(
-    () => ({ cx, cy, rx: rxProp, ry: ryProp, ...rest }) as EllipseProps
+    () => ({ cx, cy, rx: rxProp, ry: ryProp, z, ...rest }) as EllipseProps
   );
 
   let ref = $state<SVGEllipseElement>();
@@ -52,6 +51,7 @@
       cy={item.cy}
       rx={item.rx}
       ry={item.ry}
+      transform={rotate ? `rotate(${rotate}, ${item.cx}, ${item.cy})` : undefined}
       fill={resolvedFill}
       fill-opacity={resolvedFillOpacity}
       stroke={resolvedStroke}
@@ -68,6 +68,7 @@
     cy={c.motionCy}
     rx={c.motionRx}
     ry={c.motionRy}
+    transform={rotate ? `rotate(${rotate}, ${c.motionCx}, ${c.motionCy})` : undefined}
     fill={c.staticFill}
     fill-opacity={c.staticFillOpacity}
     stroke={c.staticStroke}
