@@ -47,7 +47,7 @@ manifest SPDX id fails inside it.
 - **Materialized from git objects** — `git ls-tree -r <commit> -- <subpath>` lists, `git
   cat-file --batch` copies — filtered by the manifest's extension allowlist and excludes.
   Never from a directory walk of a live checkout, never from a consumer's own discovery.
-  Symlinks are skipped (a snapshot holds bytes, not links); a collection that matches no
+  Symlinks are skipped (a snapshot holds bytes, not links); a subpath that matches no
   file fails. A collection's `files` names upstream files kept whatever their extension
   — a module-type or config file a runtime reads to load the source as written, like the
   `package.json` whose `"type": "module"` makes Node read `.ts` as ESM; each must exist

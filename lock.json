@@ -171,9 +171,9 @@
 		},
 		"storybook": {
 			"commit": "acd2e6982c42e45752011252da388a09ca79bf43",
-			"files": 1706,
-			"bytes": 9791568,
-			"digest": "sha256:bc253834580b8ee6b333aab0c635a2491838ef7c814031850ff2ebd3bb8773a5"
+			"files": 1712,
+			"bytes": 9809333,
+			"digest": "sha256:511b975c9b755e9b020a4304a5a672b2186545cf5eef9b316bc6ea7fb59e8535"
 		},
 		"continue": {
 			"commit": "5522c6f44ca0ac3528b37244818fbfa39b5af470",

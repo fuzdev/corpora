@@ -45,6 +45,7 @@ export const materialize_collection = async (
 	const large: string[] = [];
 	const kept: Array<{ path: string; oid: string }> = [];
 	for (const subpath of collection.subpaths) {
+		const before = kept.length;
 		for (const entry of await ls_tree(source, collection.commit, subpath)) {
 			if (!is_included_path(entry.path, include, collection.exclude)) continue;
 			if (entry.mode === '120000') {
@@ -59,9 +60,11 @@ export const materialize_collection = async (
 			if (entry.size >= LARGE_FILE_BYTES) large.push(entry.path);
 			kept.push({ path: entry.path, oid: entry.oid });
 		}
-	}
-	if (kept.length === 0) {
-		throw new Error(`${collection.name}: no files matched — did the upstream layout change?`);
+		if (kept.length === before) {
+			throw new Error(
+				`${collection.name}: subpath "${subpath}" matched no files — did the upstream layout change?`
+			);
+		}
 	}
 	for (const path of collection.files ?? []) {
 		const entry = (await ls_tree(source, collection.commit, path)).find((e) => e.path === path);

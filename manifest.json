@@ -309,14 +309,13 @@
 			"url": "https://github.com/storybookjs/storybook",
 			"commit": "acd2e6982c42e45752011252da388a09ca79bf43",
 			"subpaths": [
+				"code/addons/docs/src/csf-plugin",
 				"code/core/src",
 				"code/lib/cli-storybook/src",
 				"code/lib/codemod/src",
 				"code/lib/core-webpack/src",
 				"code/lib/create-storybook/src",
-				"code/lib/csf-plugin/src",
-				"code/lib/eslint-plugin/src",
-				"code/lib/react-dom-shim/src"
+				"code/lib/eslint-plugin/src"
 			],
 			"exclude": [
 				"code/core/src/common/__testfixtures__",
