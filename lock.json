@@ -31,7 +31,7 @@
 			"bytes": 1988464,
 			"digest": "sha256:d7dc7582bd2a77c6dc14624dd9a702f8479bc6cd99b61deb9ab53e84e63c5e56"
 		},
-		"fuz_docs": {
+		"docs.fuz.dev": {
 			"commit": "9d0e2c66c4d5f081a97fbda4883793d6c9d3c49f",
 			"files": 66,
 			"bytes": 486441,

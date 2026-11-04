@@ -53,8 +53,8 @@
 			"origin": "own"
 		},
 		{
-			"name": "fuz_docs",
-			"url": "https://github.com/fuzdev/fuz_docs",
+			"name": "docs.fuz.dev",
+			"url": "https://github.com/fuzdev/docs.fuz.dev",
 			"commit": "9d0e2c66c4d5f081a97fbda4883793d6c9d3c49f",
 			"subpaths": ["src"],
 			"exclude": [],
