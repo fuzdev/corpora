@@ -22,19 +22,14 @@
 			<a class="u-url" rel="me" href="https://bsky.app/profile/ryanatkn.com">@ryanatkn.com</a>
 		</li>
 		<li>
-			<a class="u-url" rel="me" href="https://www.webdevladder.net/">webdevladder.net</a> is my
-			professional blog and public alias
+			<a href="https://www.fuz.dev/">fuz.dev</a> - free software for human agency
 			<ul>
 				<li>
-					@webdevladder on
-					<a class="u-url" rel="me" href="https://www.youtube.com/@webdevladder">YouTube</a>,
-					<a class="u-url" rel="me" href="https://www.reddit.com/user/webdevladder/">Reddit</a>, and
-					<a class="u-url" rel="me" href="https://news.ycombinator.com/user?id=webdevladder">HN</a>
+					@fuzdev on <a href="https://github.com/fuzdev">GitHub</a> and
+					<a href="https://www.npmjs.com/org/fuzdev">npm</a>
 				</li>
 				<li>
-					@webdevladder_vods on
-					<a class="u-url" rel="me" href="https://www.youtube.com/@webdevladder_vods">YouTube</a>
-					for lower effort videos
+					Bluesky as <a href="https://bsky.app/profile/fuz.dev">@fuz.dev</a>
 				</li>
 			</ul>
 		</li>

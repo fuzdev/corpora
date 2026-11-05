@@ -55,7 +55,7 @@
 		{
 			"name": "docs.fuz.dev",
 			"url": "https://github.com/fuzdev/docs.fuz.dev",
-			"commit": "9d0e2c66c4d5f081a97fbda4883793d6c9d3c49f",
+			"commit": "7a163a0194a767b5115b047ff17048158f0b5a25",
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "0BSD", "file": "LICENSE"},
@@ -146,17 +146,7 @@
 		{
 			"name": "ryanatkn.com",
 			"url": "https://github.com/ryanatkn/ryanatkn.com",
-			"commit": "0b6107e6af8070f6e56d8f4bf65652187f095bff",
-			"subpaths": ["src"],
-			"exclude": [],
-			"license": {"spdx": "0BSD", "file": "LICENSE"},
-			"shaped_by": "tsv",
-			"origin": "own"
-		},
-		{
-			"name": "webdevladder.net",
-			"url": "https://github.com/ryanatkn/webdevladder.net",
-			"commit": "ed715e0bde144bc8ce41e012c230e2baac694cc9",
+			"commit": "b4a699325d3da7b542a7500022fea6db2daddbbf",
 			"subpaths": ["src"],
 			"exclude": [],
 			"license": {"spdx": "0BSD", "file": "LICENSE"},

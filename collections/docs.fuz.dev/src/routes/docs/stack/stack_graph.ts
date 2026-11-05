@@ -23,13 +23,24 @@ export const stack_nodes: Array<StackNode> = [
 		y: 960
 	},
 	{
+		name: 'docs.fuz.dev',
+		category: 'app',
+		language: 'ts',
+		description:
+			'experimental AI-generated docs and skills for Fuz, a zippy stack for human agency',
+		layer: 7,
+		fan_in: 0,
+		x: -375,
+		y: 120
+	},
+	{
 		name: 'fuz_app',
 		category: 'fullstack',
 		language: 'ts',
 		description: 'fullstack app library',
 		layer: 7,
 		fan_in: 1,
-		x: -375,
+		x: -225,
 		y: 120
 	},
 	{
@@ -39,7 +50,7 @@ export const stack_nodes: Array<StackNode> = [
 		description: 'blog software from scratch with SvelteKit',
 		layer: 7,
 		fan_in: 0,
-		x: -225,
+		x: -75,
 		y: 120
 	},
 	{
@@ -62,17 +73,6 @@ export const stack_nodes: Array<StackNode> = [
 		fan_in: 9,
 		x: 0,
 		y: 480
-	},
-	{
-		name: 'fuz_docs',
-		category: 'app',
-		language: 'ts',
-		description:
-			'experimental AI-generated docs and skills for Fuz, a zippy stack for human agency',
-		layer: 7,
-		fan_in: 0,
-		x: -75,
-		y: 120
 	},
 	{
 		name: 'fuz_repos',
@@ -175,6 +175,46 @@ export const stack_edges: Array<StackEdge> = [
 		kind: 'dev'
 	},
 	{
+		from: 'docs.fuz.dev',
+		to: 'blake3',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'fuz_code',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'fuz_css',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'fuz_ui',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'fuz_util',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'gro',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'mdz',
+		kind: 'dev'
+	},
+	{
+		from: 'docs.fuz.dev',
+		to: 'svelte-docinfo',
+		kind: 'dev'
+	},
+	{
 		from: 'fuz_app',
 		to: 'blake3',
 		kind: 'peer'
@@ -321,46 +361,6 @@ export const stack_edges: Array<StackEdge> = [
 	},
 	{
 		from: 'fuz_css',
-		to: 'svelte-docinfo',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'blake3',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'fuz_code',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'fuz_css',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'fuz_ui',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'fuz_util',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'gro',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
-		to: 'mdz',
-		kind: 'dev'
-	},
-	{
-		from: 'fuz_docs',
 		to: 'svelte-docinfo',
 		kind: 'dev'
 	},

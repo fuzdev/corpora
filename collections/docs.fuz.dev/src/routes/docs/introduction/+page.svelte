@@ -14,7 +14,7 @@
 	<TomeSection>
 		<TomeSectionHeader text="Overview" />
 		<p>
-			fuz_docs is an experimental website with AI-generated documentation and agent skills for
+			docs.fuz.dev is an experimental website with AI-generated documentation and agent skills for
 			<a href="https://www.fuz.dev/">Fuz</a>, a zippy stack for human agency. It's a poorly-reviewed
 			actively-evolving dumping ground of conventions, patterns, and reference material for
 			<GithubLink path="fuzdev"><code>@fuzdev</code></GithubLink> projects. Everything is in flux,
@@ -75,10 +75,6 @@
 				<tr>
 					<td><TomeLink slug="api" /></td>
 					<td>Auto-generated TypeScript and Svelte API documentation</td>
-				</tr>
-				<tr>
-					<td><TomeLink slug="library" /></td>
-					<td>Package metadata and exports</td>
 				</tr>
 			</tbody>
 		</table>

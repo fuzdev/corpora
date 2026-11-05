@@ -1,5 +1,5 @@
 <script lang="ts">
-	import LibraryDetail from '@fuzdev/fuz_ui/LibraryDetail.svelte';
+	import LibrarySummary from '@fuzdev/fuz_ui/LibrarySummary.svelte';
 	import { Library, library_context } from '@fuzdev/fuz_ui/library.svelte.ts';
 	import DocsFooter from '@fuzdev/fuz_ui/DocsFooter.svelte';
 	import { site_context } from '@fuzdev/fuz_ui/site.svelte.ts';
@@ -9,13 +9,13 @@
 
 	import { library_json } from '#routes/library.ts';
 
-	const library = new Library(library_json, '/fuz_docs');
+	const library = new Library(library_json, '/docs.fuz.dev');
 	library_context.set(() => library);
 	const site = site_context.get();
 </script>
 
 <svelte:head>
-	<title>about - fuz_docs</title>
+	<title>about - docs.fuz.dev</title>
 </svelte:head>
 
 <main class="width_atmost_md pb_xl9">
@@ -27,12 +27,12 @@
 		</header>
 		<Breadcrumb />
 	</section>
-	<EcosystemLinksPanel />
-	<section class="box width:100%">
+	<section class="box mb_lg">
 		<div class="panel p_md width_atmost_md">
-			<LibraryDetail {library} />
+			<LibrarySummary {library} />
 		</div>
 	</section>
+	<EcosystemLinksPanel />
 	<section class="box">
 		<DocsFooter repo_url={site.repo_url} root_url={FUZ_DEV_URL}>
 			<div class="mb_xl5">

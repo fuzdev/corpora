@@ -32,10 +32,10 @@
 			"digest": "sha256:d7dc7582bd2a77c6dc14624dd9a702f8479bc6cd99b61deb9ab53e84e63c5e56"
 		},
 		"docs.fuz.dev": {
-			"commit": "9d0e2c66c4d5f081a97fbda4883793d6c9d3c49f",
-			"files": 66,
-			"bytes": 486441,
-			"digest": "sha256:dabb790343a127520ced05babe2de0600016c44bf88c5781f86683be0703433e"
+			"commit": "7a163a0194a767b5115b047ff17048158f0b5a25",
+			"files": 65,
+			"bytes": 487221,
+			"digest": "sha256:553db8731a8c4d9b5963c6c83f7ff46a4f180c2d6d06d1acc07d4827adfb9824"
 		},
 		"fuz_repos": {
 			"commit": "1f2d3bfcd4542ba35c7692ab97b0c2dae367997f",
@@ -86,16 +86,10 @@
 			"digest": "sha256:67ab6dc494f4db84dcc80aa6553d357dab3f50c59fb316b269b527fb4c9d15e3"
 		},
 		"ryanatkn.com": {
-			"commit": "0b6107e6af8070f6e56d8f4bf65652187f095bff",
+			"commit": "b4a699325d3da7b542a7500022fea6db2daddbbf",
 			"files": 53,
-			"bytes": 65678,
-			"digest": "sha256:b81a0110c9e240c838286233ee7b6e05b4149dedadce9df730f4406426474e45"
-		},
-		"webdevladder.net": {
-			"commit": "ed715e0bde144bc8ce41e012c230e2baac694cc9",
-			"files": 40,
-			"bytes": 66828,
-			"digest": "sha256:62ba6a04a1aa38ee0990c040cd2086fb2b0f27253af82ab936354c0a704f466e"
+			"bytes": 62036,
+			"digest": "sha256:3aa12887617ce8fb8e82465142ed619d3039aaff66081c482b8bec04213a4965"
 		},
 		"earbetter": {
 			"commit": "5d2ecd94004ac5a10e1ee6c33aa387337f0febb2",
