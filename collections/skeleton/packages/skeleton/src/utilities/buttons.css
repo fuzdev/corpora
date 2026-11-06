@@ -1,0 +1,181 @@
+/* Components: Buttons */
+
+@utility btn {
+	--btn-size: var(--text-base);
+
+	border-radius: var(--radius-base);
+
+	/* Icon Spacing */
+	display: inline-flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: center;
+	gap: --spacing(2);
+
+	/* Typography */
+	text-decoration-line: none;
+	white-space: nowrap;
+
+	/* Size */
+	font-size: var(--btn-size);
+	line-height: var(--btn-size);
+	padding-block: calc((var(--btn-size) - --spacing(0.5)) / 2);
+	padding-inline: calc((var(--btn-size) - --spacing(0.5)) / 2 + var(--spacing));
+
+	/* Inner Icon Sizing */
+	& > :where(svg) {
+		width: var(--btn-size);
+		height: var(--btn-size);
+	}
+
+	/* Transitions */
+	transition-property: var(--default-transition-property);
+	transition-timing-function: var(--default-transition-timing-function);
+	transition-duration: var(--default-transition-duration);
+
+	@variant not-disabled {
+		@variant hover {
+			filter: brightness(125%);
+			@variant dark {
+				filter: brightness(75%);
+			}
+		}
+	}
+}
+
+@utility btn-icon {
+	--btn-size: var(--text-base);
+
+	border-radius: var(--radius-base);
+
+	/* Center Icons */
+	display: inline-flex;
+	justify-content: center;
+	align-items: center;
+
+	/* Typography */
+	text-decoration-line: none;
+	white-space: nowrap;
+
+	/* Size */
+	font-size: var(--btn-size);
+	line-height: var(--btn-size);
+	width: calc(var(--btn-size) * 2 - --spacing(0.5));
+	height: calc(var(--btn-size) * 2 - --spacing(0.5));
+	padding: calc((var(--btn-size) - --spacing(0.5)) / 2);
+
+	/* Inner Icon Sizing */
+	& > :where(svg) {
+		width: var(--btn-size);
+		height: var(--btn-size);
+	}
+
+	/* Transitions */
+	transition-property: var(--default-transition-property);
+	transition-timing-function: var(--default-transition-timing-function);
+	transition-duration: var(--default-transition-duration);
+
+	@variant not-disabled {
+		@variant hover {
+			filter: brightness(125%);
+			@variant dark {
+				filter: brightness(75%);
+			}
+		}
+	}
+}
+
+/* Sizes --- */
+
+/* Button */
+@utility btn-xs {
+	--btn-size: var(--text-xs);
+}
+@utility btn-sm {
+	--btn-size: var(--text-sm);
+}
+@utility btn-base {
+	--btn-size: var(--text-base);
+}
+@utility btn-lg {
+	--btn-size: var(--text-lg);
+}
+@utility btn-xl {
+	--btn-size: var(--text-xl);
+}
+@utility btn-2xl {
+	--btn-size: var(--text-2xl);
+}
+@utility btn-3xl {
+	--btn-size: var(--text-3xl);
+}
+@utility btn-4xl {
+	--btn-size: var(--text-4xl);
+}
+@utility btn-5xl {
+	--btn-size: var(--text-5xl);
+}
+@utility btn-6xl {
+	--btn-size: var(--text-6xl);
+}
+@utility btn-7xl {
+	--btn-size: var(--text-7xl);
+}
+@utility btn-8xl {
+	--btn-size: var(--text-8xl);
+}
+@utility btn-9xl {
+	--btn-size: var(--text-9xl);
+}
+
+/* Button Icon */
+@utility btn-icon-xs {
+	--btn-size: var(--text-xs);
+}
+@utility btn-icon-sm {
+	--btn-size: var(--text-sm);
+}
+@utility btn-icon-base {
+	--btn-size: var(--text-base);
+}
+@utility btn-icon-lg {
+	--btn-size: var(--text-lg);
+}
+@utility btn-icon-xl {
+	--btn-size: var(--text-xl);
+}
+@utility btn-icon-2xl {
+	--btn-size: var(--text-2xl);
+}
+@utility btn-icon-3xl {
+	--btn-size: var(--text-3xl);
+}
+@utility btn-icon-4xl {
+	--btn-size: var(--text-4xl);
+}
+@utility btn-icon-5xl {
+	--btn-size: var(--text-5xl);
+}
+@utility btn-icon-6xl {
+	--btn-size: var(--text-6xl);
+}
+@utility btn-icon-7xl {
+	--btn-size: var(--text-7xl);
+}
+@utility btn-icon-8xl {
+	--btn-size: var(--text-8xl);
+}
+@utility btn-icon-9xl {
+	--btn-size: var(--text-9xl);
+}
+
+/* Group --- */
+
+@utility btn-group {
+	border-radius: var(--radius-container);
+	display: inline-flex;
+	align-items: center;
+	gap: --spacing(2);
+	padding: --spacing(2);
+	overflow: hidden;
+}

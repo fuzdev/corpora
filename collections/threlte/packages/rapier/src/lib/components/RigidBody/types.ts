@@ -1,0 +1,109 @@
+import type { RigidBody as RapierRigidBody } from '@dimforge/rapier3d-compat'
+import type { Snippet } from 'svelte'
+import type { Euler, Vector3Tuple } from 'three'
+import type { RigidBodyTypeString } from '../../lib/parseRigidBodyType.js'
+import type { CreateEvent, RigidBodyEvents } from '../../types/types.js'
+
+export interface RigidBodyProps extends CreateEvent<RapierRigidBody>, RigidBodyEvents {
+  rigidBody?: RapierRigidBody | undefined
+
+  /**
+   * Specify the type of this rigid body
+   */
+  type?: RigidBodyTypeString
+
+  /** Whether or not this body can sleep. This property is not reactive.
+   *
+   * @default true
+   */
+  canSleep?: boolean
+
+  /**
+   * The linear velocity of this body.
+   *
+   * @default [0, 0, 0]
+   */
+  linearVelocity?: Vector3Tuple
+
+  /**
+   * The angular velocity of this body.
+   *
+   * @default [0, 0, 0]
+   */
+  angularVelocity?: Parameters<Euler['set']>
+
+  /**
+   * The scaling factor applied to the gravity affecting the rigid-body.
+   *
+   * @default 1
+   */
+  gravityScale?: number
+
+  /**
+   * Whether or not Continous Collision Detection is enabled for this rigid-body.
+   * https://rapier.rs/docs/user_guides/javascript/rigid_bodies#continuous-collision-detection
+   *
+   * @default false
+   */
+  ccd?: boolean
+
+  /**
+   * Locks all rotations that would have resulted from forces on the created rigid-body.
+   */
+  lockRotations?: boolean
+
+  /**
+   * Locks all translations that would have resulted from forces on the created rigid-body.
+   */
+  lockTranslations?: boolean
+
+  /**
+   * Allow rotation of this rigid-body only along specific axes.
+   */
+  enabledRotations?: [x: boolean, y: boolean, z: boolean]
+
+  /**
+   * Allow translations of this rigid-body only along specific axes.
+   */
+  enabledTranslations?: [x: boolean, y: boolean, z: boolean]
+
+  /**
+   * Dominance is a non-realistic, but sometimes useful, feature.
+   * It can be used to make one rigid-body immune to forces
+   * originating from contacts with some other bodies.
+   *
+   * Number in the range -127 to 127
+   *
+   * @default 0
+   */
+  dominance?: number
+
+  /**
+   * Damping lets you slow down a rigid-body automatically. This can be used to
+   * achieve a wide variety of effects like fake air friction. Larger values of
+   * damping coefficients lead to a stronger slow-downs.
+   *
+   * @default 0
+   */
+  linearDamping?: number
+
+  /**
+   * Damping lets you slow down a rigid-body automatically. This can be used to
+   * achieve a wide variety of effects like fake air friction. Larger values of
+   * damping coefficients lead to a stronger slow-downs.
+   *
+   * @default 0
+   */
+  angularDamping?: number
+
+  /**
+   * Set the rigidBody as enabled or disabled.
+   */
+  enabled?: boolean
+  /**
+   * An arbitrary user-defined object associated with this rigid-body.
+   */
+  userData?: Record<string, any>
+
+  children?: Snippet<[{ rigidBody: RapierRigidBody }]>
+}

@@ -50,8 +50,9 @@ manifest SPDX id fails inside it.
   Symlinks are skipped (a snapshot holds bytes, not links); a subpath that matches no
   file fails. A collection's `files` names upstream files kept whatever their extension
   — a module-type or config file a runtime reads to load the source as written, like the
-  `package.json` whose `"type": "module"` makes Node read `.ts` as ESM; each must exist
-  at the commit.
+  `package.json` whose `"type": "module"` makes Node read `.ts` as ESM, or an upstream
+  attribution notice a license requires to accompany the code, like the `NOTICE.txt`
+  crediting Apache-2.0 code a library ported; each must exist at the commit.
 - **Code as people write it.** Upstream test fixtures are excluded by the upstream's
   own meaning, and so is a third-party bundle an upstream vendors into its tree (both
   spelled per collection in the manifest's `exclude`); conformance suites (test262, the TypeScript compiler's cases, wpt,

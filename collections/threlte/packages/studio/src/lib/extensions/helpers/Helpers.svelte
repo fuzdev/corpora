@@ -1,0 +1,167 @@
+<script lang="ts">
+  import { isInstanceOf, T, useTask, useThrelte } from '@threlte/core'
+  import type { DirectionalLight, Light, Object3D, PointLight, SpotLight } from 'three'
+  import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
+  import HorizontalButtonGroup from '../../components/HorizontalButtonGroup.svelte'
+  import ToolbarButton from '../../components/ToolbarButton.svelte'
+  import ToolbarItem from '../../components/ToolbarItem.svelte'
+  import { useStudio } from '../../internal/extensions.js'
+  import { useObjectSelection } from '../object-selection/useObjectSelection.svelte.js'
+  import { useStudioObjectsRegistry } from '../studio-objects-registry/useStudioObjectsRegistry.svelte.js'
+  import { useTransactions } from '../transactions/useTransactions.js'
+  import AxesHelper from './AxesHelper.svelte'
+  import GroupHelper from './GroupHelper.svelte'
+  import Mounter from './Mounter.svelte'
+  import { helpersScope, type HelpersActions, type HelpersState } from './types.js'
+  import type { Snippet } from 'svelte'
+
+  let { children }: { children?: Snippet } = $props()
+
+  const { autoRenderTask } = useThrelte()
+  const { createExtension } = useStudio()
+  const { onTransaction } = useTransactions()
+
+  const ext = createExtension<HelpersState, HelpersActions>({
+    scope: helpersScope,
+    state({ persist }) {
+      return {
+        enabled: persist(true)
+      }
+    },
+    actions: {
+      toggleEnabled({ state }) {
+        state.enabled = !state.enabled
+      },
+      setEnabled({ state }, enabled) {
+        state.enabled = enabled
+      }
+    }
+  })
+
+  const objectSelection = useObjectSelection()
+
+  const { addObject, removeObject } = useStudioObjectsRegistry()
+
+  const activeHelpers = new Set<Object3D>()
+
+  useTask(
+    () => {
+      for (const helper of activeHelpers) {
+        if ('update' in helper && typeof helper.update === 'function') {
+          helper.update()
+        }
+      }
+    },
+    {
+      autoInvalidate: false,
+      before: autoRenderTask
+    }
+  )
+
+  const onCreate = (ref: Object3D): (() => void) => {
+    addObject(ref)
+    activeHelpers.add(ref)
+    return () => {
+      removeObject(ref)
+      activeHelpers.delete(ref)
+    }
+  }
+
+  const castsShadow = (light: Light): light is DirectionalLight | PointLight | SpotLight => {
+    return (
+      isInstanceOf(light, 'DirectionalLight') ||
+      isInstanceOf(light, 'PointLight') ||
+      isInstanceOf(light, 'SpotLight')
+    )
+  }
+
+  let invalidations = $state(1)
+  onTransaction(() => {
+    invalidations++
+  })
+</script>
+
+<ToolbarItem position="left">
+  <HorizontalButtonGroup>
+    <ToolbarButton
+      onclick={ext.toggleEnabled}
+      active={ext.state.enabled}
+      label="Helpers"
+      icon="mdiFitToScreen"
+      tooltip="Helpers"
+    />
+  </HorizontalButtonGroup>
+</ToolbarItem>
+
+{#if ext.state.enabled}
+  <AxesHelper
+    length={999}
+    width={0.2}
+  />
+
+  {#each objectSelection.selectedObjects as object (object.uuid)}
+    <Mounter parent={object}>
+      <AxesHelper
+        length={0.5}
+        width={0.2}
+        opacity={0.3}
+        overlay
+      />
+
+      {#if isInstanceOf(object, 'Group')}
+        <GroupHelper oncreate={onCreate} />
+      {/if}
+    </Mounter>
+
+    {#if isInstanceOf(object, 'Camera')}
+      <T.CameraHelper
+        userData={{ ignoreOverrideMaterial: true }}
+        args={[object]}
+        oncreate={onCreate}
+      />
+    {:else if isInstanceOf(object, 'Light')}
+      {#if castsShadow(object) && invalidations && object.castShadow}
+        <T.CameraHelper
+          userData={{ ignoreOverrideMaterial: true }}
+          args={[object.shadow.camera]}
+          oncreate={onCreate}
+        />
+      {/if}
+
+      {#if isInstanceOf(object, 'DirectionalLight')}
+        <T.DirectionalLightHelper
+          userData={{ ignoreOverrideMaterial: true }}
+          args={[object, 10]}
+          oncreate={onCreate}
+        />
+      {:else if isInstanceOf(object, 'SpotLight')}
+        <T.SpotLightHelper
+          userData={{ ignoreOverrideMaterial: true }}
+          args={[object]}
+          oncreate={onCreate}
+        />
+      {:else if isInstanceOf(object, 'PointLight')}
+        <T.PointLightHelper
+          userData={{ ignoreOverrideMaterial: true }}
+          args={[object, 10]}
+          oncreate={onCreate}
+        />
+      {:else if isInstanceOf(object, 'HemisphereLight')}
+        <T.HemisphereLightHelper
+          userData={{ ignoreOverrideMaterial: true }}
+          args={[object, 10]}
+          oncreate={onCreate}
+        />
+      {:else if isInstanceOf(object, 'RectAreaLight')}
+        <T
+          is={RectAreaLightHelper}
+          userData={{ ignoreOverrideMaterial: true }}
+          oncreate={onCreate}
+          args={[object]}
+        />
+      {/if}
+    {/if}
+  {/each}
+{/if}
+
+{@render children?.()}

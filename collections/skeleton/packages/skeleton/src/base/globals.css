@@ -1,0 +1,79 @@
+/* Base - Globals */
+/* Skeleton global styles, enabled by default. */
+
+@layer base {
+	:root {
+		/* Design Tokens --- */
+		/* Defines form field placeholder text styling. */
+		--field-placeholder: var(--color-surface-700-300);
+
+		/* Color Scheme --- */
+		/* https://tailwindcss.com/docs/color-scheme */
+		/* IMPORTANT: this must retain the @variant to work. */
+		color-scheme: light;
+		@variant dark {
+			color-scheme: dark;
+		}
+
+		/* Scrollbars --- */
+		/* https://developer.mozilla.org/en-US/docs/Web/CSS/scrollbar-color */
+		/* https://developer.chrome.com/docs/css-ui/scrollbar-styling */
+		scrollbar-width: thin;
+		scrollbar-color: light-dark(var(--color-surface-300), var(--color-surface-700)) transparent; /* thumb / track */
+
+		/* Mobile Tap Highlight Color (WebKit only) --- */
+		/* IMPORTANT: this is useful for mobile accessibility. */
+		/* https://developer.mozilla.org/en-US/docs/Web/CSS/-webkit-tap-highlight-color */
+		-webkit-tap-highlight-color: color-mix(in oklab, var(--color-surface-50-950) 30%, transparent);
+	}
+
+	html {
+		/* Background --- */
+		background-color: light-dark(var(--color-root-bg-light), var(--color-root-bg-dark));
+	}
+
+	body {
+		/* Typography --- */
+		color: light-dark(var(--typo-base--color-light), var(--typo-base--color-dark));
+		font-family: var(--typo-base--font-family);
+		font-size: var(--typo-base--font-size);
+		line-height: var(--typo-base--line-height);
+		font-weight: var(--typo-base--font-weight);
+		font-style: var(--typo-base--font-style);
+		letter-spacing: var(--typo-base--letter-spacing);
+		font-stretch: var(--typo-base--font-stretch);
+		font-kerning: var(--typo-base--font-kerning);
+		text-shadow: var(--typo-base--text-shadow);
+		word-spacing: var(--typo-base--word-spacing);
+		hyphens: var(--typo-base--hyphens);
+		text-transform: var(--typo-base--text-transform);
+	}
+
+	/* Selection --- */
+	/* https://developer.mozilla.org/en-US/docs/Web/CSS/::selection */
+	::selection {
+		background-color: color-mix(in oklab, light-dark(var(--color-brand-light), var(--color-brand-dark)) 50%, transparent);
+	}
+
+	/* Disabled State --- */
+	*:disabled,
+	.disabled {
+		box-shadow: none;
+		cursor: not-allowed;
+		opacity: 0.5;
+		& > * {
+			pointer-events: none;
+		}
+	}
+
+	/* Outlines and Focus --- */
+	/*
+		REMINDER: Never disabled focus and outlines
+		as this would be harmful to accessibility!
+		Source: http://www.outlinenone.com/
+
+		EXAMPLE: Set a global focus style.
+		Apply this in your app's global stylesheet:
+		:focus { @apply focus:outline-primary-500; }
+	*/
+}

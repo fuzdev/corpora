@@ -1,0 +1,66 @@
+[data-scope='tags-input'] {
+	&[data-part='root'] {
+		width: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: --spacing(2);
+	}
+
+	&[data-part='label'] {
+		@apply label-text;
+	}
+
+	&[data-part='control'] {
+		@apply input;
+
+		display: flex;
+		flex-wrap: wrap;
+		gap: --spacing(1.5);
+	}
+
+	&[data-part='item-preview'] {
+		@apply btn btn-sm preset-filled;
+
+		&[data-highlighted] {
+			outline: 2px solid var(--color-surface-950-50);
+			outline-offset: 1px;
+		}
+	}
+
+	&[data-part='item-text'] {
+		line-height: 1;
+	}
+
+	&[data-part='item-delete-trigger'] {
+		width: var(--text-xs);
+		height: var(--text-xs);
+		display: flex;
+		justify-content: center;
+		align-items: center;
+
+		/* Inner Icon Sizing */
+		& > :where(svg) {
+			width: var(--text-xs);
+			height: var(--text-xs);
+		}
+	}
+
+	&[data-part='item-input'] {
+		@apply input;
+	}
+
+	&[data-part='input'] {
+		@apply input-ghost!;
+		width: auto !important;
+	}
+
+	&[data-part='clear-trigger'] {
+		@apply btn btn-sm preset-tonal;
+
+		width: fit-content;
+
+		@variant hover {
+			@apply preset-filled-error-500;
+		}
+	}
+}

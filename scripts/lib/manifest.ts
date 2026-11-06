@@ -38,8 +38,10 @@ export interface Collection {
 	/**
 	 * Repo-relative files to vendor verbatim whatever their extension — a module-type or
 	 * config file a runtime reads to load the source as written, like the `package.json`
-	 * whose `"type": "module"` makes Node read `.ts` as ESM. Each must be a regular file
-	 * at the pinned commit, or the materializer fails.
+	 * whose `"type": "module"` makes Node read `.ts` as ESM, or an upstream attribution
+	 * notice a license requires to accompany the code, like the `NOTICE.txt` crediting
+	 * Apache-2.0 code a library ported. Each must be a regular file at the pinned commit,
+	 * or the materializer fails.
 	 */
 	files?: string[];
 	/** License provenance; must be a permissive license the materializer can verify. */

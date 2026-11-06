@@ -1,0 +1,26 @@
+/* Components: Forms > Input Group */
+
+@utility field-group {
+	display: grid;
+	gap: --spacing(1);
+
+	& .label {
+		border-radius: var(--radius-base);
+
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		height: 100%;
+		padding-inline: --spacing(3);
+	}
+
+	& > *:not(:last-child) {
+		border-start-end-radius: 0;
+		border-end-end-radius: 0;
+	}
+
+	& > *:not(:first-child) {
+		border-start-start-radius: 0;
+		border-end-start-radius: 0;
+	}
+}

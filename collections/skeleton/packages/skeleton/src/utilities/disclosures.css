@@ -1,0 +1,62 @@
+/* Components: Disclosures */
+
+@utility disclosure-group {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	gap: --spacing(4);
+}
+
+@utility disclosure {
+	--disclosure-size: var(--text-base);
+
+	interpolate-size: allow-keywords;
+
+	width: 100%;
+
+	& summary {
+		border-radius: var(--radius-base);
+		width: 100%;
+		text-align: start;
+
+		/* Size */
+		font-size: var(--disclosure-size);
+		line-height: var(--disclosure-size);
+		padding-block: calc((var(--disclosure-size) - --spacing(0.5)) / 2);
+		padding-inline: calc((var(--disclosure-size) - --spacing(0.5)) / 2 + var(--spacing));
+
+		/* Inner Icon Sizing */
+		& > :where(svg) {
+			width: var(--disclosure-size);
+			height: var(--disclosure-size);
+		}
+
+		/* Transitions */
+		transition-property: var(--default-transition-property);
+		transition-timing-function: var(--default-transition-timing-function);
+		transition-duration: var(--default-transition-duration);
+
+		@variant not-disabled {
+			@variant hover {
+				@apply preset-tonal-primary;
+			}
+		}
+	}
+
+	&::details-content {
+		block-size: 0;
+		overflow-y: clip;
+		transition:
+			content-visibility var(--default-transition-duration) allow-discrete,
+			block-size var(--default-transition-duration) var(--default-transition-timing-function);
+	}
+
+	&[open]::details-content {
+		block-size: auto;
+	}
+}
+
+@utility disclosure-content {
+	padding-block: calc((var(--disclosure-size, var(--text-base)) - --spacing(0.5)) / 2);
+	padding-inline: calc((var(--disclosure-size, var(--text-base)) - --spacing(0.5)) / 2 + var(--spacing));
+}

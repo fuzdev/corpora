@@ -157,6 +157,54 @@
 			"bytes": 729401,
 			"digest": "sha256:11357beb11fb2b51cbed8f24d46d4b17ad6528b8e4cf387d404384acd96e06ef"
 		},
+		"bits-ui": {
+			"commit": "d093bd0edcc0ef555b408e86a4948a8434b1b03f",
+			"files": 509,
+			"bytes": 1469429,
+			"digest": "sha256:efc6951bf707c34709d9fef9987902805894bd2e759416aee1b98ecdbcf8c65c"
+		},
+		"shadcn-svelte": {
+			"commit": "3c4152d7d3904e76f6f756ec8ffca7c9ec72f977",
+			"files": 566,
+			"bytes": 870354,
+			"digest": "sha256:be3ff8b2bb191b60b942f5d3e1952f2534b9c78d277ef6073614584fa4e27304"
+		},
+		"skeleton": {
+			"commit": "e65535ebfb9b37bf37ccde1ed854b96397d21550",
+			"files": 541,
+			"bytes": 561005,
+			"digest": "sha256:467674cdc54dbfcd020b8968fdf07b58804c1501ac646483867c1de2f0ed51c9"
+		},
+		"xyflow": {
+			"commit": "1bc405cd113618c17fd181b931a9fe573bec9fee",
+			"files": 181,
+			"bytes": 455522,
+			"digest": "sha256:c8b39bd4d98d30eeb2f3c35ca2e9b6b06c7ba2801d35c2928db9a2bb8fb691a0"
+		},
+		"threlte": {
+			"commit": "7dbbdaa4bfb140105f8ee5ed0d3284a4578cd90b",
+			"files": 603,
+			"bytes": 1375005,
+			"digest": "sha256:74a5995f22f2bd29059494070014473eb2948db7bd3f44a3fe1c7e5b95b86934"
+		},
+		"runed": {
+			"commit": "78e78987bf4f83691f6f8a0808dfe4260a8d6f09",
+			"files": 106,
+			"bytes": 358468,
+			"digest": "sha256:f7d827ca0440d370f7634c12910f20720436c67eb37c5a9222b6ee7372a62ca3"
+		},
+		"daisyui": {
+			"commit": "bf3bac3a397b543e55641ecb2d60a2ed961f09ec",
+			"files": 73,
+			"bytes": 280171,
+			"digest": "sha256:cca606ff9fd54e1db6e6f6216b5b9be04cd3e15e347850947f550eee067c3d8c"
+		},
+		"open-props": {
+			"commit": "f39ab7c377a0e047f930982e3611bbc95254a260",
+			"files": 37,
+			"bytes": 104730,
+			"digest": "sha256:d57911427a22174e16b1b6a6e66d8cbe25a3a2d1e1179bf04ec4c5808b99240a"
+		},
 		"typescript-parser": {
 			"commit": "050880ce59e30b356b686bd3144efe24f875ebc8",
 			"files": 2,

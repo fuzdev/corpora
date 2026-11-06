@@ -285,6 +285,131 @@
 			"origin": "third_party"
 		},
 		{
+			"name": "bits-ui",
+			"url": "https://github.com/huntabyte/bits-ui",
+			"commit": "d093bd0edcc0ef555b408e86a4948a8434b1b03f",
+			"subpaths": ["packages/bits-ui/src/lib"],
+			"exclude": [],
+			"files": ["NOTICE.txt"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "oxfmt",
+			"origin": "third_party"
+		},
+		{
+			"name": "shadcn-svelte",
+			"url": "https://github.com/huntabyte/shadcn-svelte",
+			"commit": "3c4152d7d3904e76f6f756ec8ffca7c9ec72f977",
+			"subpaths": [
+				"docs/src/lib/registry/ui",
+				"docs/src/lib/registry/hooks",
+				"docs/src/lib/registry/lib",
+				"packages/cli/src",
+				"packages/primitives/src"
+			],
+			"exclude": [
+				"packages/primitives/src/lib/message-scroller/fixtures",
+				"packages/primitives/src/lib/questionnaire/fixtures"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE.md"},
+			"shaped_by": "oxfmt",
+			"origin": "third_party"
+		},
+		{
+			"name": "skeleton",
+			"url": "https://github.com/skeletonlabs/skeleton",
+			"commit": "e65535ebfb9b37bf37ccde1ed854b96397d21550",
+			"subpaths": [
+				"packages/skeleton/src",
+				"packages/skeleton-common/src",
+				"packages/skeleton-svelte/src",
+				"packages/cli/src"
+			],
+			"exclude": [
+				"packages/skeleton/src/themes",
+				"packages/cli/src/commands/migrate/migrations/skeleton-5/changes.md"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier",
+			"origin": "third_party"
+		},
+		{
+			"name": "xyflow",
+			"url": "https://github.com/xyflow/xyflow",
+			"commit": "1bc405cd113618c17fd181b931a9fe573bec9fee",
+			"subpaths": ["packages/svelte/src/lib", "packages/svelte/src/styles", "packages/system/src"],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier",
+			"origin": "third_party"
+		},
+		{
+			"name": "threlte",
+			"url": "https://github.com/threlte/threlte",
+			"commit": "7dbbdaa4bfb140105f8ee5ed0d3284a4578cd90b",
+			"subpaths": [
+				"packages/core/src/lib",
+				"packages/extras/src/lib",
+				"packages/flex/src/lib",
+				"packages/rapier/src/lib",
+				"packages/studio/src/lib",
+				"packages/theatre/src/lib",
+				"packages/xr/src/lib"
+			],
+			"exclude": [
+				"packages/core/src/lib/__tests__/__fixtures__",
+				"packages/core/src/lib/components/T/__tests__/__fixtures__",
+				"packages/core/src/lib/webgpu/__tests__/__fixtures__",
+				"packages/extras/src/lib/components/portals/__tests__/__fixtures__",
+				"packages/extras/src/lib/interactivity/__tests__/__fixtures__",
+				"packages/core/src/lib/frame-scheduling/README.md"
+			],
+			"license": {"spdx": "MIT", "file": "LICENSE.md"},
+			"shaped_by": "prettier",
+			"origin": "third_party"
+		},
+		{
+			"name": "runed",
+			"url": "https://github.com/svecosystem/runed",
+			"commit": "78e78987bf4f83691f6f8a0808dfe4260a8d6f09",
+			"subpaths": ["packages/runed/src/lib"],
+			"exclude": ["packages/runed/src/lib/kit/README.md"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier",
+			"origin": "third_party"
+		},
+		{
+			"name": "daisyui",
+			"url": "https://github.com/saadeghi/daisyui",
+			"commit": "bf3bac3a397b543e55641ecb2d60a2ed961f09ec",
+			"subpaths": ["packages/daisyui/src"],
+			"exclude": ["packages/daisyui/src/themes"],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "prettier",
+			"origin": "third_party"
+		},
+		{
+			"name": "open-props",
+			"url": "https://github.com/argyleink/open-props",
+			"commit": "f39ab7c377a0e047f930982e3611bbc95254a260",
+			"subpaths": [
+				"src/extra",
+				"src/props.highlights.css",
+				"src/props.layouts.css",
+				"src/props.shadows.dark.css",
+				"src/props.shadows.light.css",
+				"src/props.supports.css",
+				"docsite/index.css",
+				"docsite/color-copy.css",
+				"docsite/palette-playground.css",
+				"docsite/syntax-highlight.css",
+				"docsite/js"
+			],
+			"exclude": [],
+			"license": {"spdx": "MIT", "file": "LICENSE"},
+			"shaped_by": "none",
+			"origin": "third_party"
+		},
+		{
 			"name": "typescript-parser",
 			"url": "https://github.com/microsoft/TypeScript",
 			"commit": "050880ce59e30b356b686bd3144efe24f875ebc8",

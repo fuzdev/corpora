@@ -1,0 +1,40 @@
+/* Components: Forms > Textarea */
+
+@utility textarea {
+	--field-size: var(--text-base);
+
+	background-color: var(--color-surface-50-950);
+	color: var(--color-surface-950-50);
+	border-radius: var(--radius-container);
+	display: block;
+	width: 100%;
+
+	/* Size */
+	font-size: var(--field-size);
+	line-height: var(--field-size);
+	padding-block: calc((var(--field-size) - --spacing(0.5)) / 2);
+	padding-inline: calc((var(--field-size) - --spacing(0.5)) / 2 + var(--spacing));
+
+	/* Edges */
+	outline-color: transparent;
+	border-width: 0;
+	--tw-ring-inset: inset;
+	--tw-ring-color: var(--color-surface-300-700);
+	--tw-ring-shadow: var(--tw-ring-inset,) 0 0 0 var(--default-ring-width) var(--tw-ring-color, currentColor);
+	box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+
+	/* Placeholder */
+	&::placeholder {
+		color: var(--field-placeholder);
+	}
+
+	@variant active {
+		--tw-ring-color: var(--color-primary-500);
+	}
+	@variant focus {
+		--tw-ring-color: var(--color-primary-500);
+	}
+	@variant focus-within {
+		--tw-ring-color: var(--color-primary-500);
+	}
+}

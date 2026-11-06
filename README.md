@@ -43,8 +43,9 @@ Both are named per collection in the manifest's `exclude`. Not:
 
 A collection can also name `files` kept verbatim outside the extension allowlist: a
 module-type or config file a runtime reads to load the source as written, such as the
-`package.json` whose `"type": "module"` tells Node the `.ts` files are ESM. Each must exist
-at the pinned commit.
+`package.json` whose `"type": "module"` tells Node the `.ts` files are ESM, or an upstream
+attribution notice a license requires to accompany the code, such as the `NOTICE.txt` that
+credits Apache-2.0 code a library ported. Each must exist at the pinned commit.
 
 Each collection is tagged `shaped_by` (`tsv`, `prettier`, `oxfmt`, `none`): who last formatted
 it. A formatter benchmarked on code it already shaped measures its idempotent path, so

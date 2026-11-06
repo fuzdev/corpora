@@ -1,0 +1,65 @@
+/* Components: Forms > Select */
+
+@utility select {
+	--field-size: var(--text-base);
+
+	background-color: var(--color-surface-50-950);
+	color: var(--color-surface-950-50);
+	border-radius: var(--radius-base);
+	display: block;
+	width: 100%;
+
+	/* Size */
+	font-size: var(--field-size);
+	line-height: var(--field-size);
+	padding-block: calc((var(--field-size) - --spacing(0.5)) / 2);
+
+	/*
+		WARNING
+		Do not set `padding-inline` or it breaks
+		the native drop-down arrow for selects.
+	*/
+
+	/* Edges */
+	outline-color: transparent;
+	border-width: 0;
+	--tw-ring-inset: inset;
+	--tw-ring-color: var(--color-surface-300-700);
+	--tw-ring-shadow: var(--tw-ring-inset,) 0 0 0 var(--default-ring-width) var(--tw-ring-color, currentColor);
+	box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+
+	@variant active {
+		--tw-ring-color: var(--color-primary-500);
+	}
+	@variant focus {
+		--tw-ring-color: var(--color-primary-500);
+	}
+	@variant focus-within {
+		--tw-ring-color: var(--color-primary-500);
+	}
+
+	/* Optgroup --- */
+
+	& optgroup {
+		background-color: var(--color-surface-50-950);
+		color: var(--color-surface-950-50);
+	}
+
+	& optgroup > * + * {
+		margin-top: --spacing(2);
+	}
+
+	& optgroup option:first-of-type {
+		margin-top: --spacing(2);
+	}
+	& optgroup option:last-child {
+		margin-bottom: --spacing(2) !important;
+	}
+
+	/* Option --- */
+
+	& option {
+		background-color: var(--color-surface-50-950);
+		color: var(--color-surface-950-50);
+	}
+}

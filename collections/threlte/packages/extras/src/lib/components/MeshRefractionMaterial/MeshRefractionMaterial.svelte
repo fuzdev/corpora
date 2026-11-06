@@ -1,0 +1,141 @@
+<script lang="ts">
+  import { isInstanceOf, T, useParent, useTask, useThrelte } from '@threlte/core'
+  import { Color, Matrix4, ShaderMaterial, Texture, Uniform, Vector2 } from 'three'
+  import { MeshBVH, MeshBVHUniformStruct, SAH } from 'three-mesh-bvh'
+  import { getImageSize } from '../../lib/getImageSize.js'
+  import type { MeshRefractionMaterialProps } from './types.js'
+  import { fragmentShader } from './fragment.js'
+  import { vertexShader } from './vertex.js'
+
+  let {
+    envMap,
+    bounces = 2,
+    ior = 2.4,
+    fresnel = 0,
+    aberrationStrength = 0,
+    color = 'white',
+    fastChroma = true,
+    ref = $bindable(),
+    ...props
+  }: MeshRefractionMaterialProps = $props()
+
+  const { size, invalidate, camera } = useThrelte()
+  const parent = useParent()
+
+  const uniforms = {
+    envMap: new Uniform<Texture | undefined>(undefined),
+    bounces: new Uniform(2),
+    ior: new Uniform(2.4),
+    aberrationStrength: new Uniform(0),
+    fresnel: new Uniform(0),
+    correctMips: new Uniform(true),
+    bvh: new Uniform(new MeshBVHUniformStruct()),
+    color: new Uniform(new Color('white')),
+    resolution: new Uniform(new Vector2()),
+    viewMatrixInverse: new Uniform(new Matrix4()),
+    projectionMatrixInverse: new Uniform(new Matrix4())
+  }
+
+  const material = new ShaderMaterial({
+    fragmentShader,
+    vertexShader,
+    uniforms,
+    defines: {}
+  })
+
+  const updateDefines = (nextDefines: Record<string, string>) => {
+    const currentDefines = material.defines ?? {}
+    const currentKeys = Object.keys(currentDefines)
+    const nextKeys = Object.keys(nextDefines)
+    const definesChanged =
+      currentKeys.length !== nextKeys.length ||
+      nextKeys.some((key) => currentDefines[key] !== nextDefines[key])
+
+    if (!definesChanged) return
+
+    material.defines = nextDefines
+    material.needsUpdate = true
+    invalidate()
+  }
+
+  $effect(() => {
+    // Sampler2D and SamplerCube need different defines
+    const isCubeMap = isInstanceOf(envMap, 'CubeTexture')
+    const image = getImageSize(isCubeMap ? envMap.image[0] : envMap?.image)
+    const w = image?.width ?? 1024
+    const cubeSize = w / 4
+    const lodMax = Math.floor(Math.log2(cubeSize))
+    const _cubeSize = Math.pow(2, lodMax)
+    const width = 3 * Math.max(_cubeSize, 16 * 7)
+    const height = 4 * _cubeSize
+
+    const nextDefines: Record<string, string> = {
+      CUBEUV_TEXEL_WIDTH: `${1.0 / width}`,
+      CUBEUV_TEXEL_HEIGHT: `${1.0 / height}`,
+      CUBEUV_MAX_MIP: `${lodMax}.0`
+    }
+
+    if (isCubeMap) nextDefines.ENVMAP_TYPE_CUBEM = ''
+
+    // Add defines from chromatic aberration
+    if (aberrationStrength > 0) nextDefines.CHROMATIC_ABERRATIONS = ''
+    if (fastChroma) nextDefines.FAST_CHROMA = ''
+
+    updateDefines(nextDefines)
+  })
+
+  $effect(() => {
+    // Update the BVH
+    if (isInstanceOf($parent, 'Mesh')) {
+      uniforms.bvh.value = new MeshBVHUniformStruct()
+      uniforms.bvh.value.updateFrom(
+        new MeshBVH($parent.geometry.clone().toNonIndexed(), {
+          strategy: SAH
+        })
+      )
+    }
+  })
+
+  $effect(() => {
+    uniforms.envMap.value = envMap
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.bounces.value = bounces
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.ior.value = ior
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.fresnel.value = fresnel
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.aberrationStrength.value = aberrationStrength
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.color.value.set(color)
+    invalidate()
+  })
+  $effect(() => {
+    uniforms.resolution.value.set(size.current.width, size.current.height)
+    invalidate()
+  })
+
+  useTask(
+    () => {
+      uniforms.viewMatrixInverse.value = camera.current.matrixWorld
+      uniforms.projectionMatrixInverse.value = camera.current.projectionMatrixInverse
+    },
+    { autoInvalidate: false }
+  )
+</script>
+
+<T
+  is={material}
+  bind:ref
+  {...props}
+/>
