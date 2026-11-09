@@ -1,6 +1,12 @@
-# The clone cache the materializer fetches pinned commits into (see scripts/lib/source.ts).
+/node_modules/
+/.gro/
+
+# The clone cache the materializer fetches pinned commits into (see src/lib/source.ts).
 .cache/
 
 # Local (per-machine, never shared)
 *.local
 *.local.*
+
+# Last, so no pattern above can hide a file under collections/, whose files every tool must see.
+!/collections/**

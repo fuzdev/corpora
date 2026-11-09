@@ -1,0 +1,151 @@
+import { assert, describe, test } from 'vitest';
+
+import { is_clean_path, is_included_path, is_under, validate_manifest } from '#lib/manifest.ts';
+
+describe('manifest', () => {
+	const include = new Set(['ts', 'svelte', 'md']);
+
+	test('is_included_path keeps included extensions outside excluded prefixes', () => {
+		assert.strictEqual(is_included_path('src/lib/a.ts', include, []), true);
+		assert.strictEqual(is_included_path('src/lib/A.SVELTE', include, []), true);
+		assert.strictEqual(is_included_path('src/lib/a.svelte.ts', include, []), true);
+		assert.strictEqual(is_included_path('src/lib/a.json', include, []), false);
+		assert.strictEqual(is_included_path('src/lib/Makefile', include, []), false);
+		assert.strictEqual(is_included_path('src/lib/.gitignore', include, []), false);
+		assert.strictEqual(is_included_path('src/.ts', include, []), false);
+		assert.strictEqual(
+			is_included_path('src/test/fixtures/a.ts', include, ['src/test/fixtures']),
+			false
+		);
+		assert.strictEqual(
+			is_included_path('src/test/fixtures.ts', include, ['src/test/fixtures']),
+			true
+		);
+		assert.strictEqual(
+			is_included_path('src/test/fixtures_more/a.ts', include, ['src/test/fixtures']),
+			true
+		);
+	});
+
+	test('is_under is prefix-by-segment, not by string', () => {
+		assert.strictEqual(is_under('a/b/c', 'a/b'), true);
+		assert.strictEqual(is_under('a/b', 'a/b'), true);
+		assert.strictEqual(is_under('a/bc', 'a/b'), false);
+	});
+
+	test('is_clean_path rejects traversal and decoration', () => {
+		for (const ok of ['src', 'packages/kit/src', 'a.b/c-d_e'])
+			assert.strictEqual(is_clean_path(ok), true, ok);
+		for (const bad of ['', '/src', 'src/', './src', 'a/../b', 'a//b', 42]) {
+			assert.strictEqual(is_clean_path(bad), false, String(bad));
+		}
+	});
+
+	const valid = {
+		version: 2,
+		include: ['ts'],
+		collections: [
+			{
+				name: 'x',
+				url: 'https://github.com/fuzdev/x',
+				commit: 'a'.repeat(40),
+				subpaths: ['src'],
+				exclude: ['src/test/fixtures'],
+				license: { spdx: 'MIT', file: 'LICENSE' },
+				shaped_by: 'tsv',
+				origin: 'own'
+			}
+		]
+	};
+
+	test('validate_manifest accepts a valid manifest', () => {
+		assert.deepEqual(validate_manifest(valid), []);
+	});
+
+	test('validate_manifest names every problem', () => {
+		const broken = structuredClone(valid) as Record<string, unknown>;
+		const c = (broken.collections as Array<Record<string, unknown>>)[0]!;
+		c.commit = 'abc';
+		c.exclude = ['elsewhere/fixtures'];
+		c.license = { spdx: 'BUSL-1.1', file: 'LICENSE' };
+		c.shaped_by = 'biome';
+		c.origin = 'upstream';
+		(broken.collections as unknown[]).push({ ...valid.collections[0] });
+		const problems = validate_manifest(broken);
+		assert.ok(
+			problems.some((p) => p.includes('commit')),
+			'commit'
+		);
+		assert.ok(
+			problems.some((p) => p.includes('not under any subpath')),
+			'exclude'
+		);
+		assert.ok(
+			problems.some((p) => p.includes('not permissive')),
+			'license'
+		);
+		assert.ok(
+			problems.some((p) => p.includes('shaped_by')),
+			'shaped_by'
+		);
+		assert.ok(
+			problems.some((p) => p.includes('origin')),
+			'origin'
+		);
+		assert.ok(
+			problems.some((p) => p.includes('duplicated')),
+			'duplicate name'
+		);
+	});
+
+	test('validate_manifest requires origin to agree with the URL owner', () => {
+		const mismatch = (url: string, origin: string): boolean => {
+			const m = structuredClone(valid);
+			Object.assign(m.collections[0]!, { url, origin });
+			return validate_manifest(m).some((p) => p.includes('disagrees'));
+		};
+		assert.ok(mismatch('https://github.com/sveltejs/kit', 'own'));
+		assert.ok(mismatch('https://github.com/ryanatkn/x', 'third_party'));
+		assert.ok(!mismatch('https://github.com/ryanatkn/x', 'own'));
+		assert.ok(!mismatch('https://github.com/sveltejs/kit', 'third_party'));
+	});
+
+	test('validate_manifest requires the current version', () => {
+		assert.ok(validate_manifest({ ...valid, version: 3 }).some((p) => p.includes('version')));
+	});
+
+	test('validate_manifest requires exactly one license source', () => {
+		const both = structuredClone(valid) as Record<string, unknown>;
+		(both.collections as Array<Record<string, unknown>>)[0]!.license = {
+			spdx: 'MIT',
+			file: 'LICENSE',
+			declared_in: 'package.json'
+		};
+		assert.ok(validate_manifest(both).some((p) => p.includes('exactly one')));
+	});
+
+	test('validate_manifest accepts named files the extension filter would drop', () => {
+		const with_files = structuredClone(valid) as Record<string, unknown>;
+		(with_files.collections as Array<Record<string, unknown>>)[0]!.files = [
+			'package.json',
+			'src/tsconfig.json'
+		];
+		assert.deepEqual(validate_manifest(with_files), []);
+	});
+
+	test('validate_manifest rejects bad, duplicate, colliding and redundant files', () => {
+		const files_problems = (files: unknown): string[] => {
+			const m = structuredClone(valid) as Record<string, unknown>;
+			(m.collections as Array<Record<string, unknown>>)[0]!.files = files;
+			return validate_manifest(m);
+		};
+		assert.ok(files_problems('package.json').some((p) => p.includes('clean relative paths')));
+		assert.ok(files_problems(['./package.json']).some((p) => p.includes('clean relative paths')));
+		assert.ok(
+			files_problems(['package.json', 'package.json']).some((p) => p.includes('duplicated'))
+		);
+		assert.ok(files_problems(['LICENSE']).some((p) => p.includes('collides')));
+		assert.ok(files_problems(['src/a.ts']).some((p) => p.includes('already kept')));
+		assert.deepEqual(files_problems(['src/test/fixtures/a.ts']), []);
+	});
+});

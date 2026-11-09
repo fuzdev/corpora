@@ -1,0 +1,31 @@
+{
+  "name": "corpora",
+  "version": "0.0.1",
+  "description": "pinned snapshot of real-code corpora for the fuz ecosystem's language tools",
+  "private": true,
+  "license": "0BSD",
+  "repository": "https://github.com/fuzdev/corpora",
+  "type": "module",
+  "imports": {
+    "#lib/*": "./src/lib/*"
+  },
+  "engines": {
+    "node": ">=24.14"
+  },
+  "scripts": {
+    "materialize": "gro task src/lib/materialize.task.ts",
+    "materialize:check": "gro task src/lib/materialize.task.ts --check",
+    "check": "gro check",
+    "typecheck": "gro typecheck",
+    "test": "gro test"
+  },
+  "devDependencies": {
+    "@fuzdev/blake3-wasm": "^0.2.0",
+    "@fuzdev/fuz_schema": "^0.5.6",
+    "@fuzdev/fuz_util": "^0.82.0",
+    "@fuzdev/gro": "^0.231.0",
+    "svelte": "^5.57.2",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.0"
+  }
+}

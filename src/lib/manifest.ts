@@ -1,10 +1,14 @@
 /**
  * The manifest: which upstream repos are vendored, at which commit, and how each
  * collection is filtered. Loaded from `manifest.json` at the repo root and validated by
- * hand — the repo has no dependencies, so no schema library.
+ * hand, with every problem reported at once.
  *
  * @module
  */
+
+import { to_error_message } from '@fuzdev/fuz_util/error.ts';
+import type { FsReadDir } from '@fuzdev/gro/fs.ts';
+import { TaskError } from '@fuzdev/gro/task.ts';
 
 /** Who last formatted a collection's code — lets a consumer pick a fair subset. */
 export type ShapedBy = 'tsv' | 'prettier' | 'oxfmt' | 'none';
@@ -88,12 +92,27 @@ const OWN_OWNERS: ReadonlySet<string> = new Set(['fuzdev', 'ryanatkn']);
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
-/** Reads and validates the manifest; throws with every problem found at once. */
-export const load_manifest = async (path: string): Promise<Manifest> => {
-	const raw: unknown = JSON.parse(await Deno.readTextFile(path));
+/**
+ * Parses JSON read from the file `label` names.
+ * @throws TaskError - naming `label` when `text` isn't JSON
+ */
+export const parse_json_text = (label: string, text: string): unknown => {
+	try {
+		return JSON.parse(text);
+	} catch (error) {
+		throw new TaskError(`${label} is not valid JSON: ${to_error_message(error)}`);
+	}
+};
+
+/**
+ * Reads and validates the manifest at `path` beneath `dir`.
+ * @throws TaskError - with every problem found at once
+ */
+export const load_manifest = async (dir: FsReadDir, path: string): Promise<Manifest> => {
+	const raw = parse_json_text(path, await dir.read_text(path));
 	const problems = validate_manifest(raw);
 	if (problems.length > 0) {
-		throw new Error(`${path} is invalid:\n  ${problems.join('\n  ')}`);
+		throw new TaskError(`${path} is invalid:\n  ${problems.join('\n  ')}`);
 	}
 	return raw as Manifest;
 };

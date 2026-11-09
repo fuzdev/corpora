@@ -18,7 +18,7 @@ manifest.json     which upstreams, at which commit, filtered how (the recipe)
 lock.json         per collection: commit, file count, bytes, content digest (generated)
 collections/      the snapshot — one directory per upstream, upstream-relative paths, verbatim bytes
   <name>/LICENSE  the upstream's license, or a note naming its package.json declaration
-scripts/          the Deno materializer (zero dependencies; git via subprocess)
+src/lib/          the materializer, gro tasks on Node (git via subprocess)
 ```
 
 Point a consumer at `collections/<name>`, never at the repo root: the tree under a
@@ -59,11 +59,15 @@ from it.
 ## Usage
 
 ```bash
-deno task materialize                 # rewrite collections/ + lock.json from manifest.json
-deno task materialize --only kit      # one collection (others keep their lock entries)
-deno task check                       # re-materialize to a temp dir; fail on any byte of drift or a leftover collection
-deno task test && deno task typecheck
+npm install
+npm run materialize                   # rewrite collections/ + lock.json from manifest.json
+npm run materialize -- --only kit     # one collection (repeatable; others keep their lock entries)
+npm run materialize:check             # re-materialize in memory; fail on any byte of drift or a leftover collection
+npm run check                         # typecheck, tests, and format over this repo's own TS
 ```
+
+`npm` needs the `--` to pass a flag through. The drift check, an unknown `--only` collection
+and bad arguments all exit 1.
 
 The materializer reads git objects, never a working tree: `git ls-tree` at the pinned
 commit lists the files, `git cat-file --batch` copies their bytes. A sibling checkout
@@ -75,7 +79,7 @@ Never format a collection in place. Copy it, or `git checkout -- collections` af
 ## Refreshing
 
 1. Edit the commits (and any new collections) in `manifest.json`.
-2. `deno task materialize`, then review the diffstat.
+2. `npm run materialize`, then review the diffstat.
 3. Commit with the per-collection commit ranges in the message. The new commit is the
    roll-up hash a reader clones; what consumers pin is the `collections/` tree id
    (`git rev-parse HEAD:collections`), which a refresh moves and a scripts or docs commit

@@ -13,9 +13,10 @@ can reproduce their numbers with one clone. First consumer: [tsv](https://github
 corpora/
 ├── manifest.json     # collections: name, url, commit, subpaths, include, exclude, files, license, shaped_by, origin
 ├── lock.json         # per collection: commit, file count, bytes, content digest (generated)
-├── scripts/          # the Deno materializer + check (zero external deps; git via subprocess)
-│   ├── materialize.ts      # CLI: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped
-│   └── lib/                # manifest (types + validation), git, source (sibling or .cache clone), snapshot
+├── src/lib/          # the materializer + check, gro tasks on Node (git via subprocess)
+│   ├── materialize.task.ts # the task: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped
+│   └── *.ts                # materialize, manifest (types + validation), git, source (sibling or .cache clone), snapshot
+├── src/test/         # vitest; `gro test` passes `--dir src`, and vite.config.ts keeps a bare `vitest` out of collections/ too
 ├── .cache/           # gitignored: bare clones fetched at the pinned commits when no sibling has them
 └── collections/
     └── <name>/       # LICENSE + the upstream-relative source tree, verbatim bytes
@@ -27,28 +28,32 @@ holds only corpus files.
 ## Commands
 
 ```bash
-deno task materialize              # rewrite collections/ + lock.json from manifest.json
-deno task materialize --only kit   # one collection; the others keep their lock entries
-deno task check                    # re-materialize into a temp dir, compare byte for byte + lock; exit 1 on drift
-deno task typecheck && deno task test
-tsv format scripts                 # the repo's own TS — never `tsv format .` (it would walk collections/)
+npm run materialize                 # rewrite collections/ + lock.json from manifest.json
+npm run materialize -- --only kit   # one collection (repeatable); the others keep their lock entries
+npm run materialize:check           # re-materialize in memory, compare byte for byte + lock; exit 1 on drift or a bad --only
+npm run check                       # gro check: typecheck + vitest + gen + format; never reaches collections/
 ```
 
-`deno task check` is what CI runs (`.github/workflows/check.yml`). It is also the
+The `--` before a flag matters: without it npm takes the flag itself. `gro format` covers
+`src/` and the root config files, so it never reaches `collections/`; never run `tsv format .`,
+which would walk it.
+
+`npm run materialize:check` is what CI runs (`.github/workflows/check.yml`), after `gro check --workspace`. It is also the
 license gate: a collection whose license file or declaration does not read as its
 manifest SPDX id fails inside it.
 
 ## Rules
 
 - **Verbatim bytes.** `.gitattributes` declares `* -text`; nothing here is ever
-  formatted, and no ignore files live under `collections/`, so every tool's discovery
-  sees every file. Never format a collection in place; copy it, or `git checkout --`
-  it afterwards.
+  formatted, and no ignore files live under `collections/` (a consumer's discovery reads
+  the root's too, so the root `.gitignore` ends by re-including everything under `collections/`),
+  so every tool's discovery sees every file. Never format a collection in place; copy
+  it, or `git checkout --` it afterwards.
 - **Materialized from git objects** — `git ls-tree -r <commit> -- <subpath>` lists, `git
   cat-file --batch` copies — filtered by the manifest's extension allowlist and excludes.
   Never from a directory walk of a live checkout, never from a consumer's own discovery.
   Symlinks are skipped (a snapshot holds bytes, not links); a subpath that matches no
-  file fails. A collection's `files` names upstream files kept whatever their extension
+  file fails, and so does a kept path that isn't UTF-8. A collection's `files` names upstream files kept whatever their extension
   — a module-type or config file a runtime reads to load the source as written, like the
   `package.json` whose `"type": "module"` makes Node read `.ts` as ESM, or an upstream
   attribution notice a license requires to accompany the code, like the `NOTICE.txt`
