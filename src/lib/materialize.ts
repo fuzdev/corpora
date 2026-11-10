@@ -22,6 +22,7 @@
  * @module
  */
 
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 import type { FsDir } from '@fuzdev/gro/fs.ts';
 import type { FsPaths } from '@fuzdev/gro/fs_paths.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
@@ -36,12 +37,12 @@ import {
 } from './manifest.ts';
 import { resolve_source } from './source.ts';
 import {
+	LockEntry,
 	diff_trees,
 	lock_entry,
 	materialize_collection,
 	read_tree,
-	write_collection,
-	type LockEntry
+	write_collection
 } from './snapshot.ts';
 
 export const MANIFEST_PATH = 'manifest.json';
@@ -72,15 +73,21 @@ export interface MaterializeResult {
 	problems: Array<string>;
 }
 
-interface Lock {
-	version: number;
-	collections: Record<string, LockEntry>;
-}
+const Lock = s.object({
+	version: s.number,
+	collections: s.record(LockEntry)
+});
+type Lock = s.Infer<typeof Lock>;
 
 const read_lock = async (project: FsDir): Promise<Lock> => {
 	const text = await project.read_text_if_exists(LOCK_PATH);
 	if (text === null) return { version: MANIFEST_VERSION, collections: {} };
-	return parse_json_text(LOCK_PATH, text) as Lock;
+	return parse_json_text(
+		Lock,
+		LOCK_PATH,
+		text,
+		`Delete ${LOCK_PATH} and run \`npm run materialize\` to regenerate it.`
+	);
 };
 
 const format_bytes = (n: number): string => `${(n / 1e6).toFixed(1)} MB`;

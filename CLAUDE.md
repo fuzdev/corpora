@@ -15,7 +15,7 @@ corpora/
 ├── lock.json         # per collection: commit, file count, bytes, content digest (generated)
 ├── src/lib/          # the materializer + check, gro tasks on Node (git via subprocess)
 │   ├── materialize.task.ts # the task: write mode, `--check`, `--only <name>`; a full run also removes/reports collections the manifest dropped
-│   └── *.ts                # materialize, manifest (types + validation), git, source (sibling or .cache clone), snapshot
+│   └── *.ts                # materialize, manifest (schemas, then cross-field checks), git, source (sibling or .cache clone), snapshot
 ├── src/test/         # vitest; `gro test` passes `--dir src`, and vite.config.ts keeps a bare `vitest` out of collections/ too
 ├── .cache/           # gitignored: bare clones fetched at the pinned commits when no sibling has them
 └── collections/

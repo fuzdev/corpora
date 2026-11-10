@@ -6,6 +6,8 @@
  */
 
 import { hash_sha256 } from '@fuzdev/fuz_util/hash.ts';
+import { meta } from '@fuzdev/fuz_schema/meta.ts';
+import * as s from '@fuzdev/fuz_schema/schema.ts';
 import type { FsDir, FsReadDir } from '@fuzdev/gro/fs.ts';
 import { fs_search } from '@fuzdev/gro/fs_search.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
@@ -40,6 +42,9 @@ export const LARGE_FILE_BYTES = 512 * 1024;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+// an upstream's package.json carries whatever its project put there, so only `license` is read
+const UpstreamPackageJson = s.strip_object({ license: s.optional(s.unknown) });
 
 /** Code-unit order, so a digest never depends on the host's locale. */
 const compare_paths = (a: { path: string }, b: { path: string }): number =>
@@ -139,8 +144,10 @@ export const license_content = async (
 	const pkg_text = decoder.decode(
 		await git_out_bytes(git, source, ['cat-file', 'blob', `${commit}:${license.declared_in}`])
 	);
-	const declared = (
-		parse_json_text(`${name}: ${license.declared_in}`, pkg_text) as { license?: unknown }
+	const declared = parse_json_text(
+		UpstreamPackageJson,
+		`${name}: ${license.declared_in}`,
+		pkg_text
 	).license;
 	if (declared !== license.spdx) {
 		throw new TaskError(
@@ -178,14 +185,18 @@ export const write_collection = async (
 	}
 };
 
+const count = s.pipe(s.number, s.safe_integer);
+
 /** What the lock records per collection. */
-export interface LockEntry {
-	commit: string;
-	files: number;
-	bytes: number;
-	/** `sha256:` over every file's path and content digest, in path order. */
-	digest: string;
-}
+export const LockEntry = s.object({
+	commit: s.string,
+	files: count,
+	bytes: count,
+	digest: meta(s.string, {
+		description: "`sha256:` over every file's path and content digest, in path order"
+	})
+});
+export type LockEntry = s.Infer<typeof LockEntry>;
 
 /** Computes a collection's lock entry from its files (sorted by path). */
 export const lock_entry = async (

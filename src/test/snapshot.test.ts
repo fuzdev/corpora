@@ -219,7 +219,7 @@ describe('license_content', () => {
 
 	test('generates a note for a matching declared license', async () => {
 		await using dir = await create_temp_dir();
-		const commit = await commit_files(dir, { 'package.json': '{"license":"MIT"}' });
+		const commit = await commit_files(dir, { 'package.json': '{"name":"x","license":"MIT"}' });
 		const bytes = await license_content(
 			git,
 			to_collection(commit, { license: { spdx: 'MIT', declared_in: 'package.json' } }),
@@ -240,6 +240,32 @@ describe('license_content', () => {
 				dir
 			),
 			'x: package.json is not valid JSON'
+		);
+	});
+
+	test('refuses a declaration file that is not a JSON object', async () => {
+		await using dir = await create_temp_dir();
+		const commit = await commit_files(dir, { 'package.json': '[]' });
+		await assert_task_error_includes(
+			license_content(
+				git,
+				to_collection(commit, { license: { spdx: 'MIT', declared_in: 'package.json' } }),
+				dir
+			),
+			'x: package.json is invalid'
+		);
+	});
+
+	test('a declaration of a non-string license is a disagreement, not a parse failure', async () => {
+		await using dir = await create_temp_dir();
+		const commit = await commit_files(dir, { 'package.json': '{"license":{"type":"MIT"}}' });
+		await assert_task_error_includes(
+			license_content(
+				git,
+				to_collection(commit, { license: { spdx: 'MIT', declared_in: 'package.json' } }),
+				dir
+			),
+			'declares license {"type":"MIT"}'
 		);
 	});
 

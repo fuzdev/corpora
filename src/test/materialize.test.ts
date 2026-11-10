@@ -265,6 +265,58 @@ describe('materialize', () => {
 	);
 
 	test(
+		'a lock that is not the lock shape names the file',
+		with_fixture(async (f) => {
+			await f.project.write('lock.json', JSON.stringify({ version: 2, collections: { zeta: {} } }));
+			await assert_task_error_includes(f.run(), 'lock.json is invalid');
+			await f.project.write('lock.json', JSON.stringify({ version: 2, collections: {}, extra: 1 }));
+			await assert_task_error_includes(f.run(), 'lock.json is invalid');
+			const entry = { commit: 'c', files: 1, bytes: 2, digest: 'd', extra: 1 };
+			await f.project.write(
+				'lock.json',
+				JSON.stringify({ version: 2, collections: { zeta: entry } })
+			);
+			await assert_task_error_includes(f.run(), 'lock.json is invalid');
+		})
+	);
+
+	test(
+		'a malformed lock is refused with the way out, in write mode too',
+		with_fixture(async (f) => {
+			await f.project.write('lock.json', JSON.stringify({ version: 2, collections: {}, extra: 1 }));
+			await assert_task_error_includes(f.run(), 'Delete lock.json and run');
+			await f.project.write('lock.json', '{not json');
+			await assert_task_error_includes(f.run(), 'Delete lock.json and run');
+			await f.project.remove('lock.json');
+			await f.run();
+			assert.isTrue(await f.project.exists('lock.json'));
+		})
+	);
+
+	test(
+		'refuses a lock whose version or counts are not numbers of that shape',
+		with_fixture(async (f) => {
+			await f.run();
+			const lock = JSON.parse(await f.project.read_text('lock.json'));
+			await f.project.write('lock.json', JSON.stringify({ ...lock, version: 'two' }));
+			await assert_task_error_includes(f.run({ check: true }), 'lock.json is invalid');
+			lock.collections.alpha.files = 1.5;
+			await f.project.write('lock.json', JSON.stringify(lock));
+			await assert_task_error_includes(f.run({ check: true }), 'collections.alpha.files');
+		})
+	);
+
+	test(
+		'a parsed lock writes back byte-identical',
+		with_fixture(async (f) => {
+			await f.run();
+			const lock = await f.project.read_text('lock.json');
+			await f.run();
+			assert.strictEqual(await f.project.read_text('lock.json'), lock);
+		})
+	);
+
+	test(
 		'an invalid manifest fails naming the problem',
 		with_fixture(async (f) => {
 			await f.project.write('manifest.json', JSON.stringify({ version: 1 }));
