@@ -52,8 +52,8 @@ export type Args = s.Infer<typeof Args>;
 export const task: Task<Args> = {
 	summary: 'materialize collections/ from manifest.json, or with --check verify they reproduce',
 	Args,
-	run: async ({ args, log }) => {
-		const { check, only } = args;
+	run: async ({ task_args, log }) => {
+		const { check, only } = task_args;
 		const git = to_git_program(spawn, { pass_env: GIT_PASS_ENV });
 		const { rows, problems } = await materialize(
 			{ git, project: fs.project, fs_paths: create_fs_paths(fs), log: (m) => log.info(m) },
