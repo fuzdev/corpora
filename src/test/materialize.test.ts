@@ -1,6 +1,8 @@
 import { fs, type FsDir } from '@fuzdev/gro/fs.ts';
 import { create_fs_paths } from '@fuzdev/gro/fs_paths.ts';
-import { is_task_error } from '@fuzdev/gro/task.ts';
+import { cwd } from '@fuzdev/gro/cwd.ts';
+import { env } from '@fuzdev/gro/env.ts';
+import { is_task_error } from '@fuzdev/gro/task_error.ts';
 import { assert, describe, test } from 'vitest';
 
 import { materialize, type MaterializeOptions } from '#lib/materialize.ts';
@@ -56,7 +58,12 @@ const create_fixture = async (): Promise<Fixture> => {
 		['zeta', commits.zeta!],
 		['alpha', commits.alpha!]
 	]);
-	const deps = { git, project, fs_paths: create_fs_paths(fs), log: () => {} };
+	const deps = {
+		git,
+		project,
+		fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+		log: () => {}
+	};
 	return {
 		project,
 		siblings,

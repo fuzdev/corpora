@@ -1,6 +1,6 @@
 import { fs, type FsDir } from '@fuzdev/gro/fs.ts';
 import { spawn, type SpawnProgram } from '@fuzdev/gro/spawn.ts';
-import { is_task_error, TaskError } from '@fuzdev/gro/task.ts';
+import { is_task_error, TaskError } from '@fuzdev/gro/task_error.ts';
 import { assert } from 'vitest';
 
 /** The program the tests run git through, with only the base environment. */

@@ -7,7 +7,7 @@
 
 import type { FsReadDir } from '@fuzdev/gro/fs.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
-import { TaskError } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 const decoder = new TextDecoder();
 // `ignoreBOM` keeps a leading U+FEFF, which is part of a path's name

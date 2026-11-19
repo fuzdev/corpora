@@ -11,7 +11,7 @@ import * as s from '@fuzdev/fuz_schema/schema.ts';
 import type { FsDir, FsReadDir } from '@fuzdev/gro/fs.ts';
 import { fs_search } from '@fuzdev/gro/fs_search.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
-import { TaskError } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 import { git_cat_blobs, git_ls_tree, git_out_bytes, type GitTreeEntry } from './git.ts';
 import {

@@ -12,7 +12,7 @@ import { to_error_message } from '@fuzdev/fuz_util/error.ts';
 import { meta } from '@fuzdev/fuz_schema/meta.ts';
 import * as s from '@fuzdev/fuz_schema/schema.ts';
 import type { FsReadDir } from '@fuzdev/gro/fs.ts';
-import { TaskError } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 /** A relative path with no leading `./`, no `..` segment, and no trailing slash. */
 export const is_clean_path = (p: string): boolean =>

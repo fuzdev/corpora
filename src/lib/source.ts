@@ -11,7 +11,7 @@ import type { FsDir, FsReadDir } from '@fuzdev/gro/fs.ts';
 import { is_fs_error, type FsErrorKind } from '@fuzdev/gro/fs_error.ts';
 import type { FsPaths } from '@fuzdev/gro/fs_paths.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
-import { TaskError } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 import { git_has_commit, git_out_bytes } from './git.ts';
 import type { Collection } from './manifest.ts';

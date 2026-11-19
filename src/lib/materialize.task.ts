@@ -2,9 +2,12 @@ import { meta } from '@fuzdev/fuz_schema/meta.ts';
 import * as s from '@fuzdev/fuz_schema/schema.ts';
 import { fs } from '@fuzdev/gro/fs.ts';
 import { create_fs_paths } from '@fuzdev/gro/fs_paths.ts';
+import { cwd } from '@fuzdev/gro/cwd.ts';
+import { env } from '@fuzdev/gro/env.ts';
 import { to_git_program } from '@fuzdev/gro/git.ts';
 import { spawn } from '@fuzdev/gro/spawn.ts';
-import { TaskError, type Task } from '@fuzdev/gro/task.ts';
+import type { Task } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 import { materialize } from './materialize.ts';
 
@@ -56,7 +59,12 @@ export const task: Task<Args> = {
 		const { check, only } = task_args;
 		const git = to_git_program(spawn, { pass_env: GIT_PASS_ENV });
 		const { rows, problems } = await materialize(
-			{ git, project: fs.project, fs_paths: create_fs_paths(fs), log: (m) => log.info(m) },
+			{
+				git,
+				project: fs.project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: (m) => log.info(m)
+			},
 			{ check, only, siblings_path: '..' }
 		);
 

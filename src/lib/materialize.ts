@@ -26,7 +26,7 @@ import * as s from '@fuzdev/fuz_schema/schema.ts';
 import type { FsDir } from '@fuzdev/gro/fs.ts';
 import type { FsPaths } from '@fuzdev/gro/fs_paths.ts';
 import type { SpawnProgram } from '@fuzdev/gro/spawn.ts';
-import { TaskError } from '@fuzdev/gro/task.ts';
+import { TaskError } from '@fuzdev/gro/task_error.ts';
 
 import {
 	MANIFEST_VERSION,

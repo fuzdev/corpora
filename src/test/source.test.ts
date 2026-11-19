@@ -1,6 +1,8 @@
 import { fs } from '@fuzdev/gro/fs.ts';
 import { is_fs_error } from '@fuzdev/gro/fs_error.ts';
 import { create_fs_paths } from '@fuzdev/gro/fs_paths.ts';
+import { cwd } from '@fuzdev/gro/cwd.ts';
+import { env } from '@fuzdev/gro/env.ts';
 import { spawn } from '@fuzdev/gro/spawn.ts';
 import { assert, describe, test } from 'vitest';
 
@@ -29,7 +31,12 @@ describe('resolve_source', () => {
 		const commit = await commit_files(sibling.dir('up'), { 'a.ts': 'a' });
 		const logged: Array<string> = [];
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: (m) => logged.push(m) },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: (m) => logged.push(m)
+			},
 			to_collection(commit, 'file:///nowhere'),
 			{ siblings_path: siblings.path }
 		);
@@ -51,7 +58,7 @@ describe('resolve_source', () => {
 		const deps = {
 			git,
 			project,
-			fs_paths: create_fs_paths(fs),
+			fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
 			log: (m: string) => logged.push(m)
 		};
 		const options = { siblings_path: siblings.path };
@@ -70,7 +77,12 @@ describe('resolve_source', () => {
 		const commit = await commit_files(upstream, { 'a.ts': 'a' });
 		const url = `file://${upstream.path}`;
 		await siblings.mkdir('up'); // no `.git`
-		const deps = { git, project, fs_paths: create_fs_paths(fs), log: () => {} };
+		const deps = {
+			git,
+			project,
+			fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+			log: () => {}
+		};
 		const from_dir = await resolve_source(deps, to_collection(commit, url), {
 			siblings_path: siblings.path
 		});
@@ -93,7 +105,12 @@ describe('resolve_source', () => {
 		const commit = await commit_files(siblings, { 'a.ts': 'a' });
 		await siblings.mkdir('up'); // git's discovery from here would find `siblings`' repo
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: () => {}
+			},
 			to_collection(commit, `file://${siblings.path}`),
 			{ siblings_path: siblings.path }
 		);
@@ -107,7 +124,12 @@ describe('resolve_source', () => {
 		const commit = await commit_files(upstream, { 'a.ts': 'a' });
 		await spawn.program('ln').run(['-s', 'up', 'up'], { cwd: siblings });
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: () => {}
+			},
 			to_collection(commit, `file://${upstream.path}`),
 			{ siblings_path: siblings.path }
 		);
@@ -123,7 +145,12 @@ describe('resolve_source', () => {
 			.program('ln')
 			.run(['-s', `${fs.project.path}/no_such_dir`, 'up'], { cwd: siblings });
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: () => {}
+			},
 			to_collection(commit, `file://${upstream.path}`),
 			{ siblings_path: siblings.path }
 		);
@@ -140,7 +167,12 @@ describe('resolve_source', () => {
 		await chmod.run(['000', 'up'], { cwd: siblings });
 		try {
 			const source = await resolve_source(
-				{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+				{
+					git,
+					project,
+					fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+					log: () => {}
+				},
 				to_collection(commit, `file://${upstream.path}`),
 				{ siblings_path: siblings.path }
 			);
@@ -160,7 +192,12 @@ describe('resolve_source', () => {
 			.program('ln')
 			.run(['-s', `${elsewhere.path}/.git`, '.git'], { cwd: siblings.dir('up') });
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: () => {}
+			},
 			to_collection(commit, 'file:///nowhere'),
 			{ siblings_path: siblings.path }
 		);
@@ -174,7 +211,12 @@ describe('resolve_source', () => {
 		await spawn.program('ln').run(['-s', outside.path, '.cache'], { cwd: project });
 		try {
 			await resolve_source(
-				{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+				{
+					git,
+					project,
+					fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+					log: () => {}
+				},
 				to_collection('f'.repeat(40), 'file:///nowhere'),
 				{ siblings_path: siblings.path }
 			);
@@ -192,7 +234,12 @@ describe('resolve_source', () => {
 		const commit = await commit_files(real, { 'a.ts': 'a' });
 		await spawn.program('ln').run(['-s', real.path, 'up'], { cwd: siblings });
 		const source = await resolve_source(
-			{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+			{
+				git,
+				project,
+				fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+				log: () => {}
+			},
 			to_collection(commit, 'file:///nowhere'),
 			{ siblings_path: siblings.path }
 		);
@@ -207,7 +254,12 @@ describe('resolve_source', () => {
 		const absent = 'f'.repeat(40);
 		await assert_task_error_includes(
 			resolve_source(
-				{ git, project, fs_paths: create_fs_paths(fs), log: () => {} },
+				{
+					git,
+					project,
+					fs_paths: create_fs_paths(fs, { cwd: cwd(), home: env.get('HOME') }),
+					log: () => {}
+				},
 				to_collection(absent, `file://${upstream.path}`),
 				{ siblings_path: siblings.path }
 			),
