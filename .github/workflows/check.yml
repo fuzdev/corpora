@@ -44,7 +44,7 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npx @fuzdev/gro check --workspace
+      - run: npx @fuzdev/gro check --workspace --lint
 
       # the materializer's own step, byte for byte, apart from the code gate above
       - run: npm run materialize:check
